@@ -57,6 +57,13 @@ pub(crate) mod ffi {
         name: String,
         id: u8,
     }
+    struct NativeSnapshotColumnFamily {
+        name: String,
+        id: u8,
+        num_columns: usize,
+        value_has_ttl: bool,
+        metadata_json: String,
+    }
 
     struct NativeShardSnapshot {
         ranges: Vec<NativeBucketRange>,
@@ -67,6 +74,9 @@ pub(crate) mod ffi {
         timestamp_seconds: u32,
         data_size_bytes: u64,
         incremental_data_size_bytes: u64,
+        has_schema_metadata: bool,
+        schema_id: u64,
+        schema_families: Vec<NativeSnapshotColumnFamily>,
     }
 
     struct NativeSnapshot {

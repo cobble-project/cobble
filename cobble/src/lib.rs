@@ -52,7 +52,7 @@
 //!
 //! - Write/read normally on each shard `Db`.
 //! - Trigger `Db::snapshot` (or `snapshot_with_callback`) on each shard.
-//! - Build `ShardSnapshotInput` list and call:
+//! - Build `ShardSnapshotMetadata` list and call:
 //!   - `DbCoordinator::take_global_snapshot(...)`
 //!   - `DbCoordinator::materialize_global_snapshot(...)`
 //!
@@ -156,9 +156,7 @@ pub use config::{
     PrimaryVolumeOffloadPolicyKind, ReadOptions, RemoteCompactionFailureMode, RuntimeManifestMode,
     ScanOptions, SstReadMetadataCacheMode, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
-pub use coordinator::{
-    CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef,
-};
+pub use coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotRef};
 pub use db::{Db, ExpandStorageMode, RecoveryMode};
 pub use db_builder::DbBuilder;
 pub use db_iter::DbIterator;
@@ -180,8 +178,11 @@ pub use read_only_db_builder::ReadOnlyDbBuilder;
 pub use reader::{GlobalSnapshotSummary, Reader, ReaderConfig};
 pub use reader_builder::ReaderBuilder;
 pub use scan::{ScanPlan, ScanSplit, ScanSplitScanner};
-pub use schema::{ColumnEvolution, ColumnFamilyOptions, Schema, SchemaBuilder};
+pub use schema::{
+    ColumnEvolution, ColumnFamilyOptions, Schema, SchemaBuilder, SnapshotColumnFamily,
+};
 pub use single_db::SingleDb;
+pub use snapshot::{ShardSnapshotMetadata, load_shard_snapshot_metadata};
 pub use snapshot_tool::prune_shard_snapshot;
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};

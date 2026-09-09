@@ -14,16 +14,36 @@ pub(crate) struct NativePendingSnapshot {
 
 pub(crate) struct NativePendingShardSnapshot {
     id: u64,
-    receiver: Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotInput>>>,
+    receiver: Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotMetadata>>>,
 }
 
 fn family((name, id): (String, u8)) -> ffi::NativeFamily {
     ffi::NativeFamily { name, id }
 }
 
+fn schema_families(
+    families: std::collections::BTreeMap<String, cobble_binding::SnapshotColumnFamily>,
+) -> Vec<ffi::NativeSnapshotColumnFamily> {
+    families
+        .into_iter()
+        .map(|(name, family)| ffi::NativeSnapshotColumnFamily {
+            name,
+            id: family.id,
+            num_columns: family.num_columns,
+            value_has_ttl: family.options.value_has_ttl,
+            metadata_json: family
+                .options
+                .metadata
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
 pub(crate) fn shard_snapshot(
-    value: cobble_binding::ShardSnapshotInput,
+    value: cobble_binding::ShardSnapshotMetadata,
 ) -> ffi::NativeShardSnapshot {
+    let families = value.column_family_ids().into_iter().map(family).collect();
     ffi::NativeShardSnapshot {
         ranges: value
             .ranges
@@ -33,13 +53,16 @@ pub(crate) fn shard_snapshot(
                 last: *range.end(),
             })
             .collect(),
-        families: value.column_family_ids.into_iter().map(family).collect(),
+        families,
         db_id: value.db_id,
         snapshot_id: value.snapshot_id,
         manifest_path: value.manifest_path,
         timestamp_seconds: value.timestamp_seconds,
         data_size_bytes: value.data_size_bytes,
         incremental_data_size_bytes: value.incremental_data_size_bytes,
+        has_schema_metadata: true,
+        schema_id: value.schema_id,
+        schema_families: schema_families(value.column_families),
     }
 }
 
@@ -62,6 +85,9 @@ pub(crate) fn shard_snapshot_ref(
         timestamp_seconds: value.timestamp_seconds,
         data_size_bytes: value.data_size_bytes,
         incremental_data_size_bytes: value.incremental_data_size_bytes,
+        has_schema_metadata: false,
+        schema_id: 0,
+        schema_families: Vec::new(),
     }
 }
 
@@ -112,15 +138,54 @@ fn native_ranges(values: Vec<ffi::NativeRange>) -> BridgeResult<Vec<RangeInclusi
         .collect()
 }
 
-pub(crate) fn shard_snapshot_input(
+pub(crate) fn shard_snapshot_metadata(
     value: ffi::NativeShardSnapshot,
-) -> BridgeResult<cobble_binding::ShardSnapshotInput> {
+) -> BridgeResult<cobble_binding::ShardSnapshotMetadata> {
     if value.db_id.is_empty() || value.manifest_path.is_empty() {
         return Err(input_error(
             "shard snapshot db_id and manifest_path must not be empty",
         ));
     }
-    Ok(cobble_binding::ShardSnapshotInput {
+    if !value.has_schema_metadata {
+        return Err(input_error("shard snapshot schema metadata is required"));
+    }
+    let mut column_families = BTreeMap::new();
+    for family in value.schema_families {
+        let metadata = (!family.metadata_json.is_empty())
+            .then(|| serde_json::from_str(&family.metadata_json))
+            .transpose()
+            .map_err(|error| {
+                input_error(&format!("invalid column family metadata json: {error}"))
+            })?;
+        column_families.insert(
+            family.name,
+            cobble_binding::SnapshotColumnFamily {
+                id: family.id,
+                num_columns: family.num_columns,
+                options: cobble_binding::ColumnFamilyOptions {
+                    value_has_ttl: family.value_has_ttl,
+                    metadata,
+                },
+            },
+        );
+    }
+    Ok(cobble_binding::ShardSnapshotMetadata {
+        ranges: native_ranges(value.ranges)?,
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+        schema_id: value.schema_id,
+        column_families,
+    })
+}
+
+pub(crate) fn shard_snapshot_reference(
+    value: ffi::NativeShardSnapshot,
+) -> BridgeResult<cobble_binding::ShardSnapshotRef> {
+    Ok(cobble_binding::ShardSnapshotRef {
         ranges: native_ranges(value.ranges)?,
         column_family_ids: native_families(value.families)?,
         db_id: value.db_id,
@@ -129,22 +194,6 @@ pub(crate) fn shard_snapshot_input(
         timestamp_seconds: value.timestamp_seconds,
         data_size_bytes: value.data_size_bytes,
         incremental_data_size_bytes: value.incremental_data_size_bytes,
-    })
-}
-
-pub(crate) fn shard_snapshot_reference(
-    value: ffi::NativeShardSnapshot,
-) -> BridgeResult<cobble_binding::ShardSnapshotRef> {
-    let input = shard_snapshot_input(value)?;
-    Ok(cobble_binding::ShardSnapshotRef {
-        ranges: input.ranges,
-        column_family_ids: input.column_family_ids,
-        db_id: input.db_id,
-        snapshot_id: input.snapshot_id,
-        manifest_path: input.manifest_path,
-        timestamp_seconds: input.timestamp_seconds,
-        data_size_bytes: input.data_size_bytes,
-        incremental_data_size_bytes: input.incremental_data_size_bytes,
     })
 }
 
@@ -208,7 +257,7 @@ pub(crate) fn native_sharded_database_get_shard_snapshot(
     snapshot_id: u64,
 ) -> BridgeResult<ffi::NativeShardSnapshot> {
     db.db
-        .shard_snapshot_input(snapshot_id)
+        .shard_snapshot_metadata(snapshot_id)
         .map(shard_snapshot)
         .map_err(format_cobble_error)
 }

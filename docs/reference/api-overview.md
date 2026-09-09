@@ -62,7 +62,7 @@ fails.
 | `Schema` | Current raw schema with family-local metadata |
 | `SchemaBuilder` | Schema evolution builder; column-family aware via optional family arguments |
 | `ColumnEvolution` | Target column mapping: `Source` with optional transform ID, `Default`, or `Null` |
-| `ShardSnapshotInput` | Shard snapshot DTO used by the coordinator |
+| `ShardSnapshotMetadata` | Shard snapshot identity, ranges, sizes, and column-family schema metadata |
 | `GlobalSnapshotManifest` | Materialized global snapshot manifest |
 
 ### Column Family Model
@@ -142,7 +142,7 @@ db.switch_memtable_type(memtable_type, flush_current) -> Result<()>
 db.cancel_snapshot(snapshot_id) -> Result<bool>
 db.expire_snapshot(snapshot_id) -> Result<bool>
 db.retain_snapshot(snapshot_id) -> bool
-db.shard_snapshot_input(snapshot_id) -> Result<ShardSnapshotInput>
+db.shard_snapshot_metadata(snapshot_id) -> Result<ShardSnapshotMetadata>
 db.expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode) -> Result<u64>
 db.wait_for_expand_adoption(timeout) -> Result<()>
 db.load_readonly_files_to_primary() -> Result<usize>
@@ -169,8 +169,11 @@ WAL branch for writes based on the historical snapshot. See
 
 Snapshot lifecycle notes:
 
+`cobble::load_shard_snapshot_metadata(&config, db_id, manifest_path)` reads a snapshot's manifest and
+schema definitions without opening a DB or resolving merge operators/transforms.
+
 - `db.snapshot()` returns a snapshot id after the async materialization flow has been scheduled.
-- `db.snapshot_with_callback(...)` delivers a `ShardSnapshotInput` once manifest publication finishes.
+- `db.snapshot_with_callback(...)` delivers a `ShardSnapshotMetadata` once manifest publication finishes, including that snapshot's schema and column-family metadata.
 - `db.cancel_snapshot(snapshot_id)` only succeeds before manifest publication completes.
 - `db.expire_snapshot(snapshot_id)` releases snapshot ownership and file references.
 - `db.retain_snapshot(snapshot_id)` keeps a completed snapshot alive across retention passes.
@@ -300,7 +303,7 @@ definition. Explicit snapshot restores and readers use the schema stored in that
 Selecting the current global snapshot captures its version when the reader opens; it does not
 automatically follow later snapshots or schema changes.
 `Table::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
-completed `ShardSnapshotInput` for opening a reader or submitting to a snapshot coordinator.
+completed `ShardSnapshotMetadata` for opening a reader or submitting to a snapshot coordinator.
 
 `snapshot_committer(config, max_pending_commits)` returns the same `TableSnapshotCommitter`
 available without a catalog. Use `submit(commit_id, shard_snapshot)` as shards arrive or

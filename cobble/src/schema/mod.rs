@@ -50,6 +50,14 @@ pub struct ColumnFamilyOptions {
     pub metadata: Option<JsonValue>,
 }
 
+/// Persisted metadata for one column family in a shard snapshot schema.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotColumnFamily {
+    pub id: u8,
+    pub num_columns: usize,
+    pub options: ColumnFamilyOptions,
+}
+
 impl Default for ColumnFamilyOptions {
     fn default() -> Self {
         Self {
@@ -1114,6 +1122,78 @@ pub(crate) fn schema_from_file(
 fn schema_file_from_payload(payload: &[u8]) -> Result<SchemaFile> {
     serde_json::from_slice(payload)
         .map_err(|err| Error::FileFormatError(format!("Failed to decode schema file: {}", err)))
+}
+
+pub(crate) fn snapshot_column_families_from_payload(
+    payload: &[u8],
+    schema_id: u64,
+) -> Result<BTreeMap<String, SnapshotColumnFamily>> {
+    let schema_file = schema_file_from_payload(payload)?;
+    if schema_file.format_version != SCHEMA_FILE_FORMAT_VERSION {
+        return Err(Error::FileFormatError(format!(
+            "Unsupported schema file format version {} (expected {})",
+            schema_file.format_version, SCHEMA_FILE_FORMAT_VERSION
+        )));
+    }
+    if schema_file.id != schema_id {
+        return Err(Error::InvalidState(format!(
+            "Schema file id mismatch: expected {}, got {}",
+            schema_id, schema_file.id
+        )));
+    }
+    if schema_file.column_families.len() > MAX_COLUMN_FAMILY_COUNT {
+        return Err(Error::FileFormatError(format!(
+            "column family count {} exceeds max {}",
+            schema_file.column_families.len(),
+            MAX_COLUMN_FAMILY_COUNT
+        )));
+    }
+    let mut column_families = BTreeMap::new();
+    for family in schema_file.column_families {
+        if column_families
+            .insert(
+                family.name,
+                SnapshotColumnFamily {
+                    id: family.id,
+                    num_columns: family
+                        .merge_operator_ids
+                        .len()
+                        .max(family.column_metadata.len()),
+                    options: family.options,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::FileFormatError(
+                "schema file contains duplicate column family names".to_string(),
+            ));
+        }
+    }
+    if column_families.is_empty() {
+        return Err(Error::FileFormatError(
+            "Schema file contains no column families".to_string(),
+        ));
+    }
+    Ok(column_families)
+}
+
+pub(crate) fn snapshot_column_families_from_schema(
+    schema: &Schema,
+) -> BTreeMap<String, SnapshotColumnFamily> {
+    schema
+        .column_families
+        .iter()
+        .map(|family| {
+            (
+                family.name.clone(),
+                SnapshotColumnFamily {
+                    id: family.id,
+                    num_columns: family.num_columns(),
+                    options: family.options.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn load_schema(

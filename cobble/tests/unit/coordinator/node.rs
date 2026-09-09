@@ -1,6 +1,7 @@
 use super::*;
 use crate::file::FileSystemRegistry;
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
+use crate::{ColumnFamilyOptions, SnapshotColumnFamily};
 
 fn cleanup_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -24,6 +25,25 @@ fn write_bucket_snapshot(
 
 fn default_column_family_ids() -> BTreeMap<String, u8> {
     BTreeMap::from([("default".to_string(), 0)])
+}
+
+fn default_column_families() -> BTreeMap<String, SnapshotColumnFamily> {
+    column_families(default_column_family_ids())
+}
+
+fn column_families(ids: BTreeMap<String, u8>) -> BTreeMap<String, SnapshotColumnFamily> {
+    ids.into_iter()
+        .map(|(name, id)| {
+            (
+                name,
+                SnapshotColumnFamily {
+                    id,
+                    num_columns: 1,
+                    options: ColumnFamilyOptions::default(),
+                },
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -54,9 +74,10 @@ fn test_global_snapshot_round_trip() {
         .take_global_snapshot(
             4,
             vec![
-                ShardSnapshotInput {
+                ShardSnapshotMetadata {
                     ranges: vec![0u16..=1u16],
-                    column_family_ids: default_column_family_ids(),
+                    schema_id: 0,
+                    column_families: default_column_families(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path_a.clone(),
@@ -64,9 +85,10 @@ fn test_global_snapshot_round_trip() {
                     data_size_bytes: 0,
                     incremental_data_size_bytes: 0,
                 },
-                ShardSnapshotInput {
+                ShardSnapshotMetadata {
                     ranges: vec![2u16..=3u16],
-                    column_family_ids: default_column_family_ids(),
+                    schema_id: 0,
+                    column_families: default_column_families(),
                     db_id: "db-b".to_string(),
                     snapshot_id: 2,
                     manifest_path: path_b.clone(),
@@ -107,7 +129,7 @@ fn test_global_snapshot_manifest_rejects_previous_physical_key_format() {
         version: 1,
         id: 1,
         total_buckets: 4,
-        column_family_ids: default_column_family_ids(),
+        column_family_ids: BTreeMap::from([("default".to_string(), 0)]),
         shard_snapshots: Vec::new(),
         watermark_seconds: 0,
     };
@@ -146,9 +168,10 @@ fn test_list_global_snapshots_returns_sorted() {
     let snapshot_2 = node
         .take_global_snapshot_with_id(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: path_a.clone(),
@@ -164,9 +187,10 @@ fn test_list_global_snapshots_returns_sorted() {
     let snapshot_1 = node
         .take_global_snapshot_with_id(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: "db-b".to_string(),
                 snapshot_id: 2,
                 manifest_path: path_b.clone(),
@@ -213,9 +237,10 @@ fn test_global_snapshot_auto_retention() {
     let snapshot_1 = node
         .take_global_snapshot_with_id(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: path.clone(),
@@ -231,9 +256,10 @@ fn test_global_snapshot_auto_retention() {
     let snapshot_2 = node
         .take_global_snapshot_with_id(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: path,
@@ -279,9 +305,10 @@ fn test_global_snapshot_retain_expire() {
     let snapshot_1 = node
         .take_global_snapshot_with_id(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: path.clone(),
@@ -298,9 +325,10 @@ fn test_global_snapshot_retain_expire() {
     let snapshot_2 = node
         .take_global_snapshot_with_id(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: path,
@@ -352,12 +380,13 @@ fn test_global_snapshot_rejects_conflicting_column_family_ids_by_name() {
     let err = DbCoordinator::build_global_snapshot(
         4,
         vec![
-            ShardSnapshotInput {
+            ShardSnapshotMetadata {
                 ranges: vec![0u16..=1u16],
-                column_family_ids: BTreeMap::from([
+                schema_id: 0,
+                column_families: column_families(BTreeMap::from([
                     ("default".to_string(), 0),
                     ("metrics".to_string(), 1),
-                ]),
+                ])),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: "file:///tmp/db-a".to_string(),
@@ -365,12 +394,13 @@ fn test_global_snapshot_rejects_conflicting_column_family_ids_by_name() {
                 data_size_bytes: 0,
                 incremental_data_size_bytes: 0,
             },
-            ShardSnapshotInput {
+            ShardSnapshotMetadata {
                 ranges: vec![2u16..=3u16],
-                column_family_ids: BTreeMap::from([
+                schema_id: 0,
+                column_families: column_families(BTreeMap::from([
                     ("default".to_string(), 0),
                     ("metrics".to_string(), 2),
-                ]),
+                ])),
                 db_id: "db-b".to_string(),
                 snapshot_id: 2,
                 manifest_path: "file:///tmp/db-b".to_string(),
@@ -391,12 +421,13 @@ fn test_global_snapshot_rejects_conflicting_column_family_ids_by_id() {
     let err = DbCoordinator::build_global_snapshot(
         4,
         vec![
-            ShardSnapshotInput {
+            ShardSnapshotMetadata {
                 ranges: vec![0u16..=1u16],
-                column_family_ids: BTreeMap::from([
+                schema_id: 0,
+                column_families: column_families(BTreeMap::from([
                     ("default".to_string(), 0),
                     ("metrics".to_string(), 1),
-                ]),
+                ])),
                 db_id: "db-a".to_string(),
                 snapshot_id: 1,
                 manifest_path: "file:///tmp/db-a".to_string(),
@@ -404,12 +435,13 @@ fn test_global_snapshot_rejects_conflicting_column_family_ids_by_id() {
                 data_size_bytes: 0,
                 incremental_data_size_bytes: 0,
             },
-            ShardSnapshotInput {
+            ShardSnapshotMetadata {
                 ranges: vec![2u16..=3u16],
-                column_family_ids: BTreeMap::from([
+                schema_id: 0,
+                column_families: column_families(BTreeMap::from([
                     ("default".to_string(), 0),
                     ("events".to_string(), 1),
-                ]),
+                ])),
                 db_id: "db-b".to_string(),
                 snapshot_id: 2,
                 manifest_path: "file:///tmp/db-b".to_string(),
@@ -452,9 +484,10 @@ fn test_list_global_snapshots_skips_checksum_mismatch_manifest() {
         let snapshot = node
             .take_global_snapshot_with_id(
                 4,
-                vec![ShardSnapshotInput {
+                vec![ShardSnapshotMetadata {
                     ranges: vec![0u16..=3u16],
-                    column_family_ids: default_column_family_ids(),
+                    schema_id: 0,
+                    column_families: default_column_families(),
                     db_id: "db-a".to_string(),
                     snapshot_id: 1,
                     manifest_path: path.clone(),

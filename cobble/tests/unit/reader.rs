@@ -1,10 +1,11 @@
 use super::*;
 use crate::VolumeDescriptor;
-use crate::coordinator::{CoordinatorConfig, DbCoordinator, ShardSnapshotInput};
+use crate::coordinator::{CoordinatorConfig, DbCoordinator};
 use crate::paths::{bucket_snapshot_dir, bucket_snapshot_manifest_path};
 use crate::test_utils::{
     encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
 };
+use crate::{ColumnFamilyOptions, ShardSnapshotMetadata, SnapshotColumnFamily};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -81,6 +82,17 @@ fn wait_for_pointer(root: &str, snapshot_id: u64) {
 
 fn default_column_family_ids() -> BTreeMap<String, u8> {
     BTreeMap::from([("default".to_string(), 0)])
+}
+
+fn default_column_families() -> BTreeMap<String, SnapshotColumnFamily> {
+    BTreeMap::from([(
+        "default".to_string(),
+        SnapshotColumnFamily {
+            id: 0,
+            num_columns: 1,
+            options: ColumnFamilyOptions::default(),
+        },
+    )])
 }
 
 #[test]
@@ -428,9 +440,10 @@ fn test_read_proxy_routes_and_evicts() {
         .take_global_snapshot(
             4,
             vec![
-                ShardSnapshotInput {
+                ShardSnapshotMetadata {
                     ranges: vec![0u16..=1u16],
-                    column_family_ids: default_column_family_ids(),
+                    schema_id: 0,
+                    column_families: default_column_families(),
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
                     manifest_path: path_a,
@@ -438,9 +451,10 @@ fn test_read_proxy_routes_and_evicts() {
                     data_size_bytes: 0,
                     incremental_data_size_bytes: 0,
                 },
-                ShardSnapshotInput {
+                ShardSnapshotMetadata {
                     ranges: vec![2u16..=3u16],
-                    column_family_ids: default_column_family_ids(),
+                    schema_id: 0,
+                    column_families: default_column_families(),
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,
                     manifest_path: path_b,
@@ -517,9 +531,10 @@ fn test_read_proxy_refreshes_on_pointer_change() {
     let global_a = coordinator
         .take_global_snapshot(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: db_a.clone(),
                 snapshot_id: snap_a,
                 manifest_path: path_a,
@@ -548,9 +563,10 @@ fn test_read_proxy_refreshes_on_pointer_change() {
     let global_b = coordinator
         .take_global_snapshot(
             4,
-            vec![ShardSnapshotInput {
+            vec![ShardSnapshotMetadata {
                 ranges: vec![0u16..=3u16],
-                column_family_ids: default_column_family_ids(),
+                schema_id: 0,
+                column_families: default_column_families(),
                 db_id: db_b.clone(),
                 snapshot_id: snap_b,
                 manifest_path: path_b,

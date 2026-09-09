@@ -66,7 +66,7 @@ fn config(root: &str, snapshot_source: bool) -> Config {
     }
 }
 
-fn snapshot(db: &Db) -> cobble::ShardSnapshotInput {
+fn snapshot(db: &Db) -> cobble::ShardSnapshotMetadata {
     let (tx, rx) = std::sync::mpsc::channel();
     db.snapshot_with_callback(move |result| tx.send(result).unwrap())
         .unwrap();

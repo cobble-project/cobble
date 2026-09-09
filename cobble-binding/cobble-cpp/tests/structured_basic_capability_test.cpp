@@ -125,6 +125,9 @@ void VerifySharded(const std::filesystem::path &root) {
   const auto pending_id = pending.id();
   const auto async_snapshot = pending.Wait();
   COBBLE_CHECK(async_snapshot.snapshot_id == pending_id);
+  COBBLE_CHECK(async_snapshot.has_schema_metadata);
+  COBBLE_CHECK(!async_snapshot.schema_column_families.empty());
+  COBBLE_CHECK(async_snapshot.schema_column_families.front().num_columns > 0);
   COBBLE_CHECK(db.GetShardSnapshot(pending_id).snapshot_id == pending_id);
   (void)db.RetainSnapshot(pending_id);
 

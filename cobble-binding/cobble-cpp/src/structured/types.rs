@@ -33,7 +33,8 @@ pub(crate) struct NativeStructuredSchemaEdit {
 
 pub(crate) struct NativePendingShardSnapshot {
     pub(crate) id: u64,
-    pub(crate) receiver: Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotInput>>>,
+    pub(crate) receiver:
+        Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotMetadata>>>,
 }
 
 pub(crate) struct NativePendingSnapshot {

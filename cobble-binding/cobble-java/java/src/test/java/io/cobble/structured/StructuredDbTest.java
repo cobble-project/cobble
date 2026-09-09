@@ -889,8 +889,8 @@ class StructuredDbTest {
 
             ShardSnapshot shardSnapshot = db.snapshot();
             assertNotNull(shardSnapshot);
-            assertNotNull(shardSnapshot.columnFamilyIds);
-            assertEquals(Integer.valueOf(0), shardSnapshot.columnFamilyIds.get("default"));
+            assertNotNull(shardSnapshot.columnFamilies);
+            assertEquals(0, shardSnapshot.columnFamilies.get("default").id);
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
 
             GlobalSnapshot globalSnapshot;

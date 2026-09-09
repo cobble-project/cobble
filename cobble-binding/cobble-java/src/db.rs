@@ -17,7 +17,6 @@ use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
-use serde_json::json;
 use std::sync::Arc;
 
 #[unsafe(no_mangle)]
@@ -2181,33 +2180,13 @@ fn direct_buffer_pool_config_array(
 
 fn build_shard_snapshot_payload(db: &Db, snapshot_id: u64) -> std::result::Result<String, String> {
     let input = db
-        .shard_snapshot_input(snapshot_id)
+        .shard_snapshot_metadata(snapshot_id)
         .map_err(|err| err.to_string())?;
     Ok(shard_snapshot_json(&input))
 }
 
-fn shard_snapshot_json(input: &cobble_binding::ShardSnapshotInput) -> String {
-    let ranges: Vec<serde_json::Value> = input
-        .ranges
-        .iter()
-        .map(|range| {
-            json!({
-                "start": *range.start(),
-                "end": *range.end(),
-            })
-        })
-        .collect();
-    json!({
-        "ranges": ranges,
-        "column_family_ids": &input.column_family_ids,
-        "db_id": &input.db_id,
-        "snapshot_id": input.snapshot_id,
-        "manifest_path": &input.manifest_path,
-        "timestamp_seconds": input.timestamp_seconds,
-        "data_size_bytes": input.data_size_bytes,
-        "incremental_data_size_bytes": input.incremental_data_size_bytes,
-    })
-    .to_string()
+fn shard_snapshot_json(input: &cobble_binding::ShardSnapshotMetadata) -> String {
+    serde_json::to_string(input).expect("snapshot metadata is serializable")
 }
 
 fn complete_snapshot_json_future(

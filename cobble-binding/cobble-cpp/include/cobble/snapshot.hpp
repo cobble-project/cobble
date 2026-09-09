@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -19,6 +20,14 @@ struct ColumnFamilyId {
   std::uint8_t id;
 };
 
+struct SnapshotColumnFamily {
+  std::string name;
+  std::uint8_t id;
+  std::size_t num_columns;
+  bool value_has_ttl;
+  std::string metadata_json;
+};
+
 struct ShardSnapshot {
   std::vector<BucketRange> ranges;
   std::vector<ColumnFamilyId> column_families;
@@ -28,6 +37,10 @@ struct ShardSnapshot {
   std::uint32_t timestamp_seconds;
   std::uint64_t data_size_bytes;
   std::uint64_t incremental_data_size_bytes;
+  // Full DB reports include schema metadata; global-manifest references do not.
+  bool has_schema_metadata = false;
+  std::uint64_t schema_id = 0;
+  std::vector<SnapshotColumnFamily> schema_column_families;
 };
 
 struct GlobalSnapshot {

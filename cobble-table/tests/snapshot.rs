@@ -1,5 +1,6 @@
 use cobble::{
-    CoordinatorConfig, DbCoordinator, ShardSnapshotInput, VolumeDescriptor, VolumeUsageKind,
+    ColumnFamilyOptions, CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata,
+    SnapshotColumnFamily, VolumeDescriptor, VolumeUsageKind,
 };
 use cobble_table::snapshot::TableSnapshotCommitter;
 use std::collections::BTreeMap;
@@ -231,10 +232,18 @@ fn shard_input(
     db_id: &str,
     ranges: Vec<RangeInclusive<u16>>,
     snapshot_id: u64,
-) -> ShardSnapshotInput {
-    ShardSnapshotInput {
+) -> ShardSnapshotMetadata {
+    ShardSnapshotMetadata {
         ranges,
-        column_family_ids: BTreeMap::from([("default".to_string(), 0)]),
+        schema_id: 0,
+        column_families: BTreeMap::from([(
+            "default".to_string(),
+            SnapshotColumnFamily {
+                id: 0,
+                num_columns: 1,
+                options: ColumnFamilyOptions::default(),
+            },
+        )]),
         db_id: db_id.to_string(),
         snapshot_id,
         manifest_path: format!("file:///snapshots/{db_id}/{snapshot_id}"),

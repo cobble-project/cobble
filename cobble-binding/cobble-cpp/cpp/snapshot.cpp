@@ -16,6 +16,14 @@ ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native) {
   shard.timestamp_seconds = native.timestamp_seconds;
   shard.data_size_bytes = native.data_size_bytes;
   shard.incremental_data_size_bytes = native.incremental_data_size_bytes;
+  shard.has_schema_metadata = native.has_schema_metadata;
+  shard.schema_id = native.schema_id;
+  shard.schema_column_families.reserve(native.schema_families.size());
+  for (const auto& family : native.schema_families) {
+    shard.schema_column_families.push_back(
+        {std::string(family.name), family.id, family.num_columns,
+         family.value_has_ttl, std::string(family.metadata_json)});
+  }
   shard.ranges.reserve(native.ranges.size());
   for (const auto& range : native.ranges) {
     shard.ranges.push_back({range.first, range.last});

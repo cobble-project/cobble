@@ -1,10 +1,10 @@
-use cobble_binding::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotInput};
+use cobble_binding::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata};
 
 use crate::{
     BridgeResult,
     error::{format_cobble_error, input_error},
     ffi,
-    snapshot::{shard_snapshot_input, snapshot},
+    snapshot::{shard_snapshot_metadata, snapshot},
 };
 
 pub(crate) struct NativeCoordinator {
@@ -28,7 +28,7 @@ pub(crate) fn native_coordinator_open_file(
     open(Config::from_path(config_path).map_err(format_cobble_error)?)
 }
 
-fn validate_coverage(total_buckets: u32, shards: &[ShardSnapshotInput]) -> BridgeResult<()> {
+fn validate_coverage(total_buckets: u32, shards: &[ShardSnapshotMetadata]) -> BridgeResult<()> {
     if total_buckets == 0 || total_buckets > u32::from(u16::MAX) + 1 {
         return Err(input_error("total_buckets must be in range 1..=65536"));
     }
@@ -66,7 +66,7 @@ pub(crate) fn native_coordinator_materialize_global_snapshot(
 ) -> BridgeResult<ffi::NativeSnapshot> {
     let shards = shards
         .into_iter()
-        .map(shard_snapshot_input)
+        .map(shard_snapshot_metadata)
         .collect::<BridgeResult<Vec<_>>>()?;
     validate_coverage(total_buckets, &shards)?;
     let global = coordinator

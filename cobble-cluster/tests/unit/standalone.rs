@@ -1,6 +1,8 @@
 use super::*;
-use cobble::VolumeDescriptor;
-use cobble::VolumeUsageKind;
+use cobble::{
+    ColumnFamilyOptions, ShardSnapshotMetadata, SnapshotColumnFamily, VolumeDescriptor,
+    VolumeUsageKind,
+};
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 
@@ -31,21 +33,27 @@ fn build_coordinator(root: &str) -> StandaloneCoordinator {
 }
 
 #[test]
-fn standalone_shard_snapshot_roundtrip_preserves_column_family_ids() {
-    let input = ShardSnapshotInput {
+fn standalone_shard_snapshot_roundtrip_preserves_schema_metadata() {
+    let input = ShardSnapshotMetadata {
         ranges: vec![0u16..=3u16],
-        column_family_ids: BTreeMap::from([("default".to_string(), 0), ("metrics".to_string(), 1)]),
         db_id: "db-a".to_string(),
         snapshot_id: 7,
         manifest_path: "file:///tmp/db-a".to_string(),
         timestamp_seconds: 11,
-        data_size_bytes: 0,
-        incremental_data_size_bytes: 0,
+        data_size_bytes: 123,
+        incremental_data_size_bytes: 45,
+        schema_id: 3,
+        column_families: BTreeMap::from([(
+            "default".to_string(),
+            SnapshotColumnFamily {
+                id: 0,
+                num_columns: 1,
+                options: ColumnFamilyOptions::default(),
+            },
+        )]),
     };
-    let snapshot = StandaloneShardSnapshot::from(input.clone());
-    assert_eq!(snapshot.column_family_ids, input.column_family_ids);
-
-    let restored = ShardSnapshotInput::from(snapshot);
+    let serialized = serde_json::to_string(&input).unwrap();
+    let restored = serde_json::from_str::<ShardSnapshotMetadata>(&serialized).unwrap();
     assert_eq!(restored, input);
 }
 

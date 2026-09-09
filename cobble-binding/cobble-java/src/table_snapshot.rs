@@ -1,4 +1,4 @@
-use crate::coordinator::parse_shard_snapshot_inputs;
+use crate::coordinator::parse_shard_snapshots;
 use crate::util::{
     decode_java_string, decode_u32, decode_u64_from_jlong, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
@@ -81,7 +81,7 @@ pub extern "system" fn Java_io_cobble_table_TableSnapshotCommitter_submitJson(
             return std::ptr::null_mut();
         }
     };
-    let mut snapshots = match parse_shard_snapshot_inputs(&json) {
+    let mut snapshots = match parse_shard_snapshots(&json) {
         Ok(snapshots) if snapshots.len() == 1 => snapshots,
         Ok(_) => {
             throw_illegal_argument(
@@ -124,7 +124,7 @@ pub extern "system" fn Java_io_cobble_table_TableSnapshotCommitter_commitBatchJs
             return std::ptr::null_mut();
         }
     };
-    let snapshots = match parse_shard_snapshot_inputs(&json) {
+    let snapshots = match parse_shard_snapshots(&json) {
         Ok(snapshots) if !snapshots.is_empty() => snapshots,
         Ok(_) => {
             throw_illegal_argument(&mut env, "shard snapshots must not be empty".to_string());

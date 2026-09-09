@@ -8,7 +8,7 @@ use std::fs::{File as StdFile, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::UNIX_EPOCH;
 use url::Url;
@@ -93,13 +93,15 @@ impl FileSystem for PosixFileSystem {
     }
 
     fn init(
-        _url: &Url,
+        url: &Url,
         _access_id: Option<String>,
         _access_key: Option<String>,
         _custom_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
         Ok(Self {
-            root: Path::new(_url.path()).to_path_buf(),
+            root: url
+                .to_file_path()
+                .map_err(|_| Error::ConfigError(format!("Invalid local file URL path: {url}")))?,
         })
     }
 

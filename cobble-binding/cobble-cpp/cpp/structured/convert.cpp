@@ -116,6 +116,14 @@ ToShardSnapshot(const structured_ffi::NativeShardSnapshot &native) {
   result.timestamp_seconds = native.timestamp_seconds;
   result.data_size_bytes = native.data_size_bytes;
   result.incremental_data_size_bytes = native.incremental_data_size_bytes;
+  result.has_schema_metadata = native.has_schema_metadata;
+  result.schema_id = native.schema_id;
+  result.schema_column_families.reserve(native.schema_families.size());
+  for (const auto &family : native.schema_families) {
+    result.schema_column_families.push_back(
+        {std::string(family.name), family.id, family.num_columns,
+         family.value_has_ttl, std::string(family.metadata_json)});
+  }
   result.ranges.reserve(native.ranges.size());
   for (const auto &range : native.ranges) {
     result.ranges.push_back({range.start_inclusive, range.end_inclusive});

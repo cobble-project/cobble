@@ -15,16 +15,22 @@ import io.cobble.table.TableSchema;
 import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
 
+import com.google.gson.Gson;
+
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -37,12 +43,39 @@ import static org.junit.jupiter.api.Assertions.*;
 class DbBindingTest {
 
     @Test
-    void tableSnapshotCommitterCoordinatesInterleavedAndBatchSnapshots() throws IOException {
+    void tableSnapshotCommitterCoordinatesInterleavedAndBatchSnapshots() throws Exception {
         Path dataDir = Files.createTempDirectory("cobble-java-table-snapshot-committer-");
         Config config = new Config().addVolume(dataDir.toString()).totalBuckets(4);
         Path configPath = writeConfigFile(dataDir, config);
         ShardSnapshot shardA = tableShardSnapshot("table-shard-a", 1L, 0, 1);
         ShardSnapshot shardB = tableShardSnapshot("table-shard-b", 2L, 2, 3);
+        String reportJson = new Gson().toJson(shardA);
+        assertFalse(reportJson.contains("\"column_family_ids\""));
+        assertTrue(reportJson.contains("\"_binding_precision_probe\":9007199254740993"));
+        ShardSnapshot jsonRoundTripped = ShardSnapshot.fromJson(new Gson().toJson(shardA));
+        assertTrue(
+                jsonRoundTripped
+                        .columnFamilies
+                        .get("default")
+                        .options
+                        .metadata
+                        .contains("\"_binding_precision_probe\":9007199254740993"));
+        ByteArrayOutputStream serialized = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(serialized)) {
+            output.writeObject(shardA);
+        }
+        ShardSnapshot serializableRoundTripped;
+        try (ObjectInputStream input =
+                new ObjectInputStream(new ByteArrayInputStream(serialized.toByteArray()))) {
+            serializableRoundTripped = (ShardSnapshot) input.readObject();
+        }
+        assertTrue(
+                serializableRoundTripped
+                        .columnFamilies
+                        .get("default")
+                        .options
+                        .metadata
+                        .contains("\"_binding_precision_probe\":9007199254740993"));
 
         TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 4, 2);
         assertNull(committer.submit(10L, shardA));
@@ -267,6 +300,8 @@ class DbBindingTest {
             table.put(row2);
             table.put(row3);
             ShardSnapshot snapshot = db.snapshot();
+            assertFalse(snapshot.columnFamilies.isEmpty());
+            assertTrue(snapshot.columnFamilies.get("events").options.metadata.contains("cobble-table"));
             try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
                     ReadOnlyTable readOnly = ReadOnlyTable.open(readOnlyDb, "events")) {
                 assertEquals(schema, readOnly.schema());
@@ -881,8 +916,8 @@ class DbBindingTest {
             assertFalse(shardSnapshot.manifestPath.isEmpty());
             assertNotNull(shardSnapshot.ranges);
             assertFalse(shardSnapshot.ranges.isEmpty());
-            assertNotNull(shardSnapshot.columnFamilyIds);
-            assertEquals(Integer.valueOf(0), shardSnapshot.columnFamilyIds.get("default"));
+            assertNotNull(shardSnapshot.columnFamilies);
+            assertEquals(0, shardSnapshot.columnFamilies.get("default").id);
             assertTrue(shardSnapshot.dataSizeBytes > 0L);
             assertTrue(shardSnapshot.incrementalDataSizeBytes > 0L);
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
@@ -2502,12 +2537,11 @@ class DbBindingTest {
     }
 
     private static ShardSnapshot tableShardSnapshot(
-            String dbId, long snapshotId, int rangeStart, int rangeEnd) {
+            String dbId, long snapshotId, int rangeStart, int rangeEnd) throws IOException {
         ShardSnapshot snapshot = new ShardSnapshot();
         snapshot.dbId = dbId;
         snapshot.snapshotId = snapshotId;
         snapshot.manifestPath = "file:///snapshots/" + dbId + "/" + snapshotId;
-        snapshot.columnFamilyIds.put("default", Integer.valueOf(0));
         ShardSnapshot.Range range = new ShardSnapshot.Range();
         range.start = rangeStart;
         range.end = rangeEnd;
@@ -2515,6 +2549,27 @@ class DbBindingTest {
         snapshot.timestampSeconds = snapshotId;
         snapshot.dataSizeBytes = 10L;
         snapshot.incrementalDataSizeBytes = 1L;
+        String metadata =
+                new String(
+                        Files.readAllBytes(
+                                Paths.get(
+                                        "..",
+                                        "..",
+                                        "..",
+                                        "spec",
+                                        "table",
+                                        "fixtures",
+                                        "table_metadata_v1.json")),
+                        StandardCharsets.UTF_8);
+        metadata =
+                metadata.substring(0, metadata.lastIndexOf('}'))
+                        + ",\"_binding_precision_probe\":9007199254740993}";
+        ShardSnapshot.SnapshotColumnFamily family = new ShardSnapshot.SnapshotColumnFamily();
+        family.id = 0;
+        family.numColumns = 3;
+        family.options.metadata = metadata;
+        snapshot.schemaId = snapshotId;
+        snapshot.columnFamilies.put("default", family);
         return snapshot;
     }
 }

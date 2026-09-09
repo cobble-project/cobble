@@ -45,7 +45,12 @@ fn native_family((name, id): (String, u8)) -> ffi::NativeFamily {
     ffi::NativeFamily { name, id }
 }
 
-fn native_shard_snapshot(value: cobble_binding::ShardSnapshotInput) -> ffi::NativeShardSnapshot {
+fn native_shard_snapshot(value: cobble_binding::ShardSnapshotMetadata) -> ffi::NativeShardSnapshot {
+    let families = value
+        .column_family_ids()
+        .into_iter()
+        .map(native_family)
+        .collect();
     ffi::NativeShardSnapshot {
         ranges: value
             .ranges
@@ -55,17 +60,30 @@ fn native_shard_snapshot(value: cobble_binding::ShardSnapshotInput) -> ffi::Nati
                 end_inclusive: *range.end(),
             })
             .collect(),
-        families: value
-            .column_family_ids
-            .into_iter()
-            .map(native_family)
-            .collect(),
+        families,
         db_id: value.db_id,
         snapshot_id: value.snapshot_id,
         manifest_path: value.manifest_path,
         timestamp_seconds: value.timestamp_seconds,
         data_size_bytes: value.data_size_bytes,
         incremental_data_size_bytes: value.incremental_data_size_bytes,
+        has_schema_metadata: true,
+        schema_id: value.schema_id,
+        schema_families: value
+            .column_families
+            .into_iter()
+            .map(|(name, family)| ffi::NativeSnapshotColumnFamily {
+                name,
+                id: family.id,
+                num_columns: family.num_columns,
+                value_has_ttl: family.options.value_has_ttl,
+                metadata_json: family
+                    .options
+                    .metadata
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect(),
     }
 }
 
@@ -90,6 +108,9 @@ fn native_shard_snapshot_ref(value: cobble_binding::ShardSnapshotRef) -> ffi::Na
         timestamp_seconds: value.timestamp_seconds,
         data_size_bytes: value.data_size_bytes,
         incremental_data_size_bytes: value.incremental_data_size_bytes,
+        has_schema_metadata: false,
+        schema_id: 0,
+        schema_families: Vec::new(),
     }
 }
 
@@ -163,7 +184,7 @@ pub(crate) fn native_structured_db_get_shard_snapshot(
     snapshot_id: u64,
 ) -> BridgeResult<ffi::NativeShardSnapshot> {
     db.db
-        .shard_snapshot_input(snapshot_id)
+        .shard_snapshot_metadata(snapshot_id)
         .map(native_shard_snapshot)
         .map_err(format_error)
 }

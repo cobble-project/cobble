@@ -205,6 +205,9 @@ MainSnapshotState VerifySnapshotsAndRecovery(
     COBBLE_CHECK(wait_cancelled == cancelled);
 
     recovery = db.TakeSnapshot();
+    COBBLE_CHECK(recovery.has_schema_metadata);
+    COBBLE_CHECK(!recovery.schema_column_families.empty());
+    COBBLE_CHECK(recovery.schema_column_families.front().num_columns > 0);
     COBBLE_CHECK(db.GetShardSnapshot(recovery.snapshot_id).manifest_path ==
                  recovery.manifest_path);
     COBBLE_CHECK(db.RetainSnapshot(recovery.snapshot_id));

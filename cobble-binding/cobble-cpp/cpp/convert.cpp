@@ -117,6 +117,14 @@ ffi::NativeShardSnapshot ToNativeShardSnapshot(const ShardSnapshot& snapshot) {
   native.timestamp_seconds = snapshot.timestamp_seconds;
   native.data_size_bytes = snapshot.data_size_bytes;
   native.incremental_data_size_bytes = snapshot.incremental_data_size_bytes;
+  native.has_schema_metadata = snapshot.has_schema_metadata;
+  native.schema_id = snapshot.schema_id;
+  native.schema_families.reserve(snapshot.schema_column_families.size());
+  for (const auto& family : snapshot.schema_column_families) {
+    native.schema_families.push_back(
+        {RustString(family.name), family.id, family.num_columns,
+         family.value_has_ttl, RustString(family.metadata_json)});
+  }
   return native;
 }
 

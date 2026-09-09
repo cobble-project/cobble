@@ -64,8 +64,8 @@ db2.put(700, b"key-b", 0, b"value-b")?;  // bucket 700 -> shard 2
 // 1) each shard snapshots and exports a shard snapshot input
 let snap1 = db1.snapshot()?;
 let snap2 = db2.snapshot()?;
-let input1 = db1.shard_snapshot_input(snap1)?;
-let input2 = db2.shard_snapshot_input(snap2)?;
+let input1 = db1.shard_snapshot_metadata(snap1)?;
+let input2 = db2.shard_snapshot_metadata(snap2)?;
 
 // 2) coordinator creates + materializes a global snapshot
 let global_manifest = coord.take_global_snapshot(total_buckets, vec![input1, input2])?;

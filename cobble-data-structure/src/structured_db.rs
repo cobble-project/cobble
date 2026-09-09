@@ -13,7 +13,7 @@ use bytes::Bytes;
 use cobble::{
     BytesMergeOperator, ColumnEvolution, Config, Db, DbBuilder, DbIterator, Error, MemtableType,
     MergeOperatorResolver, ReadOptions, RecoveryMode, Result, ScanOptions, Schema, SchemaBuilder,
-    ShardSnapshotInput, WriteBatch, WriteOptions,
+    ShardSnapshotMetadata, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -2076,7 +2076,7 @@ impl StructuredDb {
 
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(Result<ShardSnapshotInput>) + Send + Sync + 'static,
+        F: Fn(Result<ShardSnapshotMetadata>) + Send + Sync + 'static,
     {
         self.db.snapshot_with_callback(callback)
     }
@@ -2093,8 +2093,8 @@ impl StructuredDb {
         self.db.retain_snapshot(snapshot_id)
     }
 
-    pub fn shard_snapshot_input(&self, snapshot_id: u64) -> Result<ShardSnapshotInput> {
-        self.db.shard_snapshot_input(snapshot_id)
+    pub fn shard_snapshot_metadata(&self, snapshot_id: u64) -> Result<ShardSnapshotMetadata> {
+        self.db.shard_snapshot_metadata(snapshot_id)
     }
 
     pub fn set_time(&self, next: u32) {

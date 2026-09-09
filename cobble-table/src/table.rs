@@ -4,7 +4,7 @@ use crate::{BucketHash, FieldId, LogicalType, Result, TableError, TableSchema, V
 use bytes::Bytes;
 use cobble::{
     ColumnFamilyOptions, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema,
-    ShardSnapshotInput, WriteOptions,
+    ShardSnapshotMetadata, WriteOptions,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
@@ -316,13 +316,13 @@ impl Table {
     /// Receive either the completed shard input or its publication error.
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(cobble::Result<ShardSnapshotInput>) + Send + Sync + 'static,
+        F: Fn(cobble::Result<ShardSnapshotMetadata>) + Send + Sync + 'static,
     {
         Ok(self.db.snapshot_with_callback(callback)?)
     }
 
     /// Create a snapshot and wait for its callback, without polling.
-    pub fn snapshot_and_wait(&self) -> Result<ShardSnapshotInput> {
+    pub fn snapshot_and_wait(&self) -> Result<ShardSnapshotMetadata> {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.snapshot_with_callback(move |result| {
             let _ = sender.send(result);
@@ -334,8 +334,8 @@ impl Table {
     }
 
     /// Return the published shard input for a completed snapshot.
-    pub fn shard_snapshot_input(&self, snapshot_id: u64) -> Result<ShardSnapshotInput> {
-        Ok(self.db.shard_snapshot_input(snapshot_id)?)
+    pub fn shard_snapshot_metadata(&self, snapshot_id: u64) -> Result<ShardSnapshotMetadata> {
+        Ok(self.db.shard_snapshot_metadata(snapshot_id)?)
     }
 
     pub(crate) fn from_metadata(

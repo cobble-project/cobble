@@ -374,7 +374,7 @@ impl Deref for SingleDb {
 
 fn materialize_global_snapshot(
     coordinator: &Arc<DbCoordinator>,
-    shard_input: crate::coordinator::ShardSnapshotInput,
+    shard_input: crate::snapshot::ShardSnapshotMetadata,
     total_buckets: u32,
     global_snapshot_id: u64,
 ) -> Result<GlobalSnapshotManifest> {

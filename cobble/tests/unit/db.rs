@@ -418,7 +418,7 @@ fn test_snapshot_completes_while_writer_rotates_multiple_memtables() {
     std::thread::sleep(Duration::from_millis(50));
     let (tx, rx) = mpsc::channel();
     let mut snapshot_id = None;
-    let snapshot_result = (|| -> Result<(u64, Result<crate::coordinator::ShardSnapshotInput>)> {
+    let snapshot_result = (|| -> Result<(u64, Result<crate::ShardSnapshotMetadata>)> {
         let id = db.snapshot_with_callback(move |result| {
             let _ = tx.send(result);
         })?;

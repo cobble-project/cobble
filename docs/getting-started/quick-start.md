@@ -121,8 +121,8 @@ db2.put(700, b"order:9", 0, b"paid")?;
 // global snapshot
 let s1 = db1.snapshot()?;
 let s2 = db2.snapshot()?;
-let i1 = db1.shard_snapshot_input(s1)?;
-let i2 = db2.shard_snapshot_input(s2)?;
+let i1 = db1.shard_snapshot_metadata(s1)?;
+let i2 = db2.shard_snapshot_metadata(s2)?;
 let manifest = coord.take_global_snapshot(1000, vec![i1, i2])?;
 coord.materialize_global_snapshot(&manifest)?;
 ```

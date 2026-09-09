@@ -1,12 +1,14 @@
 use std::collections::{BTreeSet, HashMap};
 
 use cobble::paths::bucket_snapshot_manifest_path;
-use cobble::test_utils::read_metadata_payload_from_path_for_test;
+use cobble::test_utils::{
+    encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
+};
 use cobble::{
     ColumnFamilyOptions, CompactionPolicyKind, Config, Db, MemtableType, MergeOperator,
     MetricValue, ReadOptions, Reader, ReaderConfig, ScanOptions, SingleDb, TimeProvider,
     TimeProviderKind, U64CounterMergeOperator, ValueType, VolumeDescriptor, VolumeUsageKind,
-    WriteBatch,
+    WriteBatch, load_shard_snapshot_metadata,
 };
 use serde_json::Value as JsonValue;
 use size::Size;
@@ -788,7 +790,7 @@ fn test_snapshot_manifest_captures_manual_time() {
         Some(1_234)
     );
     assert_eq!(
-        db.shard_snapshot_input(snapshot_id)
+        db.shard_snapshot_metadata(snapshot_id)
             .unwrap()
             .timestamp_seconds,
         1_234
@@ -1737,6 +1739,7 @@ fn test_db_incremental_snapshot_restore() {
         Some(base_snapshot_id)
     );
     assert!(manifest_json.get("vlog_files").is_some());
+    let captured_metadata = db.shard_snapshot_metadata(incremental_snapshot_id).unwrap();
     db.close().unwrap();
 
     let ro =
@@ -1746,11 +1749,90 @@ fn test_db_incremental_snapshot_restore() {
     let value2 = ro.get(0, b"k2").unwrap().expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
 
-    let writable = Db::open_from_snapshot(config, incremental_snapshot_id, db.id()).unwrap();
+    let writable =
+        Db::open_from_snapshot(config.clone(), incremental_snapshot_id, db.id()).unwrap();
     let value1 = writable.get(0, b"k1").unwrap().expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
     let value2 = writable.get(0, b"k2").unwrap().expect("k2 value present");
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
+    drop(ro);
+    drop(writable);
+
+    let source_manifest_path = Path::new(root).join(bucket_snapshot_manifest_path(
+        db.id(),
+        incremental_snapshot_id,
+    ));
+    let expected_metadata = load_shard_snapshot_metadata(
+        &config,
+        db.id(),
+        source_manifest_path.to_string_lossy().as_ref(),
+    )
+    .unwrap();
+    let mut expected_captured = captured_metadata;
+    expected_captured.manifest_path = source_manifest_path.to_string_lossy().into_owned();
+    assert_eq!(expected_metadata, expected_captured);
+    let metadata_copy = tempfile::Builder::new()
+        .prefix("snapshot metadata space ")
+        .tempdir()
+        .unwrap();
+    let copied_manifest_path = metadata_copy
+        .path()
+        .join("snapshot")
+        .join(format!("SNAPSHOT-{incremental_snapshot_id}"));
+    let copied_schema_path = metadata_copy
+        .path()
+        .join("schema")
+        .join(format!("schema-{}", expected_metadata.schema_id));
+    std::fs::create_dir_all(copied_manifest_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(copied_schema_path.parent().unwrap()).unwrap();
+    std::fs::copy(&source_manifest_path, &copied_manifest_path).unwrap();
+    std::fs::copy(
+        schema_file_path(root, db.id(), expected_metadata.schema_id),
+        &copied_schema_path,
+    )
+    .unwrap();
+    let mut schema_json: JsonValue = serde_json::from_slice(
+        &read_metadata_payload_from_path_for_test(&copied_schema_path).unwrap(),
+    )
+    .unwrap();
+    schema_json["column_families"][0]["merge_operator_ids"][0] =
+        JsonValue::String("unregistered-merge-operator".into());
+    std::fs::write(
+        &copied_schema_path,
+        encode_metadata_payload_for_test(&serde_json::to_vec(&schema_json).unwrap()),
+    )
+    .unwrap();
+    let absolute_manifest_path = copied_manifest_path.to_string_lossy().into_owned();
+    let file_url_manifest_path = url::Url::from_file_path(&copied_manifest_path)
+        .unwrap()
+        .to_string();
+    let metadata_only_config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}", metadata_copy.path().display()),
+                vec![VolumeUsageKind::Meta],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}/missing-sst", metadata_copy.path().display()),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+        ],
+        ..Config::default()
+    };
+    let mut expected_absolute = expected_metadata.clone();
+    expected_absolute.manifest_path = absolute_manifest_path.clone();
+    assert_eq!(
+        load_shard_snapshot_metadata(&metadata_only_config, db.id(), &absolute_manifest_path)
+            .unwrap(),
+        expected_absolute
+    );
+    let mut expected_file_url = expected_metadata;
+    expected_file_url.manifest_path = file_url_manifest_path.clone();
+    assert_eq!(
+        load_shard_snapshot_metadata(&metadata_only_config, db.id(), &file_url_manifest_path)
+            .unwrap(),
+        expected_file_url
+    );
 
     cleanup_test_root(root);
 }
@@ -2486,7 +2568,7 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
 
     let resume_config = config;
     let writable = Db::resume(resume_config, db.id()).unwrap();
-    let bucket_snapshot = writable.shard_snapshot_input(snapshot_id).unwrap();
+    let bucket_snapshot = writable.shard_snapshot_metadata(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, vec![0u16..=7u16]);
 
     let manifest_path = format!(
@@ -2575,7 +2657,7 @@ fn test_db_resume_from_historical_snapshot_keeps_snapshot_lifecycle() {
     // Snapshots newer than the selected state are still owned by the resumed manager.
     assert_eq!(
         resumed
-            .shard_snapshot_input(latest_snapshot_id)
+            .shard_snapshot_metadata(latest_snapshot_id)
             .unwrap()
             .snapshot_id,
         latest_snapshot_id
@@ -2919,7 +3001,7 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
         .unwrap()
         .expect("right value after resume");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
-    let bucket_snapshot = resumed.shard_snapshot_input(snapshot_id).unwrap();
+    let bucket_snapshot = resumed.shard_snapshot_metadata(snapshot_id).unwrap();
     assert_eq!(bucket_snapshot.ranges, ranges);
     resumed.close().unwrap();
     cleanup_test_root(root);

@@ -8,7 +8,7 @@
 //! publish a new equivalent global snapshot when work is replayed.
 
 use crate::{Result, TableError};
-use cobble::{DbCoordinator, GlobalSnapshotManifest, ShardSnapshotInput};
+use cobble::{DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +27,7 @@ struct CommitterState {
 
 #[derive(Default)]
 struct PendingCommit {
-    shards: BTreeMap<String, ShardSnapshotInput>,
+    shards: BTreeMap<String, ShardSnapshotMetadata>,
     prepared_snapshot: Option<GlobalSnapshotManifest>,
 }
 
@@ -67,7 +67,7 @@ impl TableSnapshotCommitter {
     pub fn submit(
         &self,
         commit_id: u64,
-        mut snapshot: ShardSnapshotInput,
+        mut snapshot: ShardSnapshotMetadata,
     ) -> Result<Option<GlobalSnapshotManifest>> {
         let mut state = self.lock_state()?;
         if is_completed_or_superseded(&state, commit_id) {
@@ -102,7 +102,7 @@ impl TableSnapshotCommitter {
     pub fn commit_batch(
         &self,
         commit_id: u64,
-        shard_snapshots: Vec<ShardSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotMetadata>,
     ) -> Result<Option<GlobalSnapshotManifest>> {
         let mut state = self.lock_state()?;
         if is_completed_or_superseded(&state, commit_id) {
@@ -234,7 +234,7 @@ fn retain_new_pending_commit(
 
 fn insert_shard(
     pending: &mut PendingCommit,
-    snapshot: ShardSnapshotInput,
+    snapshot: ShardSnapshotMetadata,
     commit_id: u64,
 ) -> Result<()> {
     match pending.shards.get(&snapshot.db_id) {
@@ -251,7 +251,7 @@ fn insert_shard(
     }
 }
 
-fn normalize_ranges(total_buckets: u32, input: &mut ShardSnapshotInput) -> Result<()> {
+fn normalize_ranges(total_buckets: u32, input: &mut ShardSnapshotMetadata) -> Result<()> {
     if input.ranges.is_empty() {
         return Err(coordination_error(format!(
             "shard snapshot ranges must not be empty for {}",
@@ -280,7 +280,7 @@ fn normalize_ranges(total_buckets: u32, input: &mut ShardSnapshotInput) -> Resul
     Ok(())
 }
 
-fn reject_overlapping_ranges(pending: &PendingCommit, input: &ShardSnapshotInput) -> Result<()> {
+fn reject_overlapping_ranges(pending: &PendingCommit, input: &ShardSnapshotMetadata) -> Result<()> {
     for (existing_db_id, existing) in &pending.shards {
         let mut left = existing.ranges.iter().peekable();
         let mut right = input.ranges.iter().peekable();
@@ -317,7 +317,7 @@ fn has_exact_bucket_coverage(total_buckets: u32, pending: &PendingCommit) -> boo
     expected == total_buckets
 }
 
-fn canonical_inputs(pending: &PendingCommit) -> Vec<ShardSnapshotInput> {
+fn canonical_inputs(pending: &PendingCommit) -> Vec<ShardSnapshotMetadata> {
     let mut inputs = pending.shards.values().cloned().collect::<Vec<_>>();
     inputs.sort_by(|left, right| {
         left.ranges

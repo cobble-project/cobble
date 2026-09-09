@@ -417,7 +417,7 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
     let resumed = writer_builder().resume().unwrap();
     assert_eq!(resumed.schema(), &schema);
     assert_eq!(resumed.get(&key).unwrap(), Some(updated));
-    assert!(resumed.shard_snapshot_input(latest.snapshot_id).is_ok());
+    assert!(resumed.shard_snapshot_metadata(latest.snapshot_id).is_ok());
     drop(resumed);
 
     let projection = reader.project_by_names(&["name"]).unwrap();

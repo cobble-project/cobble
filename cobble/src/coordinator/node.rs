@@ -10,6 +10,7 @@ use crate::paths::{
     SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path,
     snapshot_manifest_name,
 };
+use crate::snapshot::ShardSnapshotMetadata;
 use crate::util::{build_commit_short_id, build_version_string};
 use dashmap::DashSet;
 use log::info;
@@ -21,20 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global manifests version 2 reference shard snapshots with big-endian bucket prefixes.
 pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 2;
-
-/// Bucket snapshot reference input.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShardSnapshotInput {
-    pub ranges: Vec<RangeInclusive<u16>>,
-    pub column_family_ids: BTreeMap<String, u8>,
-    pub db_id: String,
-    pub snapshot_id: u64,
-    pub manifest_path: String,
-    /// Timestamp (seconds) when the shard snapshot was initiated.
-    pub timestamp_seconds: u32,
-    pub data_size_bytes: u64,
-    pub incremental_data_size_bytes: u64,
-}
 
 /// Bucket snapshot reference stored in a global manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -124,7 +111,7 @@ impl DbCoordinator {
     pub fn take_global_snapshot(
         &self,
         total_buckets: u32,
-        shard_snapshots: Vec<ShardSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotMetadata>,
     ) -> Result<GlobalSnapshotManifest> {
         let id = self.allocate_snapshot_id();
         Self::build_global_snapshot(total_buckets, shard_snapshots, id)
@@ -133,7 +120,7 @@ impl DbCoordinator {
     pub fn take_global_snapshot_with_id(
         &self,
         total_buckets: u32,
-        shard_snapshots: Vec<ShardSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotMetadata>,
         id: u64,
     ) -> Result<GlobalSnapshotManifest> {
         Self::build_global_snapshot(total_buckets, shard_snapshots, id)
@@ -145,7 +132,7 @@ impl DbCoordinator {
 
     fn build_global_snapshot(
         total_buckets: u32,
-        shard_snapshots: Vec<ShardSnapshotInput>,
+        shard_snapshots: Vec<ShardSnapshotMetadata>,
         id: u64,
     ) -> Result<GlobalSnapshotManifest> {
         if shard_snapshots.is_empty() {
@@ -164,9 +151,10 @@ impl DbCoordinator {
                 )));
             }
             watermark_seconds = watermark_seconds.min(bucket.timestamp_seconds);
+            let column_family_ids = bucket.column_family_ids();
             bucket_refs.push(ShardSnapshotRef {
                 ranges: bucket.ranges,
-                column_family_ids: bucket.column_family_ids,
+                column_family_ids,
                 db_id: bucket.db_id,
                 snapshot_id: bucket.snapshot_id,
                 manifest_path: bucket.manifest_path,
@@ -304,28 +292,31 @@ impl DbCoordinator {
     }
 }
 
-fn merge_column_family_ids(shard_snapshots: &[ShardSnapshotInput]) -> Result<BTreeMap<String, u8>> {
+fn merge_column_family_ids(
+    shard_snapshots: &[ShardSnapshotMetadata],
+) -> Result<BTreeMap<String, u8>> {
     let mut by_name = BTreeMap::new();
     let mut by_id = BTreeMap::new();
     for shard in shard_snapshots {
-        if shard.column_family_ids.is_empty() {
+        if shard.column_families.is_empty() {
             return Err(Error::CoordinationError(format!(
                 "Column family ids missing for {}:{}",
                 shard.db_id, shard.snapshot_id
             )));
         }
-        for (name, id) in &shard.column_family_ids {
+        for (name, family) in &shard.column_families {
+            let id = family.id;
             if let Some(existing_id) = by_name.get(name) {
-                if *existing_id != *id {
+                if *existing_id != id {
                     return Err(Error::CoordinationError(format!(
                         "column family '{}' has conflicting ids {} and {} across shards",
                         name, existing_id, id
                     )));
                 }
             } else {
-                by_name.insert(name.clone(), *id);
+                by_name.insert(name.clone(), id);
             }
-            if let Some(existing_name) = by_id.get(id) {
+            if let Some(existing_name) = by_id.get(&id) {
                 if existing_name != name {
                     return Err(Error::CoordinationError(format!(
                         "column family id {} is assigned to both '{}' and '{}' across shards",
@@ -333,7 +324,7 @@ fn merge_column_family_ids(shard_snapshots: &[ShardSnapshotInput]) -> Result<BTr
                     )));
                 }
             } else {
-                by_id.insert(*id, name.clone());
+                by_id.insert(id, name.clone());
             }
         }
     }

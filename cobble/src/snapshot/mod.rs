@@ -2,6 +2,7 @@
 mod manager;
 pub(crate) mod manifest;
 mod memtable;
+mod metadata;
 
 use crate::config::VolumeDescriptor;
 use crate::db_state::LSMTreeScope;
@@ -25,6 +26,7 @@ pub(crate) use manifest::{
     load_manifest_entry, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;
+pub use metadata::{ShardSnapshotMetadata, load_shard_snapshot_metadata};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

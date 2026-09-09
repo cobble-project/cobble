@@ -5,7 +5,7 @@ use crate::{
     StructuredWriteOptions,
 };
 use cobble::{
-    CoordinatorConfig, DbCoordinator, ShardSnapshotInput, VolumeDescriptor, VolumeUsageKind,
+    CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata, VolumeDescriptor, VolumeUsageKind,
 };
 use std::collections::BTreeMap;
 
@@ -45,7 +45,7 @@ fn write_and_snapshot(
     config: &Config,
     structured_schema: StructuredSchema,
     writes: impl FnOnce(&StructuredDb),
-) -> (StructuredDb, ShardSnapshotInput) {
+) -> (StructuredDb, ShardSnapshotMetadata) {
     let mut db = StructuredDb::open(config.clone(), vec![0u16..=3u16]).unwrap();
     db.update_schema()
         .add_list_column(

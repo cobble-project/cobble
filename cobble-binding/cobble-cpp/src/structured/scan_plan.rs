@@ -149,6 +149,9 @@ fn native_shard(value: cobble_binding::ShardSnapshotRef) -> ffi::NativeShardSnap
         timestamp_seconds: value.timestamp_seconds,
         data_size_bytes: value.data_size_bytes,
         incremental_data_size_bytes: value.incremental_data_size_bytes,
+        has_schema_metadata: false,
+        schema_id: 0,
+        schema_families: Vec::new(),
     }
 }
 

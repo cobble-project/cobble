@@ -17,7 +17,7 @@ fn full_bucket_range() -> Vec<std::ops::RangeInclusive<u16>> {
 fn write_and_snapshot(
     config: &Config,
     writes: impl FnOnce(&Db),
-) -> (Db, crate::coordinator::ShardSnapshotInput) {
+) -> (Db, crate::ShardSnapshotMetadata) {
     let db = Db::open(config.clone(), full_bucket_range()).unwrap();
     writes(&db);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -341,7 +341,7 @@ fn test_scan_plan_column_family_projection() {
         )
         .unwrap();
     });
-    assert_eq!(shard_input.column_family_ids.get("metrics"), Some(&1));
+    assert_eq!(shard_input.column_family_ids().get("metrics"), Some(&1));
 
     let coordinator = DbCoordinator::open(CoordinatorConfig {
         volumes: vec![crate::config::VolumeDescriptor::new(

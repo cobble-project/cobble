@@ -109,7 +109,7 @@ db.update_schema()
   })
   .commit()?;
 let snap = db.snapshot()?;
-let shard_input = db.shard_snapshot_input(snap)?;
+let shard_input = db.shard_snapshot_metadata(snap)?;
 ```
 
 Snapshot/coordinator flow is the same as raw `Db`, but values are encoded/decoded with the structured schema.

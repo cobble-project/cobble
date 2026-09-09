@@ -1208,10 +1208,10 @@ impl Db {
     }
 
     /// Flush the active memtable, schedule manifest materialization, and invoke the callback with
-    /// a [`crate::coordinator::ShardSnapshotInput`] once publication completes.
+    /// a [`crate::ShardSnapshotMetadata`] once publication completes.
     pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
+        F: Fn(Result<crate::snapshot::ShardSnapshotMetadata>) + Send + Sync + 'static,
     {
         let _access = self.begin_access()?;
         self.create_snapshot_with_callback(callback)
@@ -1223,24 +1223,25 @@ impl Db {
     /// ordinary access guard would be rejected by design.
     fn create_snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
     where
-        F: Fn(Result<crate::coordinator::ShardSnapshotInput>) + Send + Sync + 'static,
+        F: Fn(Result<crate::snapshot::ShardSnapshotMetadata>) + Send + Sync + 'static,
     {
         let db_id = self.id.clone();
         let schema_manager = Arc::clone(&self.schema_manager);
         let wrapper: SnapshotCallback = Arc::new(move |result: Result<SnapshotManifestInfo>| {
             callback(result.and_then(|info| {
-                let column_family_ids = schema_manager
-                    .schema(info.latest_schema_id)?
-                    .column_family_ids();
-                Ok(crate::coordinator::ShardSnapshotInput {
+                let schema = schema_manager.schema(info.latest_schema_id)?;
+                Ok(crate::snapshot::ShardSnapshotMetadata {
                     ranges: info.bucket_ranges,
-                    column_family_ids,
                     db_id: db_id.clone(),
                     snapshot_id: info.id,
                     manifest_path: info.manifest_path,
                     timestamp_seconds: info.timestamp_seconds,
                     data_size_bytes: info.data_size_bytes,
                     incremental_data_size_bytes: info.incremental_data_size_bytes,
+                    schema_id: schema.version(),
+                    column_families: crate::schema::snapshot_column_families_from_schema(
+                        schema.as_ref(),
+                    ),
                 })
             }));
         });
@@ -1413,17 +1414,14 @@ impl Db {
         self.snapshot_manager.retain_snapshot(snapshot_id)
     }
 
-    /// Build a ShardSnapshotInput for a given snapshot id.
-    pub fn shard_snapshot_input(
+    /// Build complete metadata for a given snapshot id.
+    pub fn shard_snapshot_metadata(
         &self,
         snapshot_id: u64,
-    ) -> Result<crate::coordinator::ShardSnapshotInput> {
+    ) -> Result<crate::snapshot::ShardSnapshotMetadata> {
         let _access = self.begin_access()?;
         let manifest = load_manifest_for_snapshot(&self.file_manager, snapshot_id)?;
-        let column_family_ids = self
-            .schema_manager
-            .schema(manifest.latest_schema_id)?
-            .column_family_ids();
+        let schema = self.schema_manager.schema(manifest.latest_schema_id)?;
         let manifest_name = snapshot_manifest_name(snapshot_id);
         let manifest_path = self
             .file_manager
@@ -1431,15 +1429,16 @@ impl Db {
             .ok_or_else(|| {
                 Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
             })?;
-        Ok(crate::coordinator::ShardSnapshotInput {
-            ranges: self.db_state.load().bucket_ranges.clone(),
-            column_family_ids,
+        Ok(crate::snapshot::ShardSnapshotMetadata {
+            ranges: manifest.bucket_ranges.clone(),
             db_id: self.id.clone(),
             snapshot_id,
             manifest_path,
             timestamp_seconds: manifest.timestamp_seconds,
             data_size_bytes: manifest.data_size_bytes,
             incremental_data_size_bytes: manifest.incremental_data_size_bytes,
+            schema_id: schema.version(),
+            column_families: crate::schema::snapshot_column_families_from_schema(schema.as_ref()),
         })
     }
 
