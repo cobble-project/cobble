@@ -33,7 +33,7 @@ let server = RemoteCompactionServer::new(server_config)?;
 server.serve("0.0.0.0:9000")?;
 ```
 
-For custom schema transforms, call `server.register_schema_transform(id, transform)?` before serving. The server needs the same implementations as the writer; see [Schema Evolution](../architecture/schema-evolution#standalone-compactors).
+For custom schema transforms, call `server.register_schema_transform(transform_type, factory)?` before serving. The server needs the same factories as the writer; see [Schema Evolution](../architecture/schema-evolution#standalone-compactors).
 
 ### Server Configuration
 

@@ -152,7 +152,7 @@ pub(crate) fn compile_column_evolution(
             if let Some(source) = existing_columns.get(&column.field_id) {
                 return Ok(ColumnEvolution::Source {
                     source_index: *source,
-                    transform_id: None,
+                    transform: None,
                 });
             }
             Ok(ColumnEvolution::Default {

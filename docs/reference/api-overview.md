@@ -61,7 +61,8 @@ fails.
 |------|-------------|
 | `Schema` | Current raw schema with family-local metadata |
 | `SchemaBuilder` | Schema evolution builder; column-family aware via optional family arguments |
-| `ColumnEvolution` | Target column mapping: `Source` with optional transform ID, `Default`, or `Null` |
+| `ColumnEvolution` | Target column mapping: `Source` with an optional transform, `Default`, or `Null` |
+| `TransformSpec` | Persisted transform type and configuration; see [Schema Evolution](../architecture/schema-evolution#persisted-transform-specifications) |
 | `ShardSnapshotMetadata` | Shard snapshot identity, ranges, sizes, and column-family schema metadata |
 | `GlobalSnapshotManifest` | Materialized global snapshot manifest |
 
@@ -124,7 +125,7 @@ Db::open_new_with_manifest_path(config, manifest_path) -> Result<Db>
 ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) -> Result<ReadOnlyDb>
 db.current_schema() -> Arc<Schema>
 db.update_schema() -> SchemaBuilder
-db.register_schema_transform(id, transform) -> Result<()>
+db.register_schema_transform(transform_type, factory) -> Result<()>
 db.put(bucket, key, column, value) -> Result<()>
 db.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
 db.scan(bucket, range) -> Result<DbIterator<'_>>
@@ -157,7 +158,7 @@ Use `RecoveryMode::SnapshotOnly` for an exact snapshot restore or `RecoveryMode:
 replay the latest snapshot's durable WAL tail. See [Write-Ahead Log](../architecture/wal).
 
 For custom column transforms, call
-`DbBuilder::register_schema_transform(id, transform) -> Result<DbBuilder>` before `open()`,
+`DbBuilder::register_schema_transform(transform_type, factory) -> Result<DbBuilder>` before `open()`,
 `resume()`, `open_from_snapshot(...)`, or `resume_from_snapshot(...)`. Use the DB registration
 method for subsequent runtime updates. See [Custom Column Transforms](../architecture/schema-evolution#custom-column-transforms)
 for examples, recovery requirements, and current support limits.
@@ -190,10 +191,10 @@ with a local read cache. See [Rescale](../architecture/rescale).
 
 ```rust
 Reader::open_current(reader_config) -> Result<Reader>
-ReaderBuilder::new(reader_config).register_schema_transform(id, transform)?.open_current() -> Result<Reader>
-ReadOnlyDbBuilder::new(config).db_id(db_id).register_schema_transform(id, transform)?.open(snapshot_id) -> Result<ReadOnlyDb>
-reader.register_schema_transform(id, transform) -> Result<()>
-read_only_db.register_schema_transform(id, transform) -> Result<()>
+ReaderBuilder::new(reader_config).register_schema_transform(transform_type, factory)?.open_current() -> Result<Reader>
+ReadOnlyDbBuilder::new(config).db_id(db_id).register_schema_transform(transform_type, factory)?.open(snapshot_id) -> Result<ReadOnlyDb>
+reader.register_schema_transform(transform_type, factory) -> Result<()>
+read_only_db.register_schema_transform(transform_type, factory) -> Result<()>
 reader.get_with_options(bucket, key, &read_options) -> Result<Option<Vec<Option<Bytes>>>>
 reader.current_global_snapshot() -> &GlobalSnapshotManifest
 reader.refresh() -> Result<()>
@@ -201,7 +202,7 @@ reader.refresh() -> Result<()>
 
 Both builders support registering transforms before opening; see [Schema Evolution](../architecture/schema-evolution#snapshot-readers).
 
-Remote and dedicated compactor entrypoints also expose `register_schema_transform(id, transform)` for process-local callback registration; see [Standalone Compactors](../architecture/schema-evolution#standalone-compactors).
+Remote and dedicated compactor entrypoints expose the same `register_schema_transform(transform_type, factory)` method; see [Standalone Compactors](../architecture/schema-evolution#standalone-compactors).
 
 #### Scan
 

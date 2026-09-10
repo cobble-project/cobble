@@ -78,7 +78,7 @@ fn test_structured_reader_transforms_follow_snapshot_schema() {
         ..ReaderConfig::from_config(&config)
     };
     let mut reader = StructuredReaderBuilder::new(read_config.clone())
-        .register_schema_transform("list-to-bytes", list_to_bytes)
+        .register_schema_transform("list-to-bytes", |_spec| Ok(list_to_bytes))
         .unwrap()
         .open_current()
         .unwrap();
@@ -90,7 +90,7 @@ fn test_structured_reader_transforms_follow_snapshot_schema() {
         )]))]
     );
 
-    db.register_schema_transform("list-to-bytes", list_to_bytes)
+    db.register_schema_transform("list-to-bytes", |_spec| Ok(list_to_bytes))
         .unwrap();
     db.update_schema()
         .transform_column(None, 1, StructuredColumnType::Bytes, "list-to-bytes")
@@ -131,7 +131,7 @@ fn test_structured_reader_transforms_follow_snapshot_schema() {
         Some(StructuredColumnValue::List(_))
     ));
 
-    db.register_schema_transform("uppercase", uppercase)
+    db.register_schema_transform("uppercase", |_spec| Ok(uppercase))
         .unwrap();
     db.update_schema()
         .transform_column(None, 1, StructuredColumnType::Bytes, "uppercase")
@@ -141,7 +141,7 @@ fn test_structured_reader_transforms_follow_snapshot_schema() {
     let latest = snapshot(&db);
     assert!(reader.get(0, b"k").is_err()); // Callback is not installed on this reader yet.
     reader
-        .register_schema_transform("uppercase", uppercase)
+        .register_schema_transform("uppercase", |_spec| Ok(uppercase))
         .unwrap();
     reader.refresh().unwrap();
     assert_eq!(reader.current_global_snapshot().id, latest);
@@ -153,9 +153,9 @@ fn test_structured_reader_transforms_follow_snapshot_schema() {
     drop(fixed);
     // Startup registration reaches both the lazy shard reader and schema bootstrap.
     let mut reopened = StructuredReaderBuilder::new(read_config)
-        .register_schema_transform("list-to-bytes", list_to_bytes)
+        .register_schema_transform("list-to-bytes", |_spec| Ok(list_to_bytes))
         .unwrap()
-        .register_schema_transform("uppercase", uppercase)
+        .register_schema_transform("uppercase", |_spec| Ok(uppercase))
         .unwrap()
         .open(latest)
         .unwrap();

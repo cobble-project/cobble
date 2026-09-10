@@ -9,8 +9,9 @@ use crate::r#type::encode_merge_separated_array;
 use crate::vlog::VlogPointer;
 use crate::{
     ColumnEvolution, CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType,
-    ReadOptions, RuntimeManifestMode, ScanOptions, TimeProviderKind, U32CounterMergeOperator,
-    U64CounterMergeOperator, VolumeDescriptor, VolumeUsageKind, WriteOptions,
+    ReadOptions, RuntimeManifestMode, ScanOptions, TimeProviderKind, TransformSpec,
+    U32CounterMergeOperator, U64CounterMergeOperator, VolumeDescriptor, VolumeUsageKind,
+    WriteOptions,
 };
 use bytes::{Bytes, BytesMut};
 use serial_test::serial;
@@ -2133,7 +2134,10 @@ fn test_scan_merges_schema_barriers_before_projection() {
 
     let source = |index, transform: Option<&str>| ColumnEvolution::Source {
         source_index: index,
-        transform_id: transform.map(str::to_owned),
+        transform: transform.map(|transform_type| TransformSpec {
+            transform_type: transform_type.to_owned(),
+            spec: Bytes::new(),
+        }),
     };
     for memtable_type in [
         MemtableType::Hash,
@@ -2196,12 +2200,14 @@ fn test_scan_merges_schema_barriers_before_projection() {
             let before_adoption = db.db_state.load();
             let before_adoption_schema = before_adoption.active_schema.as_ref().unwrap().version();
             for (id, left, right) in [("angle", "<", ">"), ("brace", "{", "}")] {
-                db.register_schema_transform(id, move |value| {
-                    Ok(value.map(|value| {
-                        [left.as_bytes(), value.as_ref(), right.as_bytes()]
-                            .concat()
-                            .into()
-                    }))
+                db.register_schema_transform(id, move |_spec| {
+                    Ok(move |value: Option<Bytes>| {
+                        Ok(value.map(|value| {
+                            [left.as_bytes(), value.as_ref(), right.as_bytes()]
+                                .concat()
+                                .into()
+                        }))
+                    })
                 })
                 .unwrap();
             }
@@ -2444,8 +2450,8 @@ fn test_scan_merges_schema_barriers_before_projection() {
             let frozen = db
                 .scan_with_options_bounds(0, None, None, &options)
                 .unwrap();
-            db.register_schema_transform("reject", |_| {
-                Err(Error::InvalidState("transform rejected".to_string()))
+            db.register_schema_transform("reject", |_spec| {
+                Ok(|_| Err(Error::InvalidState("transform rejected".to_string())))
             })
             .unwrap();
             let mut schema = db.update_schema();
@@ -2502,12 +2508,16 @@ fn test_db_registered_schema_transform_remaps_old_values() {
     db.put(0, b"old-row", 0, b"discarded").unwrap();
     db.put(0, b"old-row", 1, b"value").unwrap();
 
-    db.register_schema_transform("append-suffix", |value| {
-        Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+    db.register_schema_transform("append-suffix", |_spec| {
+        Ok(|value: Option<Bytes>| {
+            Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+        })
     })
     .unwrap();
     let duplicate = db
-        .register_schema_transform("append-suffix", Ok)
+        .register_schema_transform("append-suffix", |_spec| {
+            Ok(|value: Option<Bytes>| Ok(value))
+        })
         .unwrap_err();
     assert!(duplicate.to_string().contains("already registered"));
 
@@ -2517,7 +2527,10 @@ fn test_db_registered_schema_transform_remaps_old_values() {
             None,
             vec![ColumnEvolution::Source {
                 source_index: 0,
-                transform_id: Some("missing-transform".to_string()),
+                transform: Some(TransformSpec {
+                    transform_type: "missing-transform".to_string(),
+                    spec: Bytes::new(),
+                }),
             }],
         )
         .unwrap_err();
@@ -2532,7 +2545,10 @@ fn test_db_registered_schema_transform_remaps_old_values() {
             vec![
                 ColumnEvolution::Source {
                     source_index: 1,
-                    transform_id: Some("append-suffix".to_string()),
+                    transform: Some(TransformSpec {
+                        transform_type: "append-suffix".to_string(),
+                        spec: Bytes::new(),
+                    }),
                 },
                 ColumnEvolution::Default {
                     value: Bytes::from_static(b"default"),
@@ -2555,7 +2571,7 @@ fn test_db_registered_schema_transform_remaps_old_values() {
 
 #[test]
 #[serial(file)]
-fn test_registered_transforms_available_during_restore_and_snapshot_switch() {
+fn test_transform_specs_available_during_restore_and_snapshot_switch() {
     let temp = tempfile::tempdir().unwrap();
     let config = Config {
         num_columns: 1,
@@ -2577,16 +2593,19 @@ fn test_registered_transforms_available_during_restore_and_snapshot_switch() {
     };
     let db_id = "transform-restore";
     let builder = || DbBuilder::new(config.clone()).db_id(db_id);
-    let transform = |value: Option<Bytes>| -> Result<Option<Bytes>> {
-        Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
-    };
     let db = builder()
         .bucket_ranges(vec![0..=0])
-        .register_schema_transform("evolve", transform)
+        .register_schema_transform("evolve", |spec| {
+            if spec != b"restore-v1" {
+                return Err(Error::InvalidState("unexpected restore plugin spec".into()));
+            }
+            Ok(|value: Option<Bytes>| {
+                Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+            })
+        })
         .unwrap()
         .open()
         .unwrap();
-    assert!(db.register_schema_transform("evolve", Ok).is_err());
     db.put(0, b"middle", 0, b"old").unwrap();
     db.memtable_manager.flush_active().unwrap();
     for result in db.memtable_manager.wait_for_flushes() {
@@ -2598,7 +2617,10 @@ fn test_registered_transforms_available_during_restore_and_snapshot_switch() {
             None,
             vec![ColumnEvolution::Source {
                 source_index: 0,
-                transform_id: Some("evolve".into()),
+                transform: Some(TransformSpec {
+                    transform_type: "evolve".into(),
+                    spec: Bytes::from_static(b"restore-v1"),
+                }),
             }],
         )
         .unwrap();
@@ -2621,10 +2643,16 @@ fn test_registered_transforms_available_during_restore_and_snapshot_switch() {
     assert!(error.to_string().contains("evolve"));
     let (tx, rx) = mpsc::channel();
     let mut db = builder()
-        .register_schema_transform("evolve", move |value| {
-            let output = transform(value)?;
-            tx.send(()).unwrap();
-            Ok(output)
+        .register_schema_transform("evolve", move |spec| {
+            if spec != b"restore-v1" {
+                return Err(Error::InvalidState("unexpected restore plugin spec".into()));
+            }
+            let tx = tx.clone();
+            Ok(move |value: Option<Bytes>| {
+                let output = value.map(|value| [value.as_ref(), b"-evolved"].concat().into());
+                tx.send(()).unwrap();
+                Ok(output)
+            })
         })
         .unwrap()
         .resume()
@@ -2649,7 +2677,14 @@ fn test_registered_transforms_available_during_restore_and_snapshot_switch() {
 
     for resume_chain in [true, false] {
         let builder = builder()
-            .register_schema_transform("evolve", transform)
+            .register_schema_transform("evolve", |spec| {
+                if spec != b"restore-v1" {
+                    return Err(Error::InvalidState("unexpected restore plugin spec".into()));
+                }
+                Ok(|value: Option<Bytes>| {
+                    Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+                })
+            })
             .unwrap();
         let db = if resume_chain {
             builder.resume_from_snapshot(snapshot_id)

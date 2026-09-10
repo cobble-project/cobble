@@ -592,6 +592,7 @@ name = "cobble"
 version = "0.5.0"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "bytes",
  "config",
  "crc32fast",

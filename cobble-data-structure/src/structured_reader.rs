@@ -11,13 +11,14 @@ use std::ops::Range;
 use std::sync::Arc;
 
 type SchemaTransformCallback = Arc<dyn Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync>;
+type SchemaTransformFactory = Arc<dyn Fn(&[u8]) -> Result<SchemaTransformCallback> + Send + Sync>;
 
 /// Builder for a structured snapshot reader with runtime schema wiring.
 pub struct StructuredReaderBuilder {
     inner: ReaderBuilder,
     volumes: Vec<VolumeDescriptor>,
     resolver: Option<Arc<dyn MergeOperatorResolver>>,
-    callbacks: Vec<(String, SchemaTransformCallback)>,
+    factories: Vec<(String, SchemaTransformFactory)>,
 }
 
 impl StructuredReaderBuilder {
@@ -26,7 +27,7 @@ impl StructuredReaderBuilder {
             volumes: config.volumes.clone(),
             inner: ReaderBuilder::new(config).merge_operator_resolver(combined_resolver(None)),
             resolver: None,
-            callbacks: Vec::new(),
+            factories: Vec::new(),
         }
     }
 
@@ -38,24 +39,28 @@ impl StructuredReaderBuilder {
         self
     }
 
-    /// Register a raw single-column transform before opening a snapshot reader.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for raw single-column transform specifications.
+    pub fn register_schema_transform<F, T>(
         mut self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<Self>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        let transform_id = transform_id.into();
-        let callback: SchemaTransformCallback = Arc::new(transform);
+        let transform_type = transform_type.into();
+        let factory: SchemaTransformFactory = Arc::new(move |spec| Ok(Arc::new(factory(spec)?)));
         self.inner = self
             .inner
-            .register_schema_transform(transform_id.clone(), {
-                let callback = Arc::clone(&callback);
-                move |value| callback(value)
+            .register_schema_transform(transform_type.clone(), {
+                let factory = Arc::clone(&factory);
+                move |spec| {
+                    let callback = factory(spec)?;
+                    Ok(move |value| callback(value))
+                }
             })?;
-        self.callbacks.push((transform_id, callback));
+        self.factories.push((transform_type, factory));
         Ok(self)
     }
 
@@ -72,7 +77,7 @@ impl StructuredReaderBuilder {
             Some(snapshot_id) => self.inner.open(snapshot_id)?,
             None => self.inner.open_current()?,
         };
-        StructuredReader::from_reader(reader, self.volumes, self.resolver, self.callbacks)
+        StructuredReader::from_reader(reader, self.volumes, self.resolver, self.factories)
     }
 }
 
@@ -82,7 +87,7 @@ pub struct StructuredReader {
     schema_snapshot_id: u64,
     volumes: Vec<VolumeDescriptor>,
     resolver: Option<Arc<dyn MergeOperatorResolver>>,
-    callbacks: Vec<(String, SchemaTransformCallback)>,
+    factories: Vec<(String, SchemaTransformFactory)>,
     default_read_options: StructuredReadOptions,
     default_scan_options: StructuredScanOptions,
 }
@@ -100,10 +105,10 @@ impl StructuredReader {
         reader: Reader,
         volumes: Vec<VolumeDescriptor>,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
-        callbacks: Vec<(String, SchemaTransformCallback)>,
+        factories: Vec<(String, SchemaTransformFactory)>,
     ) -> Result<Self> {
         let structured_schema =
-            load_schema_from_reader(&reader, &volumes, resolver.as_ref(), &callbacks)?;
+            load_schema_from_reader(&reader, &volumes, resolver.as_ref(), &factories)?;
         let schema_snapshot_id = reader.current_global_snapshot().id;
         Ok(Self {
             reader,
@@ -111,7 +116,7 @@ impl StructuredReader {
             schema_snapshot_id,
             volumes,
             resolver,
-            callbacks,
+            factories,
             default_read_options: StructuredReadOptions::default(),
             default_scan_options: StructuredScanOptions::default(),
         })
@@ -203,23 +208,27 @@ impl StructuredReader {
         self.refresh_structured_schema_if_changed()
     }
 
-    /// Register a raw single-column transform for future lazy shard opens.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for raw single-column transform specifications.
+    pub fn register_schema_transform<F, T>(
         &mut self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        let transform_id = transform_id.into();
-        let callback: SchemaTransformCallback = Arc::new(transform);
+        let transform_type = transform_type.into();
+        let factory: SchemaTransformFactory = Arc::new(move |spec| Ok(Arc::new(factory(spec)?)));
         self.reader
-            .register_schema_transform(transform_id.clone(), {
-                let callback = Arc::clone(&callback);
-                move |value| callback(value)
+            .register_schema_transform(transform_type.clone(), {
+                let factory = Arc::clone(&factory);
+                move |spec| {
+                    let callback = factory(spec)?;
+                    Ok(move |value| callback(value))
+                }
             })?;
-        self.callbacks.push((transform_id, callback));
+        self.factories.push((transform_type, factory));
         Ok(())
     }
 
@@ -252,7 +261,7 @@ impl StructuredReader {
             &self.reader,
             &self.volumes,
             self.resolver.as_ref(),
-            &self.callbacks,
+            &self.factories,
         )?;
         self.structured_schema = Arc::new(schema);
         self.schema_snapshot_id = snapshot_id;
@@ -265,7 +274,7 @@ fn load_schema_from_reader(
     reader: &Reader,
     volumes: &[VolumeDescriptor],
     resolver: Option<&Arc<dyn cobble::MergeOperatorResolver>>,
-    callbacks: &[(String, SchemaTransformCallback)],
+    factories: &[(String, SchemaTransformFactory)],
 ) -> Result<StructuredSchema> {
     let manifest = reader.current_global_snapshot();
     let shard = manifest.shard_snapshots.first().ok_or_else(|| {
@@ -279,10 +288,13 @@ fn load_schema_from_reader(
     let mut builder = ReadOnlyDbBuilder::new(config)
         .db_id(shard.db_id.clone())
         .merge_operator_resolver(combined_resolver(resolver.cloned()));
-    for (transform_id, callback) in callbacks {
+    for (transform_id, factory) in factories {
         let transform_id = transform_id.clone();
-        let callback = Arc::clone(callback);
-        builder = builder.register_schema_transform(transform_id, move |value| callback(value))?;
+        let factory = Arc::clone(factory);
+        builder = builder.register_schema_transform(transform_id, move |spec| {
+            let callback = factory(spec)?;
+            Ok(move |value| callback(value))
+        })?;
     }
     let read_only = builder.open(shard.snapshot_id)?;
     load_structured_schema_from_cobble_schema(&read_only.current_schema())

@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod evolution;
 mod projection;
 
-pub use evolution::ColumnEvolution;
+pub use evolution::{ColumnEvolution, TransformSpec};
 use evolution::{
-    ColumnEvolutionFile, SchemaEvolution, classify_columns, compile_evolution,
+    ColumnEvolutionFile, ExecutableTransform, SchemaEvolution, classify_columns, compile_evolution,
     evolve_value_with_transition,
 };
 pub(crate) use evolution::{SchemaTransformRegistry, TransitionCompatibility};
@@ -201,8 +201,10 @@ impl Schema {
                 None => TransitionCompatibility::Compatible,
             };
             let columns = family.evolution.columns.as_ref().map(Arc::clone);
+            let transforms = Arc::clone(&family.evolution.transforms);
             family.evolution = SchemaEvolution {
                 columns,
+                transforms,
                 compatibility,
             };
             family.last_incompatible_schema_id =
@@ -523,15 +525,16 @@ pub(crate) struct SchemaManager {
 }
 
 impl SchemaManager {
-    pub(crate) fn register_transform<F>(
+    pub(crate) fn register_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 
     pub(crate) fn new(num_columns: usize) -> Self {
@@ -726,15 +729,13 @@ impl SchemaManager {
         Arc::clone(&self.transforms)
     }
 
-    /// Attach runtime transform implementations and validate all loaded schemas.
+    /// Attach runtime transform implementations and resolve all loaded schemas.
     pub(crate) fn with_transform_registry(
         mut self,
         transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
         self.transforms = transforms;
-        for schema in self.schemas.read().unwrap().values() {
-            self.validate_schema_transforms(schema)?;
-        }
+        self.resolve_loaded_schema_transforms()?;
         Ok(self)
     }
 
@@ -937,7 +938,8 @@ impl SchemaManager {
         if self.schemas.read().unwrap().contains_key(&schema_id) {
             return Ok(());
         }
-        let schema = load_schema(file_manager, schema_id, resolver)?;
+        let mut schema = load_schema(file_manager, schema_id, resolver)?;
+        self.resolve_schema_transforms(&mut schema)?;
         self.register_loaded_schema(schema);
         Ok(())
     }
@@ -956,7 +958,8 @@ impl SchemaManager {
         if self.schemas.read().unwrap().contains_key(&schema_file.id) {
             return Ok(());
         }
-        let schema = schema_from_file(schema_file, resolver)?;
+        let mut schema = schema_from_file(schema_file, resolver)?;
+        self.resolve_schema_transforms(&mut schema)?;
         self.register_loaded_schema(schema);
         Ok(())
     }
@@ -1006,20 +1009,48 @@ impl SchemaManager {
         }
     }
 
-    pub(crate) fn validate_schema_transforms(&self, schema: &Schema) -> Result<()> {
-        for family in schema.column_families.iter() {
+    fn resolve_loaded_schema_transforms(&self) -> Result<()> {
+        let loaded = self
+            .schemas
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut resolved = Vec::with_capacity(loaded.len());
+        for schema in loaded {
+            let mut schema = schema.as_ref().clone();
+            self.resolve_schema_transforms(&mut schema)?;
+            resolved.push(Arc::new(schema));
+        }
+        let latest_version = self.latest_schema().version();
+        let mut schemas = self.schemas.write().unwrap();
+        for schema in resolved {
+            schemas.insert(schema.version(), Arc::clone(&schema));
+            if schema.version() == latest_version {
+                self.latest_schema.store(schema);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_schema_transforms(&self, schema: &mut Schema) -> Result<()> {
+        let families = Arc::make_mut(&mut schema.column_families);
+        for family in families {
             let Some(columns) = family.evolution.columns.as_ref() else {
                 continue;
             };
-            for column in columns.iter() {
+            let mut transforms = HashMap::new();
+            for (column_index, column) in columns.iter().enumerate() {
                 if let ColumnEvolution::Source {
-                    transform_id: Some(transform_id),
+                    transform: Some(transform),
                     ..
                 } = column
                 {
-                    self.transforms.resolve(transform_id)?;
+                    transforms.insert(column_index, self.transforms.resolve(transform)?);
                 }
             }
+            family.evolution.transforms = Arc::new(transforms);
         }
         Ok(())
     }
@@ -1272,6 +1303,7 @@ fn load_column_families(
                             .map(ColumnEvolution::from)
                             .collect(),
                         TransitionCompatibility::Unknown,
+                        HashMap::new(),
                     )
                 });
         column_families.push(column_family);
@@ -1305,6 +1337,8 @@ pub struct SchemaBuilder {
     column_family_name_index: HashMap<String, u8>,
     /// The complete target-to-source mapping for each column family.
     transitions: Vec<Vec<ColumnEvolution>>,
+    /// Executable callbacks for transformed target columns, prepared before publication.
+    resolved_transforms: Vec<HashMap<usize, Arc<dyn ExecutableTransform>>>,
     _access_guard: Option<OwnedDbAccessGuard>,
 }
 
@@ -1325,17 +1359,19 @@ impl SchemaBuilder {
                 (0..family.num_columns())
                     .map(|source_index| ColumnEvolution::Source {
                         source_index,
-                        transform_id: None,
+                        transform: None,
                     })
                     .collect()
             })
             .collect::<Vec<_>>();
+        let resolved_transforms = (0..column_families.len()).map(|_| HashMap::new()).collect();
         Self {
             manager,
             base_schema: Arc::clone(&schema),
             column_families,
             column_family_name_index: schema.column_family_name_index.as_ref().clone(),
             transitions,
+            resolved_transforms,
             _access_guard: access_guard,
         }
     }
@@ -1474,8 +1510,9 @@ impl SchemaBuilder {
 
     /// Atomically replace all columns in one family from current sources, defaults, or nulls.
     ///
-    /// Each entry describes one target column. A source transform ID must be
-    /// registered through [`Db::register_schema_transform`](crate::Db::register_schema_transform) before calling
+    /// Each entry describes one target column. A source transform must be
+    /// registered through [`Db::register_schema_transform`](crate::Db::register_schema_transform)
+    /// through [`Db::register_schema_transform`](crate::Db::register_schema_transform) before calling
     /// this method. A single schema transition stores at most one transform per
     /// column, so remapping an already transformed source with another transform
     /// returns an error; commit an intermediate schema instead.
@@ -1488,11 +1525,7 @@ impl SchemaBuilder {
         let old_columns = self.transitions[family_position].len();
         let mut used_sources = vec![false; old_columns];
         for column in &columns {
-            if let ColumnEvolution::Source {
-                source_index,
-                transform_id,
-            } = column
-            {
+            if let ColumnEvolution::Source { source_index, .. } = column {
                 if *source_index >= old_columns {
                     return Err(Error::InvalidState(format!(
                         "Cannot remap source column {source_index} from {old_columns} columns"
@@ -1503,38 +1536,36 @@ impl SchemaBuilder {
                         "Cannot remap source column {source_index} more than once"
                     )));
                 }
-                if let Some(transform_id) = transform_id {
-                    self.manager.transforms.resolve(transform_id)?;
-                }
             }
         }
 
-        let old_transition = self.transitions[family_position].clone();
+        let old_transition = &self.transitions[family_position];
+        let old_resolved_transforms = &self.resolved_transforms[family_position];
         let composed_transition = columns
             .iter()
             .map(|column| match column {
                 ColumnEvolution::Source {
                     source_index,
-                    transform_id,
+                    transform,
                 } => match &old_transition[*source_index] {
                     ColumnEvolution::Source {
                         source_index: original_source_index,
-                        transform_id: existing_transform_id,
-                    } => match (existing_transform_id, transform_id) {
-                        (Some(existing_transform_id), Some(transform_id)) => {
+                        transform: existing_transform,
+                    } => match (existing_transform, transform) {
+                        (Some(existing_transform), Some(transform)) => {
                             Err(Error::InvalidState(format!(
-                                "Cannot compose schema transforms '{}' and '{}' in one schema commit; commit an intermediate schema first",
-                                existing_transform_id, transform_id
+                                "Cannot compose schema transforms {:?} and {:?} in one schema commit; commit an intermediate schema first",
+                                existing_transform, transform
                             )))
                         }
                         (Some(_), None) => Ok(old_transition[*source_index].clone()),
-                        (None, transform_id) => Ok(ColumnEvolution::Source {
+                        (None, transform) => Ok(ColumnEvolution::Source {
                             source_index: *original_source_index,
-                            transform_id: transform_id.clone(),
+                            transform: transform.clone(),
                         }),
                     },
                     ColumnEvolution::Default { .. } | ColumnEvolution::Null
-                        if transform_id.is_some() =>
+                        if transform.is_some() =>
                     {
                         Err(Error::InvalidState(
                             "Cannot apply a schema transform to a default or null source in one schema commit"
@@ -1546,6 +1577,24 @@ impl SchemaBuilder {
                 evolution => Ok(evolution.clone()),
             })
             .collect::<Result<Vec<_>>>()?;
+
+        let mut resolved_transforms = HashMap::new();
+        for (target_column, column) in columns.iter().enumerate() {
+            let resolved = match column {
+                ColumnEvolution::Source {
+                    transform: Some(transform),
+                    ..
+                } => Some(self.manager.transforms.resolve(transform)?),
+                ColumnEvolution::Source {
+                    source_index,
+                    transform: None,
+                } => old_resolved_transforms.get(source_index).cloned(),
+                ColumnEvolution::Default { .. } | ColumnEvolution::Null => None,
+            };
+            if let Some(resolved) = resolved {
+                resolved_transforms.insert(target_column, resolved);
+            }
+        }
 
         let family = &mut self.column_families[family_position];
         let old_operators = std::mem::take(&mut family.operators);
@@ -1567,6 +1616,7 @@ impl SchemaBuilder {
             })
             .collect();
         self.transitions[family_position] = composed_transition;
+        self.resolved_transforms[family_position] = resolved_transforms;
         Ok(())
     }
 
@@ -1574,7 +1624,12 @@ impl SchemaBuilder {
     pub fn commit(mut self) -> Arc<Schema> {
         for (position, family) in self.column_families.iter_mut().enumerate() {
             let previous = self.base_schema.column_families.get(position);
-            family.evolution = compile_evolution(previous, family, &self.transitions[position]);
+            family.evolution = compile_evolution(
+                previous,
+                family,
+                &self.transitions[position],
+                std::mem::take(&mut self.resolved_transforms[position]),
+            );
         }
         self.manager
             .commit_build(self.base_schema.as_ref(), self.column_families)
@@ -1606,6 +1661,7 @@ impl SchemaBuilder {
         ));
         self.column_family_name_index.insert(normalized, next_id);
         self.transitions.push(Vec::new());
+        self.resolved_transforms.push(HashMap::new());
         Ok(next_id)
     }
 
@@ -1663,7 +1719,6 @@ impl SchemaBuilder {
                 default_values.len()
             )));
         }
-        let transition = &mut self.transitions[family_position];
         for (&index, default_value) in indexes.iter().zip(default_values.iter()) {
             let target = default_value
                 .as_ref()
@@ -1671,7 +1726,8 @@ impl SchemaBuilder {
                 .map_or(ColumnEvolution::Null, |value| ColumnEvolution::Default {
                     value,
                 });
-            transition.insert(index, target);
+            self.transitions[family_position].insert(index, target);
+            self.shift_resolved_transforms_for_insert(family_position, index);
         }
         Ok(())
     }
@@ -1682,7 +1738,27 @@ impl SchemaBuilder {
         index: usize,
     ) -> Result<()> {
         self.transitions[family_position].remove(index);
+        let resolved = &mut self.resolved_transforms[family_position];
+        let shifted = std::mem::take(resolved)
+            .into_iter()
+            .filter_map(|(column, transform)| match column.cmp(&index) {
+                std::cmp::Ordering::Less => Some((column, transform)),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some((column - 1, transform)),
+            })
+            .collect();
+        *resolved = shifted;
         Ok(())
+    }
+
+    fn shift_resolved_transforms_for_insert(&mut self, family_position: usize, index: usize) {
+        let resolved = &mut self.resolved_transforms[family_position];
+        *resolved = std::mem::take(resolved)
+            .into_iter()
+            .map(|(column, transform)| {
+                (if column >= index { column + 1 } else { column }, transform)
+            })
+            .collect();
     }
 
     fn resolve_existing_family_position(&self, column_family: Option<String>) -> Result<usize> {

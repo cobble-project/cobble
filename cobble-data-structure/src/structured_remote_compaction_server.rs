@@ -32,17 +32,18 @@ impl StructuredRemoteCompactionServer {
         self.inner.supported_merge_operator_ids()
     }
 
-    /// Register a raw single-column transform under its stable persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for raw single-column transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
         self.inner
-            .register_schema_transform(transform_id, transform)
+            .register_schema_transform(transform_type, factory)
     }
 
     pub fn serve(&self, address: &str) -> Result<()> {

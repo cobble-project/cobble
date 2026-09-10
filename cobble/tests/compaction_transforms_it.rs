@@ -3,8 +3,8 @@ use bytes::Bytes;
 use cobble::{
     BytesMergeOperator, ColumnEvolution, CompactionMode, Config, Db, DbBuilder,
     DedicatedCompactionExecution, DedicatedCompactionExecutor, DedicatedCompactionMonitor,
-    DedicatedCompactionPlan, ReadOnlyDbBuilder, RuntimeManifestMode, U32CounterMergeOperator,
-    VolumeDescriptor,
+    DedicatedCompactionPlan, ReadOnlyDbBuilder, RuntimeManifestMode, TransformSpec,
+    U32CounterMergeOperator, VolumeDescriptor,
 };
 use size::Size;
 use std::process::{Child, Command};
@@ -30,6 +30,17 @@ fn parse_number(value: Option<Bytes>) -> cobble::Result<Option<Bytes>> {
             Ok(Bytes::copy_from_slice(&number.to_le_bytes()))
         })
         .transpose()
+}
+
+fn parse_number_plugin(
+    spec: &[u8],
+) -> cobble::Result<fn(Option<Bytes>) -> cobble::Result<Option<Bytes>>> {
+    if spec != b"\x00parse-number\xff" {
+        return Err(cobble::Error::InvalidState(
+            "unexpected parse plugin spec".into(),
+        ));
+    }
+    Ok(parse_number)
 }
 
 fn render_number(value: Option<Bytes>) -> cobble::Result<Option<Bytes>> {
@@ -97,10 +108,10 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
             assert!(err.to_string().contains("not registered"), "{err}");
         } else {
             executor
-                .register_schema_transform("parse", parse_number)
+                .register_schema_transform("parse-number", parse_number_plugin)
                 .unwrap();
             executor
-                .register_schema_transform("render", render_number)
+                .register_schema_transform("render", |_spec| Ok(render_number))
                 .unwrap();
             assert!(matches!(
                 executor.execute(&plan).unwrap(),
@@ -117,9 +128,9 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
         let db = DbBuilder::new(config.clone())
             .db_id("transform-shard")
             .bucket_ranges(vec![0..=0])
-            .register_schema_transform("parse", parse_number)
+            .register_schema_transform("parse-number", parse_number_plugin)
             .unwrap()
-            .register_schema_transform("render", render_number)
+            .register_schema_transform("render", |_spec| Ok(render_number))
             .unwrap()
             .open()
             .unwrap();
@@ -137,7 +148,10 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
 
         let source = |index, transform: Option<&str>| ColumnEvolution::Source {
             source_index: index,
-            transform_id: transform.map(str::to_owned),
+            transform: transform.map(|transform_type| TransformSpec {
+                transform_type: transform_type.to_owned(),
+                spec: Bytes::new(),
+            }),
         };
         let mut schema = db.update_schema();
         schema
@@ -145,7 +159,13 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
                 None,
                 vec![
                     source(1, None),
-                    source(0, Some("parse")),
+                    ColumnEvolution::Source {
+                        source_index: 0,
+                        transform: Some(TransformSpec {
+                            transform_type: "parse-number".to_string(),
+                            spec: Bytes::from_static(b"\x00parse-number\xff"),
+                        }),
+                    },
                     ColumnEvolution::Default {
                         value: Bytes::from_static(b"D"),
                     },
@@ -216,10 +236,10 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
         )
         .unwrap();
         monitor
-            .register_schema_transform("parse", parse_number)
+            .register_schema_transform("parse-number", parse_number_plugin)
             .unwrap();
         monitor
-            .register_schema_transform("render", render_number)
+            .register_schema_transform("render", |_spec| Ok(render_number))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let plan = loop {
@@ -298,9 +318,9 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
         );
         let db = DbBuilder::new(config.clone())
             .db_id("transform-shard")
-            .register_schema_transform("parse", parse_number)
+            .register_schema_transform("parse-number", parse_number_plugin)
             .unwrap()
-            .register_schema_transform("render", render_number)
+            .register_schema_transform("render", |_spec| Ok(render_number))
             .unwrap()
             .resume()
             .unwrap();
@@ -325,9 +345,9 @@ fn dedicated_transforms_cross_process_and_preserve_snapshot_values() {
         db.close().unwrap();
         let current = ReadOnlyDbBuilder::new(config.clone())
             .db_id("transform-shard")
-            .register_schema_transform("parse", parse_number)
+            .register_schema_transform("parse-number", parse_number_plugin)
             .unwrap()
-            .register_schema_transform("render", render_number)
+            .register_schema_transform("render", |_spec| Ok(render_number))
             .unwrap()
             .open(after.snapshot_id)
             .unwrap();

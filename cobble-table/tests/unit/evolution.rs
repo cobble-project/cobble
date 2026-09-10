@@ -76,7 +76,7 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
     let target = TableMetadata::compile(schema).unwrap();
     let keep = ColumnEvolution::Source {
         source_index: 1,
-        transform_id: None,
+        transform: None,
     };
     let default = |logical_type: &LogicalType| ColumnEvolution::Default {
         value: ValueCodec::encode(logical_type, &Value::Null)

@@ -46,22 +46,25 @@ let _new_schema = builder.commit();
 
 ## Custom Column Transforms
 
-Register a transform on `Db`, then reference its stable ID in `SchemaBuilder::remap_columns`:
+Register a transform factory on `Db`, then reference its type and configuration in `SchemaBuilder::remap_columns`. A fixed transform simply ignores the configuration:
 
 ```rust
 use bytes::Bytes;
-use cobble::{ColumnEvolution, DbBuilder};
+use cobble::{ColumnEvolution, DbBuilder, TransformSpec};
 
 fn append_suffix(value: Option<Bytes>) -> cobble::Result<Option<Bytes>> {
     Ok(value.map(|value| [value.as_ref(), b"-v2"].concat().into()))
 }
 
-db.register_schema_transform("append-suffix-v1", append_suffix)?;
+db.register_schema_transform("append-suffix-v1", |_spec| Ok(append_suffix))?;
 let mut schema = db.update_schema();
 schema.remap_columns(None, vec![
     ColumnEvolution::Source {
         source_index: 0,
-        transform_id: Some("append-suffix-v1".into()),
+        transform: Some(TransformSpec {
+            transform_type: "append-suffix-v1".into(),
+            spec: Bytes::new(),
+        }),
     },
     ColumnEvolution::Default { value: Bytes::from_static(b"new-column") },
     ColumnEvolution::Null,
@@ -71,18 +74,50 @@ schema.commit();
 
 Each entry defines one target column. `Source` refers to a column in the builder's current layout; omitted columns are removed. A transform receives only that column's `Option<Bytes>` and returns `Result<Option<Bytes>>`; it cannot read other columns. New writes must already use the new representation. A column can have one transform per schema transition; commit an intermediate schema before applying another.
 
-Only the transform ID is persisted, so register the same implementation on every restart. Use the builder **before recovery begins**: restoring memtables or replaying WAL can trigger background compaction before the DB is returned.
+Only the transform type and configuration are persisted, so register the same factory on every restart. Use the builder **before recovery begins**: restoring memtables or replaying WAL can trigger background compaction before the DB is returned.
 
 ```rust
 let db = DbBuilder::new(config)
     .db_id("my-shard")
-    .register_schema_transform("append-suffix-v1", append_suffix)?
+    .register_schema_transform("append-suffix-v1", |_spec| Ok(append_suffix))?
     .resume()?;
 ```
 
 Builder registration also works with `open()`, `open_from_snapshot(snapshot_id)`, and `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
 
 Custom transforms support `Db`, `ReadOnlyDb`, and `Reader` reads (`get`, multi-get, and scan), plus local, remote, and dedicated compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Higher-level binding registration is not yet available.
+
+### Persisted Transform Specifications
+
+`TransformSpec` persists a transform type and opaque bytes (base64 in the `spec` field of schema metadata), not executable code. The same registration API supports per-column configuration:
+
+```rust
+use cobble::TransformSpec;
+
+fn suffix_factory(spec: &[u8]) -> cobble::Result<
+    impl Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync,
+> {
+    let suffix = Bytes::copy_from_slice(spec);
+    Ok(move |value: Option<Bytes>| {
+        Ok(value.map(|value| [value.as_ref(), suffix.as_ref()].concat().into()))
+    })
+}
+
+db.register_schema_transform("suffix-v1", suffix_factory)?;
+let mut schema = db.update_schema();
+schema.remap_columns(None, vec![ColumnEvolution::Source {
+    source_index: 0,
+    transform: Some(TransformSpec {
+        transform_type: "suffix-v1".into(),
+        spec: Bytes::from_static(b"-v2"),
+    }),
+}])?;
+schema.commit();
+```
+
+The factory interprets the configuration and returns a single-column callback. Cobble resolves it during schema setup; reads reuse the resolved callback rather than rebuilding it for each value. A factory may run for multiple schemas or shard loads, so it must be reusable. Keep the meaning of each transform type stable, including its configuration encoding.
+
+Register the factory with `register_schema_transform` in every process that reads or compacts these schemas. DB and reader builders provide the same method for registration before recovery. Missing factories or invalid configuration fail schema resolution; storing a specification does not install its implementation.
 
 ### Snapshot Readers
 
@@ -93,11 +128,11 @@ use cobble::{ReadOnlyDbBuilder, ReaderBuilder};
 
 let snapshot = ReadOnlyDbBuilder::new(config)
     .db_id("my-shard")
-    .register_schema_transform("append-suffix-v1", append_suffix)?
+    .register_schema_transform("append-suffix-v1", |_spec| Ok(append_suffix))?
     .open(snapshot_id)?;
 
 let reader = ReaderBuilder::new(reader_config)
-    .register_schema_transform("append-suffix-v1", append_suffix)?
+    .register_schema_transform("append-suffix-v1", |_spec| Ok(append_suffix))?
     .open_current()?; // Use open(global_snapshot_id) for a specific snapshot.
 ```
 
@@ -109,13 +144,13 @@ Register the same IDs and implementations in each compactor process before start
 
 ```rust
 let server = cobble::RemoteCompactionServer::new(server_config)?;
-server.register_schema_transform("append-suffix-v1", append_suffix)?;
+server.register_schema_transform("append-suffix-v1", |_spec| Ok(append_suffix))?;
 server.serve("0.0.0.0:9000")?;
 ```
 
 Dedicated compaction exposes the same method on `DedicatedCompactor`, `DedicatedCompactionService`, `DedicatedCompactionMonitor`, `DedicatedCompactionPlanner`, and `DedicatedCompactionExecutor`. Register before `run`, `poll`, `plan`, or `execute`; separately deployed planners and executors need their own registrations. Service registrations are shared with its discovered shards and workers.
 
-Remote requests carry the complete schema chain through the planned target, including intermediate versions with no remaining files. Dedicated compactors load the chain from shared storage. Only IDs and schema definitions travel between processes, never callback code; use an application-owned compactor executable to register custom Rust callbacks, not the unmodified CLI. Missing IDs fail planning/execution without publishing a compaction result. Registration must be repeated after restart.
+Remote requests carry the complete schema chain through the planned target, including intermediate versions with no remaining files. Dedicated compactors load the chain from shared storage. Transform specifications travel with those definitions, never callback code; use an application-owned compactor executable to register factories, not the unmodified CLI. Missing factories fail planning/execution without publishing a compaction result. Registration must be repeated after restart.
 
 ## Add Column: What Actually Happens
 

@@ -163,16 +163,17 @@ impl DedicatedCompactionMonitor {
         })
     }
 
-    /// Register a single-column schema transform under its stable persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 
     /// Discovers current DBs and returns at most one plan per DB.
@@ -369,16 +370,17 @@ impl DedicatedCompactionService {
         })
     }
 
-    /// Register a single-column schema transform under its stable persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 
     /// Signals the scanner and workers to stop. Running compactions finish their current step.

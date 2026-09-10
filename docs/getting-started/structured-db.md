@@ -139,8 +139,10 @@ Register a transform before referring to its ID in a schema update:
 use bytes::Bytes;
 use cobble_data_structure::StructuredColumnType;
 
-db.register_schema_transform("uppercase-v1", |value| {
-    Ok(value.map(|bytes| Bytes::from(bytes.to_ascii_uppercase())))
+db.register_schema_transform("uppercase-v1", |_spec| {
+    Ok(|value: Option<Bytes>| {
+        Ok(value.map(|bytes| Bytes::from(bytes.to_ascii_uppercase())))
+    })
 })?;
 db.update_schema()
     .transform_column(None, 0, StructuredColumnType::Bytes, "uppercase-v1")
@@ -152,20 +154,22 @@ Transforms receive one column's optional encoded bytes and return bytes in the t
 For element-wise List changes, use the adapter without handling List encoding yourself:
 
 ```rust
+let transform_list_config = list_config.clone();
 db.register_schema_transform(
     "list-uppercase-v1",
-    StructuredColumnType::list_element_transform(list_config.clone(), |element| {
-        Ok(Bytes::from(element.to_ascii_uppercase()))
-    }),
+    move |_spec| Ok(StructuredColumnType::list_element_transform(
+        transform_list_config.clone(),
+        |element| Ok(Bytes::from(element.to_ascii_uppercase())),
+    )),
 )?;
 db.update_schema()
     .transform_column(None, 1, StructuredColumnType::List(list_config), "list-uppercase-v1")
     .commit()?;
 ```
 
-The adapter preserves element order, count and TTL timestamps; it does not filter or truncate the List. Its `preserve_element_ttl` setting must match both source and target encoding. The same adapter can be passed to `register_schema_transform` on dedicated and remote compactors.
+The adapter preserves element order, count and TTL timestamps; it does not filter or truncate the List. Its `preserve_element_ttl` setting must match both source and target encoding. A factory returning the same adapter can be registered on dedicated and remote compactors.
 
-Only transform IDs are persisted. Before reopening a database that uses them, register the same callbacks through `StructuredDbBuilder`, `StructuredReadOnlyDbBuilder`, or `StructuredReaderBuilder` using `.register_schema_transform(id, callback)?`, then call the desired open/resume method. Register them on compactor processes too (`StructuredRemoteCompactionServer::register_schema_transform`). See [schema evolution](../architecture/schema-evolution.md) for the callback contract.
+`transform_column` records the transform type with an empty specification. Before reopening a database that uses it, register the same factory through `StructuredDbBuilder`, `StructuredReadOnlyDbBuilder`, or `StructuredReaderBuilder` using `.register_schema_transform(id, factory)?`, then call the desired open/resume method. Register it on compactor processes too (`StructuredRemoteCompactionServer::register_schema_transform`). See [schema evolution](../architecture/schema-evolution.md) for the factory and callback contract.
 
 ## StructuredReader and StructuredReadOnlyDb
 

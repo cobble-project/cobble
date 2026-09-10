@@ -100,7 +100,7 @@ pub struct Reader {
 
 impl Reader {
     /// Opens a fixed global snapshot without eagerly opening its shards.
-    /// Schema transform IDs are validated when each routed shard is loaded.
+    /// Persisted schema transforms are resolved when each routed shard is loaded.
     pub fn open(read_config: ReaderConfig, global_snapshot_id: u64) -> Result<Self> {
         Self::open_with_resolver(read_config, global_snapshot_id, None)
     }
@@ -534,16 +534,17 @@ impl Reader {
         Ok(())
     }
 
-    /// Registers a schema transform for future lazy shard opens and refreshes.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 }
 

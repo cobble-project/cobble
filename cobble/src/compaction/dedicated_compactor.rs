@@ -63,7 +63,7 @@ pub struct DedicatedCompactor {
     /// Saved merge operator resolver, passed to every schema reload so custom merge
     /// operators remain functional across manifest refreshes.
     resolver: Option<Arc<dyn crate::MergeOperatorResolver>>,
-    /// Process-local implementations for stable transform IDs persisted in schemas.
+    /// Process-local factories for transforms persisted in schemas.
     transforms: Arc<SchemaTransformRegistry>,
     poll_interval: Duration,
     /// Interval at which the lease heartbeat is refreshed. Independently computed from
@@ -236,17 +236,18 @@ impl DedicatedCompactionPlanner {
         })
     }
 
-    /// Register a single-column schema transform under its stable persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
         self.inner
-            .register_schema_transform(transform_id, transform)
+            .register_schema_transform(transform_type, factory)
     }
 
     pub fn plan(&self) -> Result<DedicatedCompactionPlanning> {
@@ -335,16 +336,17 @@ impl DedicatedCompactionExecutor {
         })
     }
 
-    /// Register a single-column schema transform under its stable persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 
     pub fn execute(&self, plan: &DedicatedCompactionPlan) -> Result<DedicatedCompactionExecution> {
@@ -527,16 +529,17 @@ impl DedicatedCompactor {
         })
     }
 
-    /// Register a single-column schema transform under its stable persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 
     /// Signals the compactor to stop its main loop.

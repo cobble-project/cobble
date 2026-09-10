@@ -13,7 +13,7 @@ use bytes::Bytes;
 use cobble::{
     BytesMergeOperator, ColumnEvolution, Config, Db, DbBuilder, DbIterator, Error, MemtableType,
     MergeOperatorResolver, ReadOptions, RecoveryMode, Result, ScanOptions, Schema, SchemaBuilder,
-    ShardSnapshotMetadata, WriteBatch, WriteOptions,
+    ShardSnapshotMetadata, TransformSpec, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -694,18 +694,19 @@ impl StructuredDbBuilder {
         self
     }
 
-    /// Register a raw single-column transform before opening persisted schemas.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for raw single-column transform specifications.
+    pub fn register_schema_transform<F, T>(
         mut self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<Self>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
         self.inner = self
             .inner
-            .register_schema_transform(transform_id, transform)?;
+            .register_schema_transform(transform_type, factory)?;
         Ok(self)
     }
 
@@ -1114,8 +1115,9 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
 
     /// Transform one existing column into `target_type` during this schema transition.
     ///
-    /// The callback registered for `transform_id` receives the source column's raw
-    /// optional bytes and must return bytes valid for `target_type`. In particular,
+    /// The factory registered for `transform_id` receives an empty specification and
+    /// returns a callback for the source column's raw optional bytes. The callback must
+    /// return bytes valid for `target_type`. In particular,
     /// list transforms must preserve or produce Cobble's complete encoded list
     /// payload, including any element TTL information.
     pub fn transform_column(
@@ -1143,7 +1145,10 @@ impl<'a, O: StructuredSchemaOwner> StructuredSchemaBuilder<'a, O> {
             let columns = (0..column_count)
                 .map(|source_index| ColumnEvolution::Source {
                     source_index,
-                    transform_id: (source_index == column_index).then(|| transform_id.clone()),
+                    transform: (source_index == column_index).then(|| TransformSpec {
+                        transform_type: transform_id.clone(),
+                        spec: Bytes::new(),
+                    }),
                 })
                 .collect();
             inner.remap_columns(core_column_family.clone(), columns)?;
@@ -1527,16 +1532,17 @@ impl StructuredDb {
         self.structured_schema.as_ref().clone()
     }
 
-    /// Register a raw single-column transform before using its persisted ID.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for raw single-column transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.db.register_schema_transform(transform_id, transform)
+        self.db.register_schema_transform(transform_type, factory)
     }
 
     pub fn update_schema(&mut self) -> StructuredSchemaBuilder<'_, Self> {

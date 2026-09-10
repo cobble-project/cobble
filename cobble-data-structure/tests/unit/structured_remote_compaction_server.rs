@@ -19,16 +19,20 @@ fn test_structured_remote_compaction_server_supported_ids() {
     let executor = cobble::DedicatedCompactionExecutor::open(config.clone()).unwrap();
     let server = StructuredRemoteCompactionServer::new(config).unwrap();
     server
-        .register_schema_transform(
-            "list-elements-v1",
-            crate::StructuredColumnType::list_element_transform(ListConfig::default(), Ok),
-        )
+        .register_schema_transform("list-elements-v1", |_spec| {
+            Ok(crate::StructuredColumnType::list_element_transform(
+                ListConfig::default(),
+                Ok,
+            ))
+        })
         .unwrap();
     executor
-        .register_schema_transform(
-            "list-elements-v1",
-            crate::StructuredColumnType::list_element_transform(ListConfig::default(), Ok),
-        )
+        .register_schema_transform("list-elements-v1", |_spec| {
+            Ok(crate::StructuredColumnType::list_element_transform(
+                ListConfig::default(),
+                Ok,
+            ))
+        })
         .unwrap();
     let ids = server.supported_merge_operator_ids();
     assert!(

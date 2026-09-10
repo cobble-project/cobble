@@ -1,9 +1,41 @@
 use super::ColumnFamily;
 use crate::error::{Error, Result};
 use crate::r#type::{Column, Value, ValueType};
+use base64::Engine as _;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+
+/// Opaque configuration for a schema transform.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TransformSpec {
+    pub transform_type: String,
+    #[serde(with = "base64_bytes")]
+    pub spec: Bytes,
+}
+
+mod base64_bytes {
+    use super::*;
+
+    pub(super) fn serialize<S>(value: &Bytes, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(value))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Bytes, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// One target column in a schema transition.
 ///
@@ -13,15 +45,12 @@ use std::sync::{Arc, RwLock};
 /// before the schema is committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColumnEvolution {
-    /// Retain a current source column, optionally applying a registered transform.
+    /// Retain a current source column, optionally applying a persisted transform.
     Source {
         /// Index of the source column in the builder's current column layout.
         source_index: usize,
-        /// Stable transform ID registered through [`Db::register_schema_transform`](crate::Db::register_schema_transform).
-        ///
-        /// The transform implementation is runtime configuration and is not
-        /// persisted in the schema file.
-        transform_id: Option<String>,
+        /// Transform descriptor resolved during schema setup.
+        transform: Option<TransformSpec>,
     },
     /// Populate the target column with a fixed value when the source row is live.
     Default {
@@ -32,13 +61,13 @@ pub enum ColumnEvolution {
     Null,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ColumnEvolutionFile {
     Source {
         source_index: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transform_id: Option<String>,
+        transform: Option<TransformSpec>,
     },
     Default {
         value: Vec<u8>,
@@ -51,10 +80,10 @@ impl From<&ColumnEvolution> for ColumnEvolutionFile {
         match evolution {
             ColumnEvolution::Source {
                 source_index,
-                transform_id,
+                transform,
             } => Self::Source {
                 source_index: *source_index,
-                transform_id: transform_id.clone(),
+                transform: transform.clone(),
             },
             ColumnEvolution::Default { value } => Self::Default {
                 value: value.to_vec(),
@@ -69,10 +98,10 @@ impl From<ColumnEvolutionFile> for ColumnEvolution {
         match evolution {
             ColumnEvolutionFile::Source {
                 source_index,
-                transform_id,
+                transform,
             } => Self::Source {
                 source_index,
-                transform_id,
+                transform,
             },
             ColumnEvolutionFile::Default { value } => Self::Default {
                 value: Bytes::from(value),
@@ -93,16 +122,30 @@ pub(crate) enum TransitionCompatibility {
 ///
 /// `columns == None` means the transition is an identity for this column family.
 /// Derived execution metadata belongs here rather than in the persisted schema model.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct SchemaEvolution {
     pub(super) columns: Option<Arc<Vec<ColumnEvolution>>>,
+    /// Resolved once during schema setup, keyed by target column; shared by read plans.
+    pub(super) transforms: Arc<HashMap<usize, Arc<dyn ExecutableTransform>>>,
     pub(super) compatibility: TransitionCompatibility,
+}
+
+impl std::fmt::Debug for SchemaEvolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SchemaEvolution")
+            .field("columns", &self.columns)
+            .field("transforms", &self.transforms.len())
+            .field("compatibility", &self.compatibility)
+            .finish()
+    }
 }
 
 impl SchemaEvolution {
     pub(super) fn identity() -> Self {
         Self {
             columns: None,
+            transforms: Arc::new(HashMap::new()),
             compatibility: TransitionCompatibility::Compatible,
         }
     }
@@ -110,21 +153,23 @@ impl SchemaEvolution {
     pub(super) fn with_columns(
         columns: Vec<ColumnEvolution>,
         compatibility: TransitionCompatibility,
+        transforms: HashMap<usize, Arc<dyn ExecutableTransform>>,
     ) -> Self {
         Self {
             columns: Some(Arc::new(columns)),
+            transforms: Arc::new(transforms),
             compatibility,
         }
     }
 }
 
 /// Converts the logical bytes for one source column during schema evolution.
-pub(crate) trait SchemaTransform: Send + Sync {
+pub(crate) trait ExecutableTransform: Send + Sync {
     /// Convert a source value into the target value.
     fn apply(&self, value: Option<Bytes>) -> Result<Option<Bytes>>;
 }
 
-impl<F> SchemaTransform for F
+impl<F> ExecutableTransform for F
 where
     F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync,
 {
@@ -133,47 +178,68 @@ where
     }
 }
 
-/// Runtime registry of schema transform implementations keyed by stable IDs.
+/// Runtime registry of schema transform factories.
 ///
-/// Schema files retain only the ID; implementations belong to a database instance.
+/// Schema files retain specifications; executable callbacks belong to a database instance.
 #[derive(Default)]
 pub(crate) struct SchemaTransformRegistry {
-    transforms: RwLock<HashMap<String, Arc<dyn SchemaTransform>>>,
+    factories: RwLock<HashMap<String, Arc<dyn TransformFactory>>>,
+}
+
+trait TransformFactory: Send + Sync {
+    fn build(&self, spec: &[u8]) -> Result<Arc<dyn ExecutableTransform>>;
+}
+
+impl<F, T> TransformFactory for F
+where
+    F: Fn(&[u8]) -> Result<T> + Send + Sync,
+    T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+{
+    fn build(&self, spec: &[u8]) -> Result<Arc<dyn ExecutableTransform>> {
+        Ok(Arc::new(self(spec)?))
+    }
 }
 
 impl SchemaTransformRegistry {
-    /// Register `transform` under its stable persisted ID.
-    ///
-    /// IDs must be unique within a registry. Re-registering an ID returns an
-    /// error rather than replacing the transform used by an existing schema.
-    pub(crate) fn register<F>(&self, transform_id: impl Into<String>, transform: F) -> Result<()>
+    pub(crate) fn register<F, T>(&self, transform_type: impl Into<String>, factory: F) -> Result<()>
     where
-        F: SchemaTransform + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        let transform_id = transform_id.into();
-        let mut transforms = self.transforms.write().unwrap();
-        if transforms.contains_key(&transform_id) {
+        let transform_type = transform_type.into();
+        if transform_type.trim().is_empty() {
+            return Err(Error::InvalidState(
+                "Schema transform type must not be empty".to_string(),
+            ));
+        }
+        let mut factories = self.factories.write().unwrap();
+        if factories.contains_key(&transform_type) {
             return Err(Error::InvalidState(format!(
                 "Schema transform '{}' is already registered",
-                transform_id
+                transform_type
             )));
         }
-        transforms.insert(transform_id, Arc::new(transform));
+        factories.insert(transform_type, Arc::new(factory));
         Ok(())
     }
 
-    pub(super) fn resolve(&self, transform_id: &str) -> Result<Arc<dyn SchemaTransform>> {
-        self.transforms
+    pub(super) fn resolve(
+        &self,
+        transform: &TransformSpec,
+    ) -> Result<Arc<dyn ExecutableTransform>> {
+        let factory = self
+            .factories
             .read()
             .unwrap()
-            .get(transform_id)
+            .get(&transform.transform_type)
             .cloned()
             .ok_or_else(|| {
                 Error::InvalidState(format!(
                     "Schema transform '{}' is not registered",
-                    transform_id
+                    transform.transform_type
                 ))
-            })
+            })?;
+        factory.build(&transform.spec)
     }
 }
 
@@ -193,7 +259,7 @@ pub(super) fn evolve_value_with_transition(
         columns.push(match target {
             ColumnEvolution::Source {
                 source_index,
-                transform_id: None,
+                transform: None,
             } => source
                 .get_mut(*source_index)
                 .ok_or_else(|| {
@@ -204,12 +270,12 @@ pub(super) fn evolve_value_with_transition(
                 })?
                 .take(),
             ColumnEvolution::Source {
-                transform_id: Some(transform_id),
+                transform: Some(transform),
                 ..
             } => {
                 return Err(Error::InvalidState(format!(
                     "Schema transform '{}' requires materialized row execution",
-                    transform_id
+                    transform.transform_type
                 )));
             }
             ColumnEvolution::Default { value } => {
@@ -239,6 +305,7 @@ pub(super) fn compile_evolution(
     previous: Option<&ColumnFamily>,
     target: &ColumnFamily,
     columns: &[ColumnEvolution],
+    transforms: HashMap<usize, Arc<dyn ExecutableTransform>>,
 ) -> SchemaEvolution {
     let Some(previous) = previous else {
         return SchemaEvolution::identity();
@@ -248,7 +315,7 @@ pub(super) fn compile_evolution(
             evolution,
             ColumnEvolution::Source {
                 source_index,
-                transform_id: None,
+                transform: None,
             } if *source_index == index
         )
     });
@@ -267,6 +334,7 @@ pub(super) fn compile_evolution(
         SchemaEvolution::with_columns(
             columns.to_vec(),
             classify_columns(previous, target, columns),
+            transforms,
         )
     }
 }
@@ -283,7 +351,7 @@ pub(super) fn classify_columns(
     for (target_index, evolution) in columns.iter().enumerate() {
         let ColumnEvolution::Source {
             source_index,
-            transform_id: None,
+            transform: None,
         } = evolution
         else {
             return TransitionCompatibility::Incompatible;

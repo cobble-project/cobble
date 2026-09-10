@@ -46,11 +46,11 @@ fn test_structured_list_and_bytes_transforms_keep_layout_and_recovery_in_sync() 
     };
     let mut db = StructuredDbBuilder::new(config.clone())
         .bucket_ranges(vec![0..=0])
-        .register_schema_transform("uppercase", uppercase)
+        .register_schema_transform("uppercase", |_spec| Ok(uppercase))
         .unwrap()
         .open()
         .unwrap();
-    db.register_schema_transform("list-uppercase-v1", uppercase_list())
+    db.register_schema_transform("list-uppercase-v1", |_spec| Ok(uppercase_list()))
         .unwrap();
     db.update_schema()
         .add_list_column(None, 1, ListConfig::default())
@@ -174,9 +174,9 @@ fn test_structured_list_and_bytes_transforms_keep_layout_and_recovery_in_sync() 
     );
     let readonly = StructuredReadOnlyDbBuilder::new(config.clone())
         .db_id(&db_id)
-        .register_schema_transform("uppercase", uppercase)
+        .register_schema_transform("uppercase", |_spec| Ok(uppercase))
         .unwrap()
-        .register_schema_transform("list-uppercase-v1", uppercase_list())
+        .register_schema_transform("list-uppercase-v1", |_spec| Ok(uppercase_list()))
         .unwrap()
         .open(snapshot_id)
         .unwrap();
@@ -195,9 +195,9 @@ fn test_structured_list_and_bytes_transforms_keep_layout_and_recovery_in_sync() 
     drop(readonly);
     let resumed = StructuredDbBuilder::new(config)
         .db_id(&db_id)
-        .register_schema_transform("uppercase", uppercase)
+        .register_schema_transform("uppercase", |_spec| Ok(uppercase))
         .unwrap()
-        .register_schema_transform("list-uppercase-v1", uppercase_list())
+        .register_schema_transform("list-uppercase-v1", |_spec| Ok(uppercase_list()))
         .unwrap()
         .resume_from_snapshot(snapshot_id)
         .unwrap();

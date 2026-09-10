@@ -26,19 +26,21 @@ impl ReaderBuilder {
         self
     }
 
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<Self>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)?;
+        self.transforms.register(transform_type, factory)?;
         Ok(self)
     }
 
-    /// Opens a fixed global snapshot. Shard transform IDs are checked lazily
+    /// Opens a fixed global snapshot. Shard schema transforms are resolved lazily
     /// when a routed bucket first opens its read-only shard.
     pub fn open(self, global_snapshot_id: u64) -> Result<Reader> {
         Reader::open_with_resolver_and_transforms(

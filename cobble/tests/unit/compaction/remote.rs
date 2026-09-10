@@ -13,7 +13,7 @@ use crate::sst::row_codec::{decode_value, encode_key, encode_value};
 use crate::r#type::{Column, Key, KvValue, Value, ValueType};
 use crate::vlog::{VlogStore, VlogVersion};
 use crate::writer_options::WriterOptions;
-use crate::{VolumeDescriptor, VolumeUsageKind};
+use crate::{TransformSpec, VolumeDescriptor, VolumeUsageKind};
 use bytes::Bytes;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
@@ -65,6 +65,13 @@ fn remote_parse_number(value: Option<Bytes>) -> Result<Option<Bytes>> {
             Ok(Bytes::copy_from_slice(&number.to_le_bytes()))
         })
         .transpose()
+}
+
+fn remote_parse_number_plugin(spec: &[u8]) -> Result<fn(Option<Bytes>) -> Result<Option<Bytes>>> {
+    if spec != b"\x01remote-parse\x80" {
+        return Err(Error::InvalidState("unexpected remote plugin spec".into()));
+    }
+    Ok(remote_parse_number)
 }
 
 fn remote_render_number(value: Option<Bytes>) -> Result<Option<Bytes>> {
@@ -704,10 +711,10 @@ fn test_remote_compaction_transforms_cross_process_with_unpersisted_chain() {
         server.register_merge_operator(Arc::new(RemotePipeMergeOperator));
         if std::env::var(CHILD_REGISTERED).unwrap() == "true" {
             server
-                .register_schema_transform("remote-parse", remote_parse_number)
+                .register_schema_transform("remote-parse", remote_parse_number_plugin)
                 .unwrap();
             server
-                .register_schema_transform("remote-render", remote_render_number)
+                .register_schema_transform("remote-render", |_spec| Ok(remote_render_number))
                 .unwrap();
         }
         server.serve(&std::env::var(CHILD_ADDR).unwrap()).unwrap();
@@ -731,18 +738,23 @@ fn test_remote_compaction_transforms_cross_process_with_unpersisted_chain() {
 
     let transforms = Arc::new(crate::schema::SchemaTransformRegistry::default());
     transforms
-        .register("remote-parse", remote_parse_number)
+        .register("remote-parse", remote_parse_number_plugin)
         .unwrap();
     transforms
-        .register("remote-render", remote_render_number)
+        .register("remote-render", |_spec| Ok(remote_render_number))
         .unwrap();
     transforms
-        .register("unused-latest", |value: Option<Bytes>| Ok(value))
+        .register("unused-latest", |_spec| {
+            Ok(|value: Option<Bytes>| Ok(value))
+        })
         .unwrap();
     let schema_manager = Arc::new(SchemaManager::new_with_transform_registry(2, transforms));
     let source = |index, transform: Option<&str>| crate::schema::ColumnEvolution::Source {
         source_index: index,
-        transform_id: transform.map(str::to_owned),
+        transform: transform.map(|transform_type| TransformSpec {
+            transform_type: transform_type.to_owned(),
+            spec: Bytes::new(),
+        }),
     };
     let mut builder = schema_manager.builder();
     builder
@@ -750,7 +762,13 @@ fn test_remote_compaction_transforms_cross_process_with_unpersisted_chain() {
             None,
             vec![
                 source(1, None),
-                source(0, Some("remote-parse")),
+                crate::schema::ColumnEvolution::Source {
+                    source_index: 0,
+                    transform: Some(TransformSpec {
+                        transform_type: "remote-parse".to_string(),
+                        spec: Bytes::from_static(b"\x01remote-parse\x80"),
+                    }),
+                },
                 crate::schema::ColumnEvolution::Default {
                     value: Bytes::from_static(b"D"),
                 },

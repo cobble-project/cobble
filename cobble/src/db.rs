@@ -289,23 +289,19 @@ impl Db {
         ))
     }
 
-    /// Register a single-column schema transform under a stable ID.
-    ///
-    /// Register before referencing the ID in a schema update. For startup
-    /// registration while resuming, use [`DbBuilder::register_schema_transform`].
-    /// Only the ID is persisted; the closure belongs to this database instance.
-    /// Duplicate IDs return an error so an existing schema's transform cannot be replaced.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
         let _access = self.begin_access()?;
         self.schema_manager
-            .register_transform(transform_id, transform)
+            .register_transform(transform_type, factory)
     }
 
     /// Start a schema update transaction.
@@ -621,8 +617,6 @@ impl Db {
                             .register_schema_from_file(&self.file_manager, schema_id)?;
                     }
                     let schema = self.schema_manager.schema(schema_id)?;
-                    self.schema_manager
-                        .validate_schema_transforms(schema.as_ref())?;
                     self.ensure_multi_lsm_scopes_for_schema_if_dirty(schema.as_ref())?;
                     for (mut encoded_key, mut encoded_value) in
                         crate::memtable::decode_vec_entry_stream(entry_bytes.as_ref())?

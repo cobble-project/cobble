@@ -95,13 +95,24 @@ fn default_column_families() -> BTreeMap<String, SnapshotColumnFamily> {
     )])
 }
 
+fn bang(value: Option<Bytes>) -> Result<Option<Bytes>> {
+    Ok(value.map(|value| [value.as_ref(), b"!"].concat().into()))
+}
+
+fn bang_plugin(spec: &[u8]) -> Result<fn(Option<Bytes>) -> Result<Option<Bytes>>> {
+    if spec != b"reader-bang-v1" {
+        return Err(Error::InvalidState("unexpected reader plugin spec".into()));
+    }
+    Ok(bang)
+}
+
 #[test]
 #[serial_test::serial(file)]
 fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
     use crate::data_file::DataFileType;
     use crate::{
         BytesMergeOperator, ColumnEvolution, Db, DbBuilder, ReadOnlyDbBuilder, ReaderBuilder,
-        U32CounterMergeOperator, WriteOptions,
+        TransformSpec, U32CounterMergeOperator, WriteOptions,
     };
 
     let render = |value: Option<Bytes>| -> Result<Option<Bytes>> {
@@ -115,12 +126,12 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             })
             .transpose()
     };
-    let bang = |value: Option<Bytes>| -> Result<Option<Bytes>> {
-        Ok(value.map(|value| [value.as_ref(), b"!"].concat().into()))
-    };
     let source = |index, id: Option<&str>| ColumnEvolution::Source {
         source_index: index,
-        transform_id: id.map(str::to_owned),
+        transform: id.map(|transform_type| TransformSpec {
+            transform_type: transform_type.to_owned(),
+            spec: Bytes::new(),
+        }),
     };
     let take_snapshot = |db: &Db| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -154,7 +165,7 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             let db = DbBuilder::new(config.clone())
                 .db_id(format!("shard-{bucket}"))
                 .bucket_ranges(vec![bucket..=bucket])
-                .register_schema_transform("render", render)
+                .register_schema_transform("render", move |_spec| Ok(render))
                 .unwrap()
                 .open()
                 .unwrap();
@@ -243,12 +254,18 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
                 .contains("render")
         );
         let direct = direct_builder()
-            .register_schema_transform("render", render)
+            .register_schema_transform("render", move |_spec| Ok(render))
             .unwrap()
             .open(shard_snapshot_id)
             .unwrap();
-        assert!(direct.register_schema_transform("render", render).is_err());
-        direct.register_schema_transform("future", bang).unwrap();
+        assert!(
+            direct
+                .register_schema_transform("render", move |_spec| Ok(render))
+                .is_err()
+        );
+        direct
+            .register_schema_transform("future", |_spec| Ok(bang))
+            .unwrap();
         let old_row = vec![
             Some(Bytes::from_static(b"sum=7-tail")),
             Some(Bytes::from_static(b"payload")),
@@ -285,8 +302,14 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
                 .contains("render")
         );
         assert_eq!(reader.cache.len(), 0);
-        reader.register_schema_transform("render", render).unwrap();
-        assert!(reader.register_schema_transform("render", render).is_err());
+        reader
+            .register_schema_transform("render", move |_spec| Ok(render))
+            .unwrap();
+        assert!(
+            reader
+                .register_schema_transform("render", move |_spec| Ok(render))
+                .is_err()
+        );
         for bucket in [0, 1, 0] {
             assert_eq!(
                 reader.get_with_options(bucket, &keys[0], &read).unwrap(),
@@ -344,7 +367,7 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             expected_scan
         );
         let mut fixed = ReaderBuilder::new(reader_config.clone())
-            .register_schema_transform("render", render)
+            .register_schema_transform("render", move |_spec| Ok(render))
             .unwrap()
             .open(first.id)
             .unwrap();
@@ -356,13 +379,19 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
         // Refresh preserves existing registrations. A new transform can be
         // registered after a lazy shard open fails, without reopening the reader.
         for db in &shards {
-            db.register_schema_transform("bang", bang).unwrap();
+            db.register_schema_transform("bang", bang_plugin).unwrap();
             let mut schema = db.update_schema();
             schema
                 .remap_columns(
                     Some("metrics".into()),
                     vec![
-                        source(0, Some("bang")),
+                        ColumnEvolution::Source {
+                            source_index: 0,
+                            transform: Some(TransformSpec {
+                                transform_type: "bang".to_string(),
+                                spec: Bytes::from_static(b"reader-bang-v1"),
+                            }),
+                        },
                         source(1, None),
                         source(2, None),
                         source(3, None),
@@ -381,7 +410,9 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
                 .to_string()
                 .contains("bang")
         );
-        reader.register_schema_transform("bang", bang).unwrap();
+        reader
+            .register_schema_transform("bang", bang_plugin)
+            .unwrap();
         let mut new_row = old_row.clone();
         new_row[0] = Some(Bytes::from_static(b"sum=7-tail!"));
         for bucket in [0, 1, 0] {
@@ -399,9 +430,9 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             Some(old_row)
         );
         let mut reopened = ReaderBuilder::new(reader_config)
-            .register_schema_transform("render", render)
+            .register_schema_transform("render", move |_spec| Ok(render))
             .unwrap()
-            .register_schema_transform("bang", bang)
+            .register_schema_transform("bang", bang_plugin)
             .unwrap()
             .open_current()
             .unwrap();

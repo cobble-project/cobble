@@ -4,6 +4,7 @@ use crate::row_merge::{SchemaMergePlan, SchemaValue, merge_schema_values};
 use crate::r#type::{Column, Value, ValueType};
 use crate::vlog::VlogPointer;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct BracketMergeOperator;
 
@@ -39,15 +40,22 @@ fn test_schema_aware_merge_materializes_transform_boundaries() {
     let schema1 = builder.commit();
     let mut schema1_file = schema_to_file(&schema1);
     let transition = schema1_file.column_families[0].transition.as_mut().unwrap();
-    let ColumnEvolutionFile::Source { transform_id, .. } = &mut transition[0] else {
+    let ColumnEvolutionFile::Source { transform, .. } = &mut transition[0] else {
         panic!("first target column should preserve the source");
     };
-    *transform_id = Some("decorate".to_string());
+    *transform = Some(TransformSpec {
+        transform_type: "decorate".to_string(),
+        spec: Bytes::new(),
+    });
 
     let registry = Arc::new(SchemaTransformRegistry::default());
     registry
-        .register("decorate", |value: Option<Bytes>| {
-            Ok(value.map(|value| [value.as_ref(), b"-x"].concat().into()))
+        .register("decorate", |_spec| {
+            Ok(
+                |value: Option<Bytes>| {
+                    Ok(value.map(|value| [value.as_ref(), b"-x"].concat().into()))
+                },
+            )
         })
         .unwrap();
     let manager = SchemaManager::new_with_transform_registry(1, registry);
@@ -195,6 +203,158 @@ fn test_schema_aware_merge_materializes_transform_boundaries() {
             .as_ref()
             .is_some_and(|column| *column.value_type() == ValueType::Delete)
     }));
+}
+
+#[test]
+fn test_transform_spec_round_trip_is_resolved_once_per_schema() {
+    let writer_calls = Arc::new(AtomicUsize::new(0));
+    let writer_calls_for_factory = Arc::clone(&writer_calls);
+    let writer_registry = Arc::new(SchemaTransformRegistry::default());
+    writer_registry
+        .register("append", move |spec| {
+            writer_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+            if spec == b"bad" {
+                return Err(Error::InvalidState("invalid append spec".to_string()));
+            }
+            let suffix = Bytes::copy_from_slice(spec);
+            Ok(move |value: Option<Bytes>| {
+                Ok(value.map(|value| [value.as_ref(), suffix.as_ref()].concat().into()))
+            })
+        })
+        .unwrap();
+    let writer = Arc::new(SchemaManager::new_with_transform_registry(
+        2,
+        writer_registry,
+    ));
+    let mut builder = writer.builder();
+    builder
+        .remap_columns(
+            None,
+            vec![
+                ColumnEvolution::Source {
+                    source_index: 0,
+                    transform: Some(TransformSpec {
+                        transform_type: "append".to_string(),
+                        spec: Bytes::from_static(b"-spec"),
+                    }),
+                },
+                ColumnEvolution::Source {
+                    source_index: 1,
+                    transform: None,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(writer_calls.load(Ordering::SeqCst), 1);
+    let error = builder
+        .remap_columns(
+            None,
+            vec![
+                ColumnEvolution::Source {
+                    source_index: 0,
+                    transform: None,
+                },
+                ColumnEvolution::Source {
+                    source_index: 1,
+                    transform: Some(TransformSpec {
+                        transform_type: "append".to_string(),
+                        spec: Bytes::from_static(b"bad"),
+                    }),
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid append spec"));
+    builder.add_column(0, None, None, None).unwrap();
+    builder.delete_column(None, 0).unwrap();
+    builder
+        .remap_columns(
+            None,
+            vec![
+                ColumnEvolution::Source {
+                    source_index: 1,
+                    transform: None,
+                },
+                ColumnEvolution::Source {
+                    source_index: 0,
+                    transform: None,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(writer_calls.load(Ordering::SeqCst), 2);
+    let schema = builder.commit();
+    let writer_route = writer
+        .compile_projection_route(0, 1, DEFAULT_COLUMN_FAMILY_ID)
+        .unwrap();
+    assert_eq!(
+        writer_route
+            .apply(&[
+                Some(Bytes::from_static(b"value")),
+                Some(Bytes::from_static(b"other")),
+            ])
+            .unwrap(),
+        vec![
+            Some(Bytes::from_static(b"other")),
+            Some(Bytes::from_static(b"value-spec")),
+        ]
+    );
+    let schema_file = schema_to_file(&schema);
+    let encoded = serde_json::to_value(&schema_file).unwrap();
+    let source = &encoded["column_families"][0]["transition"][1];
+    assert_eq!(source["transform"]["transform_type"], "append");
+    assert_eq!(source["transform"]["spec"], "LXNwZWM=");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_factory = Arc::clone(&calls);
+    let registry = Arc::new(SchemaTransformRegistry::default());
+    registry
+        .register("append", move |spec| {
+            calls_for_factory.fetch_add(1, Ordering::SeqCst);
+            let suffix = Bytes::copy_from_slice(spec);
+            Ok(move |value: Option<Bytes>| {
+                Ok(value.map(|value| [value.as_ref(), suffix.as_ref()].concat().into()))
+            })
+        })
+        .unwrap();
+    let restored = SchemaManager::new_with_transform_registry(2, registry);
+    let decoded: SchemaFile = serde_json::from_value(encoded.clone()).unwrap();
+    restored.register_schema_from_def(&decoded, None).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    for _ in 0..2 {
+        let route = restored
+            .compile_projection_route(0, 1, DEFAULT_COLUMN_FAMILY_ID)
+            .unwrap();
+        assert_eq!(
+            route
+                .apply(&[
+                    Some(Bytes::from_static(b"value")),
+                    Some(Bytes::from_static(b"other")),
+                ])
+                .unwrap(),
+            vec![
+                Some(Bytes::from_static(b"other")),
+                Some(Bytes::from_static(b"value-spec")),
+            ]
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let mut malformed = encoded.clone();
+    malformed["column_families"][0]["transition"][1]["transform"]["spec"] =
+        serde_json::Value::String("not-base64!".to_string());
+    assert!(serde_json::from_value::<SchemaFile>(malformed).is_err());
+
+    let mut legacy = encoded;
+    let source = legacy["column_families"][0]["transition"][1]
+        .as_object_mut()
+        .unwrap();
+    source.remove("transform");
+    source.insert(
+        "transform_id".to_string(),
+        serde_json::Value::String("append".to_string()),
+    );
+    assert!(serde_json::from_value::<SchemaFile>(legacy).is_err());
 }
 
 #[test]
@@ -418,10 +578,13 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
         .transition
         .as_mut()
         .expect("mixed transition");
-    let ColumnEvolutionFile::Source { transform_id, .. } = &mut transition[0] else {
+    let ColumnEvolutionFile::Source { transform, .. } = &mut transition[0] else {
         panic!("first target column should use a source");
     };
-    *transform_id = Some("test-transform".to_string());
+    *transform = Some(TransformSpec {
+        transform_type: "test-transform".to_string(),
+        spec: Bytes::new(),
+    });
     let payload = serde_json::to_vec(&schema_file).unwrap();
     let restored_file: SchemaFile = serde_json::from_slice(&payload).unwrap();
     let restored = schema_from_file(&restored_file, None).unwrap();
@@ -451,23 +614,27 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
 
     let transforms = Arc::new(SchemaTransformRegistry::default());
     transforms
-        .register("first", |value: Option<Bytes>| {
-            let mut value = value.expect("first transform source").to_vec();
-            value.extend_from_slice(b"-first");
-            Ok(Some(value.into()))
+        .register("first", |_spec| {
+            Ok(|value: Option<Bytes>| {
+                let mut value = value.expect("first transform source").to_vec();
+                value.extend_from_slice(b"-first");
+                Ok(Some(value.into()))
+            })
         })
         .unwrap();
     let duplicate = transforms
-        .register("first", |value: Option<Bytes>| Ok(value))
+        .register("first", |_spec| Ok(|value: Option<Bytes>| Ok(value)))
         .unwrap_err();
     assert!(duplicate.to_string().contains("already registered"));
     transforms
-        .register("second", |value: Option<Bytes>| {
-            let mut value = value
-                .unwrap_or_else(|| Bytes::from_static(b"null"))
-                .to_vec();
-            value.extend_from_slice(b"-second");
-            Ok(Some(value.into()))
+        .register("second", |_spec| {
+            Ok(|value: Option<Bytes>| {
+                let mut value = value
+                    .unwrap_or_else(|| Bytes::from_static(b"null"))
+                    .to_vec();
+                value.extend_from_slice(b"-second");
+                Ok(Some(value.into()))
+            })
         })
         .unwrap();
 
@@ -485,16 +652,22 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
     let schema2 = builder.commit();
     let mut schema1_file = schema_to_file(&schema1);
     let schema1_transition = schema1_file.column_families[0].transition.as_mut().unwrap();
-    let ColumnEvolutionFile::Source { transform_id, .. } = &mut schema1_transition[0] else {
+    let ColumnEvolutionFile::Source { transform, .. } = &mut schema1_transition[0] else {
         panic!("first schema should preserve its source column");
     };
-    *transform_id = Some("first".to_string());
+    *transform = Some(TransformSpec {
+        transform_type: "first".to_string(),
+        spec: Bytes::new(),
+    });
     let mut schema2_file = schema_to_file(&schema2);
     for evolution in schema2_file.column_families[0].transition.as_mut().unwrap() {
-        let ColumnEvolutionFile::Source { transform_id, .. } = evolution else {
+        let ColumnEvolutionFile::Source { transform, .. } = evolution else {
             panic!("second schema should preserve every source column");
         };
-        *transform_id = Some("second".to_string());
+        *transform = Some(TransformSpec {
+            transform_type: "second".to_string(),
+            spec: Bytes::new(),
+        });
     }
     // Later compatible schemas inherit a barrier even when the missing
     // predecessor is registered after them. A separate family stays independent.
@@ -582,19 +755,12 @@ fn test_schema_evolution_mixes_add_delete_and_replace() {
 
     let missing_registry = Arc::new(SchemaTransformRegistry::default());
     missing_registry
-        .register("second", |value: Option<Bytes>| Ok(value))
+        .register("second", |_spec| Ok(|value: Option<Bytes>| Ok(value)))
         .unwrap();
     let missing = SchemaManager::new_with_transform_registry(1, missing_registry);
-    missing
+    let error = missing
         .register_schema_from_def(&schema1_file, None)
-        .unwrap();
-    missing
-        .register_schema_from_def(&schema2_file, None)
-        .unwrap();
-    let error = match missing.compile_projection_route(0, 2, DEFAULT_COLUMN_FAMILY_ID) {
-        Ok(_) => panic!("missing transform must reject route compilation"),
-        Err(error) => error,
-    };
+        .unwrap_err();
     assert!(error.to_string().contains("'first' is not registered"));
 }
 
@@ -608,14 +774,14 @@ fn test_schema_evolution_remaps_columns_atomically() {
             vec![
                 ColumnEvolution::Source {
                     source_index: 2,
-                    transform_id: None,
+                    transform: None,
                 },
                 ColumnEvolution::Default {
                     value: Bytes::from_static(b"new"),
                 },
                 ColumnEvolution::Source {
                     source_index: 0,
-                    transform_id: None,
+                    transform: None,
                 },
             ],
         )
@@ -663,11 +829,11 @@ fn test_schema_evolution_remaps_columns_atomically() {
                 vec![
                     ColumnEvolution::Source {
                         source_index: 0,
-                        transform_id: None,
+                        transform: None,
                     },
                     ColumnEvolution::Source {
                         source_index: 0,
-                        transform_id: None,
+                        transform: None,
                     },
                 ],
             )

@@ -544,16 +544,17 @@ impl ReadOnlyDb {
         Ok(iter)
     }
 
-    /// Registers a schema transform for this read-only view and future reads.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
         self.schema_manager
-            .register_transform(transform_id, transform)
+            .register_transform(transform_type, factory)
     }
 }

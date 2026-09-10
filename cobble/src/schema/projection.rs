@@ -1,4 +1,4 @@
-use super::evolution::SchemaTransform;
+use super::evolution::ExecutableTransform;
 use super::{ColumnEvolution, DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaEvolution, SchemaManager};
 use crate::error::{Error, Result};
 use bytes::Bytes;
@@ -14,7 +14,7 @@ enum RouteSource {
 #[derive(Clone)]
 struct SchemaColumnRoute {
     source: RouteSource,
-    transforms: Vec<Arc<dyn SchemaTransform>>,
+    transforms: Vec<Arc<dyn ExecutableTransform>>,
 }
 
 /// A compiled source-schema to target-schema column route.
@@ -157,12 +157,22 @@ impl SchemaManager {
                 match evolution {
                     ColumnEvolution::Source {
                         source_index,
-                        transform_id,
+                        transform,
                     } => {
-                        if let Some(transform_id) = transform_id {
-                            route
-                                .transforms
-                                .push(self.transforms.resolve(transform_id)?);
+                        if transform.is_some() {
+                            route.transforms.push(
+                                family
+                                    .evolution
+                                    .transforms
+                                    .get(&target_column)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        Error::InvalidState(format!(
+                                            "schema {} transform for column {} is not resolved",
+                                            schema_id, target_column
+                                        ))
+                                    })?,
+                            );
                         }
                         route.source = RouteSource::Source(*source_index);
                     }

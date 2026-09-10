@@ -1134,19 +1134,17 @@ impl RemoteCompactionServer {
         }
     }
 
-    /// Register a single-column schema transform under its stable persisted ID.
-    ///
-    /// The callback stays in this compactor process; remote requests carry only the ID recorded
-    /// in their schema definitions. Register every ID needed by incoming requests before serving.
-    pub fn register_schema_transform<F>(
+    /// Register a factory for persisted schema transform specifications.
+    pub fn register_schema_transform<F, T>(
         &self,
-        transform_id: impl Into<String>,
-        transform: F,
+        transform_type: impl Into<String>,
+        factory: F,
     ) -> Result<()>
     where
-        F: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
-        self.transforms.register(transform_id, transform)
+        self.transforms.register(transform_type, factory)
     }
 
     pub fn supported_merge_operator_ids(&self) -> Vec<String> {
@@ -1414,7 +1412,7 @@ impl RemoteCompactionServer {
     /// The request carries real schema definitions, including version 0 when a selected file uses
     /// it, so the server does not synthesize a fallback layout from the target. That matters when
     /// version 0 has a different width or merge operators from the fixed target. Attaching the
-    /// process-local transform registry validates every persisted transform ID before execution.
+    /// process-local transform registry resolves every persisted transform before execution.
     fn build_schema_manager(
         merge_operator_resolver: Option<&Arc<dyn MergeOperatorResolver>>,
         schemas: &[crate::schema::SchemaFile],
