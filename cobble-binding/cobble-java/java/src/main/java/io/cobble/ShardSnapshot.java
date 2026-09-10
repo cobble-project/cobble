@@ -34,8 +34,8 @@ public final class ShardSnapshot implements Serializable {
     /**
      * Column-family IDs from a persisted global-manifest shard reference.
      *
-     * <p>Coordinator reports serialize {@link #columnFamilies} instead; this reference-only
-     * mapping is deliberately omitted from their JSON.
+     * <p>Coordinator reports serialize {@link #columnFamilies} instead; this reference-only mapping
+     * is deliberately omitted from their JSON.
      */
     @SerializedName("column_family_ids")
     public Map<String, Integer> columnFamilyIds;

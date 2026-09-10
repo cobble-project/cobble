@@ -16,7 +16,6 @@ import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
 
 import com.google.gson.Gson;
-
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -301,7 +300,12 @@ class DbBindingTest {
             table.put(row3);
             ShardSnapshot snapshot = db.snapshot();
             assertFalse(snapshot.columnFamilies.isEmpty());
-            assertTrue(snapshot.columnFamilies.get("events").options.metadata.contains("cobble-table"));
+            assertTrue(
+                    snapshot.columnFamilies
+                            .get("events")
+                            .options
+                            .metadata
+                            .contains("cobble-table"));
             try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
                     ReadOnlyTable readOnly = ReadOnlyTable.open(readOnlyDb, "events")) {
                 assertEquals(schema, readOnly.schema());
