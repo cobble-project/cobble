@@ -1050,7 +1050,8 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
     std::fs::write(&result_file, &valid_result).unwrap();
     assert!(
         wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
-            count_compaction_results(root) == 0
+            // The compactor may publish a later job immediately after this retry resumes.
+            !result_file.exists()
                 && std::fs::read(&current)
                     .map(|bytes| bytes != valid_current)
                     .unwrap_or(false)
