@@ -958,6 +958,18 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
         || count_data_files(root) > 0 && runtime_current_exists(root)
     ));
 
+    // Drain the initial writes before fault injection. Older asynchronous flush snapshots
+    // (including their temporary files) are not evidence that this compaction acquired suspension.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let baseline_snapshot = db
+        .snapshot_with_callback(move |result| {
+            tx.send(result).unwrap();
+        })
+        .expect("capture baseline snapshot");
+    rx.recv_timeout(Duration::from_secs(15))
+        .expect("baseline snapshot callback")
+        .expect("materialize baseline snapshot");
+
     let current = find_file(root, |path| {
         path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
             && path
@@ -967,7 +979,6 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
                 == Some("runtime")
     });
     let valid_current = std::fs::read(&current).unwrap();
-    let initial_snapshots = count_snapshots(root);
     let (stop, handle) = spawn_compactor(config, db_id);
     assert!(
         wait_for(Duration::from_secs(10), Duration::from_millis(20), || {
@@ -987,7 +998,7 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
     std::fs::write(&current, b"corrupt runtime current\n").unwrap();
     assert!(
         wait_for(Duration::from_secs(15), Duration::from_millis(100), || {
-            count_snapshots(root) > initial_snapshots && count_compaction_results(root) == 1
+            snapshot_exists(root, baseline_snapshot + 1) && count_compaction_results(root) == 1
         }),
         "failed runtime publication should retain the compaction result"
     );
