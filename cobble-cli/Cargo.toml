@@ -32,5 +32,11 @@ storage-sftp = ["cobble/storage-sftp", "cobble-web-monitor/storage-sftp"]
 
 [dependencies]
 cobble = { workspace = true }
+cobble-table = { workspace = true }
 cobble-web-monitor = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+size = { workspace = true }
+tempfile = "3.20.0"

@@ -17,6 +17,7 @@ mod scan;
 mod schema;
 pub mod snapshot;
 mod table;
+mod transform;
 mod write;
 
 #[cfg(test)]
@@ -42,4 +43,5 @@ pub use schema::{TableSchema, TableSchemaBuilder};
 pub use table::{
     ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,
 };
+pub use transform::register_schema_transforms;
 pub use write::{TableWriteBuilder, TableWritePlan};

@@ -1,4 +1,5 @@
 use cobble::{Config, DedicatedCompactionService, RemoteCompactionServer};
+use cobble_table::register_schema_transforms;
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use log::LevelFilter::Info;
 use std::error::Error;
@@ -67,6 +68,7 @@ fn run_remote_compactor(mut args: impl Iterator<Item = String>) -> Result<(), Bo
         .or_else(|| Some("127.0.0.1:0".to_string()))
         .unwrap();
     let server = RemoteCompactionServer::new(config)?;
+    register_schema_transforms(&server)?;
     server.serve(&bind_addr)?;
     Ok(())
 }
@@ -188,6 +190,7 @@ fn run_compact(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Err
     );
     let service =
         DedicatedCompactionService::open_storage_paths(config, paths, worker_count, scan_interval)?;
+    register_schema_transforms(&service)?;
     service.run()?;
     Ok(())
 }

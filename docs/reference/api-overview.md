@@ -290,7 +290,9 @@ Projections and scan cursors can outlive the table handle.
 `Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
 renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
 schema does not refresh an already opened reader or writer automatically.
-`TransformField` changes a non-key field using a persisted `TransformSpec`; materialization
+`AlterFieldType` provides built-in lossless widening with automatic factory registration
+on Table builders and CLI compactors. `TransformField` supports custom conversions using
+a persisted `TransformSpec`; materialization
 applies intermediate catalog versions in order. Register factories on writer and reader
 builders before opening. See [Table field transforms](../architecture/schema-evolution#table-field-transforms).
 

@@ -1,14 +1,15 @@
 use crate::catalog::{TableId, physical_table_name};
 use crate::metadata::TableMetadata;
 use crate::table::{TypedRead, load_table_metadata, load_table_metadata_for_shard, validate_name};
+use crate::transform::TABLE_TRANSFORM_TYPE;
 use crate::{
     ReadOnlyTable, Result, Table, TableError, TableKey, TableKeyBuilder, TableProjection,
-    TableScan, TableSchema, TableWritePlan, Value,
+    TableScan, TableSchema, TableWritePlan, Value, register_schema_transforms,
 };
 use bytes::Bytes;
 use cobble::{
     Config, Db, DbBuilder, DbIterator, ReadOnlyDbBuilder, ReadOptions, Reader, ReaderBuilder,
-    ReaderConfig, ScanOptions,
+    ReaderConfig, ScanOptions, SchemaTransformRegistrar,
 };
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,11 @@ impl TableSchemaTransformFactories {
         T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
     {
         let transform_type = transform_type.into();
+        if transform_type == TABLE_TRANSFORM_TYPE {
+            return Err(TableError::Storage(cobble::Error::InvalidState(format!(
+                "Schema transform '{TABLE_TRANSFORM_TYPE}' is reserved by cobble-table"
+            ))));
+        }
         if transform_type.trim().is_empty() {
             return Err(TableError::Storage(cobble::Error::InvalidState(
                 "Schema transform type must not be empty".to_string(),
@@ -52,32 +58,11 @@ impl TableSchemaTransformFactories {
         Ok(())
     }
 
-    fn apply_to_db_builder(&self, mut builder: DbBuilder) -> Result<DbBuilder> {
+    pub(crate) fn apply_to<B: SchemaTransformRegistrar>(&self, builder: B) -> Result<B> {
+        register_schema_transforms(&builder)?;
         for (transform_type, factory) in &self.0 {
             let factory = Arc::clone(factory);
-            builder = builder
-                .register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
-        }
-        Ok(builder)
-    }
-
-    fn apply_to_reader_builder(&self, mut builder: ReaderBuilder) -> Result<ReaderBuilder> {
-        for (transform_type, factory) in &self.0 {
-            let factory = Arc::clone(factory);
-            builder = builder
-                .register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
-        }
-        Ok(builder)
-    }
-
-    pub(crate) fn apply_to_read_only_builder(
-        &self,
-        mut builder: ReadOnlyDbBuilder,
-    ) -> Result<ReadOnlyDbBuilder> {
-        for (transform_type, factory) in &self.0 {
-            let factory = Arc::clone(factory);
-            builder = builder
-                .register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
+            builder.register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
         }
         Ok(builder)
     }
@@ -229,7 +214,7 @@ impl TableWriterBuilder {
         if let Some(db_id) = &self.db_id {
             builder = builder.db_id(db_id.clone());
         }
-        self.transforms.apply_to_db_builder(builder)
+        self.transforms.apply_to(builder)
     }
 }
 
@@ -393,7 +378,7 @@ impl TableReaderBuilder {
         let name = self.required_table_name()?;
         let builder = self
             .transforms
-            .apply_to_reader_builder(ReaderBuilder::new(ReaderConfig::from_config(&self.config)))?;
+            .apply_to(ReaderBuilder::new(ReaderConfig::from_config(&self.config)))?;
         let mut reader = match self.selection.ok_or_else(|| {
             TableError::InvalidSchema("TableReaderBuilder requires a snapshot selection".into())
         })? {
@@ -474,7 +459,7 @@ impl ReadOnlyTableBuilder {
         })?;
         let db = Arc::new(
             self.transforms
-                .apply_to_read_only_builder(ReadOnlyDbBuilder::new(self.config).db_id(db_id))?
+                .apply_to(ReadOnlyDbBuilder::new(self.config).db_id(db_id))?
                 .open(snapshot_id)?,
         );
         let metadata = load_table_metadata(&db.current_schema(), &name)?;

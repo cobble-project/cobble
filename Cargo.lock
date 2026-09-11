@@ -643,8 +643,12 @@ name = "cobble-cli"
 version = "0.5.0"
 dependencies = [
  "cobble",
+ "cobble-table",
  "cobble-web-monitor",
  "log",
+ "serde_json",
+ "size",
+ "tempfile",
 ]
 
 [[package]]

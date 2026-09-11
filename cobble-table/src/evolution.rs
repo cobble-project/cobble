@@ -1,5 +1,6 @@
 use crate::logical_type::{assign_fresh_field_ids, assign_fresh_type_ids};
 use crate::metadata::TableMetadata;
+use crate::transform::compile_table_transform;
 use crate::{
     DataField, FieldId, LogicalType, LogicalTypeKind, Result, TableError, TableSchema, Value,
     ValueCodec,
@@ -23,6 +24,14 @@ pub enum SchemaChange {
     },
     /// Drop a non-key top-level field.
     DropField { field_name: String },
+    /// Losslessly widen one existing non-key field's logical type.
+    ///
+    /// The catalog derives and persists the built-in transform from the field's
+    /// actual current type and this target type.
+    AlterFieldType {
+        field_name: String,
+        logical_type: LogicalType,
+    },
     /// Transform one existing non-key field, optionally changing its logical type.
     ///
     /// The field name is resolved when this change is applied. Catalog storage
@@ -114,6 +123,24 @@ pub(crate) fn apply_schema_changes(
                 // A later drop makes an earlier same-version transform unreachable.
                 field_transforms.remove(&field.id);
             }
+            SchemaChange::AlterFieldType {
+                field_name,
+                logical_type,
+            } => {
+                let index = transform_field_index(
+                    &schema,
+                    &key_ids,
+                    &added_fields,
+                    &field_transforms,
+                    &field_name,
+                )?;
+                let source = schema.fields[index].logical_type.clone();
+                let transform = compile_table_transform(&source, &logical_type)?;
+                schema.fields[index].logical_type = logical_type;
+                if let Some(transform) = transform {
+                    field_transforms.insert(schema.fields[index].id, transform);
+                }
+            }
             SchemaChange::TransformField {
                 field_name,
                 mut logical_type,
@@ -124,26 +151,14 @@ pub(crate) fn apply_schema_changes(
                         "field transform type must not be empty".to_string(),
                     ));
                 }
-                let index = field_index(&schema, &field_name)?;
+                let index = transform_field_index(
+                    &schema,
+                    &key_ids,
+                    &added_fields,
+                    &field_transforms,
+                    &field_name,
+                )?;
                 let field = &mut schema.fields[index];
-                if key_ids.contains(&field.id) {
-                    return Err(TableError::InvalidSchema(format!(
-                        "key field '{}' cannot be transformed",
-                        field_name
-                    )));
-                }
-                if added_fields.contains(&field.id) {
-                    return Err(TableError::InvalidSchema(format!(
-                        "added field '{}' cannot be transformed in the same schema version",
-                        field_name
-                    )));
-                }
-                if field_transforms.contains_key(&field.id) {
-                    return Err(TableError::InvalidSchema(format!(
-                        "field '{}' has multiple transforms in one schema version",
-                        field_name
-                    )));
-                }
                 if logical_type != field.logical_type {
                     let mut new_nested_ids = HashSet::new();
                     collect_type_field_ids(&logical_type, &mut new_nested_ids);
@@ -268,6 +283,33 @@ fn field_index(schema: &TableSchema, field_name: &str) -> Result<usize> {
         .iter()
         .position(|field| field.name == field_name)
         .ok_or_else(|| TableError::InvalidSchema(format!("field '{field_name}' does not exist")))
+}
+
+fn transform_field_index(
+    schema: &TableSchema,
+    key_ids: &HashSet<FieldId>,
+    added_fields: &HashSet<FieldId>,
+    transforms: &HashMap<FieldId, TransformSpec>,
+    field_name: &str,
+) -> Result<usize> {
+    let index = field_index(schema, field_name)?;
+    let field = &schema.fields[index];
+    if key_ids.contains(&field.id) {
+        return Err(TableError::InvalidSchema(format!(
+            "key field '{field_name}' cannot be transformed"
+        )));
+    }
+    if added_fields.contains(&field.id) {
+        return Err(TableError::InvalidSchema(format!(
+            "added field '{field_name}' cannot be transformed in the same schema version"
+        )));
+    }
+    if transforms.contains_key(&field.id) {
+        return Err(TableError::InvalidSchema(format!(
+            "field '{field_name}' has multiple transforms in one schema version"
+        )));
+    }
+    Ok(index)
 }
 
 fn next_field_id(used_field_ids: &HashSet<FieldId>) -> Result<u32> {

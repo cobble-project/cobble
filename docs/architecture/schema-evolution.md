@@ -150,9 +150,36 @@ server.serve("0.0.0.0:9000")?;
 
 Dedicated compaction exposes the same method on `DedicatedCompactor`, `DedicatedCompactionService`, `DedicatedCompactionMonitor`, `DedicatedCompactionPlanner`, and `DedicatedCompactionExecutor`. Register before `run`, `poll`, `plan`, or `execute`; separately deployed planners and executors need their own registrations. Service registrations are shared with its discovered shards and workers.
 
-Remote requests carry the complete schema chain through the planned target, including intermediate versions with no remaining files. Dedicated compactors load the chain from shared storage. Transform specifications travel with those definitions, never callback code; use an application-owned compactor executable to register factories, not the unmodified CLI. Missing factories fail planning/execution without publishing a compaction result. Registration must be repeated after restart.
+Remote requests carry the complete schema chain through the planned target, including intermediate versions with no remaining files. Dedicated compactors load the chain from shared storage. Transform specifications travel with those definitions, never callback code. The CLI installs the built-in Table transform factory automatically; custom factories require an application-owned compactor executable. Missing factories fail planning/execution without publishing a compaction result. Registration must be repeated after restart.
 
 ### Table Field Transforms
+
+For built-in lossless type changes, use `SchemaChange::AlterFieldType`:
+
+```rust
+catalog.evolve_schema(&identifier, vec![SchemaChange::AlterFieldType {
+    field_name: "count".into(),
+    logical_type: LogicalType::int64().nullable(),
+}])?;
+```
+
+Supported changes are signed integer widening, `Float32` to `Float64`, Decimal precision
+increases with unchanged scale, Time/Timestamp precision increases with unchanged timestamp
+kind, and relaxing top-level nullability. Keys cannot change. Narrowing, parsing strings,
+cross-family numeric casts, timezone changes, and recursive nested-type changes are rejected.
+Float widening preserves numeric values, signed zero, infinities, and NaN classification,
+but not NaN payload bits. Identical types need no transform.
+
+Table writer, reader, read-only, and scan-split builders install the built-in factory before
+opening. Both `cobble-cli compact` and `cobble-cli remote-compactor` install it automatically.
+No transform ID or factory registration is needed for this path. The transform type
+`cobble.table/v1` is reserved by Table builders and cannot be overridden.
+
+When configuring core DB/reader builders or programmatic compactors directly, call
+`cobble_table::register_schema_transforms(&target)?` before opening or starting work.
+This installs Table's built-ins through the core `SchemaTransformRegistrar` interface;
+callers do not need to know individual transform types or factories. The core does not
+depend on the Table crate.
 
 Use `Catalog::evolve_schema` with `SchemaChange::TransformField` to change an existing
 non-key field's type or value semantics. Address the field by name; the catalog stores
