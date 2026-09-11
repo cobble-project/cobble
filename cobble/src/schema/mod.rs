@@ -1511,8 +1511,7 @@ impl SchemaBuilder {
     /// Atomically replace all columns in one family from current sources, defaults, or nulls.
     ///
     /// Each entry describes one target column. A source transform must be
-    /// registered through [`Db::register_schema_transform`](crate::Db::register_schema_transform)
-    /// through [`Db::register_schema_transform`](crate::Db::register_schema_transform) before calling
+    /// registered through [`Db::register_schema_transform`](crate::Db::register_schema_transform) before calling
     /// this method. A single schema transition stores at most one transform per
     /// column, so remapping an already transformed source with another transform
     /// returns an error; commit an intermediate schema instead.

@@ -1,10 +1,11 @@
-use crate::logical_type::assign_fresh_field_ids;
+use crate::logical_type::{assign_fresh_field_ids, assign_fresh_type_ids};
 use crate::metadata::TableMetadata;
 use crate::{
     DataField, FieldId, LogicalType, LogicalTypeKind, Result, TableError, TableSchema, Value,
     ValueCodec,
 };
-use cobble::ColumnEvolution;
+use cobble::{ColumnEvolution, TransformSpec};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// A top-level table schema edit addressed by its current field name.
@@ -22,6 +23,22 @@ pub enum SchemaChange {
     },
     /// Drop a non-key top-level field.
     DropField { field_name: String },
+    /// Transform one existing non-key field, optionally changing its logical type.
+    ///
+    /// The field name is resolved when this change is applied. Catalog storage
+    /// retains the resulting stable field id with the opaque transform spec.
+    TransformField {
+        field_name: String,
+        logical_type: LogicalType,
+        transform: TransformSpec,
+    },
+}
+
+/// One persisted field transform for a single catalog schema version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FieldTransform {
+    pub(crate) field_id: FieldId,
+    pub(crate) transform: TransformSpec,
 }
 
 /// Apply sequential schema edits while retaining every historical field id.
@@ -32,7 +49,7 @@ pub(crate) fn apply_schema_changes(
     mut schema: TableSchema,
     changes: Vec<SchemaChange>,
     mut used_field_ids: HashSet<FieldId>,
-) -> Result<(TableSchema, HashSet<FieldId>)> {
+) -> Result<(TableSchema, HashSet<FieldId>, Vec<FieldTransform>)> {
     if changes.is_empty() {
         return Err(TableError::InvalidSchema(
             "schema changes must not be empty".to_string(),
@@ -45,6 +62,8 @@ pub(crate) fn apply_schema_changes(
         .copied()
         .collect::<HashSet<_>>();
 
+    let mut added_fields = HashSet::new();
+    let mut field_transforms = HashMap::new();
     for change in changes {
         match change {
             SchemaChange::AddField { name, logical_type } => {
@@ -66,6 +85,7 @@ pub(crate) fn apply_schema_changes(
                 let mut next_id = next_field_id(&used_field_ids)?;
                 assign_fresh_field_ids(std::slice::from_mut(&mut added), &mut next_id)?;
                 collect_field_ids(&added, &mut used_field_ids);
+                added_fields.insert(added.id);
                 schema.fields.push(added);
             }
             SchemaChange::RenameField {
@@ -90,18 +110,73 @@ pub(crate) fn apply_schema_changes(
                         field_name
                     )));
                 }
-                schema.fields.remove(index);
+                let field = schema.fields.remove(index);
+                // A later drop makes an earlier same-version transform unreachable.
+                field_transforms.remove(&field.id);
+            }
+            SchemaChange::TransformField {
+                field_name,
+                mut logical_type,
+                transform,
+            } => {
+                if transform.transform_type.trim().is_empty() {
+                    return Err(TableError::InvalidSchema(
+                        "field transform type must not be empty".to_string(),
+                    ));
+                }
+                let index = field_index(&schema, &field_name)?;
+                let field = &mut schema.fields[index];
+                if key_ids.contains(&field.id) {
+                    return Err(TableError::InvalidSchema(format!(
+                        "key field '{}' cannot be transformed",
+                        field_name
+                    )));
+                }
+                if added_fields.contains(&field.id) {
+                    return Err(TableError::InvalidSchema(format!(
+                        "added field '{}' cannot be transformed in the same schema version",
+                        field_name
+                    )));
+                }
+                if field_transforms.contains_key(&field.id) {
+                    return Err(TableError::InvalidSchema(format!(
+                        "field '{}' has multiple transforms in one schema version",
+                        field_name
+                    )));
+                }
+                if logical_type != field.logical_type {
+                    let mut new_nested_ids = HashSet::new();
+                    collect_type_field_ids(&logical_type, &mut new_nested_ids);
+                    if !new_nested_ids.is_empty() {
+                        let mut next_id = next_field_id(&used_field_ids)?;
+                        assign_fresh_type_ids(&mut logical_type, &mut next_id)?;
+                        new_nested_ids.clear();
+                        collect_type_field_ids(&logical_type, &mut new_nested_ids);
+                        used_field_ids.extend(new_nested_ids);
+                    }
+                }
+                field.logical_type = logical_type;
+                field_transforms.insert(field.id, transform);
             }
         }
     }
     let schema = TableSchema::new(schema.fields, schema.primary_key, schema.bucket_key)?;
-    Ok((schema, used_field_ids))
+    let mut field_transforms = field_transforms
+        .into_iter()
+        .map(|(field_id, transform)| FieldTransform {
+            field_id,
+            transform,
+        })
+        .collect::<Vec<_>>();
+    field_transforms.sort_by_key(|transform| transform.field_id);
+    Ok((schema, used_field_ids, field_transforms))
 }
 
 /// Compile core column remapping for two validated table metadata versions.
 pub(crate) fn compile_column_evolution(
     existing: &TableMetadata,
     target: &TableMetadata,
+    field_transforms: &[FieldTransform],
 ) -> Result<Vec<ColumnEvolution>> {
     if existing.layout.key_fields != target.layout.key_fields
         || existing.layout.bucket_fields != target.layout.bucket_fields
@@ -116,12 +191,22 @@ pub(crate) fn compile_column_evolution(
         .iter()
         .map(|field| (field.id, field))
         .collect::<HashMap<_, _>>();
+    let transforms = field_transforms
+        .iter()
+        .map(|transform| (transform.field_id, &transform.transform))
+        .collect::<HashMap<_, _>>();
+    if transforms.len() != field_transforms.len() {
+        return Err(TableError::InvalidSchema(
+            "catalog schema has duplicate field transforms".to_string(),
+        ));
+    }
     for field in &target.schema.fields {
         if let Some(previous) = existing_fields.get(&field.id)
             && previous.logical_type != field.logical_type
+            && !transforms.contains_key(&field.id)
         {
             return Err(TableError::InvalidSchema(format!(
-                "schema evolution changed the type of field {}",
+                "schema evolution changed the type of field {} without a transform",
                 field.id.0
             )));
         }
@@ -152,8 +237,14 @@ pub(crate) fn compile_column_evolution(
             if let Some(source) = existing_columns.get(&column.field_id) {
                 return Ok(ColumnEvolution::Source {
                     source_index: *source,
-                    transform: None,
+                    transform: transforms.get(&column.field_id).map(|spec| (*spec).clone()),
                 });
+            }
+            if transforms.contains_key(&column.field_id) {
+                return Err(TableError::InvalidSchema(format!(
+                    "catalog transform cannot target added field {}",
+                    column.field_id.0
+                )));
             }
             Ok(ColumnEvolution::Default {
                 value: ValueCodec::encode_validated(target_fields[&column.field_id], &Value::Null)?

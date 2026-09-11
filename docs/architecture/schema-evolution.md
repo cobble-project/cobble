@@ -152,6 +152,26 @@ Dedicated compaction exposes the same method on `DedicatedCompactor`, `Dedicated
 
 Remote requests carry the complete schema chain through the planned target, including intermediate versions with no remaining files. Dedicated compactors load the chain from shared storage. Transform specifications travel with those definitions, never callback code; use an application-owned compactor executable to register factories, not the unmodified CLI. Missing factories fail planning/execution without publishing a compaction result. Registration must be repeated after restart.
 
+### Table Field Transforms
+
+Use `Catalog::evolve_schema` with `SchemaChange::TransformField` to change an existing
+non-key field's type or value semantics. Address the field by name; the catalog stores
+its stable field ID and `TransformSpec`. Materializing a shard applies each intermediate
+catalog version in order and updates its `RecordLayout` together with the core schema.
+
+The callback receives the column's **ValueCodec-encoded bytes**, not a plain string or
+integer. Decode using the old logical type and encode the result using the new type.
+New writes already use the new type. A field can have one transform per catalog version;
+use separate versions for multiple transformations.
+
+Register the factory through `register_schema_transform` on `TableWriterBuilder`,
+`ReadOnlyTableBuilder`, or `TableReaderBuilder` before opening. Distributed scan workers
+register it on `TableScanSplit::scanner_builder(config)` before calling `open()`.
+When using an existing core DB handle, register on that handle before materialization.
+Compactors need the same factory registration described above. Catalog metadata and scan
+plans carry specifications, not executable implementations; restart each process with
+its factories registered again.
+
 ## Add Column: What Actually Happens
 
 When a column is added:

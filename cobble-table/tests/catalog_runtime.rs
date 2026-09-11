@@ -1,10 +1,62 @@
-use cobble::{Config, ShardSnapshotMetadata, VolumeDescriptor, VolumeUsageKind};
+use bytes::Bytes;
+use cobble::{
+    Config, DbBuilder, ShardSnapshotMetadata, TransformSpec, VolumeDescriptor, VolumeUsageKind,
+};
 use cobble_table::catalog::{Catalog, FileCatalog, FileCatalogConfig, TableIdentifier};
 use cobble_table::{
     LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableScanPlan, TableScanSplit,
-    TableSchema, Value,
+    TableSchema, Value, ValueCodec,
 };
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+type TableTransform = Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
+
+fn table_transform_factory(spec: &[u8]) -> cobble::Result<TableTransform> {
+    let spec = spec.to_vec();
+    Ok(Box::new(move |value| {
+        value
+            .map(|raw| match spec.as_slice() {
+                b"string-to-binary" => {
+                    let value = ValueCodec::decode(&LogicalType::string().nullable(), &raw)
+                        .map_err(|error| cobble::Error::InputError(error.to_string()))?;
+                    let Value::String(value) = value else {
+                        return Err(cobble::Error::InputError(
+                            "expected a string table value".to_string(),
+                        ));
+                    };
+                    ValueCodec::encode(
+                        &LogicalType::binary().nullable(),
+                        &Value::Binary(value.into()),
+                    )
+                    .map(Bytes::from)
+                    .map_err(|error| cobble::Error::InputError(error.to_string()))
+                }
+                b"append-bang" => {
+                    let value = ValueCodec::decode(&LogicalType::binary().nullable(), &raw)
+                        .map_err(|error| cobble::Error::InputError(error.to_string()))?;
+                    let Value::Binary(value) = value else {
+                        return Err(cobble::Error::InputError(
+                            "expected a binary table value".to_string(),
+                        ));
+                    };
+                    let mut value = value.to_vec();
+                    value.push(b'!');
+                    ValueCodec::encode(
+                        &LogicalType::binary().nullable(),
+                        &Value::Binary(value.into()),
+                    )
+                    .map(Bytes::from)
+                    .map_err(|error| cobble::Error::InputError(error.to_string()))
+                }
+                _ => Err(cobble::Error::InputError(
+                    "unexpected table transform spec".to_string(),
+                )),
+            })
+            .transpose()
+    }))
+}
 
 #[test]
 fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
@@ -180,6 +232,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         Some(vec![rows[0][0].clone(), Value::String("event".into())])
     );
     let left_index = keys.iter().position(|key| key.bucket() < 2).unwrap();
+    let right_index = keys.iter().position(|key| key.bucket() >= 2).unwrap();
     let shard_reader = users
         .readonly_table_builder(runtime.clone())
         .unwrap()
@@ -216,13 +269,78 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .open()
         .unwrap();
     assert_eq!(renamed_reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
+    let materialization_runtime = Config {
+        volumes: VolumeDescriptor::single_volume(format!(
+            "file://{}",
+            root.path().join("materialization-runtime").display()
+        )),
+        total_buckets: 4,
+        ..Config::default()
+    };
+    let replay_db = Arc::new(
+        DbBuilder::new(materialization_runtime.clone())
+            .register_schema_transform("test.table.transform", table_transform_factory)
+            .unwrap()
+            .db_id("replay-shard")
+            .bucket_ranges(vec![0..=1])
+            .open()
+            .unwrap(),
+    );
+    let mapping_db = Arc::new(
+        DbBuilder::new(materialization_runtime)
+            .register_schema_transform("test.table.transform", table_transform_factory)
+            .unwrap()
+            .db_id("mapping-retry")
+            .bucket_ranges(vec![2..=3])
+            .open()
+            .unwrap(),
+    );
+    let replay_initial = catalog
+        .materialize_table(Arc::clone(&replay_db), &accounts_id)
+        .unwrap();
+    drop(replay_initial);
+    let mapping_initial = catalog
+        .materialize_table(Arc::clone(&mapping_db), &accounts_id)
+        .unwrap();
+    mapping_initial.put(&rows[right_index]).unwrap();
+    mapping_initial.snapshot_and_wait().unwrap();
+    drop(mapping_initial);
+    catalog
+        .evolve_schema(
+            &accounts_id,
+            vec![
+                SchemaChange::RenameField {
+                    field_name: "name".into(),
+                    new_name: "label".into(),
+                },
+                SchemaChange::TransformField {
+                    field_name: "label".into(),
+                    logical_type: LogicalType::binary().nullable(),
+                    transform: TransformSpec {
+                        transform_type: "test.table.transform".into(),
+                        spec: Bytes::from_static(b"string-to-binary"),
+                    },
+                },
+            ],
+        )
+        .unwrap();
     let evolved = catalog
         .evolve_schema(
             &accounts_id,
-            vec![SchemaChange::AddField {
-                name: "region".into(),
-                logical_type: LogicalType::string().nullable(),
-            }],
+            vec![
+                SchemaChange::TransformField {
+                    field_name: "label".into(),
+                    logical_type: LogicalType::binary().nullable(),
+                    transform: TransformSpec {
+                        transform_type: "test.table.transform".into(),
+                        spec: Bytes::from_static(b"append-bang"),
+                    },
+                },
+                SchemaChange::AddField {
+                    name: "region".into(),
+                    logical_type: LogicalType::string().nullable(),
+                },
+            ],
         )
         .unwrap();
     let old_reader = evolved
@@ -237,6 +355,49 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         Some(rows[left_index].clone())
     );
     assert_eq!(table_field_count(&left_snapshot), 2);
+    let intermediate = warehouse.join(format!(
+        "warehouse/catalog/tables/TABLE-{}/schemas/SCHEMA-1",
+        users.table_id()
+    ));
+    let unavailable_intermediate = intermediate.with_extension("unavailable");
+    std::fs::rename(&intermediate, &unavailable_intermediate).unwrap();
+    assert!(
+        catalog
+            .materialize_table(Arc::clone(&replay_db), &accounts_id)
+            .is_err()
+    );
+    std::fs::rename(&unavailable_intermediate, &intermediate).unwrap();
+    let replayed = catalog
+        .materialize_table(Arc::clone(&replay_db), &accounts_id)
+        .unwrap();
+    assert_eq!(replayed.schema(), evolved.schema());
+    drop(replayed);
+
+    let failed_mapping =
+        catalog_schema_mapping_path(&warehouse, users.table_id().as_u32(), "mapping-retry", 1);
+    std::fs::create_dir_all(&failed_mapping).unwrap();
+    assert!(
+        catalog
+            .materialize_table(Arc::clone(&mapping_db), &accounts_id)
+            .is_err()
+    );
+    std::fs::remove_dir(&failed_mapping).unwrap();
+    let mapping_retried = catalog
+        .materialize_table(Arc::clone(&mapping_db), &accounts_id)
+        .unwrap();
+    assert_eq!(mapping_retried.schema(), evolved.schema());
+    let Value::Int64(id) = rows[right_index][0] else {
+        panic!("catalog schema always starts with an int64 id");
+    };
+    assert_eq!(
+        mapping_retried.get(&keys[right_index]).unwrap(),
+        Some(vec![
+            rows[right_index][0].clone(),
+            Value::Binary(format!("user-{id}!").into()),
+            Value::Null,
+        ])
+    );
+    drop(mapping_retried);
     drop(catalog);
 
     // The worker supplies fresh local primary/cache roots; the plan never appends catalog paths.
@@ -302,14 +463,29 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     );
     drop(worker_historical);
 
+    assert!(
+        evolved
+            .writer_builder(runtime.clone())
+            .unwrap()
+            .db_id("shard-0")
+            .bucket_ranges(vec![0..=1])
+            .resume()
+            .is_err()
+    );
     let resumed = evolved
         .writer_builder(runtime.clone())
+        .unwrap()
+        .register_schema_transform("test.table.transform", table_transform_factory)
         .unwrap()
         .db_id("shard-0")
         .bucket_ranges(vec![0..=1])
         .resume()
         .unwrap();
     let mut expected = rows[left_index].clone();
+    let Value::Int64(id) = rows[left_index][0] else {
+        panic!("catalog schema always starts with an int64 id");
+    };
+    expected[1] = Value::Binary(format!("user-{id}!").into());
     expected.push(Value::Null);
     assert_eq!(resumed.schema(), evolved.schema());
     assert_eq!(resumed.get(&keys[left_index]).unwrap(), Some(expected));
@@ -320,6 +496,84 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let resumed_snapshot = resumed.snapshot_and_wait().unwrap();
     assert_eq!(table_field_count(&resumed_snapshot), 3);
     drop(resumed);
+
+    let resumed_right = evolved
+        .writer_builder(runtime.clone())
+        .unwrap()
+        .register_schema_transform("test.table.transform", table_transform_factory)
+        .unwrap()
+        .db_id("shard-1")
+        .bucket_ranges(vec![2..=3])
+        .resume()
+        .unwrap();
+    let resumed_right_snapshot = resumed_right.snapshot_and_wait().unwrap();
+    drop(resumed_right);
+    let evolved_global = committer
+        .commit_batch(2, vec![resumed_snapshot.clone(), resumed_right_snapshot])
+        .unwrap()
+        .unwrap();
+    let evolved_reader = evolved
+        .reader_builder(runtime.clone())
+        .unwrap()
+        .register_schema_transform("test.table.transform", table_transform_factory)
+        .unwrap()
+        .global_snapshot(evolved_global.id)
+        .open()
+        .unwrap();
+    let transformed_rows = rows
+        .iter()
+        .map(|row| {
+            let Value::Int64(id) = row[0] else {
+                panic!("catalog schema always starts with an int64 id");
+            };
+            vec![
+                row[0].clone(),
+                Value::Binary(format!("user-{id}!").into()),
+                Value::Null,
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        evolved_reader.multi_get(&keys).unwrap(),
+        transformed_rows
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>()
+    );
+    let evolved_shard_reader = evolved
+        .readonly_table_builder(runtime.clone())
+        .unwrap()
+        .register_schema_transform("test.table.transform", table_transform_factory)
+        .unwrap()
+        .shard_snapshot(&resumed_snapshot.db_id, resumed_snapshot.snapshot_id)
+        .open()
+        .unwrap();
+    assert_eq!(
+        evolved_shard_reader.get(&keys[left_index]).unwrap(),
+        Some(transformed_rows[left_index].clone())
+    );
+    let evolved_plan = evolved_reader.scan_plan().unwrap();
+    let mut evolved_splits = evolved_plan.splits().unwrap();
+    let split_json = serde_json::to_string(&evolved_splits[0]).unwrap();
+    evolved_splits[0] = serde_json::from_str(&split_json).unwrap();
+    let mut scanned_rows = evolved_splits
+        .into_iter()
+        .flat_map(|split| {
+            split
+                .scanner_builder(worker_scan_runtime.clone())
+                .register_schema_transform("test.table.transform", table_transform_factory)
+                .unwrap()
+                .open()
+                .unwrap()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    scanned_rows.sort_by_key(|row| match row.first() {
+        Some(Value::Int64(id)) => *id,
+        _ => panic!("catalog schema always starts with an int64 id"),
+    });
+    assert_eq!(scanned_rows, transformed_rows);
 
     // An explicit historical restore must not apply the catalog's latest schema.
     let restored = evolved
@@ -335,14 +589,14 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         Some(rows[left_index].clone())
     );
     drop(restored);
-    // The table-local pointer is still the original published global snapshot.
+    // The original reader remains pinned while the table pointer advances.
     assert_eq!(
         coordinator
             .load_current_global_snapshot()
             .unwrap()
             .unwrap()
             .id,
-        first.id
+        evolved_global.id
     );
     assert_eq!(reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
 }
@@ -373,4 +627,20 @@ fn table_field_count(snapshot: &ShardSnapshotMetadata) -> usize {
         .as_array()
         .unwrap()
         .len()
+}
+
+fn catalog_schema_mapping_path(
+    warehouse: &Path,
+    table_id: u32,
+    db_id: &str,
+    catalog_schema_id: u32,
+) -> PathBuf {
+    let digest = Sha256::digest(db_id.as_bytes());
+    let shard = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    warehouse.join(format!(
+        "warehouse/catalog/tables/TABLE-{table_id}/shards/{shard}/SCHEMA-{catalog_schema_id}"
+    ))
 }

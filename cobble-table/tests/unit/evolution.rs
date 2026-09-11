@@ -1,9 +1,10 @@
 use crate::evolution::{apply_schema_changes, compile_column_evolution, schema_field_ids};
 use crate::metadata::TableMetadata;
 use crate::{
-    DataField, FieldId, LogicalType, SchemaChange, TableError, TableSchema, Value, ValueCodec,
+    DataField, FieldId, LogicalType, LogicalTypeKind, SchemaChange, TableError, TableSchema, Value,
+    ValueCodec,
 };
-use cobble::ColumnEvolution;
+use cobble::{ColumnEvolution, TransformSpec};
 
 #[test]
 fn named_changes_preserve_history_and_compile_stable_column_mappings() {
@@ -30,7 +31,7 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
     )
     .unwrap();
     let history = schema_field_ids(&source.schema);
-    let (schema, history) = apply_schema_changes(
+    let (schema, history, transforms) = apply_schema_changes(
         source.schema.clone(),
         vec![
             SchemaChange::RenameField {
@@ -73,6 +74,7 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
             .into_iter()
             .collect()
     );
+    assert!(transforms.is_empty());
     let target = TableMetadata::compile(schema).unwrap();
     let keep = ColumnEvolution::Source {
         source_index: 1,
@@ -84,7 +86,7 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
             .into(),
     };
     assert_eq!(
-        compile_column_evolution(&source, &target).unwrap(),
+        compile_column_evolution(&source, &target, &[]).unwrap(),
         vec![
             keep.clone(),
             default(&target.schema.fields[2].logical_type),
@@ -95,7 +97,7 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
     assert_eq!(target.schema.fields[0].name, "current");
     assert_eq!(source.layout.key_fields, target.layout.key_fields);
 
-    let (schema, history) = apply_schema_changes(
+    let (schema, history, transforms) = apply_schema_changes(
         target.schema,
         vec![
             SchemaChange::DropField {
@@ -110,9 +112,10 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
     .unwrap();
     // A catalog persists these two pieces separately; restore both before the
     // next edit so deleted nested and top-level IDs stay reserved.
+    assert!(transforms.is_empty());
     let encoded = serde_json::to_vec(&(schema, history)).unwrap();
     let (schema, history) = serde_json::from_slice(&encoded).unwrap();
-    let (schema, history) = apply_schema_changes(
+    let (schema, history, transforms) = apply_schema_changes(
         schema,
         vec![
             SchemaChange::AddField {
@@ -127,11 +130,12 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
         history,
     )
     .unwrap();
+    assert!(transforms.is_empty());
     assert_eq!(schema.fields[2].id, FieldId(74));
     assert_eq!(schema.primary_key, vec![FieldId(10)]);
     let final_metadata = TableMetadata::compile(schema.clone()).unwrap();
     assert_eq!(
-        compile_column_evolution(&source, &final_metadata).unwrap(),
+        compile_column_evolution(&source, &final_metadata, &[]).unwrap(),
         vec![keep, default(&LogicalType::int32().nullable()),]
     );
 
@@ -158,6 +162,14 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
         SchemaChange::DropField {
             field_name: "Current".into(),
         },
+        SchemaChange::TransformField {
+            field_name: "account_id".into(),
+            logical_type: LogicalType::int64(),
+            transform: TransformSpec {
+                transform_type: "test.transform".into(),
+                spec: Vec::new().into(),
+            },
+        },
     ] {
         assert!(matches!(
             apply_schema_changes(schema.clone(), vec![change], history.clone()),
@@ -166,9 +178,42 @@ fn named_changes_preserve_history_and_compile_stable_column_mappings() {
     }
 
     // A field ID alone does not authorize interpreting old bytes as a new type.
-    let mut incompatible = schema;
+    let mut incompatible = schema.clone();
     incompatible.fields[0].logical_type = LogicalType::int64().nullable();
     assert!(
-        compile_column_evolution(&source, &TableMetadata::compile(incompatible).unwrap()).is_err()
+        compile_column_evolution(&source, &TableMetadata::compile(incompatible).unwrap(), &[])
+            .is_err()
     );
+
+    let (transformed, _, transforms) = apply_schema_changes(
+        schema,
+        vec![
+            SchemaChange::RenameField {
+                field_name: "current".into(),
+                new_name: "renamed".into(),
+            },
+            SchemaChange::TransformField {
+                field_name: "renamed".into(),
+                logical_type: LogicalType::struct_from_fields([(
+                    "new_child",
+                    LogicalType::binary().nullable(),
+                )])
+                .unwrap()
+                .nullable(),
+                transform: TransformSpec {
+                    transform_type: "test.transform".into(),
+                    spec: Vec::new().into(),
+                },
+            },
+        ],
+        history,
+    )
+    .unwrap();
+    assert_eq!(transformed.fields[0].id, FieldId(30));
+    let LogicalTypeKind::Struct { fields } = &transformed.fields[0].logical_type.kind else {
+        panic!("transform changed the field to a struct");
+    };
+    assert_eq!(fields[0].id, FieldId(75));
+    assert_eq!(transforms.len(), 1);
+    assert_eq!(transforms[0].field_id, FieldId(30));
 }

@@ -253,12 +253,12 @@ exclusive-end semantics as raw `Db`.
 | `TableReader` | Read proxy over a pinned global `Reader`, routing requests across shards |
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
-| `SchemaChange` | Add, rename, or drop top-level fields by name while retaining stable field identities |
+| `SchemaChange` | Add, rename, drop, or transform top-level fields by name while retaining stable field identities |
 | `CatalogTable` | Loaded table definition with reader, writer, and snapshot committer factories sharing a stable storage namespace |
 | `TableSnapshotCommitter` | Collect shard snapshots and publish complete global checkpoints |
 | `TableWriteBuilder` / `TableWritePlan` | Capture a table definition and storage routes for distributed shard writers; plans support Serde serialization |
 | `TableScanPlan` / `TableScanSplit` | Fixed snapshot scan descriptions that support Serde serialization for distributed workers |
-| `TableScanSplitScanner` | Typed row decoding over the core `ScanSplitScanner` |
+| `TableScanSplitScanner` / `TableScanSplitScannerBuilder` | Typed row decoding over the core `ScanSplitScanner`, with worker-local transform registration |
 
 Define a new schema by name; field IDs are assigned automatically:
 
@@ -283,13 +283,16 @@ calling `Db::close()` affects all users of that database.
 
 `ReadOnlyTable::open(Arc::clone(&db), name)` uses an existing read-only shard.
 `TableReader::open(reader, name)` takes ownership of a core `Reader` and pins its current
-global snapshot. The proxy handles bucket routing and cross-shard schema validation;
+global snapshot. The proxy handles bucket routing;
 `ReadOnlyTable` only accesses its shard. Both provide typed reads, projections, and scans.
 Projections and scan cursors can outlive the table handle.
 
 `Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
 renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
 schema does not refresh an already opened reader or writer automatically.
+`TransformField` changes a non-key field using a persisted `TransformSpec`; materialization
+applies intermediate catalog versions in order. Register factories on writer and reader
+builders before opening. See [Table field transforms](../architecture/schema-evolution#table-field-transforms).
 
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
 Catalog APIs are grouped under `cobble_table::catalog`. With a `FileCatalog`, use the loaded

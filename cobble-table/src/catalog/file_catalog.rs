@@ -3,7 +3,9 @@ use crate::catalog::{
     Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogTable, SchemaChange, TableId,
     TableIdentifier,
 };
-use crate::evolution::{apply_schema_changes, compile_column_evolution, schema_field_ids};
+use crate::evolution::{
+    FieldTransform, apply_schema_changes, compile_column_evolution, schema_field_ids,
+};
 use crate::metadata::TableMetadata;
 use crate::snapshot::TableSnapshotCommitter;
 use crate::write::{TABLE_WRITE_PLAN_FORMAT, TABLE_WRITE_PLAN_VERSION};
@@ -252,6 +254,7 @@ struct TableSchemaRecord {
     catalog_schema_id: CatalogSchemaId,
     schema: TableSchema,
     used_field_ids: Vec<FieldId>,
+    field_transforms: Vec<FieldTransform>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,27 +367,7 @@ impl FileCatalog {
         table_id: TableId,
         catalog_schema_id: CatalogSchemaId,
     ) -> CatalogResult<TableSchemaRecord> {
-        let path = table_schema_path(table_id, catalog_schema_id);
-        let record: TableSchemaRecord = read_json(&self.store, &path)?;
-        validate_header(&record.format, record.version)?;
-        debug_assert_eq!(record.table_id, table_id);
-        debug_assert_eq!(record.catalog_schema_id, catalog_schema_id);
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(record.schema.validate().is_ok());
-            debug_assert!(
-                record
-                    .used_field_ids
-                    .windows(2)
-                    .all(|window| window[0] < window[1])
-            );
-            debug_assert!(
-                schema_field_ids(&record.schema)
-                    .iter()
-                    .all(|field_id| record.used_field_ids.binary_search(field_id).is_ok())
-            );
-        }
-        Ok(record)
+        load_table_schema_record(&self.store, table_id, catalog_schema_id)
     }
 
     fn catalog_table(
@@ -486,85 +469,130 @@ fn materialize_table_definition(
     let physical_name = physical_table_name(table_id);
     let target = TableMetadata::compile_catalog(schema.clone(), table_id, catalog_schema_id)?;
     let current = db.current_schema();
-    let core_schema_id =
-        if let Some(column_family_id) = current.column_family_ids().get(&physical_name).copied() {
-            let options = current.column_family_options_in_family(column_family_id);
-            let existing = options.metadata.as_ref().ok_or_else(|| {
-                TableError::InvalidSchema(format!(
-                    "column family '{physical_name}' is not a catalog table"
-                ))
-            })?;
-            let existing = TableMetadata::from_value(existing)?;
-            let binding = existing.catalog_binding.ok_or_else(|| {
-                TableError::InvalidSchema(format!(
-                    "column family '{physical_name}' is not a catalog table"
-                ))
-            })?;
-            if binding.table_id != table_id {
-                return Err(TableError::InvalidSchema(format!(
-                    "column family '{physical_name}' belongs to another catalog table"
-                ))
-                .into());
-            }
-            if binding.catalog_schema_id > catalog_schema_id {
-                return Err(TableError::InvalidSchema(format!(
-                    "catalog schema {} cannot replace newer materialized schema {}",
-                    catalog_schema_id, binding.catalog_schema_id
-                ))
-                .into());
-            }
-            if binding.catalog_schema_id == catalog_schema_id {
-                if existing != target
-                    || current.num_columns_in_family(column_family_id)
-                        != Some(target.layout.value_columns.len().max(1))
-                {
-                    return Err(TableError::InvalidSchema(
-                        "materialized table metadata does not match the catalog".to_string(),
+    let materialized = if let Some(column_family_id) =
+        current.column_family_ids().get(&physical_name).copied()
+    {
+        let options = current.column_family_options_in_family(column_family_id);
+        let existing = options.metadata.as_ref().ok_or_else(|| {
+            TableError::InvalidSchema(format!(
+                "column family '{physical_name}' is not a catalog table"
+            ))
+        })?;
+        let existing = TableMetadata::from_value(existing)?;
+        let binding = existing.catalog_binding.ok_or_else(|| {
+            TableError::InvalidSchema(format!(
+                "column family '{physical_name}' is not a catalog table"
+            ))
+        })?;
+        if binding.table_id != table_id {
+            return Err(TableError::InvalidSchema(format!(
+                "column family '{physical_name}' belongs to another catalog table"
+            ))
+            .into());
+        }
+        if binding.catalog_schema_id > catalog_schema_id {
+            return Err(TableError::InvalidSchema(format!(
+                "catalog schema {} cannot replace newer materialized schema {}",
+                catalog_schema_id, binding.catalog_schema_id
+            ))
+            .into());
+        }
+        let source_record = load_table_schema_record(store, table_id, binding.catalog_schema_id)?;
+        let mut materialized = TableMetadata::compile_catalog(
+            source_record.schema,
+            table_id,
+            binding.catalog_schema_id,
+        )?;
+        if existing != materialized
+            || current.num_columns_in_family(column_family_id)
+                != Some(materialized.layout.value_columns.len().max(1))
+        {
+            return Err(TableError::InvalidSchema(
+                "materialized table metadata does not match the catalog".to_string(),
+            )
+            .into());
+        }
+        write_schema_mapping(
+            store,
+            shard_schema_mapping(table_id, db, binding.catalog_schema_id, current.version()),
+        )?;
+        let mut materialized_catalog_schema_id = binding.catalog_schema_id;
+        while materialized_catalog_schema_id < catalog_schema_id {
+            let next_catalog_schema_id =
+                materialized_catalog_schema_id.next().ok_or_else(|| {
+                    CatalogError::InvalidSchemaEvolution(
+                        "catalog schema id space exhausted".to_string(),
                     )
-                    .into());
-                }
-                current.version()
-            } else {
-                let remap = compile_column_evolution(&existing, &target)?;
-                let mut builder = db.update_schema();
-                builder.remap_columns(Some(physical_name.clone()), remap)?;
-                builder.set_column_family_options(
-                    Some(physical_name.clone()),
-                    ColumnFamilyOptions {
-                        metadata: Some(target.to_value()?),
-                        ..ColumnFamilyOptions::default()
-                    },
-                )?;
-                builder.commit().version()
-            }
-        } else {
+                })?;
+            let next_record = load_table_schema_record(store, table_id, next_catalog_schema_id)?;
+            let next = TableMetadata::compile_catalog(
+                next_record.schema,
+                table_id,
+                next_catalog_schema_id,
+            )?;
+            let remap =
+                compile_column_evolution(&materialized, &next, &next_record.field_transforms)?;
             let mut builder = db.update_schema();
-            builder.ensure_column_family_exists(physical_name.clone())?;
-            for column in 0..target.layout.value_columns.len().max(1) {
-                builder.add_column(column, None, None, Some(physical_name.clone()))?;
-            }
+            builder.remap_columns(Some(physical_name.clone()), remap)?;
             builder.set_column_family_options(
                 Some(physical_name.clone()),
                 ColumnFamilyOptions {
-                    metadata: Some(target.to_value()?),
+                    metadata: Some(next.to_value()?),
                     ..ColumnFamilyOptions::default()
                 },
             )?;
-            builder.commit().version()
-        };
+            let core_schema_id = builder.commit().version();
+            write_schema_mapping(
+                store,
+                shard_schema_mapping(table_id, db, next_catalog_schema_id, core_schema_id),
+            )?;
+            materialized = next;
+            materialized_catalog_schema_id = next_catalog_schema_id;
+        }
+        materialized
+    } else {
+        let mut builder = db.update_schema();
+        builder.ensure_column_family_exists(physical_name.clone())?;
+        for column in 0..target.layout.value_columns.len().max(1) {
+            builder.add_column(column, None, None, Some(physical_name.clone()))?;
+        }
+        builder.set_column_family_options(
+            Some(physical_name.clone()),
+            ColumnFamilyOptions {
+                metadata: Some(target.to_value()?),
+                ..ColumnFamilyOptions::default()
+            },
+        )?;
+        let core_schema_id = builder.commit().version();
+        write_schema_mapping(
+            store,
+            shard_schema_mapping(table_id, db, catalog_schema_id, core_schema_id),
+        )?;
+        return Ok((physical_name, target));
+    };
+    if materialized != target {
+        return Err(TableError::InvalidSchema(
+            "materialized table metadata does not match the requested catalog schema".to_string(),
+        )
+        .into());
+    }
+    Ok((physical_name, materialized))
+}
 
-    write_schema_mapping(
-        store,
-        ShardSchemaMappingFile {
-            format: CATALOG_FORMAT.to_string(),
-            version: CATALOG_VERSION,
-            table_id,
-            db_id: db.id().to_string(),
-            catalog_schema_id,
-            core_schema_id,
-        },
-    )?;
-    Ok((physical_name, target))
+fn shard_schema_mapping(
+    table_id: TableId,
+    db: &Db,
+    catalog_schema_id: CatalogSchemaId,
+    core_schema_id: u64,
+) -> ShardSchemaMappingFile {
+    ShardSchemaMappingFile {
+        format: CATALOG_FORMAT.to_string(),
+        version: CATALOG_VERSION,
+        table_id,
+        db_id: db.id().to_string(),
+        catalog_schema_id,
+        core_schema_id,
+    }
 }
 
 fn write_schema_mapping(
@@ -586,6 +614,37 @@ fn write_schema_mapping(
         }
     }
     write_json(store, &path, &mapping)
+}
+
+fn load_table_schema_record(
+    store: &CatalogStore,
+    table_id: TableId,
+    catalog_schema_id: CatalogSchemaId,
+) -> CatalogResult<TableSchemaRecord> {
+    let record: TableSchemaRecord =
+        read_json(store, &table_schema_path(table_id, catalog_schema_id))?;
+    validate_header(&record.format, record.version)?;
+    if record.table_id != table_id || record.catalog_schema_id != catalog_schema_id {
+        return Err(CatalogError::InvalidMetadata(
+            "table schema record does not match its lookup key".to_string(),
+        ));
+    }
+    #[cfg(debug_assertions)]
+    {
+        debug_assert!(record.schema.validate().is_ok());
+        debug_assert!(
+            record
+                .used_field_ids
+                .windows(2)
+                .all(|window| window[0] < window[1])
+        );
+        debug_assert!(
+            schema_field_ids(&record.schema)
+                .iter()
+                .all(|field_id| record.used_field_ids.binary_search(field_id).is_ok())
+        );
+    }
+    Ok(record)
 }
 
 impl CatalogTable {
@@ -825,6 +884,7 @@ impl Catalog for FileCatalog {
                 table_id,
                 catalog_schema_id: CatalogSchemaId::INITIAL,
                 used_field_ids: sorted_field_ids(schema_field_ids(&schema)),
+                field_transforms: Vec::new(),
                 schema,
             };
             write_json(
@@ -909,7 +969,7 @@ impl Catalog for FileCatalog {
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>();
-            let (next_schema, used_field_ids) =
+            let (next_schema, used_field_ids, field_transforms) =
                 apply_schema_changes(current_schema.schema, changes, used_field_ids)
                     .map_err(|error| CatalogError::InvalidSchemaEvolution(error.to_string()))?;
             let next_catalog_schema_id = current_catalog_schema_id.next().ok_or_else(|| {
@@ -922,6 +982,7 @@ impl Catalog for FileCatalog {
                 catalog_schema_id: next_catalog_schema_id,
                 schema: next_schema,
                 used_field_ids: sorted_field_ids(used_field_ids),
+                field_transforms,
             };
             write_json(
                 &self.store,

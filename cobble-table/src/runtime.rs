@@ -5,11 +5,83 @@ use crate::{
     ReadOnlyTable, Result, Table, TableError, TableKey, TableKeyBuilder, TableProjection,
     TableScan, TableSchema, TableWritePlan, Value,
 };
+use bytes::Bytes;
 use cobble::{
-    Config, Db, DbBuilder, DbIterator, ReadOnlyDb, ReadOptions, Reader, ReaderConfig, ScanOptions,
+    Config, Db, DbBuilder, DbIterator, ReadOnlyDbBuilder, ReadOptions, Reader, ReaderBuilder,
+    ReaderConfig, ScanOptions,
 };
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
+
+type SchemaTransformCallback =
+    Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
+type SchemaTransformFactory =
+    Arc<dyn Fn(&[u8]) -> cobble::Result<SchemaTransformCallback> + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct TableSchemaTransformFactories(Vec<(String, SchemaTransformFactory)>);
+
+impl TableSchemaTransformFactories {
+    pub(crate) fn register<F, T>(
+        &mut self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        let transform_type = transform_type.into();
+        if transform_type.trim().is_empty() {
+            return Err(TableError::Storage(cobble::Error::InvalidState(
+                "Schema transform type must not be empty".to_string(),
+            )));
+        }
+        if self
+            .0
+            .iter()
+            .any(|(existing, _)| existing == &transform_type)
+        {
+            return Err(TableError::Storage(cobble::Error::InvalidState(format!(
+                "Schema transform '{}' is already registered",
+                transform_type
+            ))));
+        }
+        let factory: SchemaTransformFactory = Arc::new(move |spec| Ok(Box::new(factory(spec)?)));
+        self.0.push((transform_type, factory));
+        Ok(())
+    }
+
+    fn apply_to_db_builder(&self, mut builder: DbBuilder) -> Result<DbBuilder> {
+        for (transform_type, factory) in &self.0 {
+            let factory = Arc::clone(factory);
+            builder = builder
+                .register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
+        }
+        Ok(builder)
+    }
+
+    fn apply_to_reader_builder(&self, mut builder: ReaderBuilder) -> Result<ReaderBuilder> {
+        for (transform_type, factory) in &self.0 {
+            let factory = Arc::clone(factory);
+            builder = builder
+                .register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
+        }
+        Ok(builder)
+    }
+
+    pub(crate) fn apply_to_read_only_builder(
+        &self,
+        mut builder: ReadOnlyDbBuilder,
+    ) -> Result<ReadOnlyDbBuilder> {
+        for (transform_type, factory) in &self.0 {
+            let factory = Arc::clone(factory);
+            builder = builder
+                .register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
+        }
+        Ok(builder)
+    }
+}
 
 /// Builder for a standalone writable typed table shard.
 pub struct TableWriterBuilder {
@@ -18,6 +90,7 @@ pub struct TableWriterBuilder {
     db_id: Option<String>,
     bucket_ranges: Vec<RangeInclusive<u16>>,
     catalog_binding: Option<(TableWritePlan, Config)>,
+    transforms: TableSchemaTransformFactories,
 }
 
 impl TableWriterBuilder {
@@ -28,6 +101,7 @@ impl TableWriterBuilder {
             db_id: None,
             bucket_ranges: Vec::new(),
             catalog_binding: None,
+            transforms: TableSchemaTransformFactories::default(),
         }
     }
 
@@ -43,6 +117,7 @@ impl TableWriterBuilder {
             db_id: None,
             bucket_ranges: Vec::new(),
             catalog_binding: Some((plan, catalog_store_config)),
+            transforms: TableSchemaTransformFactories::default(),
         }
     }
 
@@ -64,6 +139,20 @@ impl TableWriterBuilder {
         self
     }
 
+    /// Register a factory for persisted schema transform specifications before opening.
+    pub fn register_schema_transform<F, T>(
+        mut self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_type, factory)?;
+        Ok(self)
+    }
+
     /// Create a new database and create the typed table schema.
     pub fn create(self, schema: TableSchema) -> Result<Table> {
         if self.catalog_binding.is_some() {
@@ -72,7 +161,7 @@ impl TableWriterBuilder {
             ));
         }
         let name = self.required_table_name()?;
-        let db = Arc::new(self.db_builder().open()?);
+        let db = Arc::new(self.db_builder()?.open()?);
         Table::create(db, name, schema)
     }
 
@@ -82,14 +171,14 @@ impl TableWriterBuilder {
             TableError::InvalidSchema("TableWriterBuilder::open requires a catalog table".into())
         })?;
         self.required_table_name()?;
-        let db = Arc::new(self.db_builder().open()?);
+        let db = Arc::new(self.db_builder()?.open()?);
         open_materialized_catalog_table(db, &plan, &store_config)
     }
 
     /// Resume a writable shard, materializing the loaded catalog definition when bound.
     pub fn resume(self) -> Result<Table> {
         let name = self.required_table_name()?;
-        let db = Arc::new(self.db_builder().resume()?);
+        let db = Arc::new(self.db_builder()?.resume()?);
         match self.catalog_binding {
             Some((plan, store_config)) => open_materialized_catalog_table(db, &plan, &store_config),
             None => Table::open(db, name),
@@ -99,7 +188,7 @@ impl TableWriterBuilder {
     /// Open a writable shard at a selected snapshot boundary.
     pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<Table> {
         let name = self.required_table_name()?;
-        let db = Arc::new(self.db_builder().open_from_snapshot(snapshot_id)?);
+        let db = Arc::new(self.db_builder()?.open_from_snapshot(snapshot_id)?);
         match self.catalog_binding {
             Some((plan, _)) => open_catalog_snapshot(db, name, plan.table_id()),
             None => Table::open(db, name),
@@ -109,7 +198,7 @@ impl TableWriterBuilder {
     /// Resume a writable shard from a selected snapshot boundary.
     pub fn resume_from_snapshot(self, snapshot_id: u64) -> Result<Table> {
         let name = self.required_table_name()?;
-        let db = Arc::new(self.db_builder().resume_from_snapshot(snapshot_id)?);
+        let db = Arc::new(self.db_builder()?.resume_from_snapshot(snapshot_id)?);
         match self.catalog_binding {
             Some((plan, _)) => open_catalog_snapshot(db, name, plan.table_id()),
             None => Table::open(db, name),
@@ -134,13 +223,13 @@ impl TableWriterBuilder {
         Ok(name)
     }
 
-    fn db_builder(&self) -> DbBuilder {
+    fn db_builder(&self) -> Result<DbBuilder> {
         let mut builder =
             DbBuilder::new(self.config.clone()).bucket_ranges(self.bucket_ranges.clone());
         if let Some(db_id) = &self.db_id {
             builder = builder.db_id(db_id.clone());
         }
-        builder
+        self.transforms.apply_to_db_builder(builder)
     }
 }
 
@@ -241,6 +330,7 @@ pub struct TableReaderBuilder {
     table_name: Option<String>,
     selection: Option<TableReaderSelection>,
     catalog_table_id: Option<TableId>,
+    transforms: TableSchemaTransformFactories,
 }
 
 enum TableReaderSelection {
@@ -255,6 +345,7 @@ impl TableReaderBuilder {
             table_name: None,
             selection: None,
             catalog_table_id: None,
+            transforms: TableSchemaTransformFactories::default(),
         }
     }
 
@@ -264,6 +355,7 @@ impl TableReaderBuilder {
             table_name: Some(table_name),
             selection: None,
             catalog_table_id: Some(table_id),
+            transforms: TableSchemaTransformFactories::default(),
         }
     }
 
@@ -283,18 +375,30 @@ impl TableReaderBuilder {
         self
     }
 
+    /// Register a factory for persisted schema transform specifications before opening.
+    pub fn register_schema_transform<F, T>(
+        mut self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_type, factory)?;
+        Ok(self)
+    }
+
     pub fn open(self) -> Result<TableReader> {
         let name = self.required_table_name()?;
+        let builder = self
+            .transforms
+            .apply_to_reader_builder(ReaderBuilder::new(ReaderConfig::from_config(&self.config)))?;
         let mut reader = match self.selection.ok_or_else(|| {
             TableError::InvalidSchema("TableReaderBuilder requires a snapshot selection".into())
         })? {
-            TableReaderSelection::Global { snapshot_id } => {
-                Reader::open(ReaderConfig::from_config(&self.config), snapshot_id)?
-            }
-            TableReaderSelection::CurrentGlobal => {
-                let reader_config = ReaderConfig::from_config(&self.config);
-                Reader::open_current(reader_config)?
-            }
+            TableReaderSelection::Global { snapshot_id } => builder.open(snapshot_id)?,
+            TableReaderSelection::CurrentGlobal => builder.open_current()?,
         };
         reader.pin_current_snapshot();
         let metadata = global_metadata(&reader, &name)?;
@@ -313,6 +417,7 @@ pub struct ReadOnlyTableBuilder {
     table_name: Option<String>,
     snapshot: Option<(String, u64)>,
     catalog_table_id: Option<TableId>,
+    transforms: TableSchemaTransformFactories,
 }
 
 impl ReadOnlyTableBuilder {
@@ -322,6 +427,7 @@ impl ReadOnlyTableBuilder {
             table_name: None,
             snapshot: None,
             catalog_table_id: None,
+            transforms: TableSchemaTransformFactories::default(),
         }
     }
 
@@ -331,6 +437,7 @@ impl ReadOnlyTableBuilder {
             table_name: Some(table_name),
             snapshot: None,
             catalog_table_id: Some(table_id),
+            transforms: TableSchemaTransformFactories::default(),
         }
     }
 
@@ -344,6 +451,20 @@ impl ReadOnlyTableBuilder {
         self
     }
 
+    /// Register a factory for persisted schema transform specifications before opening.
+    pub fn register_schema_transform<F, T>(
+        mut self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_type, factory)?;
+        Ok(self)
+    }
+
     pub fn open(self) -> Result<ReadOnlyTable> {
         let name = self.required_table_name()?;
         let (db_id, snapshot_id) = self.snapshot.ok_or_else(|| {
@@ -351,11 +472,11 @@ impl ReadOnlyTableBuilder {
                 "ReadOnlyTableBuilder requires a shard snapshot selection".into(),
             )
         })?;
-        let db = Arc::new(ReadOnlyDb::open_with_db_id(
-            self.config,
-            snapshot_id,
-            db_id,
-        )?);
+        let db = Arc::new(
+            self.transforms
+                .apply_to_read_only_builder(ReadOnlyDbBuilder::new(self.config).db_id(db_id))?
+                .open(snapshot_id)?,
+        );
         let metadata = load_table_metadata(&db.current_schema(), &name)?;
         validate_catalog_binding(&metadata, self.catalog_table_id)?;
         ReadOnlyTable::from_shard_metadata(db, name, metadata)

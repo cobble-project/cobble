@@ -12,6 +12,7 @@ use crate::db_iter::{BucketedRow, DbIterator};
 use crate::error::Result;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::read_only_db::ReadOnlyDb;
+use crate::read_only_db_builder::ReadOnlyDbBuilder;
 use crate::sst::row_codec::encode_key;
 use crate::r#type::Key;
 use bytes::Bytes;
@@ -129,12 +130,12 @@ impl ScanSplit {
         config: Config,
         options: &ScanOptions,
     ) -> Result<ScanSplitScanner> {
-        self.create_scanner_internal(config, None, Some(options))
+        self.create_scanner_with_builder(ReadOnlyDbBuilder::new(config), options)
     }
 
     /// Create a scanner with default scan behavior (no explicit scan options).
     pub fn create_scanner_without_options(&self, config: Config) -> Result<ScanSplitScanner> {
-        self.create_scanner_internal(config, None, None)
+        self.create_scanner_internal(ReadOnlyDbBuilder::new(config), None)
     }
 
     /// Create a scanner with a merge operator resolver.
@@ -144,7 +145,10 @@ impl ScanSplit {
         resolver: Arc<dyn MergeOperatorResolver>,
         options: &ScanOptions,
     ) -> Result<ScanSplitScanner> {
-        self.create_scanner_internal(config, Some(resolver), Some(options))
+        self.create_scanner_with_builder(
+            ReadOnlyDbBuilder::new(config).merge_operator_resolver(resolver),
+            options,
+        )
     }
 
     /// Create a scanner with a merge operator resolver and default scan behavior.
@@ -153,28 +157,32 @@ impl ScanSplit {
         config: Config,
         resolver: Arc<dyn MergeOperatorResolver>,
     ) -> Result<ScanSplitScanner> {
-        self.create_scanner_internal(config, Some(resolver), None)
+        self.create_scanner_internal(
+            ReadOnlyDbBuilder::new(config).merge_operator_resolver(resolver),
+            None,
+        )
+    }
+
+    /// Create a scanner from a configured snapshot builder.
+    ///
+    /// The split supplies its source database id and snapshot id; callers use
+    /// the builder to install runtime schema wiring before that snapshot opens.
+    pub fn create_scanner_with_builder(
+        &self,
+        builder: ReadOnlyDbBuilder,
+        options: &ScanOptions,
+    ) -> Result<ScanSplitScanner> {
+        self.create_scanner_internal(builder, Some(options))
     }
 
     fn create_scanner_internal(
         &self,
-        config: Config,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        builder: ReadOnlyDbBuilder,
         options: Option<&ScanOptions>,
     ) -> Result<ScanSplitScanner> {
-        let db = match resolver {
-            Some(resolver) => ReadOnlyDb::open_with_db_id_and_resolver(
-                config,
-                self.shard.snapshot_id,
-                self.shard.db_id.clone(),
-                resolver,
-            )?,
-            _ => ReadOnlyDb::open_with_db_id(
-                config,
-                self.shard.snapshot_id,
-                self.shard.db_id.clone(),
-            )?,
-        };
+        let db = builder
+            .db_id(self.shard.db_id.clone())
+            .open(self.shard.snapshot_id)?;
         let buckets: Vec<u16> = self
             .shard
             .ranges

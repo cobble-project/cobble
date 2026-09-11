@@ -1,9 +1,11 @@
 use crate::metadata::TableMetadata;
+use crate::runtime::TableSchemaTransformFactories;
 use crate::table::{CompiledTable, compile_table, decode_table_scan_row, validate_name};
 use crate::{Result, TableError, TableSchema, Value};
+use bytes::Bytes;
 use cobble::{
-    Config, ScanOptions, ScanSplit, ScanSplitScanner, ShardSnapshotRef, VolumeDescriptor,
-    VolumeUsageKind,
+    Config, ReadOnlyDbBuilder, ScanOptions, ScanSplit, ScanSplitScanner, ShardSnapshotRef,
+    VolumeDescriptor, VolumeUsageKind,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -130,6 +132,23 @@ impl TableScanSplit {
 
     /// Open this shard and return a typed full-scan iterator.
     pub fn create_scanner(&self, runtime: Config) -> Result<TableScanSplitScanner> {
+        self.create_scanner_with_transforms(runtime, &TableSchemaTransformFactories::default())
+    }
+
+    /// Start configuring a worker-local scanner for this split.
+    pub fn scanner_builder(&self, runtime: Config) -> TableScanSplitScannerBuilder {
+        TableScanSplitScannerBuilder {
+            split: self.clone(),
+            runtime,
+            transforms: TableSchemaTransformFactories::default(),
+        }
+    }
+
+    fn create_scanner_with_transforms(
+        &self,
+        runtime: Config,
+        transforms: &TableSchemaTransformFactories,
+    ) -> Result<TableScanSplitScanner> {
         self.validate()?;
         let credential_source = self.auth_source.as_ref().unwrap_or(&runtime);
         let source_volumes = self
@@ -142,8 +161,9 @@ impl TableScanSplit {
         config.total_buckets = self.total_buckets;
 
         let compiled = compile_table(self.metadata.clone(), self.total_buckets)?;
-        let scanner = self.split.create_scanner(
-            config,
+        let builder = transforms.apply_to_read_only_builder(ReadOnlyDbBuilder::new(config))?;
+        let scanner = self.split.create_scanner_with_builder(
+            builder,
             &ScanOptions::default().with_column_family(self.name.clone()),
         )?;
         Ok(TableScanSplitScanner {
@@ -178,6 +198,35 @@ impl TableScanSplit {
             ));
         }
         Ok(())
+    }
+}
+
+/// Builder for one worker-local typed scan split scanner.
+pub struct TableScanSplitScannerBuilder {
+    split: TableScanSplit,
+    runtime: Config,
+    transforms: TableSchemaTransformFactories,
+}
+
+impl TableScanSplitScannerBuilder {
+    /// Register a factory for persisted schema transform specifications before opening.
+    pub fn register_schema_transform<F, T>(
+        mut self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_type, factory)?;
+        Ok(self)
+    }
+
+    /// Open this fixed split using the supplied worker runtime configuration.
+    pub fn open(self) -> Result<TableScanSplitScanner> {
+        self.split
+            .create_scanner_with_transforms(self.runtime, &self.transforms)
     }
 }
 

@@ -334,7 +334,10 @@ pub(crate) fn assign_fresh_field_ids(fields: &mut [DataField], next_id: &mut u32
     Ok(())
 }
 
-fn assign_fresh_type_ids(logical_type: &mut LogicalType, next_id: &mut u32) -> Result<()> {
+pub(crate) fn assign_fresh_type_ids(
+    logical_type: &mut LogicalType,
+    next_id: &mut u32,
+) -> Result<()> {
     match &mut logical_type.kind {
         LogicalTypeKind::List { element_type } => assign_fresh_type_ids(element_type, next_id),
         LogicalTypeKind::Map {
