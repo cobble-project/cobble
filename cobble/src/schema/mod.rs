@@ -34,6 +34,19 @@ pub(crate) const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 pub(crate) const MAX_COLUMN_FAMILY_COUNT: usize = 230;
 const SCHEMA_FILE_FORMAT_VERSION: u32 = 2;
 
+/// Registers executable factories for persisted schema transform specifications.
+pub trait SchemaTransformRegistrar {
+    /// Register one transform factory for this runtime endpoint.
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static;
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 /// Column-family scoped schema options.
 ///

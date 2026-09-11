@@ -548,6 +548,20 @@ impl Reader {
     }
 }
 
+impl crate::SchemaTransformRegistrar for Reader {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        Reader::register_schema_transform(self, transform_type, factory)
+    }
+}
+
 fn decode_global_snapshot(bytes: &[u8]) -> Result<GlobalSnapshotManifest> {
     let manifest: GlobalSnapshotManifest =
         serde_json::from_slice(bytes).map_err(|err: SerdeError| {

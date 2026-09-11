@@ -40,6 +40,20 @@ pub struct ReadOnlyDb {
     metrics_manager: Arc<MetricsManager>,
 }
 
+impl crate::SchemaTransformRegistrar for ReadOnlyDb {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        ReadOnlyDb::register_schema_transform(self, transform_type, factory)
+    }
+}
+
 impl ReadOnlyDb {
     /// Open a read-only view from a snapshot manifest scoped to a database id.
     pub fn open_with_db_id(

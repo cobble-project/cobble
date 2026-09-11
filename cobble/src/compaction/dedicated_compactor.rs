@@ -1279,6 +1279,48 @@ impl DedicatedCompactor {
     }
 }
 
+impl crate::SchemaTransformRegistrar for DedicatedCompactor {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        DedicatedCompactor::register_schema_transform(self, transform_type, factory)
+    }
+}
+
+impl crate::SchemaTransformRegistrar for DedicatedCompactionPlanner {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        DedicatedCompactionPlanner::register_schema_transform(self, transform_type, factory)
+    }
+}
+
+impl crate::SchemaTransformRegistrar for DedicatedCompactionExecutor {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        DedicatedCompactionExecutor::register_schema_transform(self, transform_type, factory)
+    }
+}
+
 fn sanitized_absolute_volume_path(path: &str) -> Result<String> {
     let normalized = normalize_storage_path_to_url(path)?;
     let mut url = url::Url::parse(&normalized)?;

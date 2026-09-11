@@ -1484,6 +1484,20 @@ fn remap_preload_file_ids(
     preloads
 }
 
+impl crate::SchemaTransformRegistrar for RemoteCompactionServer {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        RemoteCompactionServer::register_schema_transform(self, transform_type, factory)
+    }
+}
+
 fn read_message<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     stream

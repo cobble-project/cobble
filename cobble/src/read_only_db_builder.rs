@@ -85,3 +85,17 @@ impl ReadOnlyDbBuilder {
         )
     }
 }
+
+impl crate::SchemaTransformRegistrar for ReadOnlyDbBuilder {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        self.transforms.register(transform_type, factory)
+    }
+}

@@ -179,8 +179,8 @@ pub use reader::{GlobalSnapshotSummary, Reader, ReaderConfig};
 pub use reader_builder::ReaderBuilder;
 pub use scan::{ScanPlan, ScanSplit, ScanSplitScanner};
 pub use schema::{
-    ColumnEvolution, ColumnFamilyOptions, Schema, SchemaBuilder, SnapshotColumnFamily,
-    TransformSpec,
+    ColumnEvolution, ColumnFamilyOptions, Schema, SchemaBuilder, SchemaTransformRegistrar,
+    SnapshotColumnFamily, TransformSpec,
 };
 pub use single_db::SingleDb;
 pub use snapshot::{ShardSnapshotMetadata, load_shard_snapshot_metadata};

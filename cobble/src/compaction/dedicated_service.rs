@@ -484,6 +484,34 @@ impl DedicatedCompactionService {
     }
 }
 
+impl crate::SchemaTransformRegistrar for DedicatedCompactionMonitor {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        DedicatedCompactionMonitor::register_schema_transform(self, transform_type, factory)
+    }
+}
+
+impl crate::SchemaTransformRegistrar for DedicatedCompactionService {
+    fn register_schema_transform<F, T>(
+        &self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        DedicatedCompactionService::register_schema_transform(self, transform_type, factory)
+    }
+}
+
 fn spawn_worker(
     worker_idx: usize,
     task_rx: Arc<Mutex<Receiver<ShardTask>>>,
