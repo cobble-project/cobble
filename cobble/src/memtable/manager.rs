@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockWriteGuard, mpsc};
 use std::thread::JoinHandle;
 
-use crate::config::MemtableType;
+use crate::config::{MemtableType, WriteOptions};
 use crate::data_file::DataFile;
 use crate::db_state::{
     DbState, DbStateHandle, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorId,
@@ -1783,6 +1783,16 @@ impl MemtableManager {
 
     /// Puts a key-value pair into the active memtable using reference types to avoid extra copy.
     pub(crate) fn put(&self, key: &RefKey<'_>, value: &RefValue<'_>) -> Result<()> {
+        self.put_bound(key, value, None)
+    }
+
+    /// Puts a key-value pair while validating an optional higher-level schema binding.
+    pub(crate) fn put_bound(
+        &self,
+        key: &RefKey<'_>,
+        value: &RefValue<'_>,
+        bound_options: Option<&WriteOptions>,
+    ) -> Result<()> {
         loop {
             // Wait for an active memtable to be available.
             if self.db_state.load().active.is_none() {
@@ -1818,6 +1828,12 @@ impl MemtableManager {
                     continue;
                 }
             }
+            if let Some(options) = bound_options {
+                options.validate_bound_column_family_cached(
+                    active.schema.as_ref(),
+                    key.column_family(),
+                )?;
+            }
             let num_columns = active
                 .schema
                 .num_columns_in_family(key.column_family())
@@ -1842,11 +1858,16 @@ impl MemtableManager {
 
     /// Puts caller-validated rows while retaining the active lock between successful entries.
     #[inline]
-    pub(crate) fn put_validated_batch<'a, I>(&self, entries: I, num_columns: usize) -> Result<()>
+    pub(crate) fn put_validated_batch<'a, I>(
+        &self,
+        entries: I,
+        num_columns: usize,
+        bound_options: Option<&WriteOptions>,
+    ) -> Result<()>
     where
         I: IntoIterator<Item = (RefKey<'a>, RefValue<'a>)>,
     {
-        self.put_validated_batch_with_callback(entries, num_columns, |_, _| {})
+        self.put_validated_batch_with_callback(entries, num_columns, bound_options, |_, _| {})
     }
 
     /// Puts caller-validated rows and invokes `on_before_apply` before each row is installed.
@@ -1855,6 +1876,7 @@ impl MemtableManager {
         &self,
         entries: I,
         num_columns: usize,
+        bound_options: Option<&WriteOptions>,
         mut on_before_apply: F,
     ) -> Result<()>
     where
@@ -1863,7 +1885,12 @@ impl MemtableManager {
     {
         let mut entries = entries.into_iter();
         loop {
-            if self.put_batch_into_active(&mut entries, num_columns, &mut on_before_apply)? {
+            if self.put_batch_into_active(
+                &mut entries,
+                num_columns,
+                bound_options,
+                &mut on_before_apply,
+            )? {
                 return Ok(());
             }
         }
@@ -1874,6 +1901,7 @@ impl MemtableManager {
         &self,
         entries: &mut I,
         num_columns: usize,
+        bound_options: Option<&WriteOptions>,
         on_before_apply: &mut F,
     ) -> Result<bool>
     where
@@ -1911,8 +1939,20 @@ impl MemtableManager {
                 return Ok(false);
             }
         }
+        let bound_column_family_id = bound_options
+            .map(|options| options.resolve_column_family_id_cached(active.schema.as_ref()))
+            .transpose()?;
 
         for (key, value) in entries {
+            if let Some(column_family_id) = bound_column_family_id
+                && key.column_family() != column_family_id
+            {
+                return Err(Error::InvalidState(format!(
+                    "Bound column family {} does not match batch key family {}",
+                    column_family_id,
+                    key.column_family()
+                )));
+            }
             debug_assert_eq!(
                 active.schema.num_columns_in_family(key.column_family()),
                 Some(num_columns)
@@ -1921,7 +1961,7 @@ impl MemtableManager {
             let put_result = active.put_ref_or_replace(&key, &value, num_columns);
             if let Err(err) = put_result {
                 self.handle_memtable_put_error(&err, active, &key, &value)?;
-                self.put(&key, &value)?;
+                self.put_bound(&key, &value, bound_options)?;
                 return Ok(false);
             }
         }

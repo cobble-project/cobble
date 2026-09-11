@@ -8,8 +8,8 @@ use crate::snapshot::SnapshotLifecycleState;
 use crate::r#type::encode_merge_separated_array;
 use crate::vlog::VlogPointer;
 use crate::{
-    ColumnEvolution, CompactionMode, DbBuilder, DbGovernance, GovernanceMode, MemtableType,
-    ReadOptions, RuntimeManifestMode, ScanOptions, TimeProviderKind, TransformSpec,
+    ColumnEvolution, ColumnFamilyOptions, CompactionMode, DbBuilder, DbGovernance, GovernanceMode,
+    MemtableType, ReadOptions, RuntimeManifestMode, ScanOptions, TimeProviderKind, TransformSpec,
     U32CounterMergeOperator, U64CounterMergeOperator, VolumeDescriptor, VolumeUsageKind,
     WriteOptions,
 };
@@ -3362,6 +3362,83 @@ fn test_db_scan_holds_snapshot_until_drop() {
     assert!(iter.next().is_none());
 
     cleanup_test_root(root);
+}
+
+#[test]
+#[serial(file)]
+fn bound_write_options_revalidate_under_active_memtable_lock() {
+    struct EvolveBeforeEncode {
+        db: Arc<Db>,
+        fired: AtomicBool,
+    }
+
+    impl AsRef<[u8]> for EvolveBeforeEncode {
+        fn as_ref(&self) -> &[u8] {
+            if !self.fired.swap(true, AtomicOrdering::SeqCst) {
+                let mut schema = self.db.update_schema();
+                schema
+                    .set_column_family_options(
+                        Some("bound".into()),
+                        ColumnFamilyOptions {
+                            metadata: Some(serde_json::json!({"layout": "new"})),
+                            ..ColumnFamilyOptions::default()
+                        },
+                    )
+                    .unwrap();
+                schema.commit();
+            }
+            b"value"
+        }
+    }
+
+    for wal_enabled in [false, true] {
+        let root = format!("/tmp/db_bound_write_options_active_schema_{wal_enabled}");
+        cleanup_test_root(&root);
+        let mut config = config_with_small_memtable(&root);
+        if wal_enabled {
+            config.wal_enabled = true;
+            config.wal_flush_interval_ms = 1;
+            config.volumes[0].set_usage(VolumeUsageKind::Wal);
+        }
+        let db = Arc::new(open_db(config));
+        let expected_options = ColumnFamilyOptions {
+            metadata: Some(serde_json::json!({"layout": "old"})),
+            ..ColumnFamilyOptions::default()
+        };
+        let mut schema = db.update_schema();
+        schema.ensure_column_family_exists("bound").unwrap();
+        schema
+            .add_column(0, None, None, Some("bound".into()))
+            .unwrap();
+        schema
+            .set_column_family_options(Some("bound".into()), expected_options.clone())
+            .unwrap();
+        schema.commit();
+
+        let options = WriteOptions::with_column_family("bound")
+            .bound_to_column_family_schema(expected_options, 1);
+        let values = [EvolveBeforeEncode {
+            db: Arc::clone(&db),
+            fired: AtomicBool::new(false),
+        }];
+        let error = db
+            .put_columns_with_options(0, b"key", &values, &options)
+            .unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        assert!(
+            db.get_with_options(
+                0,
+                b"key",
+                &ReadOptions::default().with_column_family("bound"),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        drop(values);
+        db.close().unwrap();
+        cleanup_test_root(&root);
+    }
 }
 
 #[test]

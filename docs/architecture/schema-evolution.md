@@ -191,6 +191,12 @@ integer. Decode using the old logical type and encode the result using the new t
 New writes already use the new type. A field can have one transform per catalog version;
 use separate versions for multiple transformations.
 
+Publishing a catalog version does not change existing live writers. To apply one explicit loaded
+version, call `CatalogTable::refresh_writer(&mut table)`: it materializes the missing versions in
+order and refreshes that table layout. Refresh other live handles and rebuild old projections;
+already-created scans and snapshot readers keep their fixed view. `Table::refresh_schema()`
+reloads only local database metadata.
+
 Register the factory through `register_schema_transform` on `TableWriterBuilder`,
 `ReadOnlyTableBuilder`, or `TableReaderBuilder` before opening. Distributed scan workers
 register it on `TableScanSplit::scanner_builder(config)` before calling `open()`.

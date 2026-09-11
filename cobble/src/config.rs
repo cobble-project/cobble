@@ -1,3 +1,4 @@
+use crate::ColumnFamilyOptions;
 use crate::SstCompressionAlgorithm;
 use crate::data_file::DataFileType;
 use crate::error::{Error, Result};
@@ -456,6 +457,7 @@ pub struct ReadOptions {
     max_index: Option<usize>,
     cached_masks: Arc<ArcSwapOption<ReadOptionsMasks>>,
     cached_column_family_id: Arc<ArcSwapOption<ColumnFamilyCacheEntry>>,
+    schema_binding: Option<Arc<ColumnFamilySchemaBinding>>,
 }
 
 #[derive(Clone)]
@@ -468,6 +470,7 @@ pub struct ScanOptions {
     max_index: Option<usize>,
     max_rows: Option<usize>,
     cached_resolution: Arc<ArcSwapOption<ScanOptionsCacheEntry>>,
+    schema_binding: Option<Arc<ColumnFamilySchemaBinding>>,
 }
 
 #[derive(Clone, Debug)]
@@ -480,12 +483,38 @@ pub struct WriteOptions {
     /// may lose the not-yet-published WAL tail.
     pub await_durable: bool,
     cached_column_family_id: Arc<ArcSwapOption<ColumnFamilyCacheEntry>>,
+    schema_binding: Option<Arc<ColumnFamilySchemaBinding>>,
 }
 
 #[derive(Clone, Debug)]
 struct ColumnFamilyCacheEntry {
     schema_version: u64,
     column_family_id: u8,
+}
+
+/// A higher-level binding to the physical definition of one column family.
+///
+/// Options carrying this binding validate it whenever their column-family resolution cache sees
+/// a new schema version. This lets structured wrappers reject stale layouts at the same point the
+/// core selects the schema for an operation, without affecting unbound KV options.
+#[derive(Debug)]
+struct ColumnFamilySchemaBinding {
+    options: ColumnFamilyOptions,
+    num_columns: usize,
+}
+
+impl ColumnFamilySchemaBinding {
+    fn validate(&self, schema: &Schema, column_family_id: u8) -> Result<()> {
+        let actual_columns = schema.num_columns_in_family(column_family_id).unwrap_or(0);
+        let actual_options = schema.column_family_options_ref(column_family_id);
+        if actual_columns != self.num_columns || actual_options != Some(&self.options) {
+            return Err(Error::InvalidState(
+                "Bound column family layout or metadata is stale; refresh the table and rebuild projections"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -507,6 +536,7 @@ impl WriteOptions {
             column_family: None,
             await_durable: true,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 
@@ -516,6 +546,7 @@ impl WriteOptions {
             column_family: Some(column_family.into()),
             await_durable: true,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 
@@ -532,7 +563,23 @@ impl WriteOptions {
             column_family: Some(column_family.into()),
             await_durable: self.await_durable,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+            schema_binding: self.schema_binding.clone(),
         }
+    }
+
+    /// Bind this option set to one higher-level column-family layout.
+    #[doc(hidden)]
+    pub fn bound_to_column_family_schema(
+        mut self,
+        options: ColumnFamilyOptions,
+        num_columns: usize,
+    ) -> Self {
+        self.schema_binding = Some(Arc::new(ColumnFamilySchemaBinding {
+            options,
+            num_columns,
+        }));
+        self.cached_column_family_id = Arc::new(ArcSwapOption::empty());
+        self
     }
 
     pub(crate) fn column_family(&self) -> Option<&str> {
@@ -547,12 +594,37 @@ impl WriteOptions {
             return Ok(cache.column_family_id);
         }
         let column_family_id = schema.resolve_column_family_id(self.column_family())?;
+        if let Some(binding) = &self.schema_binding {
+            binding.validate(schema, column_family_id)?;
+        }
         self.cached_column_family_id
             .store(Some(Arc::new(ColumnFamilyCacheEntry {
                 schema_version,
                 column_family_id,
             })));
         Ok(column_family_id)
+    }
+
+    pub(crate) fn validate_bound_column_family_cached(
+        &self,
+        schema: &Schema,
+        column_family_id: u8,
+    ) -> Result<()> {
+        if self.schema_binding.is_none() {
+            return Ok(());
+        }
+        let resolved = self.resolve_column_family_id_cached(schema)?;
+        if resolved != column_family_id {
+            return Err(Error::InvalidState(format!(
+                "Bound column family resolves to {}, not {}",
+                resolved, column_family_id
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_schema_binding(&self) -> bool {
+        self.schema_binding.is_some()
     }
 }
 
@@ -571,6 +643,7 @@ impl Default for ReadOptions {
             max_index: None,
             cached_masks: Arc::new(ArcSwapOption::empty()),
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 }
@@ -586,6 +659,7 @@ impl Default for ScanOptions {
             max_index: None,
             max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 }
@@ -614,6 +688,7 @@ impl Default for WriteOptions {
             column_family: None,
             await_durable: true,
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 }
@@ -640,11 +715,27 @@ impl ScanOptions {
             max_index,
             max_rows: None,
             cached_resolution: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 
     pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
         self.column_family = Some(column_family.into());
+        self.invalidate_caches();
+        self
+    }
+
+    /// Bind this option set to one higher-level column-family layout.
+    #[doc(hidden)]
+    pub fn bound_to_column_family_schema(
+        mut self,
+        options: ColumnFamilyOptions,
+        num_columns: usize,
+    ) -> Self {
+        self.schema_binding = Some(Arc::new(ColumnFamilySchemaBinding {
+            options,
+            num_columns,
+        }));
         self.invalidate_caches();
         self
     }
@@ -737,6 +828,9 @@ impl ScanOptions {
         }
 
         let column_family_id = schema.resolve_column_family_id(self.column_family())?;
+        if let Some(binding) = &self.schema_binding {
+            binding.validate(schema.as_ref(), column_family_id)?;
+        }
         let effective_schema = if let Some(columns) = self.columns() {
             schema.project_in_family(column_family_id, columns)
         } else {
@@ -789,11 +883,27 @@ impl ReadOptions {
             max_index,
             cached_masks: Arc::new(ArcSwapOption::empty()),
             cached_column_family_id: Arc::new(ArcSwapOption::empty()),
+            schema_binding: None,
         }
     }
 
     pub fn with_column_family(mut self, column_family: impl Into<String>) -> Self {
         self.column_family = Some(column_family.into());
+        self.invalidate_caches();
+        self
+    }
+
+    /// Bind this option set to one higher-level column-family layout.
+    #[doc(hidden)]
+    pub fn bound_to_column_family_schema(
+        mut self,
+        options: ColumnFamilyOptions,
+        num_columns: usize,
+    ) -> Self {
+        self.schema_binding = Some(Arc::new(ColumnFamilySchemaBinding {
+            options,
+            num_columns,
+        }));
         self.invalidate_caches();
         self
     }
@@ -829,6 +939,9 @@ impl ReadOptions {
             return Ok(cache.column_family_id);
         }
         let column_family_id = schema.resolve_column_family_id(self.column_family())?;
+        if let Some(binding) = &self.schema_binding {
+            binding.validate(schema, column_family_id)?;
+        }
         self.cached_column_family_id
             .store(Some(Arc::new(ColumnFamilyCacheEntry {
                 schema_version,

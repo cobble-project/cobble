@@ -296,6 +296,13 @@ a persisted `TransformSpec`; materialization
 applies intermediate catalog versions in order. Register factories on writer and reader
 builders before opening. See [Table field transforms](../architecture/schema-evolution#table-field-transforms).
 
+To advance a live writable handle, load the intended catalog version and call
+`loaded_table.refresh_writer(&mut writer)?`. It materializes that version's missing schema
+steps and refreshes that handle's local layout, returning whether it changed. Refresh other live
+handles and rebuild old projections after a local schema change; already-created scans and
+snapshot readers remain fixed to their original view. `Table::refresh_schema()` only reloads
+local database metadata and does not read a catalog.
+
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
 Catalog APIs are grouped under `cobble_table::catalog`. With a `FileCatalog`, use the loaded
 table's `writer_builder(config)`, `readonly_table_builder(config)` for a shard,

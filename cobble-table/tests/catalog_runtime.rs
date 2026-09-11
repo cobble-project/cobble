@@ -348,12 +348,13 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .materialize_table(Arc::clone(&replay_db), &accounts_id)
         .unwrap();
     drop(replay_initial);
-    let mapping_initial = catalog
+    let mut mapping_initial = catalog
         .materialize_table(Arc::clone(&mapping_db), &accounts_id)
         .unwrap();
     mapping_initial.put(&rows[right_index]).unwrap();
     mapping_initial.snapshot_and_wait().unwrap();
-    drop(mapping_initial);
+    let stale_projection = mapping_initial.project_by_names(&["score"]).unwrap();
+    let mut stale_scan = mapping_initial.scan(keys[right_index].bucket()).unwrap();
     catalog
         .evolve_schema(
             &accounts_id,
@@ -423,23 +424,62 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             .is_err()
     );
     std::fs::remove_dir(&failed_mapping).unwrap();
-    let mapping_retried = catalog
-        .materialize_table(Arc::clone(&mapping_db), &accounts_id)
-        .unwrap();
-    assert_eq!(mapping_retried.schema(), evolved.schema());
+    assert!(mapping_initial.get(&keys[right_index]).is_err());
+    assert!(
+        mapping_initial
+            .multi_get(&[keys[right_index].clone()])
+            .is_err()
+    );
+    assert!(mapping_initial.put(&rows[right_index]).is_err());
+    assert!(
+        mapping_initial
+            .put_with_options(&rows[right_index], &cobble::WriteOptions::with_ttl(1))
+            .is_err()
+    );
+    assert!(mapping_initial.delete(&keys[right_index]).is_err());
+    assert!(mapping_initial.scan(keys[right_index].bucket()).is_err());
+    assert!(stale_projection.get(&keys[right_index]).is_err());
+    assert_eq!(stale_scan.next().unwrap().unwrap(), rows[right_index]);
+    assert!(stale_scan.next().is_none());
+    drop(stale_scan);
+
+    assert!(evolved.refresh_writer(&mut mapping_initial).unwrap());
+    assert!(!evolved.refresh_writer(&mut mapping_initial).unwrap());
+    assert!(events.refresh_writer(&mut mapping_initial).is_err());
+    assert_eq!(mapping_initial.schema(), evolved.schema());
     let Value::Int8(score) = rows[right_index][2] else {
         panic!("catalog schema score starts as int8");
     };
+    let refreshed_row = vec![
+        rows[right_index][0].clone(),
+        rows[right_index][1].clone(),
+        Value::Int64(i64::from(score)),
+        Value::Null,
+    ];
     assert_eq!(
-        mapping_retried.get(&keys[right_index]).unwrap(),
-        Some(vec![
-            rows[right_index][0].clone(),
-            rows[right_index][1].clone(),
-            Value::Int64(i64::from(score)),
-            Value::Null,
-        ])
+        mapping_initial.get(&keys[right_index]).unwrap(),
+        Some(refreshed_row.clone())
     );
-    drop(mapping_retried);
+    mapping_initial
+        .put_with_options(&refreshed_row, &cobble::WriteOptions::with_ttl(1))
+        .unwrap();
+    assert_eq!(
+        mapping_initial.get(&keys[right_index]).unwrap(),
+        Some(refreshed_row)
+    );
+    assert_eq!(
+        mapping_initial
+            .project_by_names(&["score"])
+            .unwrap()
+            .get(&keys[right_index])
+            .unwrap(),
+        Some(vec![Value::Int64(i64::from(score))])
+    );
+    let mut unrelated = mapping_db.update_schema();
+    unrelated.ensure_column_family_exists("unrelated").unwrap();
+    unrelated.commit();
+    assert!(mapping_initial.get(&keys[right_index]).unwrap().is_some());
+    drop(mapping_initial);
     drop(catalog);
 
     // The worker supplies fresh local primary/cache roots; the plan never appends catalog paths.

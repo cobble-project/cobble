@@ -661,6 +661,29 @@ impl CatalogTable {
             .writer_builder(runtime)
     }
 
+    /// Materialize this loaded catalog version into a writable table and refresh its local layout.
+    ///
+    /// The caller controls which catalog version is loaded; this method never follows catalog
+    /// CURRENT implicitly.
+    pub fn refresh_writer(&self, table: &mut Table) -> CatalogResult<bool> {
+        let physical_name = physical_table_name(self.table_id);
+        if table.name() != physical_name {
+            return Err(TableError::InvalidSchema(
+                "Table does not belong to this catalog table".to_string(),
+            )
+            .into());
+        }
+        materialize_loaded_table(
+            &CatalogStore::open(
+                &self.runtime_context.config,
+                &self.runtime_context.storage_id,
+            )?,
+            table.db(),
+            self,
+        )?;
+        table.refresh_schema().map_err(Into::into)
+    }
+
     /// Build an owned snapshot reader for this table using its catalog-managed shared storage.
     pub fn reader_builder(&self, runtime: Config) -> CatalogResult<TableReaderBuilder> {
         let context = &self.runtime_context;

@@ -524,10 +524,14 @@ impl Db {
                 num_columns,
                 &key,
                 &record,
-                options.await_durable,
+                options,
             )
         } else {
-            self.memtable_manager.put(&key, &record)
+            self.memtable_manager.put_bound(
+                &key,
+                &record,
+                options.has_schema_binding().then_some(options),
+            )
         };
         // Record after the write completes (active lock released) to avoid re-entering the
         // manager while holding it.
@@ -543,19 +547,24 @@ impl Db {
         num_columns: usize,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
-        await_durable: bool,
+        options: &WriteOptions,
     ) -> Result<()> {
         let mut guard = wal_writer.lock_for_schema(schema_id)?;
         let completion = {
             let mut batch = guard.begin_batch();
             batch.append_ref(schema_id, key, value, num_columns);
-            match self.memtable_manager.put(key, value) {
+            let applied = self.memtable_manager.put_bound(
+                key,
+                value,
+                options.has_schema_binding().then_some(options),
+            );
+            match applied {
                 Ok(()) => batch.commit().expect("single WAL append has a completion"),
                 Err(err) => return Err(err),
             }
         };
         drop(guard);
-        if await_durable {
+        if options.await_durable {
             completion.wait_result()?;
         }
         Ok(())
@@ -743,10 +752,14 @@ impl Db {
                 num_columns,
                 &key,
                 &record,
-                options.await_durable,
+                options,
             )
         } else {
-            self.memtable_manager.put(&key, &record)
+            self.memtable_manager.put_bound(
+                &key,
+                &record,
+                options.has_schema_binding().then_some(options),
+            )
         };
         let decision = self.memtable_manager.record_adaptive_write(1);
         self.apply_adaptive_decision(decision);
@@ -806,6 +819,7 @@ impl Db {
                 let result = self.memtable_manager.put_validated_batch_with_callback(
                     entries,
                     num_columns,
+                    options.has_schema_binding().then_some(options),
                     |key, value| batch.append_ref(schema.version(), key, value, num_columns),
                 );
                 let completion = batch.commit();
@@ -818,8 +832,11 @@ impl Db {
                 result
             }
         } else {
-            self.memtable_manager
-                .put_validated_batch(entries, num_columns)
+            self.memtable_manager.put_validated_batch(
+                entries,
+                num_columns,
+                options.has_schema_binding().then_some(options),
+            )
         };
         let decision = self.memtable_manager.record_adaptive_write(count.get());
         self.apply_adaptive_decision(decision);
@@ -896,6 +913,7 @@ impl Db {
                 let result = self.memtable_manager.put_validated_batch_with_callback(
                     entries,
                     num_columns,
+                    options.has_schema_binding().then_some(options),
                     |key, value| batch.append_ref(schema.version(), key, value, num_columns),
                 );
                 let completion = batch.commit();
@@ -908,8 +926,11 @@ impl Db {
                 result
             }
         } else {
-            self.memtable_manager
-                .put_validated_batch(entries, num_columns)
+            self.memtable_manager.put_validated_batch(
+                entries,
+                num_columns,
+                options.has_schema_binding().then_some(options),
+            )
         };
         let decision = self.memtable_manager.record_adaptive_write(count.get());
         self.apply_adaptive_decision(decision);
@@ -957,6 +978,11 @@ impl Db {
         batch: WriteBatch,
         options: &WriteOptions,
     ) -> Result<()> {
+        if options.has_schema_binding() {
+            return Err(Error::InvalidState(
+                "Bound WriteOptions cannot be used with WriteBatch".to_string(),
+            ));
+        }
         let _access = self.begin_access()?;
         let batch_len = batch.ops.len() as u64;
         let mut pending: std::collections::BTreeMap<(u16, u8, Bytes), Value> =

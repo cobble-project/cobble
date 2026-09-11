@@ -347,9 +347,17 @@ impl Schema {
     }
 
     pub fn column_family_options_in_family(&self, column_family_id: u8) -> ColumnFamilyOptions {
-        self.column_family_by_id(column_family_id)
-            .map(|family| family.options.clone())
+        self.column_family_options_ref(column_family_id)
+            .cloned()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn column_family_options_ref(
+        &self,
+        column_family_id: u8,
+    ) -> Option<&ColumnFamilyOptions> {
+        self.column_family_by_id(column_family_id)
+            .map(|family| &family.options)
     }
 
     pub(crate) fn column_family_id_list(&self) -> Vec<u8> {

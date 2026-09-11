@@ -11,6 +11,7 @@ use std::sync::{Arc, mpsc};
 
 pub(crate) struct CompiledTable {
     schema: TableSchema,
+    column_family_options: ColumnFamilyOptions,
     key_positions: Vec<usize>,
     key_types: Vec<LogicalType>,
     bucket_key_fields: usize,
@@ -217,8 +218,10 @@ impl Table {
 
     /// Write one full row with caller options safely rebound to this table.
     pub fn put_with_options(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
-        let options = options.bound_to_column_family(self.name.clone());
-        self.put_bound(row, &options)
+        let mut bound = self.write_options.clone();
+        bound.ttl_seconds = options.ttl_seconds;
+        bound.await_durable = options.await_durable;
+        self.put_bound(row, &bound)
     }
 
     /// Delete one complete row.
@@ -338,22 +341,70 @@ impl Table {
         Ok(self.db.shard_snapshot_metadata(snapshot_id)?)
     }
 
+    /// Refresh this writable handle from the local database schema.
+    ///
+    /// This does not consult a catalog or track a moving catalog version. Existing projections
+    /// remain bound to the layout they were compiled with and must be rebuilt after a change.
+    pub fn refresh_schema(&mut self) -> Result<bool> {
+        let metadata = load_table_metadata(&self.db.current_schema(), &self.name)?;
+        if self.compiled.column_family_options.metadata.as_ref() == Some(&metadata.to_value()?) {
+            return Ok(false);
+        }
+        self.compiled = compile_table(metadata, self.db.total_buckets())?;
+        (self.read_options, self.scan_options, self.write_options) =
+            build_bound_options(&self.name, &self.compiled);
+        Ok(true)
+    }
+
+    pub(crate) fn db(&self) -> &Db {
+        self.db.as_ref()
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(crate) fn from_metadata(
         db: Arc<Db>,
         name: String,
         metadata: TableMetadata,
     ) -> Result<Self> {
         let compiled = compile_table(metadata, db.total_buckets())?;
+        let (read_options, scan_options, write_options) = build_bound_options(&name, &compiled);
         Ok(Self {
             read_backend: ReadBackend::Writable(Arc::clone(&db)),
             db,
-            name: name.clone(),
+            name,
             compiled,
-            read_options: ReadOptions::default().with_column_family(name.clone()),
-            scan_options: ScanOptions::default().with_column_family(name.clone()),
-            write_options: WriteOptions::with_column_family(name),
+            read_options,
+            scan_options,
+            write_options,
         })
     }
+}
+
+fn build_bound_options(
+    name: &str,
+    compiled: &CompiledTable,
+) -> (ReadOptions, ScanOptions, WriteOptions) {
+    (
+        ReadOptions::default()
+            .with_column_family(name)
+            .bound_to_column_family_schema(
+                compiled.column_family_options.clone(),
+                compiled.physical_columns,
+            ),
+        ScanOptions::default()
+            .with_column_family(name)
+            .bound_to_column_family_schema(
+                compiled.column_family_options.clone(),
+                compiled.physical_columns,
+            ),
+        WriteOptions::with_column_family(name).bound_to_column_family_schema(
+            compiled.column_family_options.clone(),
+            compiled.physical_columns,
+        ),
+    )
 }
 
 fn ensure_table_schema(db: &Db, name: &str, schema: TableSchema) -> Result<TableMetadata> {
@@ -858,8 +909,17 @@ fn build_projection_parts<S: AsRef<str>>(
             sources,
             has_key_fields,
         }),
-        ReadOptions::for_columns_in_family(name.to_string(), physical_columns.clone()),
-        ScanOptions::for_columns(physical_columns).with_column_family(name.to_string()),
+        ReadOptions::for_columns_in_family(name.to_string(), physical_columns.clone())
+            .bound_to_column_family_schema(
+                compiled.column_family_options.clone(),
+                compiled.physical_columns,
+            ),
+        ScanOptions::for_columns(physical_columns)
+            .with_column_family(name.to_string())
+            .bound_to_column_family_schema(
+                compiled.column_family_options.clone(),
+                compiled.physical_columns,
+            ),
     ))
 }
 
@@ -868,6 +928,10 @@ pub(crate) fn compile_table(
     total_buckets: u32,
 ) -> Result<Arc<CompiledTable>> {
     metadata.validate()?;
+    let column_family_options = ColumnFamilyOptions {
+        metadata: Some(metadata.to_value()?),
+        ..ColumnFamilyOptions::default()
+    };
     let positions = metadata
         .schema
         .fields
@@ -897,6 +961,7 @@ pub(crate) fn compile_table(
         .collect::<Vec<_>>();
     Ok(Arc::new(CompiledTable {
         schema: metadata.schema,
+        column_family_options,
         key_positions,
         key_types,
         bucket_key_fields: metadata.layout.bucket_fields.len(),
