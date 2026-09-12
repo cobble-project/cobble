@@ -208,7 +208,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     )));
     assert!(!properties.contains("catalog-runtime-secret"));
 
-    let reader = users
+    let mut reader = users
         .reader_builder(runtime.clone())
         .unwrap()
         .current_global_snapshot()
@@ -218,6 +218,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         reader.multi_get(&keys).unwrap(),
         rows.iter().cloned().map(Some).collect::<Vec<_>>()
     );
+    let old_projection = reader.project_by_names(&["score"]).unwrap();
+    let old_scan = reader.scan(keys[0].bucket()).unwrap();
     let scan_plan = reader.scan_plan().unwrap();
     let scan_plan_json = serde_json::to_string(&scan_plan).unwrap();
     assert!(!scan_plan_json.contains("catalog-runtime-access"));
@@ -385,6 +387,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             ],
         )
         .unwrap();
+    assert!(!reader.refresh().unwrap());
+    assert_eq!(reader.schema(), &schema);
     let old_reader = evolved
         .reader_builder(runtime.clone())
         .unwrap()
@@ -498,20 +502,6 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         total_buckets: 1,
         ..Config::default()
     };
-    let mut worker_splits = worker_scan_plan.splits().unwrap();
-    let first_split_json = serde_json::to_string(&worker_splits[0]).unwrap();
-    worker_splits[0] = serde_json::from_str::<TableScanSplit>(&first_split_json).unwrap();
-    let mut worker_rows = worker_splits
-        .into_iter()
-        .flat_map(|split| split.create_scanner(worker_scan_runtime.clone()).unwrap())
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    worker_rows.sort_by_key(|row| match row.first() {
-        Some(Value::Int64(id)) => *id,
-        _ => panic!("catalog schema always starts with an int64 id"),
-    });
-    assert_eq!(worker_rows, rows);
-
     // A worker needs only the serialized, fixed plan, not a live catalog or its latest schema.
     let worker_plan =
         serde_json::from_str::<cobble_table::TableWritePlan>(&write_plan_json).unwrap();
@@ -581,6 +571,28 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .commit_batch(2, vec![resumed_snapshot.clone(), resumed_right_snapshot])
         .unwrap()
         .unwrap();
+    let current_path = user_root.join("snapshot/CURRENT");
+    let valid_current = std::fs::read(&current_path).unwrap();
+    std::fs::write(&current_path, b"corrupt global current\n").unwrap();
+    assert!(reader.refresh().is_err());
+    assert_eq!(reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
+    std::fs::write(&current_path, &valid_current).unwrap();
+    let candidate_manifest = std::path::PathBuf::from(
+        resumed_snapshot
+            .manifest_path
+            .strip_prefix("file://")
+            .unwrap_or(&resumed_snapshot.manifest_path),
+    );
+    let unavailable_manifest = candidate_manifest.with_extension("unavailable");
+    std::fs::rename(&candidate_manifest, &unavailable_manifest).unwrap();
+    assert!(reader.refresh().is_err());
+    assert_eq!(reader.schema(), &schema);
+    assert_eq!(reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
+    assert_eq!(reader.scan_plan().unwrap().snapshot_id(), first.id);
+    std::fs::rename(&unavailable_manifest, &candidate_manifest).unwrap();
+    assert!(reader.refresh().unwrap());
+    assert!(!reader.refresh().unwrap());
+    assert_eq!(reader.schema(), evolved.schema());
     let evolved_reader = evolved
         .reader_builder(runtime.clone())
         .unwrap()
@@ -609,6 +621,39 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             .map(Some)
             .collect::<Vec<_>>()
     );
+    assert_eq!(
+        reader.multi_get(&keys).unwrap(),
+        transformed_rows
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        old_projection.get(&keys[0]).unwrap(),
+        Some(vec![rows[0][2].clone()])
+    );
+    assert_eq!(
+        old_scan.collect::<Result<Vec<_>, _>>().unwrap(),
+        rows.iter()
+            .zip(&keys)
+            .filter(|(_, key)| key.bucket() == keys[0].bucket())
+            .map(|(row, _)| row.clone())
+            .collect::<Vec<_>>()
+    );
+    let mut worker_splits = worker_scan_plan.splits().unwrap();
+    let first_split_json = serde_json::to_string(&worker_splits[0]).unwrap();
+    worker_splits[0] = serde_json::from_str::<TableScanSplit>(&first_split_json).unwrap();
+    let mut worker_rows = worker_splits
+        .into_iter()
+        .flat_map(|split| split.create_scanner(worker_scan_runtime.clone()).unwrap())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    worker_rows.sort_by_key(|row| match row.first() {
+        Some(Value::Int64(id)) => *id,
+        _ => panic!("catalog schema always starts with an int64 id"),
+    });
+    assert_eq!(worker_rows, rows);
     let evolved_shard_reader = evolved
         .readonly_table_builder(runtime.clone())
         .unwrap()
@@ -653,7 +698,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         Some(rows[left_index].clone())
     );
     drop(restored);
-    // The original reader remains pinned while the table pointer advances.
+    // The refreshed reader now follows the committed global snapshot.
     assert_eq!(
         coordinator
             .load_current_global_snapshot()
@@ -662,7 +707,10 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             .id,
         evolved_global.id
     );
-    assert_eq!(reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
+    assert_eq!(
+        reader.get(&keys[0]).unwrap(),
+        Some(transformed_rows[0].clone())
+    );
 }
 
 fn key(mut builder: TableKeyBuilder, value: &Value) -> TableKey {

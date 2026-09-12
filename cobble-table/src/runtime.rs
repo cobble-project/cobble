@@ -307,6 +307,29 @@ impl TableReader {
             .ok_or_else(|| TableError::internal("table reader is missing its global read state"))?;
         state.scan_plan()
     }
+
+    /// Refresh this reader to the latest committed global snapshot.
+    ///
+    /// Existing projections, scans, and scan plans retain their current fixed view. If the
+    /// current pointer is unchanged, this returns `false`; an error leaves this reader unchanged.
+    pub fn refresh(&mut self) -> Result<bool> {
+        let state = self
+            .typed
+            .global_state()
+            .ok_or_else(|| TableError::internal("table reader is missing its global read state"))?;
+        let Some((reader, name, previous_table_id)) = state.refreshed_snapshot()? else {
+            return Ok(false);
+        };
+        let metadata = global_metadata(&reader, &name)?;
+        if previous_table_id != metadata.catalog_binding.map(|binding| binding.table_id) {
+            return Err(TableError::InvalidSchema(
+                "refreshed global snapshot belongs to a different catalog table".into(),
+            ));
+        }
+        let refreshed = Self::from_metadata(reader, name, metadata)?;
+        self.typed = refreshed.typed;
+        Ok(true)
+    }
 }
 
 /// Builder for a global typed reader pinned to one snapshot selection.
@@ -561,6 +584,20 @@ impl GlobalReaderState {
             snapshot.shard_snapshots,
             state.reader.config().clone(),
         )
+    }
+
+    fn refreshed_snapshot(&self) -> Result<Option<(Reader, String, Option<TableId>)>> {
+        let state = lock_global_state(&self.state)?;
+        Ok(state.reader.refreshed_snapshot()?.map(|reader| {
+            (
+                reader,
+                state.name.clone(),
+                state
+                    .metadata
+                    .catalog_binding
+                    .map(|binding| binding.table_id),
+            )
+        }))
     }
 }
 

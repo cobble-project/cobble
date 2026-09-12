@@ -401,6 +401,17 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             schema.commit();
         }
         let second = publish(&shards);
+        let mut candidate = reader.refreshed_snapshot().unwrap().unwrap();
+        assert_eq!(candidate.current_global_snapshot().id, second.id);
+        assert_eq!(candidate.cache.capacity(), reader.cache.capacity());
+        assert_eq!(candidate.cache.len(), 0);
+        assert!(
+            candidate
+                .get_with_options(0, &keys[0], &read)
+                .unwrap_err()
+                .to_string()
+                .contains("bang")
+        );
         reader.refresh().unwrap();
         assert_eq!(reader.current_global_snapshot().id, second.id);
         assert!(
@@ -415,6 +426,10 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             .unwrap();
         let mut new_row = old_row.clone();
         new_row[0] = Some(Bytes::from_static(b"sum=7-tail!"));
+        assert_eq!(
+            candidate.get_with_options(0, &keys[0], &read).unwrap(),
+            Some(new_row.clone())
+        );
         for bucket in [0, 1, 0] {
             assert_eq!(
                 reader.get_with_options(bucket, &keys[0], &read).unwrap(),

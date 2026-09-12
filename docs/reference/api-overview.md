@@ -286,6 +286,10 @@ calling `Db::close()` affects all users of that database.
 global snapshot. The proxy handles bucket routing;
 `ReadOnlyTable` only accesses its shard. Both provide typed reads, projections, and scans.
 Projections and scan cursors can outlive the table handle.
+`reader.refresh()?` on a `TableReader` explicitly advances it to the latest committed global snapshot
+and returns whether it changed. It derives the schema from that snapshot, never from the latest
+catalog record. Existing projections, scans, and scan plans remain fixed views; `ReadOnlyTable`
+is always fixed. Refresh does not retain snapshots against external expiration.
 
 `Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
 renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
@@ -299,9 +303,9 @@ builders before opening. See [Table field transforms](../architecture/schema-evo
 To advance a live writable handle, load the intended catalog version and call
 `loaded_table.refresh_writer(&mut writer)?`. It materializes that version's missing schema
 steps and refreshes that handle's local layout, returning whether it changed. Refresh other live
-handles and rebuild old projections after a local schema change; already-created scans and
-snapshot readers remain fixed to their original view. `Table::refresh_schema()` only reloads
-local database metadata and does not read a catalog.
+handles and rebuild old projections after a local schema change. Already-created scans remain
+fixed; snapshot readers only advance through explicit `TableReader::refresh()`.
+`Table::refresh_schema()` only reloads local database metadata and does not read a catalog.
 
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
 Catalog APIs are grouped under `cobble_table::catalog`. With a `FileCatalog`, use the loaded
@@ -316,7 +320,7 @@ change its snapshot location.
 For catalog-backed writers, `open()` creates a shard and `resume()` applies the loaded table
 definition. Explicit snapshot restores and readers use the schema stored in that snapshot.
 Selecting the current global snapshot captures its version when the reader opens; it does not
-automatically follow later snapshots or schema changes.
+automatically follow later snapshots or schema changes without `TableReader::refresh()`.
 `Table::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
 completed `ShardSnapshotMetadata` for opening a reader or submitting to a snapshot coordinator.
 

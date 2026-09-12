@@ -285,6 +285,45 @@ impl Reader {
         self.reload_if_changed(pointer, modified, true)
     }
 
+    /// Build a fixed reader for the latest committed global snapshot.
+    ///
+    /// The original reader remains unchanged. The candidate shares its storage and schema
+    /// resources but starts with an empty shard cache, so no shard is opened eagerly.
+    #[doc(hidden)]
+    pub fn refreshed_snapshot(&self) -> Result<Option<Self>> {
+        let (pointer, modified) = read_manifest_pointer(&self.fs, None)?
+            .ok_or_else(|| Error::IoError("Global snapshot pointer missing".to_string()))?;
+        if self.last_pointer.as_deref() == Some(pointer.as_str()) {
+            return Ok(None);
+        }
+        let global_snapshot = load_global_snapshot_by_name(&self.fs, &pointer)?;
+        if global_snapshot.id == self.global_snapshot.id {
+            return Ok(None);
+        }
+        let bucket_map = build_bucket_map(&global_snapshot)?;
+        let snapshot_id = global_snapshot.id;
+        let mut config = self.config.clone();
+        config.total_buckets = global_snapshot.total_buckets;
+        Ok(Some(Self {
+            config,
+            global_snapshot,
+            bucket_map,
+            cache: LruCache::new(self.cache.capacity()),
+            block_cache: self.block_cache.clone(),
+            fs: Arc::clone(&self.fs),
+            db_id: self.db_id.clone(),
+            metrics_manager: Arc::clone(&self.metrics_manager),
+            last_pointer: Some(pointer),
+            last_pointer_modified: modified,
+            auto_refresh: false,
+            fixed_snapshot_id: Some(snapshot_id),
+            reload_tolerance: self.reload_tolerance,
+            last_refresh_at: Some(Instant::now()),
+            resolver: self.resolver.clone(),
+            transforms: Arc::clone(&self.transforms),
+        }))
+    }
+
     pub fn get(&mut self, bucket_id: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
         self.get_with_options(bucket_id, key, &ReadOptions::default())
     }
