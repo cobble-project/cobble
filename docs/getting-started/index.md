@@ -20,3 +20,4 @@ Start with [Quick Start](quick-start) for runnable examples, then use the focuse
 | [Reader & Distributed Scan](reader-and-scan) | Serve snapshot-following reads or run parallel analytical scans across shards |
 | [Remote Compaction](remote-compaction) | Offload background compaction to dedicated worker nodes |
 | [Structured DB](structured-db) | Type-safe row-oriented wrappers for all of the above |
+| [Table](table) | Named schemas, typed rows, Catalog management, and distributed table reads/writes |
