@@ -83,10 +83,6 @@ where
         self.index.len()
     }
 
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     pub(crate) fn clear(&mut self) {
         self.index.clear();
         self.nodes.clear();

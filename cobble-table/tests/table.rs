@@ -482,9 +482,10 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
     let mut reader_config = config.clone();
     reader_config.total_buckets = 64;
     reader_config.reader.pin_partition_in_memory_count = 1;
+    reader_config.reader.reload_tolerance_seconds = 3600;
     let open_reader = || TableReaderBuilder::new(reader_config.clone()).table_name("events");
     let reader = open_reader().current_global_snapshot().open().unwrap();
-    assert_eq!(reader.schema(), &schema);
+    assert_eq!(reader.schema().as_ref(), &schema);
     let reader_keys = rows
         .iter()
         .map(|row| build_runtime_key(reader.key_builder(), &row[..1]))

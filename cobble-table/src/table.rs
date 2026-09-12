@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
 pub(crate) struct CompiledTable {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     column_family_options: ColumnFamilyOptions,
     key_positions: Vec<usize>,
     key_types: Vec<LogicalType>,
@@ -539,6 +539,10 @@ impl TypedRead {
         &self.compiled.schema
     }
 
+    pub(crate) fn schema_arc(&self) -> Arc<TableSchema> {
+        Arc::clone(&self.compiled.schema)
+    }
+
     /// Start building one primary key in schema order.
     pub fn key_builder(&self) -> TableKeyBuilder {
         TableKeyBuilder {
@@ -960,7 +964,7 @@ pub(crate) fn compile_table(
         .map(|position| metadata.schema.fields[*position].logical_type.clone())
         .collect::<Vec<_>>();
     Ok(Arc::new(CompiledTable {
-        schema: metadata.schema,
+        schema: Arc::new(metadata.schema),
         column_family_options,
         key_positions,
         key_types,

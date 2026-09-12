@@ -194,8 +194,9 @@ use separate versions for multiple transformations.
 Publishing a catalog version does not change existing live writers. To apply one explicit loaded
 version, call `CatalogTable::refresh_writer(&mut table)`: it materializes the missing versions in
 order and refreshes that table layout. Refresh other live handles and rebuild old projections;
-already-created scans keep their fixed view. `TableReader::refresh()` explicitly switches to the
-latest committed global snapshot and derives its schema from that snapshot, not catalog CURRENT;
+already-created scans keep their fixed view. Current `TableReader` instances check for the latest
+committed global snapshot on their configured access interval and derive its schema from that
+snapshot, not catalog CURRENT; `refresh()` performs an explicit check. Fixed snapshot readers,
 old projections, scans, and plans remain fixed, and `ReadOnlyTable` never refreshes.
 `Table::refresh_schema()` reloads only local database metadata.
 

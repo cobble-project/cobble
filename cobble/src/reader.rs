@@ -20,7 +20,7 @@ use serde_json::Error as SerdeError;
 use size::Size;
 use std::collections::HashMap;
 use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -83,7 +83,7 @@ pub struct Reader {
     config: Config,
     global_snapshot: GlobalSnapshotManifest,
     bucket_map: Vec<Option<Arc<BucketSnapshotKey>>>,
-    cache: LruCache<Arc<BucketSnapshotKey>, Arc<ReadOnlyDb>>,
+    cache: Arc<Mutex<LruCache<Arc<BucketSnapshotKey>, Arc<ReadOnlyDb>>>>,
     block_cache: Option<BlockCache>,
     fs: Arc<dyn FileSystem>,
     db_id: String,
@@ -175,7 +175,9 @@ impl Reader {
             config,
             global_snapshot,
             bucket_map,
-            cache: LruCache::new(read_config.pin_partition_in_memory_count),
+            cache: Arc::new(Mutex::new(LruCache::new(
+                read_config.pin_partition_in_memory_count,
+            ))),
             block_cache,
             fs,
             db_id,
@@ -263,7 +265,9 @@ impl Reader {
             config,
             global_snapshot,
             bucket_map,
-            cache: LruCache::new(read_config.pin_partition_in_memory_count),
+            cache: Arc::new(Mutex::new(LruCache::new(
+                read_config.pin_partition_in_memory_count,
+            ))),
             block_cache,
             fs,
             db_id,
@@ -288,7 +292,8 @@ impl Reader {
     /// Build a fixed reader for the latest committed global snapshot.
     ///
     /// The original reader remains unchanged. The candidate shares its storage and schema
-    /// resources but starts with an empty shard cache, so no shard is opened eagerly.
+    /// resources and shard cache, so no shard is opened eagerly and unchanged shards can be
+    /// reused by the new view.
     #[doc(hidden)]
     pub fn refreshed_snapshot(&self) -> Result<Option<Self>> {
         let (pointer, modified) = read_manifest_pointer(&self.fs, None)?
@@ -308,7 +313,7 @@ impl Reader {
             config,
             global_snapshot,
             bucket_map,
-            cache: LruCache::new(self.cache.capacity()),
+            cache: Arc::clone(&self.cache),
             block_cache: self.block_cache.clone(),
             fs: Arc::clone(&self.fs),
             db_id: self.db_id.clone(),
@@ -437,6 +442,15 @@ impl Reader {
         self.fixed_snapshot_id
     }
 
+    /// Return the on-access refresh interval for a current-pointer reader.
+    ///
+    /// This is intended for higher-level readers that pin their initial view and manage their
+    /// own replacement policy. Fixed snapshot readers return `None`.
+    #[doc(hidden)]
+    pub fn auto_refresh_interval(&self) -> Option<Duration> {
+        self.auto_refresh.then_some(self.reload_tolerance)
+    }
+
     /// Freeze a current-pointer reader at the manifest it has already loaded.
     /// This does not reload metadata or open any shard snapshots, and does not
     /// retain the selected snapshot against external expiration.
@@ -497,8 +511,14 @@ impl Reader {
     }
 
     fn load_snapshot(&mut self, key: &Arc<BucketSnapshotKey>) -> Result<Arc<ReadOnlyDb>> {
-        if let Some(db) = self.cache.get(key) {
-            return Ok(Arc::clone(db));
+        if let Some(db) = self
+            .cache
+            .lock()
+            .map_err(|_| Error::IoError("Reader shard cache lock poisoned".to_string()))?
+            .get(key)
+            .cloned()
+        {
+            return Ok(db);
         }
         let shard_metrics_manager = Arc::new(MetricsManager::new(format!(
             "{}-{}",
@@ -513,7 +533,14 @@ impl Reader {
             self.resolver.clone(),
             Arc::clone(&self.transforms),
         )?);
-        self.cache.insert(Arc::clone(key), Arc::clone(&db));
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| Error::IoError("Reader shard cache lock poisoned".to_string()))?;
+        if let Some(existing) = cache.get(key) {
+            return Ok(Arc::clone(existing));
+        }
+        cache.insert(Arc::clone(key), Arc::clone(&db));
         Ok(db)
     }
 
@@ -568,7 +595,6 @@ impl Reader {
         self.bucket_map = bucket_map;
         self.last_pointer = Some(pointer);
         self.last_pointer_modified = modified;
-        self.cache.clear();
         self.last_refresh_at = Some(Instant::now());
         Ok(())
     }

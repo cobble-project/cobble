@@ -6,13 +6,16 @@ use crate::{
     ReadOnlyTable, Result, Table, TableError, TableKey, TableKeyBuilder, TableProjection,
     TableScan, TableSchema, TableWritePlan, Value, register_schema_transforms,
 };
+use arc_swap::{ArcSwap, Guard};
 use bytes::Bytes;
 use cobble::{
     Config, Db, DbBuilder, DbIterator, ReadOnlyDbBuilder, ReadOptions, Reader, ReaderBuilder,
     ReaderConfig, ScanOptions, SchemaTransformRegistrar,
 };
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 type SchemaTransformCallback =
     Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
@@ -235,57 +238,139 @@ fn open_catalog_snapshot(db: Arc<Db>, name: String, table_id: TableId) -> Result
 
 /// A typed global snapshot read proxy.
 pub struct TableReader {
-    typed: TypedRead,
+    typed: ArcSwap<TypedRead>,
+    refresh: AutoRefreshController,
 }
 
+struct AutoRefreshController {
+    interval: Option<Duration>,
+    started_at: Instant,
+    next_check_at: AtomicU64,
+    refreshing: Mutex<()>,
+}
+
+impl AutoRefreshController {
+    fn new(interval: Option<Duration>) -> Self {
+        let started_at = Instant::now();
+        let next_check_at = interval.map_or(0, duration_nanos);
+        Self {
+            interval,
+            started_at,
+            next_check_at: AtomicU64::new(next_check_at),
+            refreshing: Mutex::new(()),
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.interval.is_some()
+            && self.elapsed_nanos() >= self.next_check_at.load(Ordering::Acquire)
+    }
+
+    fn schedule_next_check(&self) {
+        let Some(interval) = self.interval else {
+            return;
+        };
+        self.next_check_at.store(
+            self.elapsed_nanos()
+                .saturating_add(duration_nanos(interval)),
+            Ordering::Release,
+        );
+    }
+
+    fn elapsed_nanos(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.refreshing
+            .lock()
+            .map_err(|_| TableError::internal("table reader refresh lock poisoned"))
+    }
+
+    fn try_lock(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>> {
+        match self.refreshing.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err(TableError::internal("table reader refresh lock poisoned"))
+            }
+        }
+    }
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/runtime.rs"]
+mod tests;
+
 impl TableReader {
-    /// Open and pin the current snapshot carried by this core reader.
+    /// Open the snapshot carried by this core reader.
+    ///
+    /// Readers opened from a core current-pointer reader check for later committed snapshots on
+    /// its configured interval. Core fixed-snapshot readers remain fixed.
     pub fn open(mut reader: Reader, name: impl Into<String>) -> Result<Self> {
+        let refresh_interval = reader.auto_refresh_interval();
         reader.pin_current_snapshot();
         let name = validate_name(name.into())?;
         let metadata = global_metadata(&reader, &name)?;
-        Self::from_metadata(reader, name, metadata)
+        Self::from_metadata(reader, name, metadata, refresh_interval)
     }
 
-    fn from_metadata(reader: Reader, name: String, metadata: TableMetadata) -> Result<Self> {
+    fn from_metadata(
+        reader: Reader,
+        name: String,
+        metadata: TableMetadata,
+        refresh_interval: Option<Duration>,
+    ) -> Result<Self> {
         let state = Arc::new(GlobalReaderState::new(
             reader,
             name.clone(),
             metadata.clone(),
         ));
         Ok(Self {
-            typed: TypedRead::from_global_metadata(state, name, metadata)?,
+            typed: ArcSwap::from_pointee(TypedRead::from_global_metadata(state, name, metadata)?),
+            refresh: AutoRefreshController::new(refresh_interval),
         })
     }
 
-    /// Return the persisted semantic schema of this table.
-    pub fn schema(&self) -> &TableSchema {
-        self.typed.schema()
+    /// Return the schema of this reader's currently loaded global snapshot.
+    ///
+    /// This accessor never checks `CURRENT`. A later fallible read may refresh a current-pointer
+    /// reader; call [`Self::refresh`] before schema inspection when the latest committed snapshot
+    /// is required.
+    pub fn schema(&self) -> Arc<TableSchema> {
+        self.typed.load().schema_arc()
     }
 
     /// Start building one primary key in schema order.
     pub fn key_builder(&self) -> TableKeyBuilder {
-        self.typed.key_builder()
+        self.typed.load().key_builder()
     }
 
     /// Compile a reusable read projection from top-level field names.
     pub fn project_by_names<S: AsRef<str>>(&self, field_names: &[S]) -> Result<TableProjection> {
-        self.typed.project_by_names(field_names)
+        self.view_for_access()?.project_by_names(field_names)
     }
 
     /// Read one row by primary key.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
-        self.typed.get(key)
+        self.view_for_access()?.get(key)
     }
 
     /// Read many primary keys while preserving order and duplicates.
     pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
-        self.typed.multi_get(keys)
+        self.view_for_access()?.multi_get(keys)
     }
 
     /// Scan all rows in one bucket.
     pub fn scan(&self, bucket: u16) -> Result<TableScan> {
-        self.typed.scan(bucket)
+        self.view_for_access()?.scan(bucket)
     }
 
     /// Scan one bucket from an inclusive primary-key bound to an exclusive bound.
@@ -295,26 +380,54 @@ impl TableReader {
         start_key_inclusive: Option<&TableKey>,
         end_key_exclusive: Option<&TableKey>,
     ) -> Result<TableScan> {
-        self.typed
+        self.view_for_access()?
             .scan_bounds(bucket, start_key_inclusive, end_key_exclusive)
     }
 
     /// Build a portable full-scan plan pinned to this reader's current snapshot.
     pub fn scan_plan(&self) -> Result<crate::TableScanPlan> {
-        let state = self
-            .typed
+        let typed = self.view_for_access()?;
+        let state = typed
             .global_state()
             .ok_or_else(|| TableError::internal("table reader is missing its global read state"))?;
         state.scan_plan()
     }
 
-    /// Refresh this reader to the latest committed global snapshot.
+    /// Refresh this current-pointer reader to the latest committed global snapshot.
     ///
     /// Existing projections, scans, and scan plans retain their current fixed view. If the
     /// current pointer is unchanged, this returns `false`; an error leaves this reader unchanged.
-    pub fn refresh(&mut self) -> Result<bool> {
-        let state = self
-            .typed
+    /// Fixed snapshot readers always return `false`.
+    pub fn refresh(&self) -> Result<bool> {
+        if self.refresh.interval.is_none() {
+            return Ok(false);
+        }
+        let _guard = self.refresh.lock()?;
+        let result = self.refresh_loaded_view();
+        self.refresh.schedule_next_check();
+        result
+    }
+
+    fn view_for_access(&self) -> Result<Guard<Arc<TypedRead>>> {
+        let view = self.typed.load();
+        if !self.refresh.due() {
+            return Ok(view);
+        }
+        let Some(_guard) = self.refresh.try_lock()? else {
+            return Ok(view);
+        };
+        drop(view);
+        if self.refresh.due() {
+            let refreshed = self.refresh_loaded_view();
+            self.refresh.schedule_next_check();
+            refreshed?;
+        }
+        Ok(self.typed.load())
+    }
+
+    fn refresh_loaded_view(&self) -> Result<bool> {
+        let typed = self.typed.load_full();
+        let state = typed
             .global_state()
             .ok_or_else(|| TableError::internal("table reader is missing its global read state"))?;
         let Some((reader, name, previous_table_id)) = state.refreshed_snapshot()? else {
@@ -326,13 +439,18 @@ impl TableReader {
                 "refreshed global snapshot belongs to a different catalog table".into(),
             ));
         }
-        let refreshed = Self::from_metadata(reader, name, metadata)?;
-        self.typed = refreshed.typed;
+        let state = Arc::new(GlobalReaderState::new(
+            reader,
+            name.clone(),
+            metadata.clone(),
+        ));
+        let typed = TypedRead::from_global_metadata(state, name, metadata)?;
+        self.typed.store(Arc::new(typed));
         Ok(true)
     }
 }
 
-/// Builder for a global typed reader pinned to one snapshot selection.
+/// Builder for a global typed reader from a fixed or current snapshot selection.
 pub struct TableReaderBuilder {
     config: Config,
     table_name: Option<String>,
@@ -377,7 +495,7 @@ impl TableReaderBuilder {
         self
     }
 
-    /// Capture CURRENT once and freeze that manifest as a fixed view.
+    /// Open the current committed snapshot and check for later commits on access intervals.
     pub fn current_global_snapshot(mut self) -> Self {
         self.selection = Some(TableReaderSelection::CurrentGlobal);
         self
@@ -408,10 +526,11 @@ impl TableReaderBuilder {
             TableReaderSelection::Global { snapshot_id } => builder.open(snapshot_id)?,
             TableReaderSelection::CurrentGlobal => builder.open_current()?,
         };
+        let refresh_interval = reader.auto_refresh_interval();
         reader.pin_current_snapshot();
         let metadata = global_metadata(&reader, &name)?;
         validate_catalog_binding(&metadata, self.catalog_table_id)?;
-        TableReader::from_metadata(reader, name, metadata)
+        TableReader::from_metadata(reader, name, metadata, refresh_interval)
     }
 
     fn required_table_name(&self) -> Result<String> {

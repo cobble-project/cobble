@@ -293,7 +293,7 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
         let mut reader = ReaderBuilder::new(reader_config.clone())
             .open_current()
             .unwrap();
-        assert_eq!(reader.cache.len(), 0);
+        assert_eq!(reader.cache.lock().unwrap().len(), 0);
         assert!(
             reader
                 .get_with_options(0, &keys[0], &read)
@@ -301,7 +301,7 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
                 .to_string()
                 .contains("render")
         );
-        assert_eq!(reader.cache.len(), 0);
+        assert_eq!(reader.cache.lock().unwrap().len(), 0);
         reader
             .register_schema_transform("render", move |_spec| Ok(render))
             .unwrap();
@@ -316,7 +316,7 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
                 Some(old_row.clone()),
                 "bucket {bucket}, format {file_type:?}"
             );
-            assert_eq!(reader.cache.len(), 1);
+            assert_eq!(reader.cache.lock().unwrap().len(), 1);
         }
         assert_eq!(
             reader
@@ -403,8 +403,8 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
         let second = publish(&shards);
         let mut candidate = reader.refreshed_snapshot().unwrap().unwrap();
         assert_eq!(candidate.current_global_snapshot().id, second.id);
-        assert_eq!(candidate.cache.capacity(), reader.cache.capacity());
-        assert_eq!(candidate.cache.len(), 0);
+        assert!(Arc::ptr_eq(&candidate.cache, &reader.cache));
+        assert_eq!(candidate.cache.lock().unwrap().len(), 1);
         assert!(
             candidate
                 .get_with_options(0, &keys[0], &read)
@@ -522,24 +522,42 @@ fn test_read_proxy_routes_and_evicts() {
     .unwrap();
     let value_a = proxy.get(0, b"key-a").unwrap();
     assert!(value_a.is_none());
-    assert_eq!(proxy.cache.len(), 1);
-    assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
-        db_id: db_a.clone(),
-        snapshot_id: snap_a,
-    })));
+    assert_eq!(proxy.cache.lock().unwrap().len(), 1);
+    assert!(
+        proxy
+            .cache
+            .lock()
+            .unwrap()
+            .contains_key(&Arc::new(BucketSnapshotKey {
+                db_id: db_a.clone(),
+                snapshot_id: snap_a,
+            }))
+    );
 
     proxy.reload_tolerance = Duration::from_millis(0);
     let value_b = proxy.get(3, b"key-b").unwrap();
     assert!(value_b.is_none());
-    assert_eq!(proxy.cache.len(), 1);
-    assert!(!proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
-        db_id: db_a,
-        snapshot_id: snap_a,
-    })));
-    assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
-        db_id: db_b,
-        snapshot_id: snap_b,
-    })));
+    assert_eq!(proxy.cache.lock().unwrap().len(), 1);
+    assert!(
+        !proxy
+            .cache
+            .lock()
+            .unwrap()
+            .contains_key(&Arc::new(BucketSnapshotKey {
+                db_id: db_a,
+                snapshot_id: snap_a,
+            }))
+    );
+    assert!(
+        proxy
+            .cache
+            .lock()
+            .unwrap()
+            .contains_key(&Arc::new(BucketSnapshotKey {
+                db_id: db_b,
+                snapshot_id: snap_b,
+            }))
+    );
 
     let values = proxy
         .multi_get(&[
@@ -564,10 +582,13 @@ fn test_read_proxy_refreshes_on_pointer_change() {
         .unwrap();
     let db_a = "db-a".to_string();
     let db_b = "db-b".to_string();
+    let db_c = "db-c".to_string();
     let snap_a = 10;
     let snap_b = 20;
+    let snap_c = 30;
     let path_a = create_bucket_manifest(Arc::clone(&fs), root, &db_a, snap_a);
     let path_b = create_bucket_manifest(Arc::clone(&fs), root, &db_b, snap_b);
+    let path_c = create_bucket_manifest(Arc::clone(&fs), root, &db_c, snap_c);
 
     let coordinator = DbCoordinator::open(CoordinatorConfig {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -577,17 +598,30 @@ fn test_read_proxy_refreshes_on_pointer_change() {
     let global_a = coordinator
         .take_global_snapshot(
             4,
-            vec![ShardSnapshotMetadata {
-                ranges: vec![0u16..=3u16],
-                schema_id: 0,
-                column_families: default_column_families(),
-                db_id: db_a.clone(),
-                snapshot_id: snap_a,
-                manifest_path: path_a,
-                timestamp_seconds: 0,
-                data_size_bytes: 0,
-                incremental_data_size_bytes: 0,
-            }],
+            vec![
+                ShardSnapshotMetadata {
+                    ranges: vec![0u16..=1u16],
+                    schema_id: 0,
+                    column_families: default_column_families(),
+                    db_id: db_a.clone(),
+                    snapshot_id: snap_a,
+                    manifest_path: path_a.clone(),
+                    timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
+                },
+                ShardSnapshotMetadata {
+                    ranges: vec![2u16..=3u16],
+                    schema_id: 0,
+                    column_families: default_column_families(),
+                    db_id: db_b,
+                    snapshot_id: snap_b,
+                    manifest_path: path_b,
+                    timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
+                },
+            ],
         )
         .unwrap();
     coordinator.materialize_global_snapshot(&global_a).unwrap();
@@ -601,40 +635,95 @@ fn test_read_proxy_refreshes_on_pointer_change() {
     .unwrap();
     proxy.reload_tolerance = Duration::from_millis(0);
     let _ = proxy.get(0, b"key").unwrap();
-    assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
-        db_id: db_a.clone(),
-        snapshot_id: snap_a,
-    })));
+    assert!(
+        proxy
+            .cache
+            .lock()
+            .unwrap()
+            .contains_key(&Arc::new(BucketSnapshotKey {
+                db_id: db_a.clone(),
+                snapshot_id: snap_a,
+            }))
+    );
 
     let global_b = coordinator
         .take_global_snapshot(
             4,
-            vec![ShardSnapshotMetadata {
-                ranges: vec![0u16..=3u16],
-                schema_id: 0,
-                column_families: default_column_families(),
-                db_id: db_b.clone(),
-                snapshot_id: snap_b,
-                manifest_path: path_b,
-                timestamp_seconds: 0,
-                data_size_bytes: 0,
-                incremental_data_size_bytes: 0,
-            }],
+            vec![
+                ShardSnapshotMetadata {
+                    ranges: vec![0u16..=1u16],
+                    schema_id: 0,
+                    column_families: default_column_families(),
+                    db_id: db_a.clone(),
+                    snapshot_id: snap_a,
+                    manifest_path: path_a,
+                    timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
+                },
+                ShardSnapshotMetadata {
+                    ranges: vec![2u16..=3u16],
+                    schema_id: 0,
+                    column_families: default_column_families(),
+                    db_id: db_c.clone(),
+                    snapshot_id: snap_c,
+                    manifest_path: path_c,
+                    timestamp_seconds: 0,
+                    data_size_bytes: 0,
+                    incremental_data_size_bytes: 0,
+                },
+            ],
         )
         .unwrap();
     coordinator.materialize_global_snapshot(&global_b).unwrap();
     wait_for_pointer(root, global_b.id);
 
+    let reused = proxy
+        .cache
+        .lock()
+        .unwrap()
+        .get(&Arc::new(BucketSnapshotKey {
+            db_id: db_a.clone(),
+            snapshot_id: snap_a,
+        }))
+        .cloned()
+        .unwrap();
+    let mut candidate = proxy.refreshed_snapshot().unwrap().unwrap();
+    let _ = candidate.get(0, b"key").unwrap();
+    let candidate_reused = candidate
+        .cache
+        .lock()
+        .unwrap()
+        .get(&Arc::new(BucketSnapshotKey {
+            db_id: db_a.clone(),
+            snapshot_id: snap_a,
+        }))
+        .cloned()
+        .unwrap();
+    assert!(Arc::ptr_eq(&reused, &candidate_reused));
+
     proxy.refresh().unwrap();
-    let _ = proxy.get(0, b"key").unwrap();
-    assert!(proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
-        db_id: db_b,
-        snapshot_id: snap_b,
-    })));
-    assert!(!proxy.cache.contains_key(&Arc::new(BucketSnapshotKey {
-        db_id: db_a,
-        snapshot_id: snap_a,
-    })));
+    let _ = proxy.get(3, b"key").unwrap();
+    assert!(
+        proxy
+            .cache
+            .lock()
+            .unwrap()
+            .contains_key(&Arc::new(BucketSnapshotKey {
+                db_id: db_c,
+                snapshot_id: snap_c,
+            }))
+    );
+    assert!(
+        !proxy
+            .cache
+            .lock()
+            .unwrap()
+            .contains_key(&Arc::new(BucketSnapshotKey {
+                db_id: db_a,
+                snapshot_id: snap_a,
+            }))
+    );
 
     cleanup_root(root);
 }

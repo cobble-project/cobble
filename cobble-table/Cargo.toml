@@ -10,6 +10,7 @@ keywords = ["database", "schema", "table"]
 categories = ["database-implementations"]
 
 [dependencies]
+arc-swap = { workspace = true }
 cobble = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

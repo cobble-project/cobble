@@ -208,12 +208,23 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     )));
     assert!(!properties.contains("catalog-runtime-secret"));
 
-    let mut reader = users
-        .reader_builder(runtime.clone())
+    let mut manual_reader_runtime = runtime.clone();
+    manual_reader_runtime.reader.reload_tolerance_seconds = 3600;
+    let reader = users
+        .reader_builder(manual_reader_runtime)
         .unwrap()
         .current_global_snapshot()
         .open()
         .unwrap();
+    let mut auto_runtime = runtime.clone();
+    auto_runtime.reader.reload_tolerance_seconds = 0;
+    let auto_reader = users
+        .reader_builder(auto_runtime)
+        .unwrap()
+        .current_global_snapshot()
+        .open()
+        .unwrap();
+    assert_eq!(auto_reader.schema().as_ref(), &schema);
     assert_eq!(
         reader.multi_get(&keys).unwrap(),
         rows.iter().cloned().map(Some).collect::<Vec<_>>()
@@ -388,18 +399,14 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         )
         .unwrap();
     assert!(!reader.refresh().unwrap());
-    assert_eq!(reader.schema(), &schema);
+    assert_eq!(reader.schema().as_ref(), &schema);
+    assert_eq!(auto_reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
     let old_reader = evolved
         .reader_builder(runtime.clone())
         .unwrap()
         .global_snapshot(first.id)
         .open()
         .unwrap();
-    assert_eq!(old_reader.schema(), &schema);
-    assert_eq!(
-        old_reader.get(&keys[left_index]).unwrap(),
-        Some(rows[left_index].clone())
-    );
     assert_eq!(table_field_count(&left_snapshot), 3);
     let intermediate = warehouse.join(format!(
         "warehouse/catalog/tables/TABLE-{}/schemas/SCHEMA-1",
@@ -571,10 +578,19 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .commit_batch(2, vec![resumed_snapshot.clone(), resumed_right_snapshot])
         .unwrap()
         .unwrap();
+    assert_eq!(auto_reader.schema().as_ref(), &schema);
+    assert_eq!(old_reader.schema().as_ref(), &schema);
+    assert!(!old_reader.refresh().unwrap());
+    assert_eq!(
+        old_reader.get(&keys[left_index]).unwrap(),
+        Some(rows[left_index].clone())
+    );
     let current_path = user_root.join("snapshot/CURRENT");
     let valid_current = std::fs::read(&current_path).unwrap();
     std::fs::write(&current_path, b"corrupt global current\n").unwrap();
     assert!(reader.refresh().is_err());
+    assert!(auto_reader.get(&keys[0]).is_err());
+    assert_eq!(auto_reader.schema().as_ref(), &schema);
     assert_eq!(reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
     std::fs::write(&current_path, &valid_current).unwrap();
     let candidate_manifest = std::path::PathBuf::from(
@@ -586,13 +602,15 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let unavailable_manifest = candidate_manifest.with_extension("unavailable");
     std::fs::rename(&candidate_manifest, &unavailable_manifest).unwrap();
     assert!(reader.refresh().is_err());
-    assert_eq!(reader.schema(), &schema);
+    assert!(auto_reader.get(&keys[0]).is_err());
+    assert_eq!(auto_reader.schema().as_ref(), &schema);
+    assert_eq!(reader.schema().as_ref(), &schema);
     assert_eq!(reader.get(&keys[0]).unwrap(), Some(rows[0].clone()));
     assert_eq!(reader.scan_plan().unwrap().snapshot_id(), first.id);
     std::fs::rename(&unavailable_manifest, &candidate_manifest).unwrap();
     assert!(reader.refresh().unwrap());
     assert!(!reader.refresh().unwrap());
-    assert_eq!(reader.schema(), evolved.schema());
+    assert_eq!(reader.schema().as_ref(), evolved.schema());
     let evolved_reader = evolved
         .reader_builder(runtime.clone())
         .unwrap()
@@ -629,6 +647,15 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             .map(Some)
             .collect::<Vec<_>>()
     );
+    assert_eq!(
+        auto_reader.multi_get(&keys).unwrap(),
+        transformed_rows
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(auto_reader.schema().as_ref(), evolved.schema());
     assert_eq!(
         old_projection.get(&keys[0]).unwrap(),
         Some(vec![rows[0][2].clone()])

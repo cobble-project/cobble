@@ -247,10 +247,10 @@ exclusive-end semantics as raw `Db`.
 |------|-------------|
 | `TableWriterBuilder` | Open a writable shard and return a `Table` |
 | `ReadOnlyTableBuilder` | Open a fixed shard snapshot and return a `ReadOnlyTable` |
-| `TableReaderBuilder` | Open a fixed global snapshot and return a `TableReader` |
+| `TableReaderBuilder` | Open a fixed or current global snapshot and return a `TableReader` |
 | `Table` | Typed reads, writes, and snapshots over a shared `Arc<Db>` |
 | `ReadOnlyTable` | Typed reads from one shard over a shared `Arc<ReadOnlyDb>` |
-| `TableReader` | Read proxy over a pinned global `Reader`, routing requests across shards |
+| `TableReader` | Read proxy over a global `Reader`, routing requests across shards |
 | `TableSchema` / `TableKey` | Logical row structure and reusable encoded primary keys |
 | `TableProjection` | Reusable field selection for typed reads and scans |
 | `SchemaChange` | Add, rename, drop, or transform top-level fields by name while retaining stable field identities |
@@ -282,14 +282,16 @@ Dropping a table releases its reference without explicitly closing the shared da
 calling `Db::close()` affects all users of that database.
 
 `ReadOnlyTable::open(Arc::clone(&db), name)` uses an existing read-only shard.
-`TableReader::open(reader, name)` takes ownership of a core `Reader` and pins its current
-global snapshot. The proxy handles bucket routing;
+`TableReader::open(reader, name)` takes ownership of a core `Reader`. A reader opened from core
+`CURRENT` checks for later committed global snapshots on its configured access interval; an
+explicit core snapshot stays fixed. The proxy handles bucket routing;
 `ReadOnlyTable` only accesses its shard. Both provide typed reads, projections, and scans.
 Projections and scan cursors can outlive the table handle.
-`reader.refresh()?` on a `TableReader` explicitly advances it to the latest committed global snapshot
-and returns whether it changed. It derives the schema from that snapshot, never from the latest
-catalog record. Existing projections, scans, and scan plans remain fixed views; `ReadOnlyTable`
-is always fixed. Refresh does not retain snapshots against external expiration.
+`reader.refresh()?` on a current `TableReader` explicitly checks the latest committed global
+snapshot and returns whether it changed; fixed readers return `false`. It derives the schema from
+that snapshot, never from the latest catalog record. `reader.schema()` reports the currently
+loaded view without I/O. Existing projections, scans, and scan plans remain fixed views;
+`ReadOnlyTable` is always fixed. Refresh does not retain snapshots against external expiration.
 
 `Catalog::evolve_schema` accepts `SchemaChange` values. Added fields must be nullable;
 renaming preserves the field ID, and deleted IDs are never reused. Publishing a catalog
@@ -304,7 +306,8 @@ To advance a live writable handle, load the intended catalog version and call
 `loaded_table.refresh_writer(&mut writer)?`. It materializes that version's missing schema
 steps and refreshes that handle's local layout, returning whether it changed. Refresh other live
 handles and rebuild old projections after a local schema change. Already-created scans remain
-fixed; snapshot readers only advance through explicit `TableReader::refresh()`.
+fixed; current snapshot readers check for commits on later fallible accesses or explicit
+`TableReader::refresh()`.
 `Table::refresh_schema()` only reloads local database metadata and does not read a catalog.
 
 Standalone readers and writers open storage directly from configuration; a catalog is not required.
@@ -319,8 +322,8 @@ unchanged. Table directories follow stable IDs, so renaming a table does not mov
 change its snapshot location.
 For catalog-backed writers, `open()` creates a shard and `resume()` applies the loaded table
 definition. Explicit snapshot restores and readers use the schema stored in that snapshot.
-Selecting the current global snapshot captures its version when the reader opens; it does not
-automatically follow later snapshots or schema changes without `TableReader::refresh()`.
+Selecting the current global snapshot loads its current version and checks for later committed
+snapshots on its configured access interval. Selecting `global_snapshot(id)` is always fixed.
 `Table::snapshot()` starts an asynchronous snapshot; `snapshot_and_wait()` returns the
 completed `ShardSnapshotMetadata` for opening a reader or submitting to a snapshot coordinator.
 
