@@ -16,6 +16,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TableCodecTest {
     @Test
@@ -68,6 +69,10 @@ class TableCodecTest {
         assertEquals(fixture.get("value_hex").getAsString(), hex(encoded));
         Value decoded = ValueCodec.decode(type, direct);
         assertEquals(value, decoded);
+        ByteBuffer binaryInput = ByteBuffer.wrap(new byte[] {0, (byte) 0xff});
+        Value borrowedBinary = ValueCodec.decode(LogicalTypes.binary(), binaryInput);
+        assertEquals(binaryInput.limit(), binaryInput.position());
+        assertTrue(((ByteBuffer) borrowedBinary.raw()).isReadOnly());
         ByteBuffer ownedInput = ByteBuffer.allocateDirect(encoded.length);
         ownedInput.put(encoded);
         ((Buffer) ownedInput).flip();

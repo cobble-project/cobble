@@ -267,9 +267,9 @@ public final class ValueCodec {
                         input.get(bytes);
                         return Value.binary(ByteBuffer.wrap(bytes));
                     }
-                    ByteBuffer slice = input.asReadOnlyBuffer().slice();
+                    Value value = Value.binary(input);
                     ((Buffer) input).position(input.limit());
-                    return Value.binary(slice);
+                    return value;
                 }
             case LIST:
                 {
