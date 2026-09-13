@@ -340,11 +340,7 @@ class DbBindingTest {
                                     .push(defaultRow.get(1))
                                     .build()));
             assertNull(
-                    table.get(
-                            table.keyBuilder()
-                                    .push(ttlRow.get(0))
-                                    .push(ttlRow.get(1))
-                                    .build()));
+                    table.get(table.keyBuilder().push(ttlRow.get(0)).push(ttlRow.get(1)).build()));
             assertNull(
                     table.get(
                             table.keyBuilder()
@@ -498,6 +494,14 @@ class DbBindingTest {
                                 .build();
                 assertEquals(row2, readOnly.get(readOnlyKey2));
                 assertNull(readOnly.get(readOnlyMissing));
+                ByteBuffer readOnlyDirectKey = ByteBuffer.allocateDirect(256);
+                assertNull(readOnly.getDirect(readOnlyMissing, readOnlyDirectKey));
+                try (DirectTableRow first = readOnly.getDirect(readOnlyKey2, readOnlyDirectKey);
+                        DirectTableRow second =
+                                readOnly.getDirect(readOnlyKey3, readOnlyDirectKey)) {
+                    assertEquals(row2, first.values());
+                    assertEquals(row3, second.values());
+                }
                 assertEquals(
                         Arrays.asList(row3, row2, row3, null),
                         readOnly.multiGet(
@@ -536,6 +540,14 @@ class DbBindingTest {
                     for (List<Value> row : cursor) rows.add(row);
                 }
                 assertEquals(Arrays.asList(row2, row3, defaultRow, durableRow), rows);
+                DirectTableRow retainedReadOnly =
+                        readOnly.getDirect(readOnlyKey2, readOnlyDirectKey);
+                readOnly.close();
+                try {
+                    assertEquals(row2, retainedReadOnly.values());
+                } finally {
+                    retainedReadOnly.close();
+                }
             }
 
             try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
@@ -776,14 +788,12 @@ class DbBindingTest {
                     assertEquals(pendingSnapshot.snapshotId(), ownedSnapshot.snapshotId);
                     ShardSnapshot loadedSnapshot =
                             owned.getShardSnapshot(pendingSnapshot.snapshotId());
-                    assertEquals(
-                            ownedSnapshot.snapshotId, loadedSnapshot.snapshotId);
+                    assertEquals(ownedSnapshot.snapshotId, loadedSnapshot.snapshotId);
                     assertEquals(ownedSnapshot.manifestPath, loadedSnapshot.manifestPath);
                     assertEquals(ownedSnapshot.schemaId, loadedSnapshot.schemaId);
                     ShardSnapshot synchronousSnapshot = owned.snapshot();
                     assertTrue(synchronousSnapshot.snapshotId > ownedSnapshot.snapshotId);
-                    assertThrows(
-                            IllegalArgumentException.class, () -> owned.getShardSnapshot(-1L));
+                    assertThrows(IllegalArgumentException.class, () -> owned.getShardSnapshot(-1L));
                     ownedGlobal = committer.submit(1L, ownedSnapshot);
                     assertNotNull(ownedGlobal);
                 } finally {
@@ -911,6 +921,8 @@ class DbBindingTest {
                         latest.projectByNames(Collections.singletonList("score"));
                 TableScanCursor oldScan = latest.scan(oldKey.bucket());
                 TableScanCursor oldProjectionScan = oldProjection.scan(oldKey.bucket());
+                ByteBuffer readerDirectKey = ByteBuffer.allocateDirect(256);
+                DirectTableRow retainedDirect = null;
                 try {
                     // The catalog is already widened, but CURRENT still selects the old snapshot.
                     assertEquals(
@@ -954,6 +966,19 @@ class DbBindingTest {
                     assertEquals(
                             Arrays.asList(widenedRow, widenedRow),
                             latest.multiGet(Arrays.asList(oldKey, oldKey)));
+                    try (DirectTableRow latestDirect = latest.getDirect(oldKey, readerDirectKey);
+                            DirectTableRow fixedDirect =
+                                    fixed.getDirect(
+                                            fixed.keyBuilder()
+                                                    .push(oldRow.get(0))
+                                                    .push(oldRow.get(1))
+                                                    .build(),
+                                            readerDirectKey)) {
+                        assertEquals(widenedRow, latestDirect.values());
+                        assertEquals(oldRow, fixedDirect.values());
+                    }
+                    retainedDirect = latest.getDirect(oldKey, readerDirectKey);
+                    assertEquals(widenedRow, retainedDirect.values());
                     assertFalse(fixed.refresh());
                     assertEquals(
                             oldRow,
@@ -974,8 +999,10 @@ class DbBindingTest {
                     assertTrue(latest.refresh());
                     assertFalse(latest.refresh());
                     assertEquals(newestRow, latest.get(oldKey));
+                    assertEquals(widenedRow, retainedDirect.values());
 
                     latest.close();
+                    assertEquals(widenedRow, retainedDirect.values());
                     assertEquals(
                             Collections.singletonList(oldRow.get(2)), oldProjection.get(oldKey));
                     oldProjection.close();
@@ -985,6 +1012,7 @@ class DbBindingTest {
                     assertEquals(oldRow, oldScan.nextRow());
                     assertNull(oldScan.nextRow());
                 } finally {
+                    if (retainedDirect != null) retainedDirect.close();
                     oldProjectionScan.close();
                     oldScan.close();
                     oldProjection.close();

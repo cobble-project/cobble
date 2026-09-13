@@ -1,10 +1,12 @@
 package io.cobble.table;
 
 import io.cobble.Config;
+import io.cobble.DirectColumns;
 import io.cobble.DirectScanCursor;
 import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -17,6 +19,18 @@ public final class TableReader extends NativeObject {
     private volatile Table.TableState state;
     private TableReaderView view;
     private long nextRefreshNanos;
+    private final DirectColumns.Reader directReader =
+            new DirectColumns.Reader() {
+                @Override
+                public int read(int bucket, ByteBuffer ioBuffer, int keyLength) {
+                    return view.getEncodedDirect(bucket, ioBuffer, keyLength, state.readOptions);
+                }
+
+                @Override
+                public ByteBuffer takeOverflowBuffer() {
+                    return view.takeDirectOverflowBuffer();
+                }
+            };
 
     private TableReader(long nativeHandle, String name) {
         super(nativeHandle);
@@ -91,6 +105,17 @@ public final class TableReader extends NativeObject {
         return columns == null
                 ? null
                 : Table.assembleRow(currentState.compiled, key.valuesInternal(), columns);
+    }
+
+    /**
+     * Reads one row through direct I/O and decodes a borrowed typed view.
+     *
+     * <p>Binary values, including nested binary values, remain valid only until the returned row is
+     * closed. The key buffer is overwritten from position zero.
+     */
+    public synchronized DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
+        access();
+        return Table.readDirectRow(state.compiled, key, keyBuffer, directReader);
     }
 
     public synchronized List<List<Value>> multiGet(List<TableKey> keys) {

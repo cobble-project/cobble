@@ -1,10 +1,12 @@
 package io.cobble.table;
 
+import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
 import io.cobble.ReadOnlyDb;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -25,6 +27,7 @@ public final class ReadOnlyTable implements AutoCloseable {
     private final int physicalColumns;
     private final ReadOptions readOptions;
     private final ScanOptions scanOptions;
+    private final DirectColumns.Reader directReader;
     private volatile boolean closed;
 
     private ReadOnlyTable(ReadOnlyDb db, String name, Table.OpenInfo openInfo) {
@@ -50,6 +53,23 @@ public final class ReadOnlyTable implements AutoCloseable {
                     physicalColumns);
             this.readOptions = readOptions;
             this.scanOptions = scanOptions;
+            this.directReader =
+                    new DirectColumns.Reader() {
+                        @Override
+                        public int read(int bucket, ByteBuffer ioBuffer, int keyLength) {
+                            return getEncodedDirectNative(
+                                    db.getNativeHandle(),
+                                    bucket,
+                                    ioBuffer,
+                                    keyLength,
+                                    ReadOnlyTable.this.readOptions.getNativeHandle());
+                        }
+
+                        @Override
+                        public ByteBuffer takeOverflowBuffer() {
+                            return takeDirectOverflowNative();
+                        }
+                    };
         } catch (RuntimeException error) {
             if (scanOptions != null) scanOptions.close();
             if (readOptions != null) readOptions.close();
@@ -97,6 +117,17 @@ public final class ReadOnlyTable implements AutoCloseable {
         Objects.requireNonNull(key, "key");
         byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), readOptions);
         return columns == null ? null : Table.assembleRow(compiled, key.valuesInternal(), columns);
+    }
+
+    /**
+     * Reads one row through direct I/O and decodes a borrowed typed view.
+     *
+     * <p>Binary values, including nested binary values, remain valid only until the returned row is
+     * closed. The key buffer is overwritten from position zero.
+     */
+    public DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
+        ensureUsable();
+        return Table.readDirectRow(compiled, key, keyBuffer, directReader);
     }
 
     /** Reads keys in one native multi-get while preserving input order and duplicates. */
@@ -158,4 +189,9 @@ public final class ReadOnlyTable implements AutoCloseable {
     }
 
     private static native String openNative(long dbHandle, String name);
+
+    private static native int getEncodedDirectNative(
+            long dbHandle, int bucket, ByteBuffer buffer, int keyLength, long options);
+
+    private static native ByteBuffer takeDirectOverflowNative();
 }

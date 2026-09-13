@@ -3,6 +3,7 @@ use crate::scan::{
     ScanCursorHandle, decode_scan_open_bounds_args, scan_options_from_handle_or_throw,
 };
 use crate::table::table_open_response;
+use crate::table_direct::{encode_direct_get, take_direct_overflow};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
@@ -11,7 +12,9 @@ use crate::util::{
 use cobble_binding::Config;
 use cobble_table::{TableReader, TableReaderBuilder, ffi};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue};
+use jni::objects::{
+    JByteArray, JByteBuffer, JClass, JIntArray, JObject, JObjectArray, JString, JValue,
+};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 
 struct TableReaderHandle(TableReader);
@@ -293,6 +296,35 @@ pub extern "system" fn Java_io_cobble_table_TableReaderView_get(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_TableReaderView_getEncodedDirectNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    view_handle: jlong,
+    bucket: jint,
+    buffer: JByteBuffer,
+    key_length: jint,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(view) = view_from_handle_or_throw(&mut env, view_handle) else {
+        return 0;
+    };
+    let Some(options) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
+        return 0;
+    };
+    encode_direct_get(&mut env, bucket, buffer, key_length, |bucket, key| {
+        view.get(bucket, key, options.read_options())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_TableReaderView_takeDirectOverflowNative(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    take_direct_overflow(&mut env)
 }
 
 #[unsafe(no_mangle)]

@@ -141,12 +141,19 @@ Use `Table.create(db, name, schema)` or `Table.open(db, name)` for typed writes 
 an existing Db; `ReadOnlyTable.open(readOnlyDb, name)` opens a shard snapshot table.
 Write rows with `put(row)`; build keys with `keyBuilder()` for `get` and `multiGet`.
 Use `projectByNames` to select fields and `scan` to iterate rows.
-`putDirect` and `getDirect` support caller-provided direct buffers.
-Pass `WriteOptions` to `put(row, options)` or `putDirect(row, keyBuffer, rowBuffer, options)`
-for per-write TTL and `awaitDurable(true)` WAL durability waits. The table keeps its own column
-family and column mapping; the options cannot redirect the write to another family.
+Pass `WriteOptions` to `put(row, options)` for per-write TTL or `awaitDurable(true)` when WAL is enabled.
+Use `putDirect(row, keyBuffer, rowBuffer[, options])` to write with direct buffers.
+`Table`, `TableReader`, and `ReadOnlyTable` support `getDirect(key, keyBuffer)`:
 
-`table.snapshot()` waits for publication; `table.asyncSnapshot()` returns a
+```java
+try (DirectTableRow row = reader.getDirect(key, keyBuffer)) {
+    if (row != null) consume(row.values());
+}
+```
+
+Copy binary values if they must remain usable after the direct row is closed.
+
+`table.snapshot()` waits for completion; `table.asyncSnapshot()` returns a
 `CompletableFuture<ShardSnapshot>`. Use `startAsyncSnapshot()` when the snapshot ID is also needed
 immediately, and `getShardSnapshot(id)` to retrieve metadata for a completed snapshot.
 Keep the table and its database open until the future completes.
@@ -182,8 +189,7 @@ try (Table writer = plan.writerBuilder(runtimeConfig)
 }
 ```
 
-The plan pins a catalog schema version and excludes credentials. Workers provide their own
-storage credentials and primary volumes through `runtimeConfig`; no Catalog object is required.
+Workers supply storage credentials and primary volumes through `runtimeConfig`.
 
 Choose `currentGlobalSnapshot()` to follow new commits, or `globalSnapshot(id)` for a fixed reader.
 Without a catalog, use `TableReader.openCurrent(config, name)` or `open(config, name, snapshotId)`.

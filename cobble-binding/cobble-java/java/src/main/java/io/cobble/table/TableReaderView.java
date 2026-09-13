@@ -5,6 +5,8 @@ import io.cobble.NativeObject;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 
+import java.nio.ByteBuffer;
+
 final class TableReaderView extends NativeObject {
     TableReaderView(long nativeHandle) {
         super(nativeHandle);
@@ -16,6 +18,15 @@ final class TableReaderView extends NativeObject {
 
     byte[][][] multiGet(int[] buckets, byte[][] keys, ReadOptions options) {
         return multiGet(nativeHandle, buckets, keys, options.getNativeHandle());
+    }
+
+    int getEncodedDirect(int bucket, ByteBuffer buffer, int keyLength, ReadOptions options) {
+        return getEncodedDirectNative(
+                nativeHandle, bucket, buffer, keyLength, options.getNativeHandle());
+    }
+
+    ByteBuffer takeDirectOverflowBuffer() {
+        return takeDirectOverflowNative();
     }
 
     DirectScanCursor scan(
@@ -39,6 +50,11 @@ final class TableReaderView extends NativeObject {
 
     private static native byte[][][] multiGet(
             long nativeHandle, int[] buckets, byte[][] keys, long options);
+
+    private static native int getEncodedDirectNative(
+            long nativeHandle, int bucket, ByteBuffer buffer, int keyLength, long options);
+
+    private static native ByteBuffer takeDirectOverflowNative();
 
     private static native DirectScanCursor openScanCursor(
             long nativeHandle,

@@ -19,9 +19,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.Set;
 
 /**
  * Typed access to one table-backed Cobble column family.
@@ -51,10 +51,6 @@ public final class Table extends NativeObject {
         int[] config = directBufferPoolConfigNative(handle);
         if (!io.cobble.Db.configureDirectBufferPool(config[0], config[1]))
             throw new IllegalStateException("direct buffer pool configuration can only grow");
-    }
-
-    private DirectColumns getDirectColumns(int bucket, ByteBuffer key, int keyLength) {
-        return DirectColumns.read(directReader, bucket, key, keyLength);
     }
 
     private static native int[] directBufferPoolConfigNative(long handle);
@@ -190,10 +186,7 @@ public final class Table extends NativeObject {
     }
 
     private void putDirectEncoded(
-            List<Value> row,
-            ByteBuffer keyBuffer,
-            ByteBuffer rowBuffer,
-            long writeOptionsHandle) {
+            List<Value> row, ByteBuffer keyBuffer, ByteBuffer rowBuffer, long writeOptionsHandle) {
         TableState state = state();
         requireDirect(keyBuffer, "keyBuffer");
         requireDirect(rowBuffer, "rowBuffer");
@@ -338,16 +331,22 @@ public final class Table extends NativeObject {
      */
     public DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
         TableState state = state();
+        return readDirectRow(state.compiled, key, keyBuffer, directReader);
+    }
+
+    static DirectTableRow readDirectRow(
+            Compiled compiled, TableKey key, ByteBuffer keyBuffer, DirectColumns.Reader reader) {
         Objects.requireNonNull(key, "key");
         requireDirect(keyBuffer, "keyBuffer");
+        byte[] encodedKey = key.encodedInternal();
         ((Buffer) keyBuffer).clear();
-        keyBuffer.put(key.encodedInternal());
+        keyBuffer.put(encodedKey);
         DirectColumns columns =
-                getDirectColumns(key.bucket(), keyBuffer, key.encodedInternal().length);
+                DirectColumns.read(reader, key.bucket(), keyBuffer, encodedKey.length);
         if (columns == null) return null;
         try {
             return new DirectTableRow(
-                    columns, assembleDirectRow(state.compiled, key.valuesInternal(), columns));
+                    columns, assembleDirectRow(compiled, key.valuesInternal(), columns));
         } catch (RuntimeException error) {
             columns.close();
             throw error;
@@ -747,11 +746,7 @@ public final class Table extends NativeObject {
     private static native long createReadViewNative(long nativeHandle, String[] fieldNames);
 
     private static native void putNative(
-            long nativeHandle,
-            int bucket,
-            byte[] key,
-            byte[] rowPayload,
-            long writeOptionsHandle);
+            long nativeHandle, int bucket, byte[] key, byte[] rowPayload, long writeOptionsHandle);
 
     private static native void putDirectNative(
             long nativeHandle,
