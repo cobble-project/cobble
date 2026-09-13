@@ -812,9 +812,11 @@ class DbBindingTest {
                 db.put(0, keyBytes("st-snap", i), 0, valueBytes("st-snap-v", i));
             }
 
-            ShardSnapshot shardSnapshot = db.snapshot();
+            PendingSnapshot<ShardSnapshot> pendingSnapshot = db.startAsyncSnapshot();
+            ShardSnapshot shardSnapshot = awaitSnapshot(pendingSnapshot.future());
             assertNotNull(shardSnapshot);
             assertTrue(shardSnapshot.snapshotId >= 0);
+            assertTrue(shardSnapshot.manifestPath.startsWith("file:"));
             assertTrue(db.retainSnapshot(shardSnapshot.snapshotId));
 
             // restore
@@ -983,6 +985,54 @@ class DbBindingTest {
             ExecutionException exception =
                     assertThrows(ExecutionException.class, () -> pendingSnapshot.future().get());
             assertInstanceOf(CancelledError.class, exception.getCause());
+        }
+    }
+
+    @Test
+    void detachedSnapshotMetadataLoader() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-detached-snapshot-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
+        String dbId;
+        String manifestPath;
+        ShardSnapshot completed;
+
+        try (Db db = Db.open(config)) {
+            dbId = db.id();
+            for (int i = 0; i < 64; i++) {
+                db.put(0, keyBytes("detached-snapshot", i), 0, valueBytes("detached-value", i));
+            }
+
+            PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();
+            completed = awaitSnapshot(pending.future());
+            manifestPath = completed.manifestPath;
+            assertTrue(manifestPath.startsWith("file:"));
+            assertTrue(manifestPath.contains("SNAPSHOT-" + pending.snapshotId()));
+        }
+
+        ShardSnapshot loaded = SnapshotTools.loadShardSnapshot(config, dbId, manifestPath);
+        assertEquals(completed.snapshotId, loaded.snapshotId);
+        assertEquals(completed.dbId, loaded.dbId);
+        assertEquals(completed.manifestPath, loaded.manifestPath);
+        assertEquals(completed.schemaId, loaded.schemaId);
+        assertEquals(completed.ranges.size(), loaded.ranges.size());
+        assertEquals(completed.columnFamilies.keySet(), loaded.columnFamilies.keySet());
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> SnapshotTools.loadShardSnapshot(config, "", manifestPath));
+        IllegalStateException relativePath =
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> SnapshotTools.loadShardSnapshot(config, dbId, "snapshot/SNAPSHOT-0"));
+        assertTrue(relativePath.getMessage().contains("manifest path must be absolute"));
+
+        try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
+            PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();
+            ShardSnapshot snapshot = awaitSnapshot(pending.future());
+            assertEquals(
+                    snapshot.schemaId,
+                    SnapshotTools.loadShardSnapshot(config, db.id(), snapshot.manifestPath)
+                            .schemaId);
         }
     }
 

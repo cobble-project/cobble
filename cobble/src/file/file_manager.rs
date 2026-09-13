@@ -2244,6 +2244,17 @@ impl FileManager {
         self.metadata_files.get(name).map(|f| f.absolute_path())
     }
 
+    /// Returns the absolute path a metadata file uses, whether or not it is tracked yet.
+    pub fn metadata_file_full_path(&self, name: &str) -> String {
+        self.get_metadata_file_full_path(name).unwrap_or_else(|| {
+            let path = self.metadata_file_path(name);
+            self.meta_volume
+                .base_dir()
+                .map(|base_dir| format!("{}/{}", base_dir, path))
+                .unwrap_or(path)
+        })
+    }
+
     /// Returns the expected path for a metadata file, even if not tracked yet.
     pub fn metadata_path(&self, name: &str) -> String {
         self.metadata_file_path(name)

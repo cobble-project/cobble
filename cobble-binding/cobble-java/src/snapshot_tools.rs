@@ -1,11 +1,12 @@
+use crate::util::to_java_string_or_throw;
 use crate::util::{
     decode_java_string, decode_u64_from_jlong, parse_config_json, throw_illegal_argument,
     throw_illegal_state,
 };
-use cobble_binding::prune_shard_snapshot;
+use cobble_binding::{load_shard_snapshot_metadata, prune_shard_snapshot};
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jlong};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jlong, jstring};
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_SnapshotTools_pruneShardSnapshotFromJson(
@@ -45,6 +46,53 @@ pub extern "system" fn Java_io_cobble_SnapshotTools_pruneShardSnapshotFromJson(
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
             JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SnapshotTools_loadShardSnapshotFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    db_id: JString,
+    manifest_path: JString,
+) -> jstring {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return std::ptr::null_mut();
+    };
+    let db_id = match decode_java_string(&mut env, db_id) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let manifest_path = match decode_java_string(&mut env, manifest_path) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    match load_shard_snapshot_metadata(&config, &db_id, &manifest_path) {
+        Ok(snapshot) => match serde_json::to_string(&snapshot) {
+            Ok(json) => to_java_string_or_throw(&mut env, json),
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
         }
     }
 }

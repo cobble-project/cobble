@@ -135,6 +135,24 @@ byte[] value = reader.get(0, "key".getBytes(), 0);
 reader.refresh();
 ```
 
+## Table APIs
+
+`io.cobble.table` provides `Table`, `ReadOnlyTable`, schemas, and Java-side key/value codecs.
+`TableSnapshotCommitter` collects shard reports into a consistent global snapshot.
+See [Table](../getting-started/table) for the storage and snapshot model; Catalog and
+online schema-evolution APIs described there are currently Rust APIs.
+
+`TableScanPlan.forCurrentSnapshot(config, tableName)` captures the current committed global
+snapshot; `forSnapshot(config, tableName, snapshotId)` selects a historical snapshot.
+Both produce fixed plans. Plans and their `TableScanSplit` assignments are serializable;
+workers provide their own configuration and storage credentials when opening scanners.
+Applications must retain referenced snapshots until all workers finish.
+
+`TableScanSplit.openTypedScanner(config, readAheadBytes)` returns a `TableScanCursor` of typed rows.
+`openScanner(config, fieldNames, readAheadBytes)` returns an encoded `ScanCursor`
+for connector integrations, reusing the core split scanner with field projection and built-in
+table transforms. Close each scanner when finished.
+
 ## Process-Level Filesystem Fallback APIs
 
 Java bindings expose process-level filesystem extension APIs so host frameworks can plug in their
@@ -437,6 +455,8 @@ SnapshotTools.pruneShardSnapshot(config, snapshot.dbId, snapshot.snapshotId);
 - `asyncSnapshot()` returns only the `CompletableFuture<ShardSnapshot>`.
 - `startAsyncSnapshot()` returns both the snapshot id and the future via `PendingSnapshot`.
 - `cancelSnapshot(snapshotId)` only succeeds before manifest publication completes.
+- After the snapshot future completes, use `ShardSnapshot.manifestPath` with
+  `SnapshotTools.loadShardSnapshot(config, dbId, path)` to read captured metadata without opening a writer DB.
 - `SnapshotTools.pruneShardSnapshot(config, dbId, snapshotId)` is the explicit out-of-band shard cleanup API.
 - The same snapshot lifecycle APIs are also available on `io.cobble.structured.Db`.
 

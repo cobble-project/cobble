@@ -1,5 +1,7 @@
 use crate::metadata::TableMetadata;
 use crate::runtime::TableSchemaTransformFactories;
+#[cfg(feature = "ffi")]
+use crate::table::build_scan_options_for_fields;
 use crate::table::{CompiledTable, compile_table, decode_table_scan_row, validate_name};
 use crate::{Result, TableError, TableSchema, Value};
 use bytes::Bytes;
@@ -60,9 +62,21 @@ impl TableScanPlan {
         self.global_snapshot_id
     }
 
+    /// Return the bucket count fixed by the global snapshot.
+    pub fn total_buckets(&self) -> u32 {
+        self.total_buckets
+    }
+
     /// Return the schema fixed into this plan.
     pub fn schema(&self) -> &TableSchema {
         &self.metadata.schema
+    }
+
+    /// Return the total encoded data size reported by all shard snapshots.
+    pub fn data_size_bytes(&self) -> u64 {
+        self.shards.iter().fold(0_u64, |total, shard| {
+            total.saturating_add(shard.data_size_bytes)
+        })
     }
 
     /// Produce one independently serializable split per shard snapshot.
@@ -149,6 +163,24 @@ impl TableScanSplit {
         runtime: Config,
         transforms: &TableSchemaTransformFactories,
     ) -> Result<TableScanSplitScanner> {
+        let compiled = compile_table(self.metadata.clone(), self.total_buckets)?;
+        let scanner = self.create_raw_scanner_with_transforms(
+            runtime,
+            transforms,
+            ScanOptions::default().with_column_family(self.name.clone()),
+        )?;
+        Ok(TableScanSplitScanner {
+            inner: scanner,
+            compiled,
+        })
+    }
+
+    fn create_raw_scanner_with_transforms(
+        &self,
+        runtime: Config,
+        transforms: &TableSchemaTransformFactories,
+        scan_options: ScanOptions,
+    ) -> Result<ScanSplitScanner> {
         self.validate()?;
         let credential_source = self.auth_source.as_ref().unwrap_or(&runtime);
         let source_volumes = self
@@ -160,16 +192,28 @@ impl TableScanSplit {
         config.volumes.extend(source_volumes);
         config.total_buckets = self.total_buckets;
 
-        let compiled = compile_table(self.metadata.clone(), self.total_buckets)?;
         let builder = transforms.apply_to(ReadOnlyDbBuilder::new(config))?;
-        let scanner = self.split.create_scanner_with_builder(
-            builder,
-            &ScanOptions::default().with_column_family(self.name.clone()),
-        )?;
-        Ok(TableScanSplitScanner {
-            inner: scanner,
-            compiled,
-        })
+        let scanner = self
+            .split
+            .create_scanner_with_builder(builder, &scan_options)?;
+        Ok(scanner)
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn create_projected_raw_scanner(
+        &self,
+        runtime: Config,
+        field_names: &[String],
+        read_ahead_bytes: i64,
+    ) -> Result<ScanSplitScanner> {
+        let compiled = compile_table(self.metadata.clone(), self.total_buckets)?;
+        let mut options = build_scan_options_for_fields(&self.name, compiled, field_names)?;
+        options.read_ahead_bytes = size::Size::from_const(read_ahead_bytes);
+        self.create_raw_scanner_with_transforms(
+            runtime,
+            &TableSchemaTransformFactories::default(),
+            options,
+        )
     }
 
     fn validate(&self) -> Result<()> {

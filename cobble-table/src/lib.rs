@@ -20,6 +20,10 @@ mod table;
 mod transform;
 mod write;
 
+#[cfg(feature = "ffi")]
+#[doc(hidden)]
+pub mod ffi;
+
 #[cfg(test)]
 #[path = "../tests/unit/metadata.rs"]
 mod metadata_tests;

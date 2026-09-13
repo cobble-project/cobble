@@ -927,6 +927,16 @@ fn build_projection_parts<S: AsRef<str>>(
     ))
 }
 
+#[cfg(feature = "ffi")]
+pub(crate) fn build_scan_options_for_fields<S: AsRef<str>>(
+    name: &str,
+    compiled: Arc<CompiledTable>,
+    field_names: &[S],
+) -> Result<ScanOptions> {
+    let (_, _, scan_options) = build_projection_parts(name, compiled, field_names)?;
+    Ok(scan_options)
+}
+
 pub(crate) fn compile_table(
     metadata: TableMetadata,
     total_buckets: u32,

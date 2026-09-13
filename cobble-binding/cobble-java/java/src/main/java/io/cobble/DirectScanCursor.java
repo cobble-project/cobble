@@ -11,10 +11,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>Each returned entry remains valid only until the cursor advances again or closes.
  */
 public final class DirectScanCursor extends NativeObject implements Iterable<DirectScanEntry> {
+    private static final DirectBufferPool DEFAULT_POOL = DirectBufferPool.defaults();
     private final DirectBufferPool pool;
     private final ByteBuffer ioBuffer;
     private final AtomicBoolean ioBufferReleased = new AtomicBoolean(false);
     private boolean iteratorCreated = false;
+
+    // Used by standalone snapshot scanners constructed through JNI.
+    private DirectScanCursor(long nativeHandle) {
+        this(nativeHandle, DEFAULT_POOL);
+    }
 
     DirectScanCursor(long nativeHandle, DirectBufferPool pool) {
         super(nativeHandle);

@@ -1443,12 +1443,7 @@ impl Db {
         let manifest = load_manifest_for_snapshot(&self.file_manager, snapshot_id)?;
         let schema = self.schema_manager.schema(manifest.latest_schema_id)?;
         let manifest_name = snapshot_manifest_name(snapshot_id);
-        let manifest_path = self
-            .file_manager
-            .get_metadata_file_full_path(&manifest_name)
-            .ok_or_else(|| {
-                Error::IoError(format!("Snapshot manifest not tracked: {}", manifest_name))
-            })?;
+        let manifest_path = self.file_manager.metadata_file_full_path(&manifest_name);
         Ok(crate::snapshot::ShardSnapshotMetadata {
             ranges: manifest.bucket_ranges.clone(),
             db_id: self.id.clone(),
