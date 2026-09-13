@@ -61,6 +61,10 @@ public final class Table implements AutoCloseable {
         }
     }
 
+    static Table fromCatalogMaterialization(Db db, String name, String openInfoJson) {
+        return new Table(db, name, TableJson.openInfoFromJson(openInfoJson));
+    }
+
     public String name() {
         ensureUsable();
         return name;
@@ -101,6 +105,20 @@ public final class Table implements AutoCloseable {
             ensureDbOpen(db);
             openInfo = TableJson.openInfoFromJson(openNative(db.getNativeHandle(), name));
         }
+        return applyOpenInfo(openInfo);
+    }
+
+    synchronized boolean refreshFromCatalog(String openInfoJson) {
+        ensureUsable();
+        return applyOpenInfo(TableJson.openInfoFromJson(openInfoJson));
+    }
+
+    Db catalogDb() {
+        ensureUsable();
+        return db;
+    }
+
+    private boolean applyOpenInfo(OpenInfo openInfo) {
         TableState previous = state;
         if (previous.matches(openInfo)) return false;
         TableState candidate = TableState.create(name, openInfo);

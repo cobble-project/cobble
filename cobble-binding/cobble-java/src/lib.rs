@@ -7,6 +7,7 @@
 //!
 #![allow(dead_code)]
 
+mod catalog;
 mod coordinator;
 mod db;
 mod dedicated_compaction;

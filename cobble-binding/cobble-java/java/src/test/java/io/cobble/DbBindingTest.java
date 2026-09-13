@@ -2,16 +2,20 @@ package io.cobble;
 
 import io.cobble.structured.ColumnValue;
 import io.cobble.structured.Row;
+import io.cobble.table.CatalogTable;
 import io.cobble.table.DataField;
 import io.cobble.table.DirectTableRow;
+import io.cobble.table.FileCatalog;
 import io.cobble.table.LogicalTypes;
 import io.cobble.table.ReadOnlyTable;
 import io.cobble.table.RecordType;
 import io.cobble.table.Table;
+import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableKey;
 import io.cobble.table.TableProjection;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableSchema;
+import io.cobble.table.TableSchemaChange;
 import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
 
@@ -450,6 +454,135 @@ class DbBindingTest {
                     assertEquals(Collections.singletonList(Value.binary(new byte[] {7})), first);
                 }
             }
+        }
+    }
+
+    @Test
+    void fileCatalogManagesTableSchemaAndWriterLifecycle() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-file-catalog-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        List<String> namespace = Collections.singletonList("analytics");
+        TableIdentifier users = new TableIdentifier(namespace, "users");
+        TableIdentifier scratch = new TableIdentifier(namespace, "scratch");
+        TableSchema initialSchema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "tenant", LogicalTypes.string()),
+                                new DataField(2, "id", LogicalTypes.int64()),
+                                new DataField(3, "payload", LogicalTypes.binary().nullable())),
+                        Arrays.asList(1L, 2L),
+                        Collections.singletonList(1L));
+        CatalogTable initial;
+        try (FileCatalog catalog = FileCatalog.open(config, "warehouse")) {
+            catalog.createNamespace(namespace);
+            initial = catalog.createTable(users, initialSchema);
+            assertTrue(catalog.tableExists(users));
+            assertEquals(Collections.singletonList(users), catalog.listTables(namespace));
+            assertEquals(Collections.singletonList(namespace), catalog.listNamespaces());
+            assertEquals(initialSchema, catalog.loadTableSchema(users, 0L));
+            try (CatalogTable loaded = catalog.loadTable(users)) {
+                assertEquals(initial.catalogSchemaId(), loaded.catalogSchemaId());
+                assertEquals(initial.schema(), loaded.schema());
+            }
+
+            try (CatalogTable createdScratch = catalog.createTable(scratch, initialSchema)) {
+                try (CatalogTable renamedScratch = catalog.renameTable(scratch, "scratch_old")) {
+                    assertEquals("scratch_old", renamedScratch.identifier().name());
+                    catalog.dropTable(renamedScratch.identifier());
+                    assertFalse(catalog.tableExists(renamedScratch.identifier()));
+                }
+            }
+        }
+
+        List<Value> row =
+                Arrays.asList(
+                        Value.string("tenant-a"), Value.int64(7L), Value.binary(new byte[] {4, 5}));
+        try (Db db = Db.open(config);
+                Table writer = initial.materializeTable(db)) {
+            assertEquals(initialSchema, writer.schema());
+            writer.put(row);
+            TableKey key = writer.keyBuilder().push(row.get(0)).push(row.get(1)).build();
+            try (TableProjection staleProjection =
+                    writer.projectByNames(Collections.singletonList("payload"))) {
+                CatalogTable evolved;
+                try (FileCatalog catalog = FileCatalog.open(config, "warehouse")) {
+                    assertThrows(
+                            IllegalStateException.class,
+                            () ->
+                                    catalog.evolveSchema(
+                                            users,
+                                            Collections.singletonList(
+                                                    TableSchemaChange.dropField("tenant"))));
+                    try (CatalogTable unchanged = catalog.loadTable(users)) {
+                        assertEquals(0L, unchanged.catalogSchemaId());
+                    }
+                    try (CatalogTable added =
+                            catalog.evolveSchema(
+                                    users,
+                                    Collections.singletonList(
+                                            TableSchemaChange.addField(
+                                                    "note", LogicalTypes.string().nullable())))) {
+                        assertEquals(1L, added.catalogSchemaId());
+                        assertTrue(added.refreshWriter(writer));
+                        assertEquals(
+                                Arrays.asList(
+                                        row.get(0), row.get(1), row.get(2), Value.nullValue()),
+                                writer.get(
+                                        writer.keyBuilder()
+                                                .push(row.get(0))
+                                                .push(row.get(1))
+                                                .build()));
+                    }
+                    try (CatalogTable renamed =
+                            catalog.evolveSchema(
+                                    users,
+                                    Collections.singletonList(
+                                            TableSchemaChange.renameField("payload", "content")))) {
+                        assertEquals(2L, renamed.catalogSchemaId());
+                        assertTrue(renamed.refreshWriter(writer));
+                    }
+                    evolved =
+                            catalog.evolveSchema(
+                                    users,
+                                    Collections.singletonList(TableSchemaChange.dropField("note")));
+                    assertEquals(3L, evolved.catalogSchemaId());
+                }
+
+                assertTrue(evolved.refreshWriter(writer));
+                assertFalse(evolved.refreshWriter(writer));
+                assertEquals(evolved.schema(), writer.schema());
+                TableKey refreshedKey =
+                        writer.keyBuilder().push(row.get(0)).push(row.get(1)).build();
+                assertEquals(row, writer.get(refreshedKey));
+                assertThrows(IllegalStateException.class, () -> staleProjection.get(key));
+
+                TableSchema unrelatedSchema =
+                        new TableSchema(
+                                Arrays.asList(
+                                        new DataField(11, "tenant", LogicalTypes.string()),
+                                        new DataField(12, "id", LogicalTypes.int64()),
+                                        new DataField(
+                                                13, "payload", LogicalTypes.binary().nullable())),
+                                Arrays.asList(11L, 12L),
+                                Collections.singletonList(11L));
+                try (Table unrelated = Table.create(db, "unrelated", unrelatedSchema)) {
+                    assertThrows(
+                            IllegalStateException.class, () -> evolved.refreshWriter(unrelated));
+                    assertEquals(unrelatedSchema, unrelated.schema());
+                }
+
+                assertThrows(IllegalStateException.class, () -> initial.refreshWriter(writer));
+                assertEquals(evolved.schema(), writer.schema());
+                evolved.close();
+            }
+        } finally {
+            initial.close();
+        }
+
+        try (FileCatalog catalog = FileCatalog.open(config, "warehouse")) {
+            catalog.dropTable(users);
+            catalog.dropNamespace(namespace);
+            assertTrue(catalog.listNamespaces().isEmpty());
         }
     }
 

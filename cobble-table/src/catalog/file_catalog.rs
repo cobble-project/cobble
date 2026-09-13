@@ -648,6 +648,25 @@ fn load_table_schema_record(
 }
 
 impl CatalogTable {
+    /// Return the stable physical column-family name for this catalog table.
+    #[cfg(feature = "ffi")]
+    #[doc(hidden)]
+    pub fn physical_name(&self) -> String {
+        physical_table_name(self.table_id)
+    }
+
+    /// Materialize this captured catalog schema into one writable shard.
+    ///
+    /// Calls for a shard must not run concurrently with other core schema updates.
+    pub fn materialize_table(&self, db: Arc<Db>) -> CatalogResult<Table> {
+        let store = CatalogStore::open(
+            &self.runtime_context.config,
+            &self.runtime_context.storage_id,
+        )?;
+        let (physical_name, target) = materialize_loaded_table(&store, db.as_ref(), self)?;
+        Table::from_metadata(db, physical_name, target).map_err(Into::into)
+    }
+
     /// Start building a portable writer initialization plan for this table.
     pub fn new_write_builder(&self) -> TableWriteBuilder {
         TableWriteBuilder::new(self.clone(), self.runtime_context.config.total_buckets)

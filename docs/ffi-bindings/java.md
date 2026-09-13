@@ -139,8 +139,16 @@ reader.refresh();
 
 `io.cobble.table` provides `Table`, `ReadOnlyTable`, schemas, and Java-side key/value codecs.
 `TableSnapshotCommitter` collects shard reports into a consistent global snapshot.
-See [Table](../getting-started/table) for the storage and snapshot model; Catalog and
-online schema-evolution APIs described there are currently Rust APIs.
+See [Table](../getting-started/table) for the storage and snapshot model.
+
+`FileCatalog.open(config, storageId)` manages namespaces, tables, and persisted schemas through
+the Rust catalog. Use `TableSchemaChange` to add nullable fields, rename fields, or drop non-key
+fields with `catalog.evolveSchema(...)`. Loaded `CatalogTable` objects represent fixed catalog
+versions: `materializeTable(db)` applies that version to a caller-owned shard, and
+`refreshWriter(table)` applies it to an existing Table and refreshes its layout. Neither method
+owns or closes the caller's Db. Publishing a catalog schema alone does not update live handles.
+Close catalog handles when no longer needed. Catalog-backed storage builders, automatic latest
+Table readers, type widening, and custom transforms are not yet exposed through these Java APIs.
 
 Table operations are bound to the schema used when the handle was opened. After an external
 schema update, call `table.refreshSchema()` and rebuild projections before using the new layout.

@@ -136,7 +136,7 @@ final class TableJson {
                 typeFromObject(requiredObject(object, "logical_type")));
     }
 
-    private static JsonObject typeObject(LogicalType type) {
+    static JsonObject typeObject(LogicalType type) {
         JsonObject object = new JsonObject();
         object.addProperty("nullable", type.isNullable());
         object.addProperty("kind", snake(type.kind().name()));

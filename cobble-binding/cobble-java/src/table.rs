@@ -321,7 +321,7 @@ pub extern "system" fn Java_io_cobble_table_Table_deleteBatchNative<'local>(
     }
 }
 
-fn table_open_response(
+pub(crate) fn table_open_response(
     env: &mut JNIEnv,
     total_buckets: u32,
     schema: &TableSchema,
