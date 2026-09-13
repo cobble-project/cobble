@@ -18,6 +18,8 @@ import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableSchema;
 import io.cobble.table.TableSchemaChange;
 import io.cobble.table.TableSnapshotCommitter;
+import io.cobble.table.TableWritePlan;
+import io.cobble.table.TableWriterBuilder;
 import io.cobble.table.Value;
 import io.cobble.table.ValueCodec;
 
@@ -611,6 +613,8 @@ class DbBindingTest {
     void tableBuiltinTransformsSurviveJavaRecoveryPaths() throws Exception {
         Path dataDir = Files.createTempDirectory("cobble-java-table-transform-recovery-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        config.volumes.get(0).accessId = "portable-plan-access-marker";
+        config.volumes.get(0).secretKey = "portable-plan-secret-marker";
         config.l0FileLimit = Integer.MAX_VALUE;
         config.reader = new Config.ReaderConfigEntry();
         config.reader.reloadToleranceSeconds = 0L;
@@ -637,6 +641,8 @@ class DbBindingTest {
         ShardSnapshot evolvedSnapshot;
         GlobalSnapshot initialGlobalSnapshot;
         GlobalSnapshot globalSnapshot;
+        TableWritePlan portablePlan;
+        String portableDbId = "portable-catalog-writer";
         try (FileCatalog catalog = FileCatalog.open(config, "warehouse");
                 Db db = Db.open(config)) {
             catalog.createNamespace(namespace);
@@ -644,6 +650,20 @@ class DbBindingTest {
                     Table writer = initial.materializeTable(db)) {
                 physicalName = writer.name();
                 sourceDbId = db.id();
+                portablePlan = initial.newWriteBuilder().totalBuckets(1).build();
+                ByteArrayOutputStream serializedPlan = new ByteArrayOutputStream();
+                try (ObjectOutputStream output = new ObjectOutputStream(serializedPlan)) {
+                    output.writeObject(portablePlan);
+                }
+                String serializedContent = serializedPlan.toString(StandardCharsets.ISO_8859_1);
+                assertFalse(serializedContent.contains("\"auth_source\""));
+                assertFalse(serializedContent.contains("portable-plan-access-marker"));
+                assertFalse(serializedContent.contains("portable-plan-secret-marker"));
+                try (ObjectInputStream input =
+                        new ObjectInputStream(
+                                new ByteArrayInputStream(serializedPlan.toByteArray()))) {
+                    portablePlan = (TableWritePlan) input.readObject();
+                }
                 String ownedDbId = "catalog-owned-writer";
                 ShardSnapshot ownedSnapshot;
                 GlobalSnapshot ownedGlobal;
@@ -722,7 +742,7 @@ class DbBindingTest {
                                             .push(oldRow.get(1))
                                             .build()));
                 }
-                CatalogTable.WriterBuilder closedBuilder = initial.writerBuilder(config);
+                TableWriterBuilder closedBuilder = initial.writerBuilder(config);
                 try (Table survivesCatalogClose =
                                 initial.writerBuilder(config).dbId(ownedDbId).resume();
                         TableReader readerSurvivesCatalogClose =
@@ -895,6 +915,23 @@ class DbBindingTest {
                                         .push(oldRow.get(1))
                                         .build()));
             }
+        }
+        try (Table portable =
+                portablePlan
+                        .writerBuilder(config)
+                        .dbId(portableDbId)
+                        .bucketRanges(new int[] {0}, new int[] {0})
+                        .open()) {
+            assertEquals(LogicalTypes.int8(), portable.schema().fields().get(2).logicalType());
+            portable.put(oldRow);
+            assertTrue(portable.snapshot().dataSizeBytes > 0L);
+        }
+        try (Table resumed = portablePlan.writerBuilder(config).dbId(portableDbId).resume()) {
+            assertEquals(LogicalTypes.int8(), resumed.schema().fields().get(2).logicalType());
+            assertEquals(
+                    oldRow,
+                    resumed.get(
+                            resumed.keyBuilder().push(oldRow.get(0)).push(oldRow.get(1)).build()));
         }
         try (ReadOnlyDb readOnly = ReadOnlyDb.open(config, evolvedSnapshot.snapshotId, sourceDbId);
                 ReadOnlyTable table = ReadOnlyTable.open(readOnly, physicalName)) {

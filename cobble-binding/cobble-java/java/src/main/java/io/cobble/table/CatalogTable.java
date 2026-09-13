@@ -87,12 +87,20 @@ public final class CatalogTable extends NativeObject {
     }
 
     /** Starts a builder for one catalog-scoped writable shard. */
-    public WriterBuilder writerBuilder(Config runtime) {
+    public TableWriterBuilder writerBuilder(Config runtime) {
         Objects.requireNonNull(runtime, "runtime");
         synchronized (this) {
             ensureOpen();
         }
-        return new WriterBuilder(this, runtime);
+        return TableWriterBuilder.fromCatalog(this, runtime);
+    }
+
+    /** Starts a builder for a portable writer initialization plan. */
+    public TableWriteBuilder newWriteBuilder() {
+        synchronized (this) {
+            ensureOpen();
+        }
+        return new TableWriteBuilder(this);
     }
 
     /** Starts a builder for one catalog-scoped global snapshot reader. */
@@ -131,7 +139,7 @@ public final class CatalogTable extends NativeObject {
 
     private static native String refreshWriterNative(long nativeHandle, long tableHandle);
 
-    private static native Table writerOpenNative(
+    static native Table writerOpenNative(
             long nativeHandle,
             String runtimeJson,
             String dbId,
@@ -146,78 +154,21 @@ public final class CatalogTable extends NativeObject {
     private static native long snapshotCommitterNative(
             long nativeHandle, String runtimeJson, int maxPendingCommits);
 
-    private void ensureOpen() {
+    static native String buildWritePlanNative(long nativeHandle, int totalBuckets);
+
+    void ensureOpen() {
         if (isDisposed() || nativeHandle == 0L)
             throw new IllegalStateException("catalog table is closed");
+    }
+
+    long nativeHandleForBuilder() {
+        ensureOpen();
+        return nativeHandle;
     }
 
     private static void ensureDbOpen(Db db) {
         if (db.isDisposed() || db.getNativeHandle() == 0L)
             throw new IllegalStateException("db is closed");
-    }
-
-    /** Configures and terminally opens one catalog-scoped writable shard. */
-    public static final class WriterBuilder {
-        private static final int OPEN = 0;
-        private static final int RESUME = 1;
-        private static final int OPEN_FROM_SNAPSHOT = 2;
-        private static final int RESUME_FROM_SNAPSHOT = 3;
-
-        private final CatalogTable table;
-        private final Config runtime;
-        private String dbId;
-        private int[] rangeStarts = new int[0];
-        private int[] rangeEnds = new int[0];
-
-        private WriterBuilder(CatalogTable table, Config runtime) {
-            this.table = table;
-            this.runtime = runtime;
-        }
-
-        public WriterBuilder dbId(String value) {
-            dbId = Objects.requireNonNull(value, "dbId");
-            return this;
-        }
-
-        public WriterBuilder bucketRanges(int[] startsInclusive, int[] endsInclusive) {
-            Objects.requireNonNull(startsInclusive, "startsInclusive");
-            Objects.requireNonNull(endsInclusive, "endsInclusive");
-            rangeStarts = startsInclusive.clone();
-            rangeEnds = endsInclusive.clone();
-            return this;
-        }
-
-        public Table open() {
-            return open(OPEN, -1L);
-        }
-
-        public Table resume() {
-            return open(RESUME, -1L);
-        }
-
-        public Table openFromSnapshot(long snapshotId) {
-            if (snapshotId < 0L) throw new IllegalArgumentException("snapshotId must be >= 0");
-            return open(OPEN_FROM_SNAPSHOT, snapshotId);
-        }
-
-        public Table resumeFromSnapshot(long snapshotId) {
-            if (snapshotId < 0L) throw new IllegalArgumentException("snapshotId must be >= 0");
-            return open(RESUME_FROM_SNAPSHOT, snapshotId);
-        }
-
-        private Table open(int mode, long snapshotId) {
-            synchronized (table) {
-                table.ensureOpen();
-                return writerOpenNative(
-                        table.nativeHandle,
-                        runtime.toJson(),
-                        dbId,
-                        rangeStarts,
-                        rangeEnds,
-                        mode,
-                        snapshotId);
-            }
-        }
     }
 
     /** Configures and terminally opens one catalog-scoped global snapshot reader. */

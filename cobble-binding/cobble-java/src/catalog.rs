@@ -5,11 +5,11 @@ use crate::util::{
     decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
     to_java_string_or_throw,
 };
-use cobble_table::SchemaChange;
 use cobble_table::catalog::{
     Catalog, CatalogSchemaId, CatalogTable as RustCatalogTable, FileCatalog as RustFileCatalog,
     FileCatalogConfig,
 };
+use cobble_table::{SchemaChange, TableWritePlan, TableWriterBuilder};
 use jni::JNIEnv;
 use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
@@ -362,17 +362,103 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_writerOpenNative(
     let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
         return std::ptr::null_mut();
     };
-    let db_id = match decode_optional_java_string(&mut env, db_id) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    let ranges = match decode_bucket_ranges(&mut env, range_starts, range_ends) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
     let builder = match table.writer_builder(runtime) {
         Ok(builder) => builder,
         Err(error) => return throw_state_and_null(&mut env, error),
+    };
+    writer_open(
+        &mut env,
+        builder,
+        db_id,
+        range_starts,
+        range_ends,
+        mode,
+        snapshot_id,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_buildWritePlanNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    total_buckets: jint,
+) -> jstring {
+    let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let builder = table.new_write_builder();
+    let result = if total_buckets == -1 {
+        builder.build()
+    } else {
+        match decode_u32("totalBuckets", total_buckets) {
+            Ok(total_buckets) => builder.total_buckets(total_buckets).build(),
+            Err(error) => return throw_argument_and_null(&mut env, error),
+        }
+    };
+    match result {
+        Ok(plan) => match serde_json::to_string(&plan) {
+            Ok(json) => to_java_string_or_throw(&mut env, json),
+            Err(error) => throw_state_and_null(&mut env, error),
+        },
+        Err(error) => throw_state_and_null(&mut env, error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_TableWritePlan_writerOpenNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    plan_json: JString,
+    runtime_json: JString,
+    db_id: JString,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    mode: jint,
+    snapshot_id: jlong,
+) -> jobject {
+    let plan: TableWritePlan = match parse_json(&mut env, plan_json, "table write plan") {
+        Some(plan) => plan,
+        None => return std::ptr::null_mut(),
+    };
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return std::ptr::null_mut();
+    };
+    let builder = match plan.writer_builder(runtime) {
+        Ok(builder) => builder,
+        Err(error) => return throw_state_and_null(&mut env, error),
+    };
+    writer_open(
+        &mut env,
+        builder,
+        db_id,
+        range_starts,
+        range_ends,
+        mode,
+        snapshot_id,
+    )
+}
+
+fn writer_open(
+    env: &mut JNIEnv,
+    builder: TableWriterBuilder,
+    db_id: JString,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    mode: jint,
+    snapshot_id: jlong,
+) -> jobject {
+    let db_id = match decode_optional_java_string(env, db_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(env, error),
+    };
+    let ranges = match decode_bucket_ranges(env, range_starts, range_ends) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(env, error),
     };
     let builder = match db_id {
         Some(db_id) => builder.db_id(db_id).bucket_ranges(ranges),
@@ -383,19 +469,18 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_writerOpenNative(
         1 => builder.resume(),
         2 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
             Ok(snapshot_id) => builder.open_from_snapshot(snapshot_id),
-            Err(error) => return throw_argument_and_null(&mut env, error),
+            Err(error) => return throw_argument_and_null(env, error),
         },
         3 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
             Ok(snapshot_id) => builder.resume_from_snapshot(snapshot_id),
-            Err(error) => return throw_argument_and_null(&mut env, error),
+            Err(error) => return throw_argument_and_null(env, error),
         },
-        _ => return throw_argument_and_null(&mut env, "invalid catalog writer open mode"),
+        _ => return throw_argument_and_null(env, "invalid catalog writer open mode"),
     };
-    let opened = match opened {
-        Ok(value) => value,
-        Err(error) => return throw_state_and_null(&mut env, error),
-    };
-    crate::table::table_to_java(&mut env, opened)
+    match opened {
+        Ok(table) => crate::table::table_to_java(env, table),
+        Err(error) => throw_state_and_null(env, error),
+    }
 }
 
 #[unsafe(no_mangle)]

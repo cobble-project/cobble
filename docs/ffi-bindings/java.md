@@ -162,6 +162,21 @@ try (CatalogTable table = catalog.loadTable(identifier);
 The example uses one bucket. Set each writer's `bucketRanges` to its assigned buckets; use
 `resume()` instead of `open()` to resume an existing shard. `materializeTable(db)` uses an existing Db.
 
+For distributed writes, build a `TableWritePlan` on the coordinator and send it to workers using
+Java serialization:
+
+```java
+TableWritePlan plan = table.newWriteBuilder().totalBuckets(16).build();
+// On a worker, after deserializing the plan:
+try (Table writer = plan.writerBuilder(runtimeConfig)
+        .dbId("shard-0").bucketRanges(new int[] {0}, new int[] {3}).open()) {
+    writer.put(row);
+}
+```
+
+The plan pins a catalog schema version and excludes credentials. Workers provide their own
+storage credentials and primary volumes through `runtimeConfig`; no Catalog object is required.
+
 Choose `currentGlobalSnapshot()` to follow new commits, or `globalSnapshot(id)` for a fixed reader.
 Without a catalog, use `TableReader.openCurrent(config, name)` or `open(config, name, snapshotId)`.
 Call `reader.refresh()` to explicitly check for a new commit in Latest mode.
