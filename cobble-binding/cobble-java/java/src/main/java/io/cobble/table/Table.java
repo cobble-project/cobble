@@ -8,6 +8,7 @@ import io.cobble.PendingSnapshot;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 import io.cobble.ShardSnapshot;
+import io.cobble.WriteOptions;
 
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -156,10 +157,20 @@ public final class Table extends NativeObject {
 
     /** Writes one full row in schema field order. */
     public void put(List<Value> row) {
+        putEncoded(row, 0L);
+    }
+
+    /** Writes one full row with caller TTL and WAL durability settings. */
+    public void put(List<Value> row, WriteOptions options) {
+        putEncoded(row, writeOptionsHandle(options));
+    }
+
+    private void putEncoded(List<Value> row, long writeOptionsHandle) {
         TableState state = state();
         requireRow(state.compiled, row);
         EncodedKey key = encodeRowKeyValidated(state.compiled, row);
-        putNative(nativeHandle, key.bucket, key.bytes, encodeValuesValidated(state.compiled, row));
+        byte[] payload = encodeValuesValidated(state.compiled, row);
+        putNative(nativeHandle, key.bucket, key.bytes, payload, writeOptionsHandle);
     }
 
     /**
@@ -169,6 +180,20 @@ public final class Table extends NativeObject {
      * and borrows them for the duration of this call.
      */
     public void putDirect(List<Value> row, ByteBuffer keyBuffer, ByteBuffer rowBuffer) {
+        putDirectEncoded(row, keyBuffer, rowBuffer, 0L);
+    }
+
+    /** Writes one full row with caller-owned direct buffers and write options. */
+    public void putDirect(
+            List<Value> row, ByteBuffer keyBuffer, ByteBuffer rowBuffer, WriteOptions options) {
+        putDirectEncoded(row, keyBuffer, rowBuffer, writeOptionsHandle(options));
+    }
+
+    private void putDirectEncoded(
+            List<Value> row,
+            ByteBuffer keyBuffer,
+            ByteBuffer rowBuffer,
+            long writeOptionsHandle) {
         TableState state = state();
         requireDirect(keyBuffer, "keyBuffer");
         requireDirect(rowBuffer, "rowBuffer");
@@ -186,7 +211,25 @@ public final class Table extends NativeObject {
         int bucket = state.compiled.bucketHash.bucket(prefix(keyBuffer, prefixEnd));
         encodeValuesToValidated(state.compiled, row, rowBuffer);
         int rowLength = rowBuffer.position();
-        putDirectNative(nativeHandle, bucket, keyBuffer, 0, keyLength, rowBuffer, 0, rowLength);
+        putDirectNative(
+                nativeHandle,
+                bucket,
+                keyBuffer,
+                0,
+                keyLength,
+                rowBuffer,
+                0,
+                rowLength,
+                writeOptionsHandle);
+    }
+
+    private static long writeOptionsHandle(WriteOptions options) {
+        WriteOptions checked = Objects.requireNonNull(options, "options");
+        long handle = checked.getNativeHandle();
+        if (checked.isDisposed() || handle == 0L) {
+            throw new IllegalStateException("write options is closed");
+        }
+        return handle;
     }
 
     /** Deletes one complete row. */
@@ -704,7 +747,11 @@ public final class Table extends NativeObject {
     private static native long createReadViewNative(long nativeHandle, String[] fieldNames);
 
     private static native void putNative(
-            long nativeHandle, int bucket, byte[] key, byte[] rowPayload);
+            long nativeHandle,
+            int bucket,
+            byte[] key,
+            byte[] rowPayload,
+            long writeOptionsHandle);
 
     private static native void putDirectNative(
             long nativeHandle,
@@ -714,7 +761,8 @@ public final class Table extends NativeObject {
             int keyLength,
             ByteBuffer rowPayload,
             int rowOffset,
-            int rowLength);
+            int rowLength,
+            long writeOptionsHandle);
 
     private static native void deleteTableNative(long nativeHandle, int bucket, byte[] key);
 

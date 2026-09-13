@@ -218,9 +218,7 @@ impl Table {
 
     /// Write one full row with caller options safely rebound to this table.
     pub fn put_with_options(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
-        let mut bound = self.write_options.clone();
-        bound.ttl_seconds = options.ttl_seconds;
-        bound.await_durable = options.await_durable;
+        let bound = self.rebound_write_options(options);
         self.put_bound(row, &bound)
     }
 
@@ -253,6 +251,13 @@ impl Table {
         self.db
             .put_columns_with_options(bucket, key, &values, options)?;
         Ok(())
+    }
+
+    pub(crate) fn rebound_write_options(&self, options: &WriteOptions) -> WriteOptions {
+        let mut bound = self.write_options.clone();
+        bound.ttl_seconds = options.ttl_seconds;
+        bound.await_durable = options.await_durable;
+        bound
     }
 
     /// Read one row by primary key.

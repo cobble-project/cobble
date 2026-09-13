@@ -118,6 +118,14 @@ class DbBindingTest {
     void tableApiUsesLocalCodecsAndRawJniRows() throws Exception {
         Path dataDir = Files.createTempDirectory("cobble-java-table-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(8);
+        Config.VolumeDescriptor walVolume = new Config.VolumeDescriptor();
+        walVolume.baseDir = dataDir.resolve("wal").toString();
+        walVolume.kinds = Collections.singletonList(Config.VolumeUsageKind.WAL);
+        config.addVolume(walVolume);
+        config.ttlEnabled = true;
+        config.defaultTtlSeconds = null;
+        config.timeProvider = Config.TimeProviderKind.MANUAL;
+        config.walEnabled = true;
         TableSchema schema =
                 new TableSchema(
                         Arrays.asList(
@@ -159,9 +167,18 @@ class DbBindingTest {
                         Value.binary(new byte[] {8, 9}),
                         Value.struct(Collections.singletonList(Value.binary(new byte[] {10}))),
                         Value.string("direct"));
+        List<Value> durableRow =
+                Arrays.asList(
+                        Value.string("tenant-a"),
+                        Value.int64(7),
+                        Value.binary(new byte[] {14}),
+                        Value.struct(Collections.singletonList(Value.nullValue())),
+                        Value.string("cleared-ttl"));
+        String dbId;
         try (Db db = Db.open(config);
                 Table table = Table.create(db, "events", schema);
                 Table reopened = Table.open(db, "events")) {
+            dbId = db.id();
             assertEquals(schema, reopened.schema());
             assertThrows(
                     IllegalArgumentException.class,
@@ -275,6 +292,72 @@ class DbBindingTest {
             assertThrows(
                     IllegalArgumentException.class,
                     () -> table.projectByNames(Collections.singletonList("missing")));
+
+            List<Value> defaultRow =
+                    Arrays.asList(
+                            Value.string("tenant-a"),
+                            Value.int64(4),
+                            Value.binary(new byte[] {11}),
+                            Value.struct(Collections.singletonList(Value.nullValue())),
+                            Value.string("default"));
+            List<Value> ttlRow =
+                    Arrays.asList(
+                            Value.string("tenant-a"),
+                            Value.int64(5),
+                            Value.binary(new byte[] {12}),
+                            Value.struct(Collections.singletonList(Value.nullValue())),
+                            Value.string("ttl"));
+            List<Value> directTtlRow =
+                    Arrays.asList(
+                            Value.string("tenant-a"),
+                            Value.int64(6),
+                            Value.binary(new byte[] {13}),
+                            Value.struct(Collections.singletonList(Value.nullValue())),
+                            Value.string("direct-ttl"));
+            table.put(defaultRow);
+            try (WriteOptions options =
+                    new WriteOptions().ttlSeconds(10).columnFamily("default").awaitDurable(false)) {
+                table.put(ttlRow, options);
+                table.putDirect(directTtlRow, directKey, directRow, options);
+                options.clearTtl();
+                options.awaitDurable(true);
+                table.put(durableRow, options);
+            }
+            try (WriteOptions closedOptions = new WriteOptions()) {
+                closedOptions.close();
+                assertThrows(
+                        IllegalStateException.class, () -> table.put(defaultRow, closedOptions));
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> table.putDirect(defaultRow, directKey, directRow, closedOptions));
+            }
+            db.setTime(11);
+            assertEquals(
+                    defaultRow,
+                    table.get(
+                            table.keyBuilder()
+                                    .push(defaultRow.get(0))
+                                    .push(defaultRow.get(1))
+                                    .build()));
+            assertNull(
+                    table.get(
+                            table.keyBuilder()
+                                    .push(ttlRow.get(0))
+                                    .push(ttlRow.get(1))
+                                    .build()));
+            assertNull(
+                    table.get(
+                            table.keyBuilder()
+                                    .push(directTtlRow.get(0))
+                                    .push(directTtlRow.get(1))
+                                    .build()));
+            assertEquals(
+                    durableRow,
+                    table.get(
+                            table.keyBuilder()
+                                    .push(durableRow.get(0))
+                                    .push(durableRow.get(1))
+                                    .build()));
 
             String originalOptionsJson = nativeTableOptions(db, "events");
             try (TableProjection staleProjection =
@@ -452,7 +535,7 @@ class DbBindingTest {
                         readOnly.scanBounds(readOnlyKey2.bucket(), readOnlyKey2, readOnlyEnd)) {
                     for (List<Value> row : cursor) rows.add(row);
                 }
-                assertEquals(Arrays.asList(row2, row3), rows);
+                assertEquals(Arrays.asList(row2, row3, defaultRow, durableRow), rows);
             }
 
             try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
@@ -478,6 +561,18 @@ class DbBindingTest {
                     assertEquals(Collections.singletonList(Value.binary(new byte[] {7})), first);
                 }
             }
+        }
+
+        try (Db resumed = Db.resume(config, dbId, RecoveryMode.LATEST_WITH_WAL);
+                Table resumedTable = Table.open(resumed, "events")) {
+            assertEquals(
+                    durableRow,
+                    resumedTable.get(
+                            resumedTable
+                                    .keyBuilder()
+                                    .push(durableRow.get(0))
+                                    .push(durableRow.get(1))
+                                    .build()));
         }
     }
 

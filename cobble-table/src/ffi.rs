@@ -6,7 +6,10 @@
 use crate::table::{ReadBackend, TypedRead};
 use crate::{ReadOnlyTable, Result, Table, TableReader, TableScanSplit, TableSchema};
 use bytes::Bytes;
-use cobble::{ColumnFamilyOptions, Config, DbIterator, ReadOptions, ScanOptions, ScanSplitScanner};
+use cobble::{
+    ColumnFamilyOptions, Config, DbIterator, ReadOptions, ScanOptions, ScanSplitScanner,
+    WriteOptions,
+};
 use std::sync::Arc;
 
 /// Exact physical column-family definition captured with a typed table view.
@@ -90,6 +93,20 @@ impl TableHandle {
             columns,
             self.table.ffi_write_options(),
         )?;
+        Ok(())
+    }
+
+    pub fn put_columns_with_options(
+        &self,
+        bucket: u16,
+        key: &[u8],
+        columns: &[&[u8]],
+        options: &WriteOptions,
+    ) -> Result<()> {
+        let bound = self.table.rebound_write_options(options);
+        self.table
+            .db()
+            .put_columns_with_options(bucket, key, columns, &bound)?;
         Ok(())
     }
 

@@ -382,6 +382,8 @@ public final class Config {
         @SerializedName("cache")
         CACHE,
         @SerializedName("readonly")
-        READONLY
+        READONLY,
+        @SerializedName("wal")
+        WAL
     }
 }

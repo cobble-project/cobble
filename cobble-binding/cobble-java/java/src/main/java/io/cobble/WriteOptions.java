@@ -21,6 +21,16 @@ public final class WriteOptions extends NativeObject {
         return this;
     }
 
+    /**
+     * Choose whether a WAL-backed write waits for durable WAL publication before returning.
+     *
+     * <p>This setting has no effect when WAL is disabled.
+     */
+    public WriteOptions awaitDurable(boolean value) {
+        setAwaitDurable(nativeHandle, value);
+        return this;
+    }
+
     /** Target one column family for subsequent writes. */
     public WriteOptions columnFamily(String columnFamily) {
         if (columnFamily == null || columnFamily.trim().isEmpty()) {
@@ -54,6 +64,8 @@ public final class WriteOptions extends NativeObject {
     private static native void setTtlSeconds(long nativeHandle, int ttlSeconds);
 
     private static native void clearTtlSeconds(long nativeHandle);
+
+    private static native void setAwaitDurable(long nativeHandle, boolean awaitDurable);
 
     private static native void setColumnFamily(long nativeHandle, String columnFamily);
 

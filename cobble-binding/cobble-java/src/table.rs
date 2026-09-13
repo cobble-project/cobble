@@ -5,6 +5,7 @@ use crate::util::{
     decode_u16, decode_u64_from_jlong, throw_illegal_argument, throw_illegal_state,
     to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
+use crate::write_options::write_options_from_handle_or_throw;
 use crate::{
     read_options::bind_to_table_schema as bind_read_options,
     scan::bind_to_table_schema as bind_scan_options,
@@ -477,6 +478,7 @@ pub extern "system" fn Java_io_cobble_table_Table_putNative(
     bucket: jint,
     key: JByteArray,
     row_payload: JByteArray,
+    write_options_handle: jlong,
 ) {
     let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
         return;
@@ -502,7 +504,14 @@ pub extern "system" fn Java_io_cobble_table_Table_putNative(
             return;
         }
     };
-    put_raw(&mut env, table, bucket, &key, &payload);
+    put_raw(
+        &mut env,
+        table,
+        bucket,
+        &key,
+        &payload,
+        write_options_handle,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -517,6 +526,7 @@ pub extern "system" fn Java_io_cobble_table_Table_putDirectNative(
     row_buffer: JByteBuffer,
     row_offset: jint,
     row_length: jint,
+    write_options_handle: jlong,
 ) {
     let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
         return;
@@ -542,7 +552,7 @@ pub extern "system" fn Java_io_cobble_table_Table_putDirectNative(
             return;
         }
     };
-    put_raw(&mut env, table, bucket, key, payload);
+    put_raw(&mut env, table, bucket, key, payload, write_options_handle);
 }
 
 #[unsafe(no_mangle)]
@@ -727,6 +737,7 @@ fn put_raw(
     bucket: u16,
     key: &[u8],
     payload: &[u8],
+    write_options_handle: jlong,
 ) {
     let columns = match decode_row_payload(payload) {
         Ok(value) => value,
@@ -735,7 +746,15 @@ fn put_raw(
             return;
         }
     };
-    if let Err(error) = table.put_columns(bucket, key, &columns) {
+    let result = if write_options_handle == 0 {
+        table.put_columns(bucket, key, &columns)
+    } else {
+        let Some(options) = write_options_from_handle_or_throw(env, write_options_handle) else {
+            return;
+        };
+        table.put_columns_with_options(bucket, key, &columns, options.write_options())
+    };
+    if let Err(error) = result {
         throw_illegal_state(env, error.to_string());
     }
 }

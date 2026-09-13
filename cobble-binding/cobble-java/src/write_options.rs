@@ -2,7 +2,7 @@ use crate::util::{decode_java_string, decode_u32, throw_illegal_argument, throw_
 use cobble_binding::WriteOptions;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jint, jlong};
+use jni::sys::{JNI_TRUE, jboolean, jint, jlong};
 
 pub(crate) struct WriteOptionsHandle {
     write_options: WriteOptions,
@@ -85,6 +85,20 @@ pub extern "system" fn Java_io_cobble_WriteOptions_clearTtlSeconds(
         return;
     };
     write_options.write_options.ttl_seconds = None;
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_WriteOptions_setAwaitDurable(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    await_durable: jboolean,
+) {
+    let Some(write_options) = write_options_from_handle_mut_or_throw(&mut env, native_handle)
+    else {
+        return;
+    };
+    write_options.write_options.await_durable = await_durable == JNI_TRUE;
 }
 
 #[unsafe(no_mangle)]

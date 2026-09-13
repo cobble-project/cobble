@@ -142,6 +142,9 @@ an existing Db; `ReadOnlyTable.open(readOnlyDb, name)` opens a shard snapshot ta
 Write rows with `put(row)`; build keys with `keyBuilder()` for `get` and `multiGet`.
 Use `projectByNames` to select fields and `scan` to iterate rows.
 `putDirect` and `getDirect` support caller-provided direct buffers.
+Pass `WriteOptions` to `put(row, options)` or `putDirect(row, keyBuffer, rowBuffer, options)`
+for per-write TTL and `awaitDurable(true)` WAL durability waits. The table keeps its own column
+family and column mapping; the options cannot redirect the write to another family.
 
 `table.snapshot()` waits for publication; `table.asyncSnapshot()` returns a
 `CompletableFuture<ShardSnapshot>`. Use `startAsyncSnapshot()` when the snapshot ID is also needed
