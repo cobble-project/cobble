@@ -12,7 +12,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
-/** Typed reader over one current or fixed global table snapshot. */
+/**
+ * Typed reader over one current or fixed global table snapshot.
+ *
+ * <p>Current readers check for new commits on read access at the configured refresh interval. Fixed
+ * readers never advance. Schema access does not perform I/O. Existing projections, cursors, and
+ * direct rows remain usable after this reader refreshes or closes and must be closed separately.
+ */
 public final class TableReader extends NativeObject {
     private final String name;
     private final long refreshIntervalNanos;
@@ -35,7 +41,10 @@ public final class TableReader extends NativeObject {
     private TableReader(long nativeHandle, String name) {
         super(nativeHandle);
         this.name = name;
-        TableReaderView initial = acquire(null);
+        long viewHandle = acquireViewNative(nativeHandle, 0L);
+        if (viewHandle == 0L)
+            throw new IllegalStateException("failed to acquire table reader view");
+        TableReaderView initial = new TableReaderView(viewHandle);
         try {
             Table.OpenInfo info =
                     TableJson.openInfoFromJson(describeViewNative(initial.getNativeHandle()));
@@ -88,6 +97,7 @@ public final class TableReader extends NativeObject {
         return new TableKeyBuilder(state().compiled);
     }
 
+    /** Checks for a newer committed snapshot; returns false for fixed or unchanged readers. */
     public synchronized boolean refresh() {
         ensureUsable();
         refreshNative(nativeHandle);
@@ -233,13 +243,6 @@ public final class TableReader extends NativeObject {
             candidate.close();
             throw error;
         }
-    }
-
-    private TableReaderView acquire(TableReaderView current) {
-        long handle =
-                acquireViewNative(nativeHandle, current == null ? 0L : current.getNativeHandle());
-        if (handle == 0L) throw new IllegalStateException("failed to acquire table reader view");
-        return new TableReaderView(handle);
     }
 
     private void scheduleNext() {

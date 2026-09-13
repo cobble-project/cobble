@@ -162,6 +162,7 @@ For catalog-managed tables, open `FileCatalog.open(config, storageId)`, then use
 or `loadTable`. Open writers and readers through the returned `CatalogTable`:
 
 ```java
+runtimeConfig.totalBuckets(1);
 try (CatalogTable table = catalog.loadTable(identifier);
         Table writer = table.writerBuilder(runtimeConfig).dbId("shard-0")
                 .bucketRanges(new int[] {0}, new int[] {0}).open();
@@ -194,6 +195,8 @@ Workers supply storage credentials and primary volumes through `runtimeConfig`.
 Choose `currentGlobalSnapshot()` to follow new commits, or `globalSnapshot(id)` for a fixed reader.
 Without a catalog, use `TableReader.openCurrent(config, name)` or `open(config, name, snapshotId)`.
 Call `reader.refresh()` to explicitly check for a new commit in Latest mode.
+Latest readers also check on read access at `config.reader.reloadToleranceSeconds` intervals;
+`schema()` reports the loaded schema without checking storage. Fixed readers never advance.
 
 Use `catalog.evolveSchema(identifier, changes)` with `TableSchemaChange` to add, rename, drop, or
 widen fields. Apply the returned catalog version with `refreshWriter(writer)`; for local Db schema
@@ -207,7 +210,11 @@ Send the serializable plan or its splits to workers and call
 `openScanner(config, fieldNames, readAheadBytes)` when encoded rows are preferred.
 
 Close tables, readers, projections, direct rows, and scanners when finished. Retain referenced
-snapshots while they are in use. See [Table](../getting-started/table) for configuration and semantics.
+snapshots while they are in use. Reader projections and scans keep their captured view across
+refreshes and can outlive the reader. Closing a table does not close a caller-supplied Db;
+close its projections and scans before explicitly closing that Db. Do not race table close or
+writer schema refresh with other operations. See [Table](../getting-started/table) for configuration
+and semantics.
 
 ## Process-Level Filesystem Fallback APIs
 

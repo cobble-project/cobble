@@ -17,9 +17,10 @@ import java.util.Set;
 /**
  * A reusable typed field projection over one table.
  *
- * <p>The projection owns its read and scan options and keeps the database reachable independently
- * of the table handle. Close its cursors and the projection before closing the database; {@link
- * #close()} must not race another operation.
+ * <p>The projection retains its read view independently of the table handle. A projection from a
+ * {@link TableReader} stays on its captured snapshot across reader refreshes. Its cursors can
+ * outlive the projection. When using a caller-owned database, close projections and cursors before
+ * closing that database. {@link #close()} must not race another operation.
  */
 public final class TableProjection implements AutoCloseable {
     private final TableReadBackend reads;
