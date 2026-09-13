@@ -559,6 +559,14 @@ impl TypedRead {
         Arc::clone(&self.compiled.schema)
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_schema_binding(&self) -> crate::ffi::TableSchemaBinding {
+        crate::ffi::TableSchemaBinding {
+            options: self.compiled.column_family_options.clone(),
+            physical_columns: self.compiled.physical_columns,
+        }
+    }
+
     /// Start building one primary key in schema order.
     pub fn key_builder(&self) -> TableKeyBuilder {
         TableKeyBuilder {

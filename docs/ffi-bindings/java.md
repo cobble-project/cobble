@@ -137,7 +137,7 @@ reader.refresh();
 
 ## Table APIs
 
-`io.cobble.table` provides `Table`, `ReadOnlyTable`, schemas, and Java-side key/value codecs.
+`io.cobble.table` provides `Table`, `ReadOnlyTable`, `TableReader`, schemas, and Java-side key/value codecs.
 `TableSnapshotCommitter` collects shard reports into a consistent global snapshot.
 See [Table](../getting-started/table) for the storage and snapshot model.
 
@@ -147,8 +147,8 @@ fields, or widen value-field types with `catalog.evolveSchema(...)`. Loaded `Cat
 represent fixed catalog versions: `materializeTable(db)` applies that version to a caller-owned shard, and
 `refreshWriter(table)` applies it to an existing Table and refreshes its layout. Neither method
 owns or closes the caller's Db. Publishing a catalog schema alone does not update live handles.
-Close catalog handles when no longer needed. Catalog-backed storage builders, automatic latest
-Table readers, and custom transforms are not yet exposed through these Java APIs.
+Close catalog handles when no longer needed. Catalog-backed storage builders are not yet exposed
+through these Java APIs. Custom transforms are not supported by the Java Table API.
 
 `TableSchemaChange.alterFieldType(name, type)` supports the same lossless changes as Rust Table,
 such as `Int8` → `Int64`; see [schema evolution](../getting-started/table#schema-evolution).
@@ -159,6 +159,15 @@ Table operations are bound to the schema used when the handle was opened. After 
 schema update, call `table.refreshSchema()` and rebuild projections before using the new layout.
 Refresh must not run concurrently with operations on that Table. Already-open scans and
 snapshot-backed `ReadOnlyTable` handles retain their original read view.
+
+`TableReader` reads across shards in a committed global snapshot. `openCurrent(config, tableName)`
+checks for new commits on access at the configured reader interval; `open(config, tableName,
+snapshotId)` remains fixed. `refresh()` explicitly checks a Latest reader and returns whether its
+view changed; it does nothing for a fixed reader. Schema and data advance together. Existing
+projections and scans keep their captured view and must be closed separately.
+Keep referenced snapshots retained while readers or their derived views are in use.
+`schema()` reports the loaded view without I/O; call `refresh()` first when you need the latest
+committed schema before building a projection.
 
 `TableScanPlan.forCurrentSnapshot(config, tableName)` captures the current committed global
 snapshot; `forSnapshot(config, tableName, snapshotId)` selects a historical snapshot.

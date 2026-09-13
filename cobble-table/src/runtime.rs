@@ -408,6 +408,14 @@ impl TableReader {
         result
     }
 
+    #[cfg(feature = "ffi")]
+    #[doc(hidden)]
+    pub fn auto_refresh_interval_nanos(&self) -> Option<u64> {
+        self.refresh
+            .interval
+            .map(|interval| interval.as_nanos().min(u128::from(u64::MAX)) as u64)
+    }
+
     fn view_for_access(&self) -> Result<Guard<Arc<TypedRead>>> {
         let view = self.typed.load();
         if !self.refresh.due() {
@@ -447,6 +455,26 @@ impl TableReader {
         let typed = TypedRead::from_global_metadata(state, name, metadata)?;
         self.typed.store(Arc::new(typed));
         Ok(true)
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_acquire_view(&self) -> crate::ffi::TableReaderView {
+        crate::ffi::TableReaderView {
+            typed: self.typed.load_full(),
+        }
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_acquire_view_if_changed(
+        &self,
+        current: &crate::ffi::TableReaderView,
+    ) -> Option<crate::ffi::TableReaderView> {
+        let typed = self.typed.load_full();
+        if Arc::ptr_eq(&typed, &current.typed) {
+            None
+        } else {
+            Some(crate::ffi::TableReaderView { typed })
+        }
     }
 }
 

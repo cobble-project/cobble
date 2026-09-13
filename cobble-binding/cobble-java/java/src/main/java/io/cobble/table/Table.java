@@ -499,6 +499,14 @@ public final class Table implements AutoCloseable {
         }
 
         static TableState create(String name, OpenInfo openInfo) {
+            return create(name, openInfo, true);
+        }
+
+        static TableState createReadOnly(String name, OpenInfo openInfo) {
+            return create(name, openInfo, false);
+        }
+
+        private static TableState create(String name, OpenInfo openInfo, boolean writable) {
             Compiled compiled = Compiled.from(openInfo.schema, openInfo.totalBuckets);
             if (openInfo.physicalColumns != compiled.physicalColumns) {
                 throw new IllegalStateException("captured table physical layout is inconsistent");
@@ -509,12 +517,12 @@ public final class Table implements AutoCloseable {
             ScanOptions scanOptions = null;
             try {
                 readOptions = ReadOptions.forColumnsInFamily(name, columns);
-                writeOptions = WriteOptions.withColumnFamily(name);
+                if (writable) writeOptions = WriteOptions.withColumnFamily(name);
                 scanOptions = new ScanOptions().columnFamily(name).columns(columns);
                 bindOptionsNative(
                         readOptions.getNativeHandle(),
                         scanOptions.getNativeHandle(),
-                        writeOptions.getNativeHandle(),
+                        writeOptions == null ? 0L : writeOptions.getNativeHandle(),
                         openInfo.columnFamilyOptionsJson,
                         openInfo.physicalColumns);
                 return new TableState(
@@ -543,7 +551,7 @@ public final class Table implements AutoCloseable {
         public void close() {
             scanOptions.close();
             readOptions.close();
-            writeOptions.close();
+            if (writeOptions != null) writeOptions.close();
         }
     }
 

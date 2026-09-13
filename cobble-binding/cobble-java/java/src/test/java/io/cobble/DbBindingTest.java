@@ -13,6 +13,7 @@ import io.cobble.table.Table;
 import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableKey;
 import io.cobble.table.TableProjection;
+import io.cobble.table.TableReader;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableSchema;
 import io.cobble.table.TableSchemaChange;
@@ -592,6 +593,8 @@ class DbBindingTest {
         Path dataDir = Files.createTempDirectory("cobble-java-table-transform-recovery-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
         config.l0FileLimit = Integer.MAX_VALUE;
+        config.reader = new Config.ReaderConfigEntry();
+        config.reader.reloadToleranceSeconds = 0L;
         List<String> namespace = Collections.singletonList("analytics");
         TableIdentifier scores = new TableIdentifier(namespace, "scores");
         TableSchema initialSchema =
@@ -606,11 +609,14 @@ class DbBindingTest {
                 Arrays.asList(Value.string("tenant-a"), Value.int64(7L), Value.int8((byte) 42));
         List<Value> widenedRow =
                 Arrays.asList(Value.string("tenant-a"), Value.int64(7L), Value.int64(42L));
+        List<Value> newestRow =
+                Arrays.asList(Value.string("tenant-a"), Value.int64(7L), Value.int64(43L));
 
         CatalogTable evolved;
         String physicalName;
         String sourceDbId;
         ShardSnapshot evolvedSnapshot;
+        GlobalSnapshot initialGlobalSnapshot;
         GlobalSnapshot globalSnapshot;
         try (FileCatalog catalog = FileCatalog.open(config, "warehouse");
                 Db db = Db.open(config)) {
@@ -623,6 +629,13 @@ class DbBindingTest {
                 ShardSnapshot beforeEvolution = db.snapshot();
                 assertTrue(db.retainSnapshot(beforeEvolution.snapshotId));
                 assertTrue(beforeEvolution.dataSizeBytes > 0L);
+                try (DbCoordinator coordinator = DbCoordinator.open(config)) {
+                    initialGlobalSnapshot =
+                            coordinator.materializeGlobalSnapshot(
+                                    1,
+                                    beforeEvolution.snapshotId,
+                                    Collections.singletonList(beforeEvolution));
+                }
 
                 evolved =
                         catalog.evolveSchema(
@@ -638,17 +651,82 @@ class DbBindingTest {
                                         .push(oldRow.get(0))
                                         .push(oldRow.get(1))
                                         .build()));
-                evolvedSnapshot = db.snapshot();
-                assertTrue(db.retainSnapshot(evolvedSnapshot.snapshotId));
-                assertTrue(evolvedSnapshot.snapshotId > beforeEvolution.snapshotId);
-                assertTrue(evolvedSnapshot.dataSizeBytes > 0L);
+                TableReader latest = TableReader.openCurrent(config, physicalName);
+                TableReader fixed =
+                        TableReader.open(config, physicalName, initialGlobalSnapshot.id);
+                TableKey oldKey =
+                        latest.keyBuilder().push(oldRow.get(0)).push(oldRow.get(1)).build();
+                TableProjection oldProjection =
+                        latest.projectByNames(Collections.singletonList("score"));
+                TableScanCursor oldScan = latest.scan(oldKey.bucket());
+                TableScanCursor oldProjectionScan = oldProjection.scan(oldKey.bucket());
+                try {
+                    // The catalog is already widened, but CURRENT still selects the old snapshot.
+                    assertEquals(
+                            LogicalTypes.int8(), latest.schema().fields().get(2).logicalType());
+                    assertEquals(oldRow, latest.get(oldKey));
+                    assertEquals(
+                            oldRow,
+                            fixed.get(
+                                    fixed.keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
 
-                try (DbCoordinator coordinator = DbCoordinator.open(config)) {
-                    globalSnapshot =
-                            coordinator.materializeGlobalSnapshot(
-                                    1,
-                                    evolvedSnapshot.snapshotId,
-                                    Collections.singletonList(evolvedSnapshot));
+                    evolvedSnapshot = db.snapshot();
+                    assertTrue(db.retainSnapshot(evolvedSnapshot.snapshotId));
+                    assertTrue(evolvedSnapshot.snapshotId > beforeEvolution.snapshotId);
+                    assertTrue(evolvedSnapshot.dataSizeBytes > 0L);
+                    try (DbCoordinator coordinator = DbCoordinator.open(config)) {
+                        globalSnapshot =
+                                coordinator.materializeGlobalSnapshot(
+                                        1,
+                                        evolvedSnapshot.snapshotId,
+                                        Collections.singletonList(evolvedSnapshot));
+                    }
+
+                    assertEquals(widenedRow, latest.get(oldKey));
+                    assertEquals(
+                            LogicalTypes.int64(), latest.schema().fields().get(2).logicalType());
+                    assertEquals(
+                            Arrays.asList(widenedRow, widenedRow),
+                            latest.multiGet(Arrays.asList(oldKey, oldKey)));
+                    assertFalse(fixed.refresh());
+                    assertEquals(
+                            oldRow,
+                            fixed.get(
+                                    fixed.keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
+
+                    writer.put(newestRow);
+                    ShardSnapshot newestSnapshot = db.snapshot();
+                    try (DbCoordinator coordinator = DbCoordinator.open(config)) {
+                        coordinator.materializeGlobalSnapshot(
+                                1,
+                                newestSnapshot.snapshotId,
+                                Collections.singletonList(newestSnapshot));
+                    }
+                    assertTrue(latest.refresh());
+                    assertFalse(latest.refresh());
+                    assertEquals(newestRow, latest.get(oldKey));
+
+                    latest.close();
+                    assertEquals(
+                            Collections.singletonList(oldRow.get(2)), oldProjection.get(oldKey));
+                    oldProjection.close();
+                    assertEquals(
+                            Collections.singletonList(oldRow.get(2)), oldProjectionScan.nextRow());
+                    assertNull(oldProjectionScan.nextRow());
+                    assertEquals(oldRow, oldScan.nextRow());
+                    assertNull(oldScan.nextRow());
+                } finally {
+                    oldProjectionScan.close();
+                    oldScan.close();
+                    oldProjection.close();
+                    fixed.close();
+                    latest.close();
                 }
             }
         }
@@ -658,7 +736,7 @@ class DbBindingTest {
             try (Db resumed = Db.resume(config, sourceDbId);
                     Table table = Table.open(resumed, physicalName)) {
                 assertEquals(
-                        widenedRow,
+                        newestRow,
                         table.get(
                                 table.keyBuilder()
                                         .push(oldRow.get(0))
@@ -704,6 +782,17 @@ class DbBindingTest {
             assertEquals(
                     widenedRow,
                     table.get(table.keyBuilder().push(oldRow.get(0)).push(oldRow.get(1)).build()));
+        }
+        try (TableReader tableReader = TableReader.open(config, physicalName, globalSnapshot.id)) {
+            assertFalse(tableReader.refresh());
+            assertEquals(
+                    widenedRow,
+                    tableReader.get(
+                            tableReader
+                                    .keyBuilder()
+                                    .push(oldRow.get(0))
+                                    .push(oldRow.get(1))
+                                    .build()));
         }
         try (Reader reader = Reader.open(config, globalSnapshot.id);
                 ScanOptions options = new ScanOptions().columnFamily(physicalName);

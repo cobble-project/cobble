@@ -17,12 +17,22 @@ public final class TableScanCursor implements AutoCloseable, Iterable<List<Value
     private final NativeObject owner;
     private final DirectScanCursor inner;
     private final RowDecoder decoder;
+    private final NativeObject retainedOwner;
     private boolean iteratorCreated;
 
     TableScanCursor(NativeObject owner, DirectScanCursor inner, RowDecoder decoder) {
+        this(owner, inner, decoder, null);
+    }
+
+    TableScanCursor(
+            NativeObject owner,
+            DirectScanCursor inner,
+            RowDecoder decoder,
+            NativeObject retainedOwner) {
         this.owner = owner;
         this.inner = inner;
         this.decoder = decoder;
+        this.retainedOwner = retainedOwner;
     }
 
     /** Returns the next owned typed row, or {@code null} when exhausted. */
@@ -63,6 +73,10 @@ public final class TableScanCursor implements AutoCloseable, Iterable<List<Value
 
     @Override
     public void close() {
-        inner.close();
+        try {
+            inner.close();
+        } finally {
+            if (retainedOwner != null) retainedOwner.close();
+        }
     }
 }

@@ -2,6 +2,7 @@ package io.cobble.table;
 
 import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
+import io.cobble.NativeObject;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 
@@ -28,6 +29,7 @@ public final class TableProjection implements AutoCloseable {
     private final boolean hasValueFields;
     private final ReadOptions readOptions;
     private final ScanOptions scanOptions;
+    private final NativeObject retainedOwner;
     private volatile boolean closed;
 
     TableProjection(
@@ -37,8 +39,27 @@ public final class TableProjection implements AutoCloseable {
             String columnFamilyOptionsJson,
             int totalPhysicalColumns,
             List<String> fieldNames) {
+        this(
+                reads,
+                tableName,
+                compiled,
+                columnFamilyOptionsJson,
+                totalPhysicalColumns,
+                fieldNames,
+                null);
+    }
+
+    TableProjection(
+            TableReadBackend reads,
+            String tableName,
+            Table.Compiled compiled,
+            String columnFamilyOptionsJson,
+            int totalPhysicalColumns,
+            List<String> fieldNames,
+            NativeObject retainedOwner) {
         this.reads = reads;
         this.compiled = compiled;
+        this.retainedOwner = retainedOwner;
         if (totalPhysicalColumns != compiled.physicalColumns) {
             throw new IllegalStateException("captured table physical layout is inconsistent");
         }
@@ -133,16 +154,25 @@ public final class TableProjection implements AutoCloseable {
         Table.validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
-        final TableProjection projection = this;
-        return new TableScanCursor(
-                reads.owner(),
-                reads.scan(bucket, start, end, scanOptions),
-                new TableScanCursor.RowDecoder() {
-                    @Override
-                    public List<Value> decode(DirectScanEntry entry) {
-                        return projection.decodeScannedRow(entry);
-                    }
-                });
+        TableReaderView retained = reads.copyReaderView();
+        TableReadBackend scanReads =
+                retained == null ? reads : TableReadBackend.readerView(retained);
+        try {
+            final TableProjection projection = this;
+            return new TableScanCursor(
+                    scanReads.owner(),
+                    scanReads.scan(bucket, start, end, scanOptions),
+                    new TableScanCursor.RowDecoder() {
+                        @Override
+                        public List<Value> decode(DirectScanEntry entry) {
+                            return projection.decodeScannedRow(entry);
+                        }
+                    },
+                    retained);
+        } catch (RuntimeException error) {
+            if (retained != null) retained.close();
+            throw error;
+        }
     }
 
     @Override
@@ -151,6 +181,7 @@ public final class TableProjection implements AutoCloseable {
         closed = true;
         scanOptions.close();
         readOptions.close();
+        if (retainedOwner != null) retainedOwner.close();
     }
 
     private List<Value> decodeScannedRow(DirectScanEntry entry) {
