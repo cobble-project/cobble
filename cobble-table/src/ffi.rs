@@ -107,8 +107,18 @@ impl TableHandle {
         Ok(())
     }
 
-    pub fn snapshot_and_wait(&self) -> Result<cobble::ShardSnapshotMetadata> {
-        self.table.snapshot_and_wait()
+    pub fn snapshot_with_callback<F>(&self, callback: F) -> Result<u64>
+    where
+        F: Fn(cobble::Result<cobble::ShardSnapshotMetadata>) + Send + Sync + 'static,
+    {
+        self.table.snapshot_with_callback(callback)
+    }
+
+    pub fn shard_snapshot_metadata(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<cobble::ShardSnapshotMetadata> {
+        self.table.shard_snapshot_metadata(snapshot_id)
     }
 
     pub fn refresh(&mut self) -> Result<bool> {

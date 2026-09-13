@@ -2,8 +2,8 @@ use crate::db::db_arc_from_handle_or_throw;
 use crate::read_only_db::read_only_db_arc_from_handle_or_throw;
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_optional_java_bytes,
-    decode_u16, throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_optional_bytes_3d, to_java_string_or_throw,
+    decode_u16, decode_u64_from_jlong, throw_illegal_argument, throw_illegal_state,
+    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
 use crate::{
     read_options::bind_to_table_schema as bind_read_options,
@@ -284,22 +284,66 @@ pub extern "system" fn Java_io_cobble_table_Table_refreshNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_Table_snapshotNative(
+pub extern "system" fn Java_io_cobble_table_Table_asyncSnapshotNative(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    snapshot_future_json: JObject,
+) -> jlong {
+    let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    if snapshot_future_json.is_null() {
+        throw_illegal_argument(&mut env, "snapshotFutureJson must not be null".to_string());
+        return 0;
+    }
+    let future = match env.new_global_ref(snapshot_future_json) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_state(&mut env, error.to_string());
+            return 0;
+        }
+    };
+    let vm = match env.get_java_vm() {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_state(&mut env, error.to_string());
+            return 0;
+        }
+    };
+    match table.snapshot_with_callback(move |result| {
+        crate::db::complete_snapshot_json_future(
+            &vm,
+            &future,
+            result.map(|snapshot| crate::db::shard_snapshot_json(&snapshot)),
+        );
+    }) {
+        Ok(snapshot_id) => snapshot_id as jlong,
+        Err(error) => {
+            throw_table_error(&mut env, error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_getShardSnapshotJsonNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_id: jlong,
 ) -> jstring {
     let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
         return std::ptr::null_mut();
     };
-    match table.snapshot_and_wait() {
-        Ok(snapshot) => match serde_json::to_string(&snapshot) {
-            Ok(json) => to_java_string_or_throw(&mut env, json),
-            Err(error) => {
-                throw_illegal_state(&mut env, error.to_string());
-                std::ptr::null_mut()
-            }
-        },
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    match table.shard_snapshot_metadata(snapshot_id) {
+        Ok(snapshot) => {
+            to_java_string_or_throw(&mut env, crate::db::shard_snapshot_json(&snapshot))
+        }
         Err(error) => {
             throw_table_error(&mut env, error);
             std::ptr::null_mut()

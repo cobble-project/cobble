@@ -669,17 +669,32 @@ class DbBindingTest {
                 String ownedDbId = "catalog-owned-writer";
                 ShardSnapshot ownedSnapshot;
                 GlobalSnapshot ownedGlobal;
-                try (Table owned =
-                                initial.writerBuilder(config)
-                                        .dbId(ownedDbId)
-                                        .bucketRanges(new int[] {0}, new int[] {0})
-                                        .open();
-                        TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2)) {
+                Table owned =
+                        initial.writerBuilder(config)
+                                .dbId(ownedDbId)
+                                .bucketRanges(new int[] {0}, new int[] {0})
+                                .open();
+                try (TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2)) {
                     owned.put(oldRow);
-                    ownedSnapshot = owned.snapshot();
+                    PendingSnapshot<ShardSnapshot> pendingSnapshot = owned.startAsyncSnapshot();
+                    ownedSnapshot = awaitSnapshot(pendingSnapshot.future());
+                    assertEquals(pendingSnapshot.snapshotId(), ownedSnapshot.snapshotId);
+                    ShardSnapshot loadedSnapshot =
+                            owned.getShardSnapshot(pendingSnapshot.snapshotId());
+                    assertEquals(
+                            ownedSnapshot.snapshotId, loadedSnapshot.snapshotId);
+                    assertEquals(ownedSnapshot.manifestPath, loadedSnapshot.manifestPath);
+                    assertEquals(ownedSnapshot.schemaId, loadedSnapshot.schemaId);
+                    ShardSnapshot synchronousSnapshot = owned.snapshot();
+                    assertTrue(synchronousSnapshot.snapshotId > ownedSnapshot.snapshotId);
+                    assertThrows(
+                            IllegalArgumentException.class, () -> owned.getShardSnapshot(-1L));
                     ownedGlobal = committer.submit(1L, ownedSnapshot);
                     assertNotNull(ownedGlobal);
+                } finally {
+                    owned.close();
                 }
+                assertThrows(IllegalStateException.class, owned::startAsyncSnapshot);
                 try (Table resumed = initial.writerBuilder(config).dbId(ownedDbId).resume();
                         TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2);
                         TableReader current =

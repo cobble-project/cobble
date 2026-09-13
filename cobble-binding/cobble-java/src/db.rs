@@ -2202,11 +2202,11 @@ fn build_shard_snapshot_payload(db: &Db, snapshot_id: u64) -> std::result::Resul
     Ok(shard_snapshot_json(&input))
 }
 
-fn shard_snapshot_json(input: &cobble_binding::ShardSnapshotMetadata) -> String {
+pub(crate) fn shard_snapshot_json(input: &cobble_binding::ShardSnapshotMetadata) -> String {
     serde_json::to_string(input).expect("snapshot metadata is serializable")
 }
 
-fn complete_snapshot_json_future(
+pub(crate) fn complete_snapshot_json_future(
     vm: &JavaVM,
     future: &GlobalRef,
     result: cobble_binding::Result<String>,

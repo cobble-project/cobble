@@ -4,6 +4,7 @@ import io.cobble.Db;
 import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
 import io.cobble.NativeObject;
+import io.cobble.PendingSnapshot;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 import io.cobble.ShardSnapshot;
@@ -17,6 +18,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.Set;
 
 /**
@@ -208,10 +211,48 @@ public final class Table extends NativeObject {
         deleteBatchTableNative(nativeHandle, buckets, keys);
     }
 
+    /**
+     * Creates a new shard snapshot asynchronously.
+     *
+     * <p>Keep this table and its DB open until the returned future completes.
+     */
+    public CompletableFuture<ShardSnapshot> asyncSnapshot() {
+        return startAsyncSnapshot().future();
+    }
+
+    /**
+     * Creates a new shard snapshot and returns its id with its completion future.
+     *
+     * <p>Keep this table and its DB open until the returned future completes.
+     */
+    public PendingSnapshot<ShardSnapshot> startAsyncSnapshot() {
+        ensureUsable();
+        CompletableFuture<String> snapshotJsonFuture = new CompletableFuture<>();
+        long snapshotId = asyncSnapshotNative(nativeHandle, snapshotJsonFuture);
+        return new PendingSnapshot<>(
+                snapshotId, snapshotJsonFuture.thenApply(ShardSnapshot::fromJson));
+    }
+
     /** Creates a new shard snapshot and waits for its manifest to be materialized. */
     public ShardSnapshot snapshot() {
+        try {
+            return asyncSnapshot().get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("snapshot interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new IllegalStateException("snapshot failed: " + cause.getMessage(), cause);
+        }
+    }
+
+    /** Returns the shard snapshot metadata for a completed local snapshot id. */
+    public ShardSnapshot getShardSnapshot(long snapshotId) {
         ensureUsable();
-        return ShardSnapshot.fromJson(snapshotNative(nativeHandle));
+        return ShardSnapshot.fromJson(getShardSnapshotJsonNative(nativeHandle, snapshotId));
     }
 
     /** Returns one owned typed row, or {@code null} when absent. */
@@ -650,7 +691,10 @@ public final class Table extends NativeObject {
 
     private static native String refreshNative(long nativeHandle);
 
-    private static native String snapshotNative(long nativeHandle);
+    private static native long asyncSnapshotNative(
+            long nativeHandle, CompletableFuture<String> snapshotJsonFuture);
+
+    private static native String getShardSnapshotJsonNative(long nativeHandle, long snapshotId);
 
     private static native byte[][] getNative(long nativeHandle, int bucket, byte[] key);
 

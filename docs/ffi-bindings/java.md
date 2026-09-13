@@ -143,6 +143,11 @@ Write rows with `put(row)`; build keys with `keyBuilder()` for `get` and `multiG
 Use `projectByNames` to select fields and `scan` to iterate rows.
 `putDirect` and `getDirect` support caller-provided direct buffers.
 
+`table.snapshot()` waits for publication; `table.asyncSnapshot()` returns a
+`CompletableFuture<ShardSnapshot>`. Use `startAsyncSnapshot()` when the snapshot ID is also needed
+immediately, and `getShardSnapshot(id)` to retrieve metadata for a completed snapshot.
+Keep the table and its database open until the future completes.
+
 For catalog-managed tables, open `FileCatalog.open(config, storageId)`, then use `createTable`
 or `loadTable`. Open writers and readers through the returned `CatalogTable`:
 
