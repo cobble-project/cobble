@@ -1419,7 +1419,7 @@ pub extern "system" fn Java_io_cobble_Db_multiGet<'local>(
     }
 }
 
-fn encode_optional_columns_to_direct_buffer<'local>(
+pub(crate) fn encode_optional_columns_to_direct_buffer<'local>(
     env: &mut JNIEnv<'local>,
     values: Option<Vec<Option<bytes::Bytes>>>,
     direct_addr: *mut u8,
@@ -2156,7 +2156,7 @@ fn db_from_handle_mut_or_throw(env: &mut JNIEnv, native_handle: jlong) -> Option
     })
 }
 
-fn direct_buffer_pool_config_array(
+pub(crate) fn direct_buffer_pool_config_array(
     env: &mut JNIEnv,
     buffer_size_bytes: usize,
     pool_size: usize,

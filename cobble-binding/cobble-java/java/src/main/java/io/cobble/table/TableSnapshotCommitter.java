@@ -31,6 +31,13 @@ public final class TableSnapshotCommitter extends NativeObject {
         super(nativeHandle);
     }
 
+    static TableSnapshotCommitter fromNativeHandle(long nativeHandle) {
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to create table snapshot committer");
+        }
+        return new TableSnapshotCommitter(nativeHandle);
+    }
+
     /** Opens a committer with an independent coordinator using a config file. */
     public static TableSnapshotCommitter open(
             String configPath, int totalBuckets, int maxPendingCommits) {

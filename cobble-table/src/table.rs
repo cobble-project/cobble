@@ -65,14 +65,14 @@ struct ProjectionPlan {
 }
 
 #[derive(Clone)]
-enum ReadBackend {
+pub(crate) enum ReadBackend {
     Writable(Arc<Db>),
     Shard(Arc<ReadOnlyDb>),
     Global(Arc<crate::runtime::GlobalReaderState>),
 }
 
 impl ReadBackend {
-    fn get_with_options(
+    pub(crate) fn get_with_options(
         &self,
         bucket: u16,
         key: &[u8],
@@ -85,7 +85,7 @@ impl ReadBackend {
         }
     }
 
-    fn multi_get_with_options(
+    pub(crate) fn multi_get_with_options(
         &self,
         keys: &[(u16, &[u8])],
         options: &ReadOptions,
@@ -97,7 +97,7 @@ impl ReadBackend {
         }
     }
 
-    fn scan_with_options_bounds(
+    pub(crate) fn scan_with_options_bounds(
         &self,
         bucket: u16,
         start: Option<&[u8]>,
@@ -356,8 +356,8 @@ impl Table {
         Ok(true)
     }
 
-    pub(crate) fn db(&self) -> &Db {
-        self.db.as_ref()
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -388,6 +388,28 @@ impl Table {
             options: self.compiled.column_family_options.clone(),
             physical_columns: self.compiled.physical_columns,
         }
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_raw_access(&self) -> crate::ffi::RawTableAccess {
+        crate::ffi::RawTableAccess::new(
+            self.read_backend.clone(),
+            self.read_options.clone(),
+            self.scan_options.clone(),
+        )
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_write_options(&self) -> &WriteOptions {
+        &self.write_options
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_raw_projection(
+        &self,
+        field_names: &[String],
+    ) -> Result<crate::ffi::RawTableAccess> {
+        Ok(self.project_by_names(field_names)?.ffi_into_raw_access())
     }
 }
 
@@ -643,6 +665,10 @@ impl TypedRead {
 }
 
 impl TableProjection {
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_into_raw_access(self) -> crate::ffi::RawTableAccess {
+        crate::ffi::RawTableAccess::new(self.backend, self.read_options, self.scan_options)
+    }
     /// Read one projected row.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.backend

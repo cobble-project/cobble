@@ -3,9 +3,10 @@ package io.cobble.table;
 import io.cobble.Db;
 import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
+import io.cobble.NativeObject;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
-import io.cobble.WriteOptions;
+import io.cobble.ShardSnapshot;
 
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -21,48 +22,75 @@ import java.util.Set;
 /**
  * Typed access to one table-backed Cobble column family.
  *
- * <p>The table does not own its {@link Db}. Close cursors and tables before closing the database;
- * as with the core {@code Db} facade, {@link #close()} must not race another operation.
+ * <p>The native table keeps an internal Rust reference to its database; this Java facade does not
+ * own a caller's {@link Db}. Closing a table releases only its own handle. Close cursors and tables
+ * before closing the database; as with the core {@code Db} facade, {@link #close()} must not race
+ * another operation.
  */
-public final class Table implements AutoCloseable {
-    private final Db db;
-    private final TableReadBackend reads;
+public final class Table extends NativeObject {
     private final String name;
     private volatile TableState state;
-    private volatile boolean closed;
+    private final DirectColumns.Reader directReader =
+            new DirectColumns.Reader() {
+                @Override
+                public int read(int bucket, ByteBuffer ioBuffer, int keyLength) {
+                    return getEncodedDirectNative(nativeHandle, bucket, ioBuffer, keyLength);
+                }
 
-    private Table(Db db, String name, OpenInfo openInfo) {
-        this.db = Objects.requireNonNull(db, "db");
-        this.reads = TableReadBackend.writable(db);
+                @Override
+                public ByteBuffer takeOverflowBuffer() {
+                    return takeDirectOverflowNative();
+                }
+            };
+
+    private static void initializeDirectBufferPool(long handle) {
+        int[] config = directBufferPoolConfigNative(handle);
+        if (!io.cobble.Db.configureDirectBufferPool(config[0], config[1]))
+            throw new IllegalStateException("direct buffer pool configuration can only grow");
+    }
+
+    private DirectColumns getDirectColumns(int bucket, ByteBuffer key, int keyLength) {
+        return DirectColumns.read(directReader, bucket, key, keyLength);
+    }
+
+    private static native int[] directBufferPoolConfigNative(long handle);
+
+    private static native int getEncodedDirectNative(
+            long handle, int bucket, ByteBuffer ioBuffer, int keyLength);
+
+    private static native ByteBuffer takeDirectOverflowNative();
+
+    private Table(long nativeHandle, String name, OpenInfo openInfo) {
+        super(nativeHandle);
         this.name = Objects.requireNonNull(name, "name");
-        this.state = TableState.create(name, openInfo);
+        this.state = TableState.createCodec(openInfo);
+        initializeDirectBufferPool(nativeHandle);
     }
 
     /** Creates a table, or opens an existing table when its semantic schema is identical. */
-    public static Table create(Db db, String name, TableSchema schema) {
+    public static Table create(io.cobble.Db db, String name, TableSchema schema) {
         Objects.requireNonNull(db, "db");
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(schema, "schema");
         synchronized (db) {
             ensureDbOpen(db);
-            String response = createNative(db.getNativeHandle(), name, TableJson.toJson(schema));
-            return new Table(db, name, TableJson.openInfoFromJson(response));
+            return createNative(db.getNativeHandle(), name, TableJson.toJson(schema));
         }
     }
 
     /** Opens a table from the metadata persisted in its named column family. */
-    public static Table open(Db db, String name) {
+    public static Table open(io.cobble.Db db, String name) {
         Objects.requireNonNull(db, "db");
         Objects.requireNonNull(name, "name");
         synchronized (db) {
             ensureDbOpen(db);
-            String response = openNative(db.getNativeHandle(), name);
-            return new Table(db, name, TableJson.openInfoFromJson(response));
+            return openNative(db.getNativeHandle(), name);
         }
     }
 
-    static Table fromCatalogMaterialization(Db db, String name, String openInfoJson) {
-        return new Table(db, name, TableJson.openInfoFromJson(openInfoJson));
+    static Table fromNativeHandle(long nativeHandle, String name, String openInfoJson) {
+        OpenInfo openInfo = TableJson.openInfoFromJson(openInfoJson);
+        return new Table(nativeHandle, name, openInfo);
     }
 
     public String name() {
@@ -82,13 +110,23 @@ public final class Table implements AutoCloseable {
     /** Compiles a reusable typed projection from top-level field names. */
     public TableProjection projectByNames(List<String> fieldNames) {
         TableState state = state();
-        return new TableProjection(
-                reads,
-                name,
-                state.compiled,
-                state.columnFamilyOptionsJson,
-                state.physicalColumns,
-                fieldNames);
+        TableReadView view =
+                new TableReadView(
+                        createReadViewNative(
+                                nativeHandle, fieldNames.toArray(new String[fieldNames.size()])));
+        try {
+            return new TableProjection(
+                    TableReadBackend.tableView(view),
+                    name,
+                    state.compiled,
+                    state.columnFamilyOptionsJson,
+                    state.physicalColumns,
+                    fieldNames,
+                    view);
+        } catch (RuntimeException error) {
+            view.close();
+            throw error;
+        }
     }
 
     /**
@@ -100,28 +138,14 @@ public final class Table implements AutoCloseable {
      */
     public synchronized boolean refreshSchema() {
         ensureUsable();
-        Table.OpenInfo openInfo;
-        synchronized (db) {
-            ensureDbOpen(db);
-            openInfo = TableJson.openInfoFromJson(openNative(db.getNativeHandle(), name));
-        }
+        Table.OpenInfo openInfo = TableJson.openInfoFromJson(refreshNative(nativeHandle));
         return applyOpenInfo(openInfo);
     }
 
-    synchronized boolean refreshFromCatalog(String openInfoJson) {
-        ensureUsable();
-        return applyOpenInfo(TableJson.openInfoFromJson(openInfoJson));
-    }
-
-    Db catalogDb() {
-        ensureUsable();
-        return db;
-    }
-
-    private boolean applyOpenInfo(OpenInfo openInfo) {
+    boolean applyOpenInfo(OpenInfo openInfo) {
         TableState previous = state;
         if (previous.matches(openInfo)) return false;
-        TableState candidate = TableState.create(name, openInfo);
+        TableState candidate = TableState.createCodec(openInfo);
         state = candidate;
         previous.close();
         return true;
@@ -132,12 +156,7 @@ public final class Table implements AutoCloseable {
         TableState state = state();
         requireRow(state.compiled, row);
         EncodedKey key = encodeRowKeyValidated(state.compiled, row);
-        putEncodedNative(
-                db.getNativeHandle(),
-                key.bucket,
-                key.bytes,
-                encodeValuesValidated(state.compiled, row),
-                state.writeOptions.getNativeHandle());
+        putNative(nativeHandle, key.bucket, key.bytes, encodeValuesValidated(state.compiled, row));
     }
 
     /**
@@ -164,32 +183,19 @@ public final class Table implements AutoCloseable {
         int bucket = state.compiled.bucketHash.bucket(prefix(keyBuffer, prefixEnd));
         encodeValuesToValidated(state.compiled, row, rowBuffer);
         int rowLength = rowBuffer.position();
-        putEncodedDirectNative(
-                db.getNativeHandle(),
-                bucket,
-                keyBuffer,
-                0,
-                keyLength,
-                rowBuffer,
-                0,
-                rowLength,
-                state.writeOptions.getNativeHandle());
+        putDirectNative(nativeHandle, bucket, keyBuffer, 0, keyLength, rowBuffer, 0, rowLength);
     }
 
     /** Deletes one complete row. */
     public void delete(TableKey key) {
-        TableState state = state();
+        state();
         Objects.requireNonNull(key, "key");
-        deleteNative(
-                db.getNativeHandle(),
-                key.bucket(),
-                key.encodedInternal(),
-                state.writeOptions.getNativeHandle());
+        deleteTableNative(nativeHandle, key.bucket(), key.encodedInternal());
     }
 
     /** Deletes complete rows in one native batch. Each row is atomic. */
     public void deleteBatch(List<TableKey> primaryKeys) {
-        TableState state = state();
+        state();
         Objects.requireNonNull(primaryKeys, "primaryKeys");
         if (primaryKeys.isEmpty()) return;
         int[] buckets = new int[primaryKeys.size()];
@@ -199,15 +205,20 @@ public final class Table implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        deleteBatchNative(
-                db.getNativeHandle(), buckets, keys, state.writeOptions.getNativeHandle());
+        deleteBatchTableNative(nativeHandle, buckets, keys);
+    }
+
+    /** Creates a new shard snapshot and waits for its manifest to be materialized. */
+    public ShardSnapshot snapshot() {
+        ensureUsable();
+        return ShardSnapshot.fromJson(snapshotNative(nativeHandle));
     }
 
     /** Returns one owned typed row, or {@code null} when absent. */
     public List<Value> get(TableKey key) {
         TableState state = state();
         Objects.requireNonNull(key, "key");
-        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), state.readOptions);
+        byte[][] columns = getNative(nativeHandle, key.bucket(), key.encodedInternal());
         return columns == null ? null : assembleRow(state.compiled, key.valuesInternal(), columns);
     }
 
@@ -222,7 +233,7 @@ public final class Table implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = reads.multiGet(buckets, keys, state.readOptions);
+        byte[][][] columns = multiGetNative(nativeHandle, buckets, keys);
         List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
         for (int i = 0; i < columns.length; i++)
             rows.add(
@@ -248,8 +259,7 @@ public final class Table implements AutoCloseable {
         ((Buffer) keyBuffer).clear();
         keyBuffer.put(key.encodedInternal());
         DirectColumns columns =
-                db.getDirectColumnsWithOptions(
-                        key.bucket(), keyBuffer, key.encodedInternal().length, state.readOptions);
+                getDirectColumns(key.bucket(), keyBuffer, key.encodedInternal().length);
         if (columns == null) return null;
         try {
             return new DirectTableRow(
@@ -272,22 +282,31 @@ public final class Table implements AutoCloseable {
         validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
-        return new TableScanCursor(
-                reads.owner(),
-                reads.scan(bucket, start, end, state.scanOptions),
-                new TableScanCursor.RowDecoder() {
-                    @Override
-                    public List<Value> decode(DirectScanEntry entry) {
-                        return decodeDirectScannedRowOwned(state.compiled, entry);
-                    }
-                });
+        TableReadView view = new TableReadView(createReadViewNative(nativeHandle, null));
+        try {
+            return new TableScanCursor(
+                    view,
+                    view.scan(bucket, start, end),
+                    new TableScanCursor.RowDecoder() {
+                        @Override
+                        public List<Value> decode(DirectScanEntry entry) {
+                            return decodeDirectScannedRowOwned(state.compiled, entry);
+                        }
+                    },
+                    view);
+        } catch (RuntimeException error) {
+            view.close();
+            throw error;
+        }
     }
 
     @Override
     public synchronized void close() {
-        if (closed) return;
-        closed = true;
-        state.close();
+        try {
+            state.close();
+        } finally {
+            super.close();
+        }
     }
 
     private static EncodedKey encodeRowKeyValidated(Compiled compiled, List<Value> row) {
@@ -409,8 +428,7 @@ public final class Table implements AutoCloseable {
     }
 
     void ensureUsable() {
-        if (closed) throw new IllegalStateException("table is closed");
-        reads.ensureOpen();
+        if (isDisposed() || nativeHandle == 0L) throw new IllegalStateException("table is closed");
     }
 
     private TableState state() {
@@ -418,7 +436,7 @@ public final class Table implements AutoCloseable {
         return state;
     }
 
-    private static void ensureDbOpen(Db db) {
+    private static void ensureDbOpen(io.cobble.Db db) {
         if (db.isDisposed()) throw new IllegalStateException("database is closed");
     }
 
@@ -478,7 +496,6 @@ public final class Table implements AutoCloseable {
         final int totalBuckets;
         final int physicalColumns;
         final ReadOptions readOptions;
-        final WriteOptions writeOptions;
         final ScanOptions scanOptions;
 
         private TableState(
@@ -487,42 +504,43 @@ public final class Table implements AutoCloseable {
                 int totalBuckets,
                 int physicalColumns,
                 ReadOptions readOptions,
-                WriteOptions writeOptions,
                 ScanOptions scanOptions) {
             this.compiled = compiled;
             this.columnFamilyOptionsJson = columnFamilyOptionsJson;
             this.totalBuckets = totalBuckets;
             this.physicalColumns = physicalColumns;
             this.readOptions = readOptions;
-            this.writeOptions = writeOptions;
             this.scanOptions = scanOptions;
         }
 
-        static TableState create(String name, OpenInfo openInfo) {
-            return create(name, openInfo, true);
+        static TableState createCodec(OpenInfo openInfo) {
+            Compiled compiled = Compiled.from(openInfo.schema, openInfo.totalBuckets);
+            if (openInfo.physicalColumns != compiled.physicalColumns) {
+                throw new IllegalStateException("captured table physical layout is inconsistent");
+            }
+            return new TableState(
+                    compiled,
+                    openInfo.columnFamilyOptionsJson,
+                    openInfo.totalBuckets,
+                    openInfo.physicalColumns,
+                    null,
+                    null);
         }
 
         static TableState createReadOnly(String name, OpenInfo openInfo) {
-            return create(name, openInfo, false);
-        }
-
-        private static TableState create(String name, OpenInfo openInfo, boolean writable) {
             Compiled compiled = Compiled.from(openInfo.schema, openInfo.totalBuckets);
             if (openInfo.physicalColumns != compiled.physicalColumns) {
                 throw new IllegalStateException("captured table physical layout is inconsistent");
             }
             int[] columns = Table.physicalColumns(compiled.physicalColumns);
             ReadOptions readOptions = null;
-            WriteOptions writeOptions = null;
             ScanOptions scanOptions = null;
             try {
                 readOptions = ReadOptions.forColumnsInFamily(name, columns);
-                if (writable) writeOptions = WriteOptions.withColumnFamily(name);
                 scanOptions = new ScanOptions().columnFamily(name).columns(columns);
                 bindOptionsNative(
                         readOptions.getNativeHandle(),
                         scanOptions.getNativeHandle(),
-                        writeOptions == null ? 0L : writeOptions.getNativeHandle(),
                         openInfo.columnFamilyOptionsJson,
                         openInfo.physicalColumns);
                 return new TableState(
@@ -531,12 +549,10 @@ public final class Table implements AutoCloseable {
                         openInfo.totalBuckets,
                         openInfo.physicalColumns,
                         readOptions,
-                        writeOptions,
                         scanOptions);
             } catch (RuntimeException error) {
                 if (scanOptions != null) scanOptions.close();
                 if (readOptions != null) readOptions.close();
-                if (writeOptions != null) writeOptions.close();
                 throw error;
             }
         }
@@ -549,9 +565,8 @@ public final class Table implements AutoCloseable {
 
         @Override
         public void close() {
-            scanOptions.close();
-            readOptions.close();
-            if (writeOptions != null) writeOptions.close();
+            if (scanOptions != null) scanOptions.close();
+            if (readOptions != null) readOptions.close();
         }
     }
 
@@ -627,34 +642,49 @@ public final class Table implements AutoCloseable {
         }
     }
 
-    private static native String createNative(long dbHandle, String name, String schemaJson);
+    private static native Table createNative(long dbHandle, String name, String schemaJson);
 
-    private static native String openNative(long dbHandle, String name);
+    private static native Table openNative(long dbHandle, String name);
 
-    static native void bindOptionsNative(
-            long readOptionsHandle,
-            long scanOptionsHandle,
-            long writeOptionsHandle,
-            String columnFamilyOptionsJson,
-            int physicalColumns);
+    private static native void disposeNative(long nativeHandle);
 
-    private static native void putEncodedNative(
-            long dbHandle, int bucket, byte[] key, byte[] rowPayload, long writeOptionsHandle);
+    private static native String refreshNative(long nativeHandle);
 
-    private static native void putEncodedDirectNative(
-            long dbHandle,
+    private static native String snapshotNative(long nativeHandle);
+
+    private static native byte[][] getNative(long nativeHandle, int bucket, byte[] key);
+
+    private static native byte[][][] multiGetNative(
+            long nativeHandle, int[] buckets, byte[][] keys);
+
+    private static native long createReadViewNative(long nativeHandle, String[] fieldNames);
+
+    private static native void putNative(
+            long nativeHandle, int bucket, byte[] key, byte[] rowPayload);
+
+    private static native void putDirectNative(
+            long nativeHandle,
             int bucket,
             ByteBuffer key,
             int keyOffset,
             int keyLength,
             ByteBuffer rowPayload,
             int rowOffset,
-            int rowLength,
-            long writeOptionsHandle);
+            int rowLength);
 
-    private static native void deleteNative(
-            long dbHandle, int bucket, byte[] key, long writeOptionsHandle);
+    private static native void deleteTableNative(long nativeHandle, int bucket, byte[] key);
 
-    private static native void deleteBatchNative(
-            long dbHandle, int[] buckets, byte[][] keys, long writeOptionsHandle);
+    private static native void deleteBatchTableNative(
+            long nativeHandle, int[] buckets, byte[][] keys);
+
+    @Override
+    protected void disposeInternal(long nativeHandle) {
+        disposeNative(nativeHandle);
+    }
+
+    static native void bindOptionsNative(
+            long readOptionsHandle,
+            long scanOptionsHandle,
+            String columnFamilyOptionsJson,
+            int physicalColumns);
 }

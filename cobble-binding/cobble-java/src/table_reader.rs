@@ -16,6 +16,10 @@ use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 
 struct TableReaderHandle(TableReader);
 
+pub(crate) fn into_table_reader_handle(reader: TableReader) -> jlong {
+    Box::into_raw(Box::new(TableReaderHandle(reader))) as jlong
+}
+
 fn reader_from_handle_or_throw(
     env: &mut JNIEnv,
     native_handle: jlong,
@@ -47,7 +51,7 @@ fn open_reader(env: &mut JNIEnv, config: Config, name: String, snapshot_id: Opti
         None => builder.current_global_snapshot().open(),
     };
     match result {
-        Ok(reader) => Box::into_raw(Box::new(TableReaderHandle(reader))) as jlong,
+        Ok(reader) => into_table_reader_handle(reader),
         Err(error) => {
             throw_illegal_state(env, error.to_string());
             0

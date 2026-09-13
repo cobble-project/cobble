@@ -90,20 +90,21 @@ public final class TableProjection implements AutoCloseable {
         }
         this.hasValueFields = !physicalColumns.isEmpty();
         if (physicalColumns.isEmpty()) physicalColumns.add(0);
-        int[] columns = toIntArray(physicalColumns);
         this.sources = sourceList.toArray(new Source[sourceList.size()]);
         this.hasKeyFields = selectsKey;
         ReadOptions readOptions = null;
         ScanOptions scanOptions = null;
         try {
-            readOptions = ReadOptions.forColumnsInFamily(tableName, columns);
-            scanOptions = new ScanOptions().columnFamily(tableName).columns(columns);
-            Table.bindOptionsNative(
-                    readOptions.getNativeHandle(),
-                    scanOptions.getNativeHandle(),
-                    0L,
-                    columnFamilyOptionsJson,
-                    totalPhysicalColumns);
+            if (!reads.usesRustTableBinding()) {
+                int[] columns = toIntArray(physicalColumns);
+                readOptions = ReadOptions.forColumnsInFamily(tableName, columns);
+                scanOptions = new ScanOptions().columnFamily(tableName).columns(columns);
+                Table.bindOptionsNative(
+                        readOptions.getNativeHandle(),
+                        scanOptions.getNativeHandle(),
+                        columnFamilyOptionsJson,
+                        totalPhysicalColumns);
+            }
             this.readOptions = readOptions;
             this.scanOptions = scanOptions;
         } catch (RuntimeException error) {
@@ -154,9 +155,13 @@ public final class TableProjection implements AutoCloseable {
         Table.validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
-        TableReaderView retained = reads.copyReaderView();
+        TableReaderView readerRetained = reads.copyReaderView();
+        TableReadView tableRetained = reads.copyTableView();
+        NativeObject retained = readerRetained != null ? readerRetained : tableRetained;
         TableReadBackend scanReads =
-                retained == null ? reads : TableReadBackend.readerView(retained);
+                readerRetained != null
+                        ? TableReadBackend.readerView(readerRetained)
+                        : tableRetained != null ? TableReadBackend.tableView(tableRetained) : reads;
         try {
             final TableProjection projection = this;
             return new TableScanCursor(
@@ -179,8 +184,8 @@ public final class TableProjection implements AutoCloseable {
     public synchronized void close() {
         if (closed) return;
         closed = true;
-        scanOptions.close();
-        readOptions.close();
+        if (scanOptions != null) scanOptions.close();
+        if (readOptions != null) readOptions.close();
         if (retainedOwner != null) retainedOwner.close();
     }
 

@@ -137,48 +137,47 @@ reader.refresh();
 
 ## Table APIs
 
-`io.cobble.table` provides `Table`, `ReadOnlyTable`, `TableReader`, schemas, and Java-side key/value codecs.
-`TableSnapshotCommitter` collects shard reports into a consistent global snapshot.
-See [Table](../getting-started/table) for the storage and snapshot model.
+Use `Table.create(db, name, schema)` or `Table.open(db, name)` for typed writes and reads over
+an existing Db; `ReadOnlyTable.open(readOnlyDb, name)` opens a shard snapshot table.
+Write rows with `put(row)`; build keys with `keyBuilder()` for `get` and `multiGet`.
+Use `projectByNames` to select fields and `scan` to iterate rows.
+`putDirect` and `getDirect` support caller-provided direct buffers.
 
-`FileCatalog.open(config, storageId)` manages namespaces, tables, and persisted schemas through
-the Rust catalog. Use `TableSchemaChange` to add nullable fields, rename fields, drop non-key
-fields, or widen value-field types with `catalog.evolveSchema(...)`. Loaded `CatalogTable` objects
-represent fixed catalog versions: `materializeTable(db)` applies that version to a caller-owned shard, and
-`refreshWriter(table)` applies it to an existing Table and refreshes its layout. Neither method
-owns or closes the caller's Db. Publishing a catalog schema alone does not update live handles.
-Close catalog handles when no longer needed. Catalog-backed storage builders are not yet exposed
-through these Java APIs. Custom transforms are not supported by the Java Table API.
+For catalog-managed tables, open `FileCatalog.open(config, storageId)`, then use `createTable`
+or `loadTable`. Open writers and readers through the returned `CatalogTable`:
 
-`TableSchemaChange.alterFieldType(name, type)` supports the same lossless changes as Rust Table,
-such as `Int8` → `Int64`; see [schema evolution](../getting-started/table#schema-evolution).
-Java `Db`, `ReadOnlyDb`, and `Reader` automatically install the built-in table transforms before
-opening or restoring schemas, so old files remain readable without manual registration.
+```java
+try (CatalogTable table = catalog.loadTable(identifier);
+        Table writer = table.writerBuilder(runtimeConfig).dbId("shard-0")
+                .bucketRanges(new int[] {0}, new int[] {0}).open();
+        TableSnapshotCommitter committer = table.snapshotCommitter(runtimeConfig, 8)) {
+    writer.put(row);
+    committer.submit(1L, writer.snapshot()); // A global commit requires all shard reports.
+    try (TableReader reader = table.readerBuilder(runtimeConfig).currentGlobalSnapshot().open()) {
+        // Use reader.get(...), multiGet(...), or scan(...).
+    }
+}
+```
 
-Table operations are bound to the schema used when the handle was opened. After an external
-schema update, call `table.refreshSchema()` and rebuild projections before using the new layout.
-Refresh must not run concurrently with operations on that Table. Already-open scans and
-snapshot-backed `ReadOnlyTable` handles retain their original read view.
+The example uses one bucket. Set each writer's `bucketRanges` to its assigned buckets; use
+`resume()` instead of `open()` to resume an existing shard. `materializeTable(db)` uses an existing Db.
 
-`TableReader` reads across shards in a committed global snapshot. `openCurrent(config, tableName)`
-checks for new commits on access at the configured reader interval; `open(config, tableName,
-snapshotId)` remains fixed. `refresh()` explicitly checks a Latest reader and returns whether its
-view changed; it does nothing for a fixed reader. Schema and data advance together. Existing
-projections and scans keep their captured view and must be closed separately.
-Keep referenced snapshots retained while readers or their derived views are in use.
-`schema()` reports the loaded view without I/O; call `refresh()` first when you need the latest
-committed schema before building a projection.
+Choose `currentGlobalSnapshot()` to follow new commits, or `globalSnapshot(id)` for a fixed reader.
+Without a catalog, use `TableReader.openCurrent(config, name)` or `open(config, name, snapshotId)`.
+Call `reader.refresh()` to explicitly check for a new commit in Latest mode.
 
-`TableScanPlan.forCurrentSnapshot(config, tableName)` captures the current committed global
-snapshot; `forSnapshot(config, tableName, snapshotId)` selects a historical snapshot.
-Both produce fixed plans. Plans and their `TableScanSplit` assignments are serializable;
-workers provide their own configuration and storage credentials when opening scanners.
-Applications must retain referenced snapshots until all workers finish.
+Use `catalog.evolveSchema(identifier, changes)` with `TableSchemaChange` to add, rename, drop, or
+widen fields. Apply the returned catalog version with `refreshWriter(writer)`; for local Db schema
+changes, call `writer.refreshSchema()`. Rebuild projections after refreshing, and do not refresh
+concurrently with writer operations. Custom transforms are not supported in Java.
 
-`TableScanSplit.openTypedScanner(config, readAheadBytes)` returns a `TableScanCursor` of typed rows.
-`openScanner(config, fieldNames, readAheadBytes)` returns an encoded `ScanCursor`
-for connector integrations, reusing the core split scanner with field projection and built-in
-table transforms. Close each scanner when finished.
+For distributed scans, create `TableScanPlan.forCurrentSnapshot(config, name)` or
+`forSnapshot(config, name, id)`, distribute its splits, and call
+`split.openTypedScanner(config, readAheadBytes)` on each worker. Use
+`openScanner(config, fieldNames, readAheadBytes)` when encoded rows are preferred.
+
+Close tables, readers, projections, direct rows, and scanners when finished. Retain referenced
+snapshots while they are in use. See [Table](../getting-started/table) for configuration and semantics.
 
 ## Process-Level Filesystem Fallback APIs
 

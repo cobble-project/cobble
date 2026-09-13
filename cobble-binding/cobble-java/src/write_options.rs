@@ -1,5 +1,5 @@
 use crate::util::{decode_java_string, decode_u32, throw_illegal_argument, throw_illegal_state};
-use cobble_binding::{ColumnFamilyOptions, WriteOptions};
+use cobble_binding::WriteOptions;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
@@ -25,22 +25,6 @@ pub(crate) fn write_options_from_handle_or_throw(
     native_handle: jlong,
 ) -> Option<&'static WriteOptionsHandle> {
     write_options_from_handle_or_throw_impl(env, native_handle)
-}
-
-pub(crate) fn bind_to_table_schema(
-    env: &mut JNIEnv,
-    native_handle: jlong,
-    options: &ColumnFamilyOptions,
-    physical_columns: usize,
-) -> bool {
-    let Some(handle) = write_options_from_handle_mut_or_throw(env, native_handle) else {
-        return false;
-    };
-    handle.write_options = handle
-        .write_options
-        .clone()
-        .bound_to_column_family_schema(options.clone(), physical_columns);
-    true
 }
 
 #[unsafe(no_mangle)]

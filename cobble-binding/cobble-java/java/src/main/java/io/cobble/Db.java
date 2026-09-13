@@ -17,6 +17,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class Db extends NativeObject {
     private static volatile DirectBufferPool directBufferPool = DirectBufferPool.defaults();
 
+    static DirectBufferPool directBufferPool() {
+        return directBufferPool;
+    }
+
     private Db(long nativeHandle) {
         super(nativeHandle);
     }

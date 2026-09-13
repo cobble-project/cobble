@@ -10,6 +10,10 @@ use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
 use std::sync::Arc;
 
+pub(crate) fn into_table_snapshot_committer_handle(committer: TableSnapshotCommitter) -> jlong {
+    Box::into_raw(Box::new(committer)) as jlong
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_TableSnapshotCommitter_openHandle(
     mut env: JNIEnv,
@@ -190,7 +194,7 @@ fn open_committer(
                 return 0;
             }
         };
-    Box::into_raw(Box::new(committer)) as jlong
+    into_table_snapshot_committer_handle(committer)
 }
 
 fn snapshot_result_to_java(

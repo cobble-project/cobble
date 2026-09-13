@@ -46,7 +46,6 @@ public final class ReadOnlyTable implements AutoCloseable {
             Table.bindOptionsNative(
                     readOptions.getNativeHandle(),
                     scanOptions.getNativeHandle(),
-                    0L,
                     columnFamilyOptionsJson,
                     physicalColumns);
             this.readOptions = readOptions;

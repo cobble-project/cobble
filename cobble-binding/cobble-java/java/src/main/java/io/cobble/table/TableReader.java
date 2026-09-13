@@ -35,18 +35,22 @@ public final class TableReader extends NativeObject {
         }
     }
 
+    static TableReader fromNativeHandle(long nativeHandle, String name) {
+        if (nativeHandle == 0L) throw new IllegalStateException("failed to open table reader");
+        try {
+            return new TableReader(nativeHandle, name);
+        } catch (RuntimeException error) {
+            disposeHandleNative(nativeHandle);
+            throw error;
+        }
+    }
+
     public static TableReader openCurrent(Config config, String tableName) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(tableName, "tableName");
         NativeLoader.load();
         long handle = openCurrentNative(config.toJson(), tableName);
-        if (handle == 0L) throw new IllegalStateException("failed to open current table reader");
-        try {
-            return new TableReader(handle, tableName);
-        } catch (RuntimeException error) {
-            disposeHandleNative(handle);
-            throw error;
-        }
+        return fromNativeHandle(handle, tableName);
     }
 
     public static TableReader open(Config config, String tableName, long snapshotId) {
@@ -54,13 +58,7 @@ public final class TableReader extends NativeObject {
         Objects.requireNonNull(tableName, "tableName");
         NativeLoader.load();
         long handle = openNative(config.toJson(), tableName, snapshotId);
-        if (handle == 0L) throw new IllegalStateException("failed to open table reader");
-        try {
-            return new TableReader(handle, tableName);
-        } catch (RuntimeException error) {
-            disposeHandleNative(handle);
-            throw error;
-        }
+        return fromNativeHandle(handle, tableName);
     }
 
     public String name() {

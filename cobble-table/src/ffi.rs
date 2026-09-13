@@ -3,7 +3,7 @@
 //! Connector-specific encoded operations live here so the semantic table API
 //! does not expose raw storage rows.
 
-use crate::table::TypedRead;
+use crate::table::{ReadBackend, TypedRead};
 use crate::{ReadOnlyTable, Result, Table, TableReader, TableScanSplit, TableSchema};
 use bytes::Bytes;
 use cobble::{ColumnFamilyOptions, Config, DbIterator, ReadOptions, ScanOptions, ScanSplitScanner};
@@ -29,9 +29,139 @@ impl TableSchemaBinding {
     }
 }
 
-/// Return the physical definition captured by this writable typed table.
-pub fn table_schema_binding(table: &Table) -> TableSchemaBinding {
-    table.ffi_schema_binding()
+/// Connector-only raw access to one captured table layout.
+///
+/// This owns the bound core options and the read backend. Cloning it creates another fixed read
+/// view without retaining the writable table handle itself.
+#[derive(Clone)]
+pub struct RawTableAccess {
+    backend: ReadBackend,
+    read_options: ReadOptions,
+    scan_options: ScanOptions,
+}
+
+/// Connector-owned writable table handle.
+///
+/// The typed table owns the database Arc and its bound options. A raw access clone freezes a
+/// matching read layout for projections and cursors without retaining Java's caller Db facade.
+pub struct TableHandle {
+    table: Table,
+    access: RawTableAccess,
+}
+
+impl TableHandle {
+    pub fn new(table: Table) -> Self {
+        let access = table.ffi_raw_access();
+        Self { table, access }
+    }
+
+    pub fn schema(&self) -> &TableSchema {
+        self.table.schema()
+    }
+
+    pub fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    pub fn total_buckets(&self) -> u32 {
+        self.table.db().total_buckets()
+    }
+
+    pub fn direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
+        cobble::ffi::db_direct_buffer_pool_config(self.table.db()).map_err(Into::into)
+    }
+
+    pub fn schema_binding(&self) -> TableSchemaBinding {
+        self.table.ffi_schema_binding()
+    }
+
+    pub fn access(&self) -> &RawTableAccess {
+        &self.access
+    }
+
+    pub fn projection(&self, field_names: &[String]) -> Result<RawTableAccess> {
+        self.table.ffi_raw_projection(field_names)
+    }
+
+    pub fn put_columns(&self, bucket: u16, key: &[u8], columns: &[&[u8]]) -> Result<()> {
+        self.table.db().put_columns_with_options(
+            bucket,
+            key,
+            columns,
+            self.table.ffi_write_options(),
+        )?;
+        Ok(())
+    }
+
+    pub fn delete(&self, bucket: u16, key: &[u8]) -> Result<()> {
+        self.table
+            .db()
+            .delete_row_with_options(bucket, key, self.table.ffi_write_options())?;
+        Ok(())
+    }
+
+    pub fn delete_batch(&self, keys: &[(u16, &[u8])]) -> Result<()> {
+        self.table
+            .db()
+            .delete_rows_with_options(keys, self.table.ffi_write_options())?;
+        Ok(())
+    }
+
+    pub fn snapshot_and_wait(&self) -> Result<cobble::ShardSnapshotMetadata> {
+        self.table.snapshot_and_wait()
+    }
+
+    pub fn refresh(&mut self) -> Result<bool> {
+        let changed = self.table.refresh_schema()?;
+        if changed {
+            self.access = self.table.ffi_raw_access();
+        }
+        Ok(changed)
+    }
+
+    #[doc(hidden)]
+    pub fn refresh_from_catalog(
+        &mut self,
+        catalog: &crate::catalog::CatalogTable,
+    ) -> crate::catalog::CatalogResult<bool> {
+        let changed = catalog.refresh_writer(&mut self.table)?;
+        self.access = self.table.ffi_raw_access();
+        Ok(changed)
+    }
+}
+
+impl RawTableAccess {
+    pub(crate) fn new(
+        backend: ReadBackend,
+        read_options: ReadOptions,
+        scan_options: ScanOptions,
+    ) -> Self {
+        Self {
+            backend,
+            read_options,
+            scan_options,
+        }
+    }
+
+    pub fn get(&self, bucket: u16, key: &[u8]) -> Result<Option<Vec<Option<Bytes>>>> {
+        self.backend
+            .get_with_options(bucket, key, &self.read_options)
+    }
+
+    pub fn multi_get(&self, keys: &[(u16, &[u8])]) -> Result<Vec<Option<Vec<Option<Bytes>>>>> {
+        self.backend
+            .multi_get_with_options(keys, &self.read_options)
+    }
+
+    pub fn scan(
+        &self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<DbIterator> {
+        self.backend
+            .scan_with_options_bounds(bucket, start, end, &self.scan_options)
+    }
 }
 
 /// Return the physical definition captured by this fixed snapshot table.

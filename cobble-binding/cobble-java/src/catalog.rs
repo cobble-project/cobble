@@ -1,7 +1,8 @@
 use crate::db::db_arc_from_handle_or_throw;
 use crate::table::table_open_response;
 use crate::util::{
-    decode_java_string, parse_config_json, throw_illegal_argument, throw_illegal_state,
+    decode_bucket_ranges, decode_java_string, decode_optional_java_string, decode_u32,
+    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
     to_java_string_or_throw,
 };
 use cobble_table::SchemaChange;
@@ -10,8 +11,8 @@ use cobble_table::catalog::{
     FileCatalogConfig,
 };
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jlong, jstring};
+use jni::objects::{JClass, JIntArray, JObject, JString};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 use std::sync::Arc;
 
 #[unsafe(no_mangle)]
@@ -301,14 +302,17 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_materializeNative(
     _class: JClass,
     native_handle: jlong,
     db_handle: jlong,
-) -> jstring {
+) -> jobject {
     let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
         return std::ptr::null_mut();
     };
     let Some(db) = db_arc_from_handle_or_throw(&mut env, db_handle) else {
         return std::ptr::null_mut();
     };
-    materialize_response(&mut env, table, db)
+    match table.materialize_table(Arc::clone(db)) {
+        Ok(materialized) => crate::table::table_to_java(&mut env, materialized),
+        Err(error) => throw_state_and_null(&mut env, error),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -316,47 +320,146 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_refreshWriterNative(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
-    db_handle: jlong,
-    table_name: JString,
+    table_handle: jlong,
 ) -> jstring {
     let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
         return std::ptr::null_mut();
     };
-    let Some(db) = db_arc_from_handle_or_throw(&mut env, db_handle) else {
+    let Some(writer) = crate::table::table_handle_from_handle_mut_or_throw(&mut env, table_handle)
+    else {
         return std::ptr::null_mut();
     };
-    let table_name = match decode_java_string(&mut env, table_name) {
+    match writer.refresh_from_catalog(table) {
+        Ok(_) => table_open_response(
+            &mut env,
+            writer.total_buckets(),
+            writer.schema(),
+            writer.schema_binding(),
+        ),
+        Err(error) => throw_state_and_null(&mut env, error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_writerOpenNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    runtime_json: JString,
+    db_id: JString,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    mode: jint,
+    snapshot_id: jlong,
+) -> jobject {
+    let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
         Ok(value) => value,
         Err(error) => return throw_argument_and_null(&mut env, error),
     };
-    if table_name != table.physical_name() {
-        throw_illegal_state(
-            &mut env,
-            "Table does not belong to this catalog table".to_string(),
-        );
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
         return std::ptr::null_mut();
-    }
-    materialize_response(&mut env, table, db)
+    };
+    let db_id = match decode_optional_java_string(&mut env, db_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let ranges = match decode_bucket_ranges(&mut env, range_starts, range_ends) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let builder = match table.writer_builder(runtime) {
+        Ok(builder) => builder,
+        Err(error) => return throw_state_and_null(&mut env, error),
+    };
+    let builder = match db_id {
+        Some(db_id) => builder.db_id(db_id).bucket_ranges(ranges),
+        None => builder.bucket_ranges(ranges),
+    };
+    let opened = match mode {
+        0 => builder.open(),
+        1 => builder.resume(),
+        2 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
+            Ok(snapshot_id) => builder.open_from_snapshot(snapshot_id),
+            Err(error) => return throw_argument_and_null(&mut env, error),
+        },
+        3 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
+            Ok(snapshot_id) => builder.resume_from_snapshot(snapshot_id),
+            Err(error) => return throw_argument_and_null(&mut env, error),
+        },
+        _ => return throw_argument_and_null(&mut env, "invalid catalog writer open mode"),
+    };
+    let opened = match opened {
+        Ok(value) => value,
+        Err(error) => return throw_state_and_null(&mut env, error),
+    };
+    crate::table::table_to_java(&mut env, opened)
 }
 
-fn materialize_response(
-    env: &mut JNIEnv,
-    table: &RustCatalogTable,
-    db: &Arc<cobble_binding::Db>,
-) -> jstring {
-    let materialized = match table.materialize_table(Arc::clone(db)) {
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_readerOpenNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    runtime_json: JString,
+    snapshot_id: jlong,
+) -> jlong {
+    let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
         Ok(value) => value,
-        Err(error) => {
-            throw_illegal_state(env, error.to_string());
-            return std::ptr::null_mut();
+        Err(error) => return throw_argument_and_zero(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return 0;
+    };
+    let builder = match table.reader_builder(runtime) {
+        Ok(builder) => builder,
+        Err(error) => return throw_state_and_zero(&mut env, error),
+    };
+    let reader = if snapshot_id == -1 {
+        builder.current_global_snapshot().open()
+    } else {
+        match decode_u64_from_jlong("snapshotId", snapshot_id) {
+            Ok(snapshot_id) => builder.global_snapshot(snapshot_id).open(),
+            Err(error) => return throw_argument_and_zero(&mut env, error),
         }
     };
-    table_open_response(
-        env,
-        db.total_buckets(),
-        materialized.schema(),
-        cobble_table::ffi::table_schema_binding(&materialized),
-    )
+    match reader {
+        Ok(reader) => crate::table_reader::into_table_reader_handle(reader),
+        Err(error) => throw_state_and_zero(&mut env, error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_snapshotCommitterNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    runtime_json: JString,
+    max_pending_commits: jint,
+) -> jlong {
+    let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_zero(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return 0;
+    };
+    let max_pending_commits = match decode_u32("maxPendingCommits", max_pending_commits) {
+        Ok(value) => value as usize,
+        Err(error) => return throw_argument_and_zero(&mut env, error),
+    };
+    match table.snapshot_committer(runtime, max_pending_commits) {
+        Ok(committer) => crate::table_snapshot::into_table_snapshot_committer_handle(committer),
+        Err(error) => throw_state_and_zero(&mut env, error),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -461,6 +564,11 @@ fn json_result<T: serde::Serialize>(
 fn throw_state_and_zero(env: &mut JNIEnv, error: impl std::fmt::Display) -> jlong {
     throw_illegal_state(env, error.to_string());
     0
+}
+
+fn throw_state_and_null(env: &mut JNIEnv, error: impl std::fmt::Display) -> jobject {
+    throw_illegal_state(env, error.to_string());
+    std::ptr::null_mut()
 }
 
 fn throw_argument_and_zero(env: &mut JNIEnv, error: impl Into<String>) -> jlong {

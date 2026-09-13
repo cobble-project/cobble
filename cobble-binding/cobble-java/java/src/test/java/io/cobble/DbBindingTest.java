@@ -22,7 +22,6 @@ import io.cobble.table.Value;
 import io.cobble.table.ValueCodec;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonObject;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -31,6 +30,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.Buffer;
@@ -193,6 +193,25 @@ class DbBindingTest {
             try (DirectTableRow direct = table.getDirect(key3, directKey)) {
                 assertNotNull(direct);
                 assertEquals(row3, direct.values());
+            }
+            try (DirectTableRow first = table.getDirect(key1, directKey);
+                    DirectTableRow second = table.getDirect(key3, directKey)) {
+                assertEquals(row1, first.values());
+                assertEquals(row3, second.values());
+            }
+
+            Table detached = Table.open(db, "events");
+            TableProjection detachedProjection =
+                    detached.projectByNames(Collections.singletonList("payload"));
+            TableScanCursor detachedScan = detached.scan(key1.bucket());
+            detached.close();
+            try {
+                assertEquals(Collections.singletonList(row1.get(2)), detachedProjection.get(key1));
+                assertEquals(row1, detachedScan.nextRow());
+                assertNotNull(db.currentSchema());
+            } finally {
+                detachedProjection.close();
+                detachedScan.close();
             }
 
             try (TableProjection projection =
@@ -625,6 +644,106 @@ class DbBindingTest {
                     Table writer = initial.materializeTable(db)) {
                 physicalName = writer.name();
                 sourceDbId = db.id();
+                String ownedDbId = "catalog-owned-writer";
+                ShardSnapshot ownedSnapshot;
+                GlobalSnapshot ownedGlobal;
+                try (Table owned =
+                                initial.writerBuilder(config)
+                                        .dbId(ownedDbId)
+                                        .bucketRanges(new int[] {0}, new int[] {0})
+                                        .open();
+                        TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2)) {
+                    owned.put(oldRow);
+                    ownedSnapshot = owned.snapshot();
+                    ownedGlobal = committer.submit(1L, ownedSnapshot);
+                    assertNotNull(ownedGlobal);
+                }
+                try (Table resumed = initial.writerBuilder(config).dbId(ownedDbId).resume();
+                        TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2);
+                        TableReader current =
+                                initial.readerBuilder(config).currentGlobalSnapshot().open();
+                        TableReader fixed =
+                                initial.readerBuilder(config)
+                                        .globalSnapshot(ownedGlobal.id)
+                                        .open()) {
+                    TableKey ownedKey =
+                            resumed.keyBuilder().push(oldRow.get(0)).push(oldRow.get(1)).build();
+                    assertEquals(oldRow, resumed.get(ownedKey));
+                    assertEquals(oldRow, current.get(ownedKey));
+                    assertEquals(oldRow, fixed.get(ownedKey));
+                    List<Value> ownedNewRow =
+                            Arrays.asList(
+                                    Value.string("tenant-a"),
+                                    Value.int64(7L),
+                                    Value.int8((byte) 43));
+                    resumed.put(ownedNewRow);
+                    GlobalSnapshot ownedNewGlobal = committer.submit(2L, resumed.snapshot());
+                    assertNotNull(ownedNewGlobal);
+                    assertEquals(ownedNewRow, current.get(ownedKey));
+                    assertEquals(oldRow, fixed.get(ownedKey));
+                }
+                try (Table atSnapshot =
+                        initial.writerBuilder(config)
+                                .dbId(ownedDbId)
+                                .openFromSnapshot(ownedSnapshot.snapshotId)) {
+                    assertEquals(
+                            oldRow,
+                            atSnapshot.get(
+                                    atSnapshot
+                                            .keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
+                }
+                try (Table resumedAtSnapshot =
+                        initial.writerBuilder(config)
+                                .dbId(ownedDbId)
+                                .resumeFromSnapshot(ownedSnapshot.snapshotId)) {
+                    assertEquals(
+                            oldRow,
+                            resumedAtSnapshot.get(
+                                    resumedAtSnapshot
+                                            .keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
+                }
+                try (Table generatedIdWriter =
+                        initial.writerBuilder(config)
+                                .bucketRanges(new int[] {0}, new int[] {0})
+                                .open()) {
+                    generatedIdWriter.put(oldRow);
+                    assertEquals(
+                            oldRow,
+                            generatedIdWriter.get(
+                                    generatedIdWriter
+                                            .keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
+                }
+                CatalogTable.WriterBuilder closedBuilder = initial.writerBuilder(config);
+                try (Table survivesCatalogClose =
+                                initial.writerBuilder(config).dbId(ownedDbId).resume();
+                        TableReader readerSurvivesCatalogClose =
+                                initial.readerBuilder(config).currentGlobalSnapshot().open()) {
+                    initial.close();
+                    assertNotNull(
+                            survivesCatalogClose.get(
+                                    survivesCatalogClose
+                                            .keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
+                    assertNotNull(
+                            readerSurvivesCatalogClose.get(
+                                    readerSurvivesCatalogClose
+                                            .keyBuilder()
+                                            .push(oldRow.get(0))
+                                            .push(oldRow.get(1))
+                                            .build()));
+                    assertThrows(IllegalStateException.class, closedBuilder::open);
+                }
                 writer.put(oldRow);
                 ShardSnapshot beforeEvolution = db.snapshot();
                 assertTrue(db.retainSnapshot(beforeEvolution.snapshotId));
@@ -2560,12 +2679,14 @@ class DbBindingTest {
     }
 
     private static String nativeTableOptions(Db db, String tableName)
-            throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
-        Method open = Table.class.getDeclaredMethod("openNative", long.class, String.class);
-        open.setAccessible(true);
-        String response = (String) open.invoke(null, db.getNativeHandle(), tableName);
-        JsonObject value = new Gson().fromJson(response, JsonObject.class);
-        return value.getAsJsonObject("column_family_options").toString();
+            throws NoSuchFieldException, IllegalAccessException {
+        try (Table table = Table.open(db, tableName)) {
+            Field state = Table.class.getDeclaredField("state");
+            state.setAccessible(true);
+            Field options = state.get(table).getClass().getDeclaredField("columnFamilyOptionsJson");
+            options.setAccessible(true);
+            return (String) options.get(state.get(table));
+        }
     }
 
     private static void installColumnFamilyOptions(Db db, String family, String optionsJson)
