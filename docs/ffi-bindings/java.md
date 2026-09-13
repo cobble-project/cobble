@@ -178,6 +178,18 @@ try (CatalogTable table = catalog.loadTable(identifier);
 The example uses one bucket. Set each writer's `bucketRanges` to its assigned buckets; use
 `resume()` instead of `open()` to resume an existing shard. `materializeTable(db)` uses an existing Db.
 
+To read one fixed shard snapshot through the catalog:
+
+```java
+try (ReadOnlyTable reader = table.readonlyTableBuilder(runtimeConfig)
+        .shardSnapshot(shardSnapshot.dbId, shardSnapshot.snapshotId).open()) {
+    // Use reader.get(...), projectByNames(...), or scan(...).
+}
+```
+
+The schema comes from the selected snapshot, not the latest catalog version. Close projections
+and cursors before this reader; closing it also releases its internally opened database.
+
 For distributed writes, build a `TableWritePlan` on the coordinator and send it to workers using
 Java serialization:
 

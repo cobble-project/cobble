@@ -488,6 +488,16 @@ impl ReadOnlyTable {
         }
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_shard_db(&self) -> Arc<ReadOnlyDb> {
+        match &self.typed.read_backend {
+            ReadBackend::Shard(db) => Arc::clone(db),
+            ReadBackend::Writable(_) | ReadBackend::Global(_) => {
+                unreachable!("read-only table must use a shard database")
+            }
+        }
+    }
+
     pub(crate) fn from_shard_metadata(
         db: Arc<ReadOnlyDb>,
         name: String,

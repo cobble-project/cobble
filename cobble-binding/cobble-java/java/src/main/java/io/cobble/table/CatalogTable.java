@@ -2,7 +2,9 @@ package io.cobble.table;
 
 import io.cobble.Config;
 import io.cobble.Db;
+import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
+import io.cobble.ReadOnlyDb;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -112,6 +114,15 @@ public final class CatalogTable extends NativeObject {
         return new ReaderBuilder(this, runtime);
     }
 
+    /** Starts a builder for one catalog-scoped table over a fixed shard snapshot. */
+    public ReadOnlyTableBuilder readonlyTableBuilder(Config runtime) {
+        Objects.requireNonNull(runtime, "runtime");
+        synchronized (this) {
+            ensureOpen();
+        }
+        return new ReadOnlyTableBuilder(this, runtime);
+    }
+
     /** Opens the catalog-scoped in-process snapshot committer. */
     public synchronized TableSnapshotCommitter snapshotCommitter(
             Config runtime, int maxPendingCommits) {
@@ -150,6 +161,9 @@ public final class CatalogTable extends NativeObject {
 
     private static native long readerOpenNative(
             long nativeHandle, String runtimeJson, long snapshotId);
+
+    private static native ReadOnlyDb readonlyTableOpenNative(
+            long nativeHandle, String runtimeJson, String dbId, long snapshotId);
 
     private static native long snapshotCommitterNative(
             long nativeHandle, String runtimeJson, int maxPendingCommits);
@@ -202,6 +216,49 @@ public final class CatalogTable extends NativeObject {
                 return TableReader.fromNativeHandle(
                         readerOpenNative(table.nativeHandle, runtime.toJson(), snapshotId),
                         table.physicalName);
+            }
+        }
+    }
+
+    /** Configures and terminally opens one catalog-scoped table over a fixed shard snapshot. */
+    public static final class ReadOnlyTableBuilder {
+        private final CatalogTable table;
+        private final Config runtime;
+        private String dbId;
+        private long snapshotId = Long.MIN_VALUE;
+
+        private ReadOnlyTableBuilder(CatalogTable table, Config runtime) {
+            this.table = table;
+            this.runtime = runtime;
+        }
+
+        /** Selects the source shard and its durable snapshot. */
+        public ReadOnlyTableBuilder shardSnapshot(String value, long snapshot) {
+            if (snapshot < 0L) throw new IllegalArgumentException("snapshotId must be >= 0");
+            dbId = Objects.requireNonNull(value, "dbId");
+            snapshotId = snapshot;
+            return this;
+        }
+
+        /** Opens the selected snapshot table. The returned table owns its snapshot database. */
+        public ReadOnlyTable open() {
+            if (snapshotId == Long.MIN_VALUE)
+                throw new IllegalStateException(
+                        "CatalogTable.ReadOnlyTableBuilder requires a shard snapshot selection");
+            NativeLoader.load();
+            ReadOnlyDb db;
+            synchronized (table) {
+                table.ensureOpen();
+                db =
+                        readonlyTableOpenNative(
+                                table.nativeHandle, runtime.toJson(), dbId, snapshotId);
+            }
+            if (db == null) throw new IllegalStateException("failed to open read-only table");
+            try {
+                return ReadOnlyTable.openOwned(db, table.physicalName);
+            } catch (RuntimeException error) {
+                db.close();
+                throw error;
             }
         }
     }

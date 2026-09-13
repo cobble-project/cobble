@@ -15,8 +15,9 @@ import java.util.Objects;
 /**
  * Typed read-only access to one table in a fixed shard snapshot.
  *
- * <p>The table keeps its {@link ReadOnlyDb} reachable but does not own it. Close cursors,
- * projections, and this table before closing the database. Close must not race another operation.
+ * <p>{@link #open(ReadOnlyDb, String)} keeps its {@link ReadOnlyDb} reachable but does not own it.
+ * Tables opened by {@link CatalogTable.ReadOnlyTableBuilder} own their snapshot database. Close
+ * their cursors and projections before closing the table. Close must not race another operation.
  */
 public final class ReadOnlyTable implements AutoCloseable {
     private final ReadOnlyDb db;
@@ -28,10 +29,12 @@ public final class ReadOnlyTable implements AutoCloseable {
     private final ReadOptions readOptions;
     private final ScanOptions scanOptions;
     private final DirectColumns.Reader directReader;
+    private final boolean ownsDb;
     private volatile boolean closed;
 
-    private ReadOnlyTable(ReadOnlyDb db, String name, Table.OpenInfo openInfo) {
+    private ReadOnlyTable(ReadOnlyDb db, String name, Table.OpenInfo openInfo, boolean ownsDb) {
         this.db = Objects.requireNonNull(db, "db");
+        this.ownsDb = ownsDb;
         this.reads = TableReadBackend.readOnly(db);
         this.name = Objects.requireNonNull(name, "name");
         this.compiled = Table.Compiled.from(openInfo.schema, openInfo.totalBuckets);
@@ -79,12 +82,20 @@ public final class ReadOnlyTable implements AutoCloseable {
 
     /** Opens a table from metadata stored in the snapshot schema. */
     public static ReadOnlyTable open(ReadOnlyDb db, String name) {
+        return open(db, name, false);
+    }
+
+    static ReadOnlyTable openOwned(ReadOnlyDb db, String name) {
+        return open(db, name, true);
+    }
+
+    private static ReadOnlyTable open(ReadOnlyDb db, String name, boolean ownsDb) {
         Objects.requireNonNull(db, "db");
         Objects.requireNonNull(name, "name");
         synchronized (db) {
             if (db.isDisposed()) throw new IllegalStateException("database is closed");
             String response = openNative(db.getNativeHandle(), name);
-            return new ReadOnlyTable(db, name, TableJson.openInfoFromJson(response));
+            return new ReadOnlyTable(db, name, TableJson.openInfoFromJson(response), ownsDb);
         }
     }
 
@@ -179,8 +190,12 @@ public final class ReadOnlyTable implements AutoCloseable {
     public synchronized void close() {
         if (closed) return;
         closed = true;
-        scanOptions.close();
-        readOptions.close();
+        try {
+            scanOptions.close();
+            readOptions.close();
+        } finally {
+            if (ownsDb) db.close();
+        }
     }
 
     private void ensureUsable() {

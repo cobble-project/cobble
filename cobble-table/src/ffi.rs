@@ -196,6 +196,14 @@ pub fn read_only_table_schema_binding(table: &ReadOnlyTable) -> TableSchemaBindi
     table.ffi_schema_binding()
 }
 
+/// Clone the snapshot database owned by a fixed read-only table.
+///
+/// This is connector-only so bindings can transfer ownership of a table-builder result without
+/// exposing a general database accessor on the typed table API.
+pub fn read_only_table_db(table: &ReadOnlyTable) -> Arc<cobble::ReadOnlyDb> {
+    table.ffi_shard_db()
+}
+
 /// A fixed raw view acquired from a global typed table reader.
 ///
 /// This is connector-only: it keeps the matching compiled layout and global

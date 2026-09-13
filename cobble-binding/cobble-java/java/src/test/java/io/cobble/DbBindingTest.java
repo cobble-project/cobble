@@ -548,6 +548,16 @@ class DbBindingTest {
                 } finally {
                     retainedReadOnly.close();
                 }
+                try (ReadOnlyTable reopenedReadOnly = ReadOnlyTable.open(readOnlyDb, "events")) {
+                    assertEquals(
+                            row2,
+                            reopenedReadOnly.get(
+                                    reopenedReadOnly
+                                            .keyBuilder()
+                                            .push(row2.get(0))
+                                            .push(row2.get(1))
+                                            .build()));
+                }
             }
 
             try (ReadOnlyDb readOnlyDb = ReadOnlyDb.open(config, snapshot.snapshotId, db.id());
@@ -752,6 +762,8 @@ class DbBindingTest {
         TableWritePlan portablePlan;
         String portableDbId = "portable-catalog-writer";
         TableScanPlan readerPlan;
+        String ownedDbId = "catalog-owned-writer";
+        ShardSnapshot ownedSnapshot;
         try (FileCatalog catalog = FileCatalog.open(config, "warehouse");
                 Db db = Db.open(config)) {
             catalog.createNamespace(namespace);
@@ -773,8 +785,6 @@ class DbBindingTest {
                                 new ByteArrayInputStream(serializedPlan.toByteArray()))) {
                     portablePlan = (TableWritePlan) input.readObject();
                 }
-                String ownedDbId = "catalog-owned-writer";
-                ShardSnapshot ownedSnapshot;
                 GlobalSnapshot ownedGlobal;
                 Table owned =
                         initial.writerBuilder(config)
@@ -1082,6 +1092,45 @@ class DbBindingTest {
                                         .push(oldRow.get(0))
                                         .push(oldRow.get(1))
                                         .build()));
+            }
+            CatalogTable.ReadOnlyTableBuilder missingSnapshot =
+                    descriptor.readonlyTableBuilder(config);
+            assertThrows(IllegalStateException.class, missingSnapshot::open);
+            ReadOnlyTable snapshotTable =
+                    descriptor
+                            .readonlyTableBuilder(config)
+                            .shardSnapshot(ownedDbId, ownedSnapshot.snapshotId)
+                            .open();
+            CatalogTable.ReadOnlyTableBuilder closedDescriptorBuilder =
+                    descriptor
+                            .readonlyTableBuilder(config)
+                            .shardSnapshot(ownedDbId, ownedSnapshot.snapshotId);
+            try {
+                assertEquals(
+                        LogicalTypes.int8(), snapshotTable.schema().fields().get(2).logicalType());
+                assertEquals(
+                        oldRow,
+                        snapshotTable.get(
+                                snapshotTable
+                                        .keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+                descriptor.close();
+                assertThrows(IllegalStateException.class, closedDescriptorBuilder::open);
+                assertEquals(
+                        oldRow,
+                        snapshotTable.get(
+                                snapshotTable
+                                        .keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+                snapshotTable.close();
+                snapshotTable.close();
+                assertThrows(IllegalStateException.class, snapshotTable::schema);
+            } finally {
+                snapshotTable.close();
             }
         }
         try (Table portable =

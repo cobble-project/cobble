@@ -520,6 +520,44 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_readerOpenNative(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_readonlyTableOpenNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    runtime_json: JString,
+    db_id: JString,
+    snapshot_id: jlong,
+) -> jobject {
+    let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return std::ptr::null_mut();
+    };
+    let db_id = match decode_java_string(&mut env, db_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let read_only_table = match table
+        .readonly_table_builder(runtime)
+        .and_then(|builder| Ok(builder.shard_snapshot(db_id, snapshot_id).open()?))
+    {
+        Ok(value) => value,
+        Err(error) => return throw_state_and_null(&mut env, error),
+    };
+    let db = cobble_table::ffi::read_only_table_db(&read_only_table);
+    read_only_db_to_java(&mut env, db)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_CatalogTable_snapshotCommitterNative(
     mut env: JNIEnv,
     _class: JClass,
@@ -572,6 +610,23 @@ fn dispose_catalog_table(env: &mut JNIEnv, native_handle: jlong) {
     }
     // SAFETY: Java serializes close with descriptor operations.
     drop(unsafe { Box::from_raw(native_handle as *mut RustCatalogTable) });
+}
+
+fn read_only_db_to_java(env: &mut JNIEnv, db: Arc<cobble_binding::ReadOnlyDb>) -> jobject {
+    let handle = Box::into_raw(Box::new(db)) as jlong;
+    match env.new_object(
+        "io/cobble/ReadOnlyDb",
+        "(J)V",
+        &[jni::objects::JValue::Long(handle)],
+    ) {
+        Ok(db) => db.into_raw(),
+        Err(error) => {
+            // SAFETY: Java did not receive this handle.
+            drop(unsafe { Box::from_raw(handle as *mut Arc<cobble_binding::ReadOnlyDb>) });
+            throw_illegal_state(env, error.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }
 
 fn file_catalog_from_handle_or_throw(
