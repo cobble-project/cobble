@@ -382,3 +382,21 @@ pub extern "system" fn Java_io_cobble_table_TableReaderView_openScanCursor(
         }
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_TableReaderView_scanPlanNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    view_handle: jlong,
+) -> jstring {
+    let Some(view) = view_from_handle_or_throw(&mut env, view_handle) else {
+        return std::ptr::null_mut();
+    };
+    match view.scan_plan() {
+        Ok(plan) => crate::table_scan::scan_plan_response(&mut env, &plan),
+        Err(error) => {
+            throw_illegal_state(&mut env, error.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}

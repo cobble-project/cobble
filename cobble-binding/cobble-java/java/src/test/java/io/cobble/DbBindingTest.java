@@ -15,6 +15,7 @@ import io.cobble.table.TableKey;
 import io.cobble.table.TableProjection;
 import io.cobble.table.TableReader;
 import io.cobble.table.TableScanCursor;
+import io.cobble.table.TableScanPlan;
 import io.cobble.table.TableSchema;
 import io.cobble.table.TableSchemaChange;
 import io.cobble.table.TableSnapshotCommitter;
@@ -643,6 +644,7 @@ class DbBindingTest {
         GlobalSnapshot globalSnapshot;
         TableWritePlan portablePlan;
         String portableDbId = "portable-catalog-writer";
+        TableScanPlan readerPlan;
         try (FileCatalog catalog = FileCatalog.open(config, "warehouse");
                 Db db = Db.open(config)) {
             catalog.createNamespace(namespace);
@@ -803,6 +805,9 @@ class DbBindingTest {
                     // The catalog is already widened, but CURRENT still selects the old snapshot.
                     assertEquals(
                             LogicalTypes.int8(), latest.schema().fields().get(2).logicalType());
+                    TableScanPlan oldPlan = latest.scanPlan();
+                    assertEquals(initialGlobalSnapshot.id, oldPlan.snapshotId());
+                    assertEquals(initialGlobalSnapshot.id, fixed.scanPlan().snapshotId());
                     assertEquals(oldRow, latest.get(oldKey));
                     assertEquals(
                             oldRow,
@@ -824,6 +829,15 @@ class DbBindingTest {
                                         Collections.singletonList(evolvedSnapshot));
                     }
 
+                    readerPlan = latest.scanPlan();
+                    assertEquals(globalSnapshot.id, readerPlan.snapshotId());
+                    assertEquals(
+                            LogicalTypes.int64(),
+                            readerPlan.schema().fields().get(2).logicalType());
+                    assertEquals(initialGlobalSnapshot.id, oldPlan.snapshotId());
+                    assertEquals(
+                            LogicalTypes.int8(), oldPlan.schema().fields().get(2).logicalType());
+                    assertEquals(initialGlobalSnapshot.id, fixed.scanPlan().snapshotId());
                     assertEquals(widenedRow, latest.get(oldKey));
                     assertEquals(
                             LogicalTypes.int64(), latest.schema().fields().get(2).logicalType());
@@ -866,6 +880,22 @@ class DbBindingTest {
                     oldProjection.close();
                     fixed.close();
                     latest.close();
+                }
+                ByteArrayOutputStream serializedReaderPlan = new ByteArrayOutputStream();
+                try (ObjectOutputStream output = new ObjectOutputStream(serializedReaderPlan)) {
+                    output.writeObject(readerPlan);
+                }
+                try (ObjectInputStream input =
+                                new ObjectInputStream(
+                                        new ByteArrayInputStream(
+                                                serializedReaderPlan.toByteArray()));
+                        TableScanCursor worker =
+                                ((TableScanPlan) input.readObject())
+                                        .splits()
+                                        .get(0)
+                                        .openTypedScanner(config, 4096)) {
+                    assertEquals(widenedRow, worker.nextRow());
+                    assertNull(worker.nextRow());
                 }
             }
         }

@@ -89,6 +89,10 @@ public final class TableScanPlan implements Serializable {
                 snapshotId == null
                         ? openCurrentNative(config.toJson(), tableName)
                         : openSnapshotNative(config.toJson(), tableName, snapshotId.longValue());
+        return fromResponseJson(json);
+    }
+
+    static TableScanPlan fromResponseJson(String json) {
         JsonObject response = JsonParser.parseString(json).getAsJsonObject();
         return new TableScanPlan(
                 response.get("plan").toString(),

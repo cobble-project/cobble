@@ -221,6 +221,11 @@ impl TableReaderView {
         self.state().scan(bucket, start, end, options)
     }
 
+    /// Build a portable scan plan from this fixed global reader view.
+    pub fn scan_plan(&self) -> Result<crate::TableScanPlan> {
+        self.state().scan_plan()
+    }
+
     fn state(&self) -> &crate::runtime::GlobalReaderState {
         self.typed
             .global_state()

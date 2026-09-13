@@ -177,6 +177,10 @@ fn open_plan(
             return std::ptr::null_mut();
         }
     };
+    scan_plan_response(env, &plan)
+}
+
+pub(crate) fn scan_plan_response(env: &mut JNIEnv, plan: &TableScanPlan) -> jstring {
     let response = serde_json::json!({
         "plan": plan,
         "schema": plan.schema(),

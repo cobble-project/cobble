@@ -28,6 +28,10 @@ final class TableReaderView extends NativeObject {
         return new TableReaderView(TableReader.cloneViewNative(nativeHandle));
     }
 
+    TableScanPlan scanPlan() {
+        return TableScanPlan.fromResponseJson(scanPlanNative(nativeHandle));
+    }
+
     @Override
     protected native void disposeInternal(long nativeHandle);
 
@@ -42,4 +46,6 @@ final class TableReaderView extends NativeObject {
             byte[] startInclusive,
             byte[] endExclusive,
             long options);
+
+    private static native String scanPlanNative(long nativeHandle);
 }

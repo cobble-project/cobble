@@ -164,6 +164,12 @@ public final class TableReader extends NativeObject {
         }
     }
 
+    /** Builds a portable full-scan plan pinned to this reader's current loaded snapshot. */
+    public synchronized TableScanPlan scanPlan() {
+        access();
+        return view.scanPlan();
+    }
+
     @Override
     public synchronized void close() {
         if (!isDisposed() && view != null) view.close();
