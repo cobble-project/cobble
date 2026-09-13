@@ -95,6 +95,28 @@ impl DbBuilder {
         Db::open_from_snapshot_with_builder(self, snapshot_id, recovery_mode)
     }
 
+    /// Restore a fresh database from a source snapshot.
+    ///
+    /// The source manifest supplies the bucket ranges and the returned database receives a fresh
+    /// identity. Registered schema transforms and other runtime wiring are retained. The source
+    /// WAL is never replayed.
+    pub fn open_new_with_snapshot(
+        self,
+        snapshot_id: u64,
+        source_db_id: impl AsRef<str>,
+    ) -> Result<Db> {
+        Db::open_new_with_snapshot_with_builder(self, snapshot_id, source_db_id)
+    }
+
+    /// Restore a fresh database from an explicit source manifest path.
+    ///
+    /// The source manifest supplies the bucket ranges and the returned database receives a fresh
+    /// identity. Registered schema transforms and other runtime wiring are retained. The source
+    /// WAL is never replayed.
+    pub fn open_new_with_manifest_path(self, manifest_path: impl Into<String>) -> Result<Db> {
+        Db::open_new_with_manifest_path_with_builder(self, manifest_path)
+    }
+
     /// Resume from the latest snapshot and replay the durable WAL tail when available.
     pub fn resume(self) -> Result<Db> {
         self.resume_with_recovery_mode(RecoveryMode::LatestWithWal)

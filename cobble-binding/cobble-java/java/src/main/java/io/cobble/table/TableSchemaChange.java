@@ -40,6 +40,16 @@ public final class TableSchemaChange {
         return new TableSchemaChange("RenameField", fields);
     }
 
+    /** Losslessly widen one non-key top-level field using Cobble's built-in table transform. */
+    public static TableSchemaChange alterFieldType(String fieldName, LogicalType logicalType) {
+        JsonObject fields = new JsonObject();
+        fields.addProperty("field_name", Objects.requireNonNull(fieldName, "fieldName"));
+        fields.add(
+                "logical_type",
+                TableJson.typeObject(Objects.requireNonNull(logicalType, "logicalType")));
+        return new TableSchemaChange("AlterFieldType", fields);
+    }
+
     static String toJson(List<TableSchemaChange> changes) {
         Objects.requireNonNull(changes, "changes");
         JsonArray values = new JsonArray();

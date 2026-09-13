@@ -12,7 +12,8 @@ use crate::util::{
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble_binding::ffi as cobble_ffi;
-use cobble_binding::{Config, Db, RecoveryMode};
+use cobble_binding::{Config, Db, DbBuilder, RecoveryMode};
+use cobble_table::register_schema_transforms;
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
@@ -129,12 +130,15 @@ fn restore_db(
             return 0;
         }
     };
-    let db = if new_db_id == JNI_TRUE {
-        Db::open_new_with_snapshot(config, snapshot_id, db_id)
-    } else {
-        Db::open_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode)
-    };
-    match db {
+    match table_db_builder(config).and_then(|builder| {
+        if new_db_id == JNI_TRUE {
+            builder.open_new_with_snapshot(snapshot_id, &db_id)
+        } else {
+            builder
+                .db_id(db_id)
+                .open_from_snapshot_with_recovery_mode(snapshot_id, recovery_mode)
+        }
+    }) {
         Ok(v) => Box::into_raw(Box::new(Arc::new(v))) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
@@ -155,7 +159,9 @@ fn restore_db_from_manifest_path(
             return 0;
         }
     };
-    match Db::open_new_with_manifest_path(config, manifest_path) {
+    match table_db_builder(config)
+        .and_then(|builder| builder.open_new_with_manifest_path(manifest_path))
+    {
         Ok(v) => Box::into_raw(Box::new(Arc::new(v))) as jlong,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
@@ -383,7 +389,11 @@ fn resume_db(
             return 0;
         }
     };
-    let db = match Db::resume_with_recovery_mode(config, db_id, recovery_mode) {
+    let db = match table_db_builder(config).and_then(|builder| {
+        builder
+            .db_id(db_id)
+            .resume_with_recovery_mode(recovery_mode)
+    }) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
@@ -414,12 +424,11 @@ fn resume_db_from_snapshot(
             return 0;
         }
     };
-    let db = match Db::resume_from_snapshot_with_recovery_mode(
-        config,
-        snapshot_id,
-        db_id,
-        recovery_mode,
-    ) {
+    let db = match table_db_builder(config).and_then(|builder| {
+        builder
+            .db_id(db_id)
+            .resume_from_snapshot_with_recovery_mode(snapshot_id, recovery_mode)
+    }) {
         Ok(v) => v,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
@@ -691,7 +700,9 @@ fn open_db_with_owned_range(
         );
         return 0;
     }
-    let db = match Db::open(config, vec![range_start..=range_end]) {
+    let db = match table_db_builder(config)
+        .and_then(|builder| builder.bucket_ranges(vec![range_start..=range_end]).open())
+    {
         Ok(db) => db,
         Err(err) => {
             throw_illegal_state(env, err.to_string());
@@ -699,6 +710,12 @@ fn open_db_with_owned_range(
         }
     };
     Box::into_raw(Box::new(Arc::new(db))) as jlong
+}
+
+fn table_db_builder(config: Config) -> cobble_binding::Result<DbBuilder> {
+    let builder = DbBuilder::new(config);
+    register_schema_transforms(&builder)?;
+    Ok(builder)
 }
 
 fn validate_total_buckets(env: &mut JNIEnv, config: &Config) -> Option<u16> {

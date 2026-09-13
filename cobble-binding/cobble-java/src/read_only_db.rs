@@ -5,7 +5,8 @@ use crate::util::{
     decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
     to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
-use cobble_binding::{Config, ReadOnlyDb};
+use cobble_binding::{Config, ReadOnlyDb, ReadOnlyDbBuilder};
+use cobble_table::register_schema_transforms;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
@@ -47,7 +48,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandle(
             return 0;
         }
     };
-    let db = match ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) {
+    let db = match open_table_read_only_db(config, snapshot_id, db_id) {
         Ok(db) => db,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -89,7 +90,7 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    let db = match ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) {
+    let db = match open_table_read_only_db(config, snapshot_id, db_id) {
         Ok(db) => db,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -97,6 +98,16 @@ pub extern "system" fn Java_io_cobble_ReadOnlyDb_openHandleFromJson(
         }
     };
     Box::into_raw(Box::new(Arc::new(db))) as jlong
+}
+
+fn open_table_read_only_db(
+    config: Config,
+    snapshot_id: u64,
+    db_id: String,
+) -> cobble_binding::Result<ReadOnlyDb> {
+    let builder = ReadOnlyDbBuilder::new(config).db_id(db_id);
+    register_schema_transforms(&builder)?;
+    builder.open(snapshot_id)
 }
 
 #[unsafe(no_mangle)]

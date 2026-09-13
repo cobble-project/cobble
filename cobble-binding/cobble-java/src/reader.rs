@@ -5,7 +5,8 @@ use crate::util::{
     decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
     to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
-use cobble_binding::{Config, Reader, ReaderConfig};
+use cobble_binding::{Config, Reader, ReaderBuilder, ReaderConfig};
+use cobble_table::register_schema_transforms;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
@@ -30,8 +31,7 @@ pub extern "system" fn Java_io_cobble_Reader_openCurrentHandle(
             return 0;
         }
     };
-    let reader_config = ReaderConfig::from_config(&config);
-    let reader = match Reader::open_current(reader_config) {
+    let reader = match open_table_reader_current(config) {
         Ok(reader) => reader,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -57,8 +57,7 @@ pub extern "system" fn Java_io_cobble_Reader_openCurrentHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    let reader_config = ReaderConfig::from_config(&config);
-    let reader = match Reader::open_current(reader_config) {
+    let reader = match open_table_reader_current(config) {
         Ok(reader) => reader,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -96,8 +95,7 @@ pub extern "system" fn Java_io_cobble_Reader_openHandle(
             return 0;
         }
     };
-    let reader_config = ReaderConfig::from_config(&config);
-    let reader = match Reader::open(reader_config, snapshot_id) {
+    let reader = match open_table_reader(config, snapshot_id) {
         Ok(reader) => reader,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -131,8 +129,7 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
     let Some(config) = parse_config_json(&mut env, &json) else {
         return 0;
     };
-    let reader_config = ReaderConfig::from_config(&config);
-    let reader = match Reader::open(reader_config, snapshot_id) {
+    let reader = match open_table_reader(config, snapshot_id) {
         Ok(reader) => reader,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -140,6 +137,18 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
         }
     };
     Box::into_raw(Box::new(reader)) as jlong
+}
+
+fn open_table_reader(config: Config, snapshot_id: u64) -> cobble_binding::Result<Reader> {
+    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config));
+    register_schema_transforms(&builder)?;
+    builder.open(snapshot_id)
+}
+
+fn open_table_reader_current(config: Config) -> cobble_binding::Result<Reader> {
+    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config));
+    register_schema_transforms(&builder)?;
+    builder.open_current()
 }
 
 #[unsafe(no_mangle)]

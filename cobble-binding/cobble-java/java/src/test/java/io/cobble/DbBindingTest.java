@@ -18,6 +18,7 @@ import io.cobble.table.TableSchema;
 import io.cobble.table.TableSchemaChange;
 import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
+import io.cobble.table.ValueCodec;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -583,6 +584,137 @@ class DbBindingTest {
             catalog.dropTable(users);
             catalog.dropNamespace(namespace);
             assertTrue(catalog.listNamespaces().isEmpty());
+        }
+    }
+
+    @Test
+    void tableBuiltinTransformsSurviveJavaRecoveryPaths() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-table-transform-recovery-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        config.l0FileLimit = Integer.MAX_VALUE;
+        List<String> namespace = Collections.singletonList("analytics");
+        TableIdentifier scores = new TableIdentifier(namespace, "scores");
+        TableSchema initialSchema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "tenant", LogicalTypes.string()),
+                                new DataField(2, "id", LogicalTypes.int64()),
+                                new DataField(3, "score", LogicalTypes.int8())),
+                        Arrays.asList(1L, 2L),
+                        Collections.singletonList(1L));
+        List<Value> oldRow =
+                Arrays.asList(Value.string("tenant-a"), Value.int64(7L), Value.int8((byte) 42));
+        List<Value> widenedRow =
+                Arrays.asList(Value.string("tenant-a"), Value.int64(7L), Value.int64(42L));
+
+        CatalogTable evolved;
+        String physicalName;
+        String sourceDbId;
+        ShardSnapshot evolvedSnapshot;
+        GlobalSnapshot globalSnapshot;
+        try (FileCatalog catalog = FileCatalog.open(config, "warehouse");
+                Db db = Db.open(config)) {
+            catalog.createNamespace(namespace);
+            try (CatalogTable initial = catalog.createTable(scores, initialSchema);
+                    Table writer = initial.materializeTable(db)) {
+                physicalName = writer.name();
+                sourceDbId = db.id();
+                writer.put(oldRow);
+                ShardSnapshot beforeEvolution = db.snapshot();
+                assertTrue(db.retainSnapshot(beforeEvolution.snapshotId));
+                assertTrue(beforeEvolution.dataSizeBytes > 0L);
+
+                evolved =
+                        catalog.evolveSchema(
+                                scores,
+                                Collections.singletonList(
+                                        TableSchemaChange.alterFieldType(
+                                                "score", LogicalTypes.int64())));
+                assertTrue(evolved.refreshWriter(writer));
+                assertEquals(
+                        widenedRow,
+                        writer.get(
+                                writer.keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+                evolvedSnapshot = db.snapshot();
+                assertTrue(db.retainSnapshot(evolvedSnapshot.snapshotId));
+                assertTrue(evolvedSnapshot.snapshotId > beforeEvolution.snapshotId);
+                assertTrue(evolvedSnapshot.dataSizeBytes > 0L);
+
+                try (DbCoordinator coordinator = DbCoordinator.open(config)) {
+                    globalSnapshot =
+                            coordinator.materializeGlobalSnapshot(
+                                    1,
+                                    evolvedSnapshot.snapshotId,
+                                    Collections.singletonList(evolvedSnapshot));
+                }
+            }
+        }
+
+        try (CatalogTable descriptor = evolved) {
+            assertEquals(1L, descriptor.catalogSchemaId());
+            try (Db resumed = Db.resume(config, sourceDbId);
+                    Table table = Table.open(resumed, physicalName)) {
+                assertEquals(
+                        widenedRow,
+                        table.get(
+                                table.keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+            }
+            try (Db restored = Db.restore(config, evolvedSnapshot.snapshotId, sourceDbId);
+                    Table restoredTable = Table.open(restored, physicalName)) {
+                assertEquals(
+                        widenedRow,
+                        restoredTable.get(
+                                restoredTable
+                                        .keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+            }
+            try (Db restored = Db.restore(config, evolvedSnapshot.snapshotId, sourceDbId, true);
+                    Table restoredTable = Table.open(restored, physicalName)) {
+                assertEquals(
+                        widenedRow,
+                        restoredTable.get(
+                                restoredTable
+                                        .keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+            }
+            try (Db restored = Db.restoreWithManifest(config, evolvedSnapshot.manifestPath);
+                    Table restoredTable = Table.open(restored, physicalName)) {
+                assertEquals(
+                        widenedRow,
+                        restoredTable.get(
+                                restoredTable
+                                        .keyBuilder()
+                                        .push(oldRow.get(0))
+                                        .push(oldRow.get(1))
+                                        .build()));
+            }
+        }
+        try (ReadOnlyDb readOnly = ReadOnlyDb.open(config, evolvedSnapshot.snapshotId, sourceDbId);
+                ReadOnlyTable table = ReadOnlyTable.open(readOnly, physicalName)) {
+            assertEquals(
+                    widenedRow,
+                    table.get(table.keyBuilder().push(oldRow.get(0)).push(oldRow.get(1)).build()));
+        }
+        try (Reader reader = Reader.open(config, globalSnapshot.id);
+                ScanOptions options = new ScanOptions().columnFamily(physicalName);
+                ScanCursor cursor =
+                        reader.scanWithOptions(0, new byte[0], new byte[] {(byte) 0xff}, options)) {
+            ScanCursor.Entry entry = cursor.nextEntry();
+            assertNotNull(entry);
+            assertEquals(1, entry.columns.length);
+            assertArrayEquals(
+                    ValueCodec.encode(LogicalTypes.int64(), Value.int64(42L)), entry.columns[0]);
+            assertNull(cursor.nextEntry());
         }
     }
 

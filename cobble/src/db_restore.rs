@@ -615,11 +615,31 @@ impl Db {
     ) -> Result<Self> {
         let source_db_id = source_db_id.as_ref();
         let manifest_path = bucket_snapshot_manifest_path(source_db_id, snapshot_id);
-        Self::open_new_with_manifest_path_and_source_id_with_resolver(
+        Self::open_new_with_manifest_path_and_source_id_with_runtime(
             config,
             manifest_path,
             format!("snapshot:{source_db_id}:{snapshot_id}"),
             resolver,
+            Arc::new(SchemaTransformRegistry::default()),
+            None,
+        )
+    }
+
+    pub(crate) fn open_new_with_snapshot_with_builder(
+        builder: DbBuilder,
+        snapshot_id: u64,
+        source_db_id: impl AsRef<str>,
+    ) -> Result<Self> {
+        let (config, _bucket_ranges, _db_id, governance, resolver, transforms) =
+            builder.into_parts();
+        let source_db_id = source_db_id.as_ref();
+        Self::open_new_with_manifest_path_and_source_id_with_runtime(
+            config,
+            bucket_snapshot_manifest_path(source_db_id, snapshot_id),
+            format!("snapshot:{source_db_id}:{snapshot_id}"),
+            resolver,
+            transforms,
+            governance,
         )
     }
 
@@ -636,19 +656,40 @@ impl Db {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         let manifest_path = manifest_path.into();
-        Self::open_new_with_manifest_path_and_source_id_with_resolver(
+        Self::open_new_with_manifest_path_and_source_id_with_runtime(
             config,
             manifest_path.clone(),
             format!("manifest:{manifest_path}"),
             resolver,
+            Arc::new(SchemaTransformRegistry::default()),
+            None,
         )
     }
 
-    fn open_new_with_manifest_path_and_source_id_with_resolver(
+    pub(crate) fn open_new_with_manifest_path_with_builder(
+        builder: DbBuilder,
+        manifest_path: impl Into<String>,
+    ) -> Result<Self> {
+        let (config, _bucket_ranges, _db_id, governance, resolver, transforms) =
+            builder.into_parts();
+        let manifest_path = manifest_path.into();
+        Self::open_new_with_manifest_path_and_source_id_with_runtime(
+            config,
+            manifest_path.clone(),
+            format!("manifest:{manifest_path}"),
+            resolver,
+            transforms,
+            governance,
+        )
+    }
+
+    fn open_new_with_manifest_path_and_source_id_with_runtime(
         config: Config,
         manifest_path: String,
         retained_owned_source_id: String,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
+        governance: Option<Arc<dyn crate::governance::DbGovernance>>,
     ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
         init_logging(&config);
@@ -674,12 +715,15 @@ impl Db {
             .ok_or_else(|| {
                 Error::IoError(format!("Snapshot manifest not found: {}", manifest_path))
             })?;
-        let schema_manager = Arc::new(SchemaManager::from_snapshot_source_manifests(
-            &file_manager,
-            &manifest_path,
-            manifest_chain.iter().map(|entry| &entry.manifest),
-            resolver,
-        )?);
+        let schema_manager = Arc::new(
+            SchemaManager::from_snapshot_source_manifests(
+                &file_manager,
+                &manifest_path,
+                manifest_chain.iter().map(|entry| &entry.manifest),
+                resolver,
+            )?
+            .with_transform_registry(transforms)?,
+        );
         schema_manager.persist_loaded_schemas(&file_manager)?;
         open_restored_db_from_manifest(
             config,
@@ -693,7 +737,7 @@ impl Db {
             false,
             Some(retained_owned_source_id),
             None,
-            None,
+            governance,
         )
     }
 

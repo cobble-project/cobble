@@ -142,13 +142,18 @@ reader.refresh();
 See [Table](../getting-started/table) for the storage and snapshot model.
 
 `FileCatalog.open(config, storageId)` manages namespaces, tables, and persisted schemas through
-the Rust catalog. Use `TableSchemaChange` to add nullable fields, rename fields, or drop non-key
-fields with `catalog.evolveSchema(...)`. Loaded `CatalogTable` objects represent fixed catalog
-versions: `materializeTable(db)` applies that version to a caller-owned shard, and
+the Rust catalog. Use `TableSchemaChange` to add nullable fields, rename fields, drop non-key
+fields, or widen value-field types with `catalog.evolveSchema(...)`. Loaded `CatalogTable` objects
+represent fixed catalog versions: `materializeTable(db)` applies that version to a caller-owned shard, and
 `refreshWriter(table)` applies it to an existing Table and refreshes its layout. Neither method
 owns or closes the caller's Db. Publishing a catalog schema alone does not update live handles.
 Close catalog handles when no longer needed. Catalog-backed storage builders, automatic latest
-Table readers, type widening, and custom transforms are not yet exposed through these Java APIs.
+Table readers, and custom transforms are not yet exposed through these Java APIs.
+
+`TableSchemaChange.alterFieldType(name, type)` supports the same lossless changes as Rust Table,
+such as `Int8` → `Int64`; see [schema evolution](../getting-started/table#schema-evolution).
+Java `Db`, `ReadOnlyDb`, and `Reader` automatically install the built-in table transforms before
+opening or restoring schemas, so old files remain readable without manual registration.
 
 Table operations are bound to the schema used when the handle was opened. After an external
 schema update, call `table.refreshSchema()` and rebuild projections before using the new layout.
