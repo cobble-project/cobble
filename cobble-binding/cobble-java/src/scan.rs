@@ -4,7 +4,9 @@ use crate::util::{
     write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
-use cobble_binding::{Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner};
+use cobble_binding::{
+    ColumnFamilyOptions, Config, DbIterator, Result, ScanOptions, ScanSplit, ScanSplitScanner,
+};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong};
@@ -12,6 +14,22 @@ use size::Size;
 
 pub(crate) struct ScanOptionsHandle {
     scan_options: ScanOptions,
+}
+
+pub(crate) fn bind_to_table_schema(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+    options: &ColumnFamilyOptions,
+    physical_columns: usize,
+) -> bool {
+    let Some(handle) = scan_options_from_handle_mut_or_throw(env, native_handle) else {
+        return false;
+    };
+    handle.scan_options = handle
+        .scan_options
+        .clone()
+        .bound_to_column_family_schema(options.clone(), physical_columns);
+    true
 }
 
 impl ScanOptionsHandle {

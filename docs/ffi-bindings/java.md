@@ -142,6 +142,11 @@ reader.refresh();
 See [Table](../getting-started/table) for the storage and snapshot model; Catalog and
 online schema-evolution APIs described there are currently Rust APIs.
 
+Table operations are bound to the schema used when the handle was opened. After an external
+schema update, call `table.refreshSchema()` and rebuild projections before using the new layout.
+Refresh must not run concurrently with operations on that Table. Already-open scans and
+snapshot-backed `ReadOnlyTable` handles retain their original read view.
+
 `TableScanPlan.forCurrentSnapshot(config, tableName)` captures the current committed global
 snapshot; `forSnapshot(config, tableName, snapshotId)` selects a historical snapshot.
 Both produce fixed plans. Plans and their `TableScanSplit` assignments are serializable;

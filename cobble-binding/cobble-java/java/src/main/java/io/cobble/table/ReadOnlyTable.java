@@ -21,6 +21,8 @@ public final class ReadOnlyTable implements AutoCloseable {
     private final TableReadBackend reads;
     private final String name;
     private final Table.Compiled compiled;
+    private final String columnFamilyOptionsJson;
+    private final int physicalColumns;
     private final ReadOptions readOptions;
     private final ScanOptions scanOptions;
     private volatile boolean closed;
@@ -30,9 +32,30 @@ public final class ReadOnlyTable implements AutoCloseable {
         this.reads = TableReadBackend.readOnly(db);
         this.name = Objects.requireNonNull(name, "name");
         this.compiled = Table.Compiled.from(openInfo.schema, openInfo.totalBuckets);
+        if (openInfo.physicalColumns != compiled.physicalColumns) {
+            throw new IllegalStateException("captured table physical layout is inconsistent");
+        }
+        this.columnFamilyOptionsJson = openInfo.columnFamilyOptionsJson;
+        this.physicalColumns = openInfo.physicalColumns;
         int[] columns = Table.physicalColumns(compiled.physicalColumns);
-        this.readOptions = ReadOptions.forColumnsInFamily(name, columns);
-        this.scanOptions = new ScanOptions().columnFamily(name).columns(columns);
+        ReadOptions readOptions = null;
+        ScanOptions scanOptions = null;
+        try {
+            readOptions = ReadOptions.forColumnsInFamily(name, columns);
+            scanOptions = new ScanOptions().columnFamily(name).columns(columns);
+            Table.bindOptionsNative(
+                    readOptions.getNativeHandle(),
+                    scanOptions.getNativeHandle(),
+                    0L,
+                    columnFamilyOptionsJson,
+                    physicalColumns);
+            this.readOptions = readOptions;
+            this.scanOptions = scanOptions;
+        } catch (RuntimeException error) {
+            if (scanOptions != null) scanOptions.close();
+            if (readOptions != null) readOptions.close();
+            throw error;
+        }
     }
 
     /** Opens a table from metadata stored in the snapshot schema. */
@@ -65,7 +88,8 @@ public final class ReadOnlyTable implements AutoCloseable {
     /** Compiles a reusable typed projection from top-level field names. */
     public TableProjection projectByNames(List<String> fieldNames) {
         ensureUsable();
-        return new TableProjection(reads, name, compiled, fieldNames);
+        return new TableProjection(
+                reads, name, compiled, columnFamilyOptionsJson, physicalColumns, fieldNames);
     }
 
     /** Returns one owned typed row, or {@code null} when absent. */

@@ -16,6 +16,7 @@ import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -24,6 +25,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -103,7 +106,7 @@ class DbBindingTest {
     }
 
     @Test
-    void tableApiUsesLocalCodecsAndRawJniRows() throws IOException {
+    void tableApiUsesLocalCodecsAndRawJniRows() throws Exception {
         Path dataDir = Files.createTempDirectory("cobble-java-table-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(8);
         TableSchema schema =
@@ -244,6 +247,68 @@ class DbBindingTest {
             assertThrows(
                     IllegalArgumentException.class,
                     () -> table.projectByNames(Collections.singletonList("missing")));
+
+            String originalOptionsJson = nativeTableOptions(db, "events");
+            try (TableProjection staleProjection =
+                            table.projectByNames(Collections.singletonList("payload"));
+                    TableScanCursor oldCursor = table.scanBounds(key1.bucket(), key1, missing)) {
+                db.updateSchema().addColumn("metrics", 0, null, null).commit();
+                assertFalse(table.refreshSchema());
+                assertEquals(row1, table.get(key1));
+
+                db.updateSchema()
+                        .setColumnFamilyOptions("events", ColumnFamilyOptions.defaults())
+                        .commit();
+                assertThrows(IllegalStateException.class, () -> table.get(key1));
+                assertThrows(IllegalArgumentException.class, table::refreshSchema);
+                installColumnFamilyOptions(db, "events", originalOptionsJson);
+                assertEquals(row1, table.get(key1));
+                assertFalse(table.refreshSchema());
+
+                List<DataField> refreshedFields = new ArrayList<DataField>(schema.fields());
+                refreshedFields.set(2, new DataField(3, "content", LogicalTypes.binary()));
+                TableSchema refreshedSchema =
+                        new TableSchema(refreshedFields, schema.primaryKey(), schema.bucketKey());
+                String refreshedOptionsJson;
+                try (Table refreshSource = Table.create(db, "events-refresh", refreshedSchema)) {
+                    refreshedOptionsJson = nativeTableOptions(db, "events-refresh");
+                }
+                installColumnFamilyOptions(db, "events", refreshedOptionsJson);
+                assertThrows(IllegalStateException.class, () -> table.get(key1));
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> table.multiGet(Arrays.asList(key1, key2)));
+                assertThrows(IllegalStateException.class, () -> table.getDirect(key1, directKey));
+                assertThrows(IllegalStateException.class, () -> table.scan(key1.bucket()));
+                assertThrows(IllegalStateException.class, () -> table.put(row1));
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> table.putDirect(row1, directKey, directRow));
+                assertThrows(IllegalStateException.class, () -> table.delete(key1));
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> table.deleteBatch(Arrays.asList(key1, key2)));
+                assertThrows(IllegalStateException.class, () -> staleProjection.get(key1));
+                assertEquals(row1, oldCursor.nextRow());
+
+                assertTrue(table.refreshSchema());
+                assertEquals(refreshedSchema, table.schema());
+                TableKey refreshedKey1 =
+                        table.keyBuilder().push(row1.get(0)).push(row1.get(1)).build();
+                assertEquals(row1, table.get(refreshedKey1));
+                assertEquals(row2, oldCursor.nextRow());
+                assertThrows(IllegalStateException.class, () -> staleProjection.get(key1));
+                try (TableProjection refreshedProjection =
+                        table.projectByNames(Arrays.asList("content", "tenant"))) {
+                    assertEquals(
+                            Arrays.asList(row1.get(2), row1.get(0)),
+                            refreshedProjection.get(refreshedKey1));
+                }
+                assertFalse(table.refreshSchema());
+                installColumnFamilyOptions(db, "events", originalOptionsJson);
+                assertTrue(table.refreshSchema());
+                assertEquals(schema, table.schema());
+            }
 
             table.delete(key1);
             assertNull(table.get(key1));
@@ -2137,6 +2202,27 @@ class DbBindingTest {
                         "encoded-raw-scan-04=encoded-raw-value-a-4/encoded-raw-value-b-4",
                         seen.get(4));
             }
+        }
+    }
+
+    private static String nativeTableOptions(Db db, String tableName)
+            throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+        Method open = Table.class.getDeclaredMethod("openNative", long.class, String.class);
+        open.setAccessible(true);
+        String response = (String) open.invoke(null, db.getNativeHandle(), tableName);
+        JsonObject value = new Gson().fromJson(response, JsonObject.class);
+        return value.getAsJsonObject("column_family_options").toString();
+    }
+
+    private static void installColumnFamilyOptions(Db db, String family, String optionsJson)
+            throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+        Method setOptions =
+                SchemaBuilder.class.getDeclaredMethod(
+                        "nativeSetColumnFamilyOptions", long.class, String.class, String.class);
+        setOptions.setAccessible(true);
+        try (SchemaBuilder builder = db.updateSchema()) {
+            setOptions.invoke(null, builder.getNativeHandle(), family, optionsJson);
+            builder.commit();
         }
     }
 

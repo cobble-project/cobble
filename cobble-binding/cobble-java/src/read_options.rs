@@ -1,7 +1,7 @@
 use crate::util::{
     decode_column_index, decode_java_string, throw_illegal_argument, throw_illegal_state,
 };
-use cobble_binding::ReadOptions;
+use cobble_binding::{ColumnFamilyOptions, ReadOptions};
 use jni::JNIEnv;
 use jni::objects::{JClass, JIntArray, JObject, JString};
 use jni::sys::{jint, jlong};
@@ -49,6 +49,22 @@ pub(crate) fn read_options_from_handle_or_throw(
     native_handle: jlong,
 ) -> Option<&'static ReadOptionsHandle> {
     read_options_from_handle_or_throw_impl(env, native_handle)
+}
+
+pub(crate) fn bind_to_table_schema(
+    env: &mut JNIEnv,
+    native_handle: jlong,
+    options: &ColumnFamilyOptions,
+    physical_columns: usize,
+) -> bool {
+    let Some(handle) = read_options_from_handle_mut_or_throw(env, native_handle) else {
+        return false;
+    };
+    handle.read_options = handle
+        .read_options
+        .clone()
+        .bound_to_column_family_schema(options.clone(), physical_columns);
+    true
 }
 
 #[unsafe(no_mangle)]

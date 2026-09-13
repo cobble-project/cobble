@@ -381,6 +381,14 @@ impl Table {
             write_options,
         })
     }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_schema_binding(&self) -> crate::ffi::TableSchemaBinding {
+        crate::ffi::TableSchemaBinding {
+            options: self.compiled.column_family_options.clone(),
+            physical_columns: self.compiled.physical_columns,
+        }
+    }
 }
 
 fn build_bound_options(
@@ -443,6 +451,14 @@ impl ReadOnlyTable {
         let current = db.current_schema();
         let metadata = load_table_metadata(&current, &name)?;
         Self::from_shard_metadata(db, name, metadata)
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn ffi_schema_binding(&self) -> crate::ffi::TableSchemaBinding {
+        crate::ffi::TableSchemaBinding {
+            options: self.typed.compiled.column_family_options.clone(),
+            physical_columns: self.typed.compiled.physical_columns,
+        }
     }
 
     pub(crate) fn from_shard_metadata(

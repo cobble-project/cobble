@@ -34,9 +34,14 @@ public final class TableProjection implements AutoCloseable {
             TableReadBackend reads,
             String tableName,
             Table.Compiled compiled,
+            String columnFamilyOptionsJson,
+            int totalPhysicalColumns,
             List<String> fieldNames) {
         this.reads = reads;
         this.compiled = compiled;
+        if (totalPhysicalColumns != compiled.physicalColumns) {
+            throw new IllegalStateException("captured table physical layout is inconsistent");
+        }
         Objects.requireNonNull(fieldNames, "fieldNames");
         if (fieldNames.isEmpty())
             throw new IllegalArgumentException("table projection must contain at least one field");
@@ -67,8 +72,24 @@ public final class TableProjection implements AutoCloseable {
         int[] columns = toIntArray(physicalColumns);
         this.sources = sourceList.toArray(new Source[sourceList.size()]);
         this.hasKeyFields = selectsKey;
-        this.readOptions = ReadOptions.forColumnsInFamily(tableName, columns);
-        this.scanOptions = new ScanOptions().columnFamily(tableName).columns(columns);
+        ReadOptions readOptions = null;
+        ScanOptions scanOptions = null;
+        try {
+            readOptions = ReadOptions.forColumnsInFamily(tableName, columns);
+            scanOptions = new ScanOptions().columnFamily(tableName).columns(columns);
+            Table.bindOptionsNative(
+                    readOptions.getNativeHandle(),
+                    scanOptions.getNativeHandle(),
+                    0L,
+                    columnFamilyOptionsJson,
+                    totalPhysicalColumns);
+            this.readOptions = readOptions;
+            this.scanOptions = scanOptions;
+        } catch (RuntimeException error) {
+            if (scanOptions != null) scanOptions.close();
+            if (readOptions != null) readOptions.close();
+            throw error;
+        }
     }
 
     /** Reads one projected row, or {@code null} when absent. */

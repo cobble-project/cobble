@@ -28,21 +28,14 @@ public final class Table implements AutoCloseable {
     private final Db db;
     private final TableReadBackend reads;
     private final String name;
-    private final Compiled compiled;
-    private final ReadOptions readOptions;
-    private final WriteOptions writeOptions;
-    private final ScanOptions scanOptions;
+    private volatile TableState state;
     private volatile boolean closed;
 
     private Table(Db db, String name, OpenInfo openInfo) {
         this.db = Objects.requireNonNull(db, "db");
         this.reads = TableReadBackend.writable(db);
         this.name = Objects.requireNonNull(name, "name");
-        this.compiled = Compiled.from(openInfo.schema, openInfo.totalBuckets);
-        int[] columns = physicalColumns(compiled.physicalColumns);
-        this.readOptions = ReadOptions.forColumnsInFamily(name, columns);
-        this.writeOptions = WriteOptions.withColumnFamily(name);
-        this.scanOptions = new ScanOptions().columnFamily(name).columns(columns);
+        this.state = TableState.create(name, openInfo);
     }
 
     /** Creates a table, or opens an existing table when its semantic schema is identical. */
@@ -74,33 +67,59 @@ public final class Table implements AutoCloseable {
     }
 
     public TableSchema schema() {
-        ensureUsable();
-        return compiled.schema;
+        return state().compiled.schema;
     }
 
     /** Starts building one primary key in schema order. */
     public TableKeyBuilder keyBuilder() {
-        ensureUsable();
-        return new TableKeyBuilder(compiled);
+        return new TableKeyBuilder(state().compiled);
     }
 
     /** Compiles a reusable typed projection from top-level field names. */
     public TableProjection projectByNames(List<String> fieldNames) {
+        TableState state = state();
+        return new TableProjection(
+                reads,
+                name,
+                state.compiled,
+                state.columnFamilyOptionsJson,
+                state.physicalColumns,
+                fieldNames);
+    }
+
+    /**
+     * Reload this table's local schema and layout.
+     *
+     * <p>Like {@link #close()}, this must not race another table operation. Existing projections
+     * must be rebuilt after a successful refresh; cursors already opened retain their old view.
+     * This does not consult a catalog.
+     */
+    public synchronized boolean refreshSchema() {
         ensureUsable();
-        return new TableProjection(reads, name, compiled, fieldNames);
+        Table.OpenInfo openInfo;
+        synchronized (db) {
+            ensureDbOpen(db);
+            openInfo = TableJson.openInfoFromJson(openNative(db.getNativeHandle(), name));
+        }
+        TableState previous = state;
+        if (previous.matches(openInfo)) return false;
+        TableState candidate = TableState.create(name, openInfo);
+        state = candidate;
+        previous.close();
+        return true;
     }
 
     /** Writes one full row in schema field order. */
     public void put(List<Value> row) {
-        ensureUsable();
-        requireRow(row);
-        EncodedKey key = encodeRowKeyValidated(row);
+        TableState state = state();
+        requireRow(state.compiled, row);
+        EncodedKey key = encodeRowKeyValidated(state.compiled, row);
         putEncodedNative(
                 db.getNativeHandle(),
                 key.bucket,
                 key.bytes,
-                encodeValuesValidated(row),
-                writeOptions.getNativeHandle());
+                encodeValuesValidated(state.compiled, row),
+                state.writeOptions.getNativeHandle());
     }
 
     /**
@@ -110,22 +129,22 @@ public final class Table implements AutoCloseable {
      * and borrows them for the duration of this call.
      */
     public void putDirect(List<Value> row, ByteBuffer keyBuffer, ByteBuffer rowBuffer) {
-        ensureUsable();
+        TableState state = state();
         requireDirect(keyBuffer, "keyBuffer");
         requireDirect(rowBuffer, "rowBuffer");
-        requireRow(row);
+        requireRow(state.compiled, row);
         ((Buffer) keyBuffer).clear();
         ((Buffer) rowBuffer).clear();
         int prefixEnd =
                 KeyCodec.encodeFromPositionsToWithPrefix(
-                        compiled.keyTypes,
+                        state.compiled.keyTypes,
                         row,
-                        compiled.keyPositions,
-                        compiled.bucketKeyFields,
+                        state.compiled.keyPositions,
+                        state.compiled.bucketKeyFields,
                         keyBuffer);
         int keyLength = keyBuffer.position();
-        int bucket = compiled.bucketHash.bucket(prefix(keyBuffer, prefixEnd));
-        encodeValuesToValidated(row, rowBuffer);
+        int bucket = state.compiled.bucketHash.bucket(prefix(keyBuffer, prefixEnd));
+        encodeValuesToValidated(state.compiled, row, rowBuffer);
         int rowLength = rowBuffer.position();
         putEncodedDirectNative(
                 db.getNativeHandle(),
@@ -136,23 +155,23 @@ public final class Table implements AutoCloseable {
                 rowBuffer,
                 0,
                 rowLength,
-                writeOptions.getNativeHandle());
+                state.writeOptions.getNativeHandle());
     }
 
     /** Deletes one complete row. */
     public void delete(TableKey key) {
-        ensureUsable();
+        TableState state = state();
         Objects.requireNonNull(key, "key");
         deleteNative(
                 db.getNativeHandle(),
                 key.bucket(),
                 key.encodedInternal(),
-                writeOptions.getNativeHandle());
+                state.writeOptions.getNativeHandle());
     }
 
     /** Deletes complete rows in one native batch. Each row is atomic. */
     public void deleteBatch(List<TableKey> primaryKeys) {
-        ensureUsable();
+        TableState state = state();
         Objects.requireNonNull(primaryKeys, "primaryKeys");
         if (primaryKeys.isEmpty()) return;
         int[] buckets = new int[primaryKeys.size()];
@@ -162,20 +181,21 @@ public final class Table implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        deleteBatchNative(db.getNativeHandle(), buckets, keys, writeOptions.getNativeHandle());
+        deleteBatchNative(
+                db.getNativeHandle(), buckets, keys, state.writeOptions.getNativeHandle());
     }
 
     /** Returns one owned typed row, or {@code null} when absent. */
     public List<Value> get(TableKey key) {
-        ensureUsable();
+        TableState state = state();
         Objects.requireNonNull(key, "key");
-        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), readOptions);
-        return columns == null ? null : assembleRow(compiled, key.valuesInternal(), columns);
+        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), state.readOptions);
+        return columns == null ? null : assembleRow(state.compiled, key.valuesInternal(), columns);
     }
 
     /** Reads keys in one native multi-get while preserving input order and duplicates. */
     public List<List<Value>> multiGet(List<TableKey> primaryKeys) {
-        ensureUsable();
+        TableState state = state();
         Objects.requireNonNull(primaryKeys, "primaryKeys");
         int[] buckets = new int[primaryKeys.size()];
         byte[][] keys = new byte[primaryKeys.size()][];
@@ -184,14 +204,16 @@ public final class Table implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = reads.multiGet(buckets, keys, readOptions);
+        byte[][][] columns = reads.multiGet(buckets, keys, state.readOptions);
         List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
         for (int i = 0; i < columns.length; i++)
             rows.add(
                     columns[i] == null
                             ? null
                             : assembleRow(
-                                    compiled, primaryKeys.get(i).valuesInternal(), columns[i]));
+                                    state.compiled,
+                                    primaryKeys.get(i).valuesInternal(),
+                                    columns[i]));
         return Collections.unmodifiableList(rows);
     }
 
@@ -202,17 +224,18 @@ public final class Table implements AutoCloseable {
      * closed. The key buffer is overwritten from position zero.
      */
     public DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
-        ensureUsable();
+        TableState state = state();
         Objects.requireNonNull(key, "key");
         requireDirect(keyBuffer, "keyBuffer");
         ((Buffer) keyBuffer).clear();
         keyBuffer.put(key.encodedInternal());
         DirectColumns columns =
                 db.getDirectColumnsWithOptions(
-                        key.bucket(), keyBuffer, key.encodedInternal().length, readOptions);
+                        key.bucket(), keyBuffer, key.encodedInternal().length, state.readOptions);
         if (columns == null) return null;
         try {
-            return new DirectTableRow(columns, assembleDirectRow(key.valuesInternal(), columns));
+            return new DirectTableRow(
+                    columns, assembleDirectRow(state.compiled, key.valuesInternal(), columns));
         } catch (RuntimeException error) {
             columns.close();
             throw error;
@@ -226,18 +249,18 @@ public final class Table implements AutoCloseable {
 
     /** Opens a typed scan over an inclusive/exclusive primary-key range in one bucket. */
     public TableScanCursor scanBounds(int bucket, TableKey startInclusive, TableKey endExclusive) {
-        ensureUsable();
+        TableState state = state();
         validateBound(bucket, startInclusive);
         validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
         return new TableScanCursor(
                 reads.owner(),
-                reads.scan(bucket, start, end, scanOptions),
+                reads.scan(bucket, start, end, state.scanOptions),
                 new TableScanCursor.RowDecoder() {
                     @Override
                     public List<Value> decode(DirectScanEntry entry) {
-                        return decodeDirectScannedRowOwned(compiled, entry);
+                        return decodeDirectScannedRowOwned(state.compiled, entry);
                     }
                 });
     }
@@ -246,12 +269,10 @@ public final class Table implements AutoCloseable {
     public synchronized void close() {
         if (closed) return;
         closed = true;
-        scanOptions.close();
-        readOptions.close();
-        writeOptions.close();
+        state.close();
     }
 
-    private EncodedKey encodeRowKeyValidated(List<Value> row) {
+    private static EncodedKey encodeRowKeyValidated(Compiled compiled, List<Value> row) {
         int size = KeyCodec.encodedSizeFromPositions(compiled.keyTypes, row, compiled.keyPositions);
         ByteBuffer output = ByteBuffer.allocate(size);
         int prefixEnd =
@@ -266,13 +287,13 @@ public final class Table implements AutoCloseable {
                 output.array());
     }
 
-    private byte[] encodeValuesValidated(List<Value> row) {
-        ByteBuffer output = ByteBuffer.allocate(encodedValuesSizeValidated(row));
-        encodeValuesToValidated(row, output);
+    private static byte[] encodeValuesValidated(Compiled compiled, List<Value> row) {
+        ByteBuffer output = ByteBuffer.allocate(encodedValuesSizeValidated(compiled, row));
+        encodeValuesToValidated(compiled, row, output);
         return output.array();
     }
 
-    private int encodedValuesSizeValidated(List<Value> row) {
+    private static int encodedValuesSizeValidated(Compiled compiled, List<Value> row) {
         if (compiled.valuePositions.length == 0) return 10;
         int size = Integer.BYTES;
         for (int i = 0; i < compiled.valuePositions.length; i++) {
@@ -284,7 +305,8 @@ public final class Table implements AutoCloseable {
         return size;
     }
 
-    private void encodeValuesToValidated(List<Value> row, ByteBuffer output) {
+    private static void encodeValuesToValidated(
+            Compiled compiled, List<Value> row, ByteBuffer output) {
         Objects.requireNonNull(output, "output");
         int start = output.position();
         try {
@@ -325,7 +347,8 @@ public final class Table implements AutoCloseable {
         return Collections.unmodifiableList(row);
     }
 
-    private List<Value> assembleDirectRow(List<Value> primaryKey, DirectColumns columns) {
+    private static List<Value> assembleDirectRow(
+            Compiled compiled, List<Value> primaryKey, DirectColumns columns) {
         if (columns.size() != compiled.physicalColumns)
             throw new IllegalStateException("table row has an incompatible physical layout");
         ArrayList<Value> row = emptyRow(compiled.schema.fields().size());
@@ -361,7 +384,7 @@ public final class Table implements AutoCloseable {
         return Collections.unmodifiableList(row);
     }
 
-    private void requireRow(List<Value> row) {
+    private static void requireRow(Compiled compiled, List<Value> row) {
         Objects.requireNonNull(row, "row");
         if (row.size() != compiled.schema.fields().size())
             throw new IllegalArgumentException("row field count does not match schema");
@@ -370,6 +393,11 @@ public final class Table implements AutoCloseable {
     void ensureUsable() {
         if (closed) throw new IllegalStateException("table is closed");
         reads.ensureOpen();
+    }
+
+    private TableState state() {
+        ensureUsable();
+        return state;
     }
 
     private static void ensureDbOpen(Db db) {
@@ -411,10 +439,93 @@ public final class Table implements AutoCloseable {
     static final class OpenInfo {
         final TableSchema schema;
         final int totalBuckets;
+        final String columnFamilyOptionsJson;
+        final int physicalColumns;
 
-        OpenInfo(TableSchema schema, int totalBuckets) {
+        OpenInfo(
+                TableSchema schema,
+                int totalBuckets,
+                String columnFamilyOptionsJson,
+                int physicalColumns) {
             this.schema = schema;
             this.totalBuckets = totalBuckets;
+            this.columnFamilyOptionsJson = columnFamilyOptionsJson;
+            this.physicalColumns = physicalColumns;
+        }
+    }
+
+    static final class TableState implements AutoCloseable {
+        final Compiled compiled;
+        final String columnFamilyOptionsJson;
+        final int totalBuckets;
+        final int physicalColumns;
+        final ReadOptions readOptions;
+        final WriteOptions writeOptions;
+        final ScanOptions scanOptions;
+
+        private TableState(
+                Compiled compiled,
+                String columnFamilyOptionsJson,
+                int totalBuckets,
+                int physicalColumns,
+                ReadOptions readOptions,
+                WriteOptions writeOptions,
+                ScanOptions scanOptions) {
+            this.compiled = compiled;
+            this.columnFamilyOptionsJson = columnFamilyOptionsJson;
+            this.totalBuckets = totalBuckets;
+            this.physicalColumns = physicalColumns;
+            this.readOptions = readOptions;
+            this.writeOptions = writeOptions;
+            this.scanOptions = scanOptions;
+        }
+
+        static TableState create(String name, OpenInfo openInfo) {
+            Compiled compiled = Compiled.from(openInfo.schema, openInfo.totalBuckets);
+            if (openInfo.physicalColumns != compiled.physicalColumns) {
+                throw new IllegalStateException("captured table physical layout is inconsistent");
+            }
+            int[] columns = Table.physicalColumns(compiled.physicalColumns);
+            ReadOptions readOptions = null;
+            WriteOptions writeOptions = null;
+            ScanOptions scanOptions = null;
+            try {
+                readOptions = ReadOptions.forColumnsInFamily(name, columns);
+                writeOptions = WriteOptions.withColumnFamily(name);
+                scanOptions = new ScanOptions().columnFamily(name).columns(columns);
+                bindOptionsNative(
+                        readOptions.getNativeHandle(),
+                        scanOptions.getNativeHandle(),
+                        writeOptions.getNativeHandle(),
+                        openInfo.columnFamilyOptionsJson,
+                        openInfo.physicalColumns);
+                return new TableState(
+                        compiled,
+                        openInfo.columnFamilyOptionsJson,
+                        openInfo.totalBuckets,
+                        openInfo.physicalColumns,
+                        readOptions,
+                        writeOptions,
+                        scanOptions);
+            } catch (RuntimeException error) {
+                if (scanOptions != null) scanOptions.close();
+                if (readOptions != null) readOptions.close();
+                if (writeOptions != null) writeOptions.close();
+                throw error;
+            }
+        }
+
+        boolean matches(OpenInfo openInfo) {
+            return totalBuckets == openInfo.totalBuckets
+                    && physicalColumns == openInfo.physicalColumns
+                    && columnFamilyOptionsJson.equals(openInfo.columnFamilyOptionsJson);
+        }
+
+        @Override
+        public void close() {
+            scanOptions.close();
+            readOptions.close();
+            writeOptions.close();
         }
     }
 
@@ -493,6 +604,13 @@ public final class Table implements AutoCloseable {
     private static native String createNative(long dbHandle, String name, String schemaJson);
 
     private static native String openNative(long dbHandle, String name);
+
+    static native void bindOptionsNative(
+            long readOptionsHandle,
+            long scanOptionsHandle,
+            long writeOptionsHandle,
+            String columnFamilyOptionsJson,
+            int physicalColumns);
 
     private static native void putEncodedNative(
             long dbHandle, int bucket, byte[] key, byte[] rowPayload, long writeOptionsHandle);

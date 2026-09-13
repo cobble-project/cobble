@@ -33,7 +33,9 @@ final class TableJson {
         JsonObject value = object(json);
         return new Table.OpenInfo(
                 schemaFromObject(requiredObject(value, "schema")),
-                requiredInt(value, "total_buckets"));
+                requiredInt(value, "total_buckets"),
+                requiredObject(value, "column_family_options").toString(),
+                requiredInt(value, "physical_columns"));
     }
 
     private static JsonObject schemaObject(TableSchema schema) {

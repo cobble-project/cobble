@@ -5,7 +5,12 @@ use crate::util::{
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
-use cobble_binding::Db;
+use crate::{
+    read_options::bind_to_table_schema as bind_read_options,
+    scan::bind_to_table_schema as bind_scan_options,
+    write_options::bind_to_table_schema as bind_write_options,
+};
+use cobble_binding::{ColumnFamilyOptions, Db};
 use cobble_table::{ReadOnlyTable, Table, TableError, TableSchema};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JIntArray, JObjectArray, JString};
@@ -51,7 +56,12 @@ pub extern "system" fn Java_io_cobble_table_Table_createNative(
             return std::ptr::null_mut();
         }
     };
-    table_open_response(&mut env, db.total_buckets(), table.schema())
+    table_open_response(
+        &mut env,
+        db.total_buckets(),
+        table.schema(),
+        cobble_table::ffi::table_schema_binding(&table),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -78,7 +88,12 @@ pub extern "system" fn Java_io_cobble_table_Table_openNative(
             return std::ptr::null_mut();
         }
     };
-    table_open_response(&mut env, db.total_buckets(), table.schema())
+    table_open_response(
+        &mut env,
+        db.total_buckets(),
+        table.schema(),
+        cobble_table::ffi::table_schema_binding(&table),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -105,7 +120,60 @@ pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_openNative(
             return std::ptr::null_mut();
         }
     };
-    table_open_response(&mut env, db.total_buckets(), table.schema())
+    table_open_response(
+        &mut env,
+        db.total_buckets(),
+        table.schema(),
+        cobble_table::ffi::read_only_table_schema_binding(&table),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_bindOptionsNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    read_options_handle: jlong,
+    scan_options_handle: jlong,
+    write_options_handle: jlong,
+    column_family_options_json: JString,
+    physical_columns: jint,
+) {
+    let options_json = match decode_java_string(&mut env, column_family_options_json) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_state(&mut env, error);
+            return;
+        }
+    };
+    let options = match serde_json::from_str::<ColumnFamilyOptions>(&options_json) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_state(
+                &mut env,
+                format!("invalid captured table column-family options: {error}"),
+            );
+            return;
+        }
+    };
+    let physical_columns = match usize::try_from(physical_columns) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            throw_illegal_state(
+                &mut env,
+                "invalid captured table physical column count".to_string(),
+            );
+            return;
+        }
+    };
+    if !bind_read_options(&mut env, read_options_handle, &options, physical_columns) {
+        return;
+    }
+    if !bind_scan_options(&mut env, scan_options_handle, &options, physical_columns) {
+        return;
+    }
+    if write_options_handle != 0 {
+        let _ = bind_write_options(&mut env, write_options_handle, &options, physical_columns);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -253,10 +321,17 @@ pub extern "system" fn Java_io_cobble_table_Table_deleteBatchNative<'local>(
     }
 }
 
-fn table_open_response(env: &mut JNIEnv, total_buckets: u32, schema: &TableSchema) -> jstring {
+fn table_open_response(
+    env: &mut JNIEnv,
+    total_buckets: u32,
+    schema: &TableSchema,
+    binding: cobble_table::ffi::TableSchemaBinding,
+) -> jstring {
     let response = match serde_json::to_string(&serde_json::json!({
         "schema": schema,
         "total_buckets": total_buckets,
+        "column_family_options": binding.column_family_options(),
+        "physical_columns": binding.physical_columns(),
     })) {
         Ok(value) => value,
         Err(error) => {
