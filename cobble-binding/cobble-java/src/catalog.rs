@@ -11,7 +11,7 @@ use cobble_table::catalog::{
 };
 use cobble_table::{SchemaChange, TableWritePlan, TableWriterBuilder};
 use jni::JNIEnv;
-use jni::objects::{JClass, JIntArray, JObject, JString};
+use jni::objects::{JClass, JIntArray, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 use std::sync::Arc;
 
@@ -582,6 +582,44 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_snapshotCommitterNative
     match table.snapshot_committer(runtime, max_pending_commits) {
         Ok(committer) => crate::table_snapshot::into_table_snapshot_committer_handle(committer),
         Err(error) => throw_state_and_zero(&mut env, error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_coordinatorNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    runtime_json: JString,
+) -> jobject {
+    let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return std::ptr::null_mut();
+    };
+    let coordinator = match table.coordinator(runtime) {
+        Ok(value) => value,
+        Err(error) => return throw_state_and_null(&mut env, error),
+    };
+    let handle = Box::into_raw(Box::new(coordinator));
+    match env.new_object(
+        "io/cobble/DbCoordinator",
+        "(J)V",
+        &[JValue::Long(handle as jlong)],
+    ) {
+        Ok(object) => object.into_raw(),
+        Err(error) => {
+            // Java did not acquire ownership when construction failed.
+            unsafe {
+                drop(Box::from_raw(handle));
+            }
+            throw_state_and_null(&mut env, error)
+        }
     }
 }
 

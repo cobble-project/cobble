@@ -2,6 +2,7 @@ package io.cobble.table;
 
 import io.cobble.Config;
 import io.cobble.Db;
+import io.cobble.DbCoordinator;
 import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 import io.cobble.ReadOnlyDb;
@@ -134,6 +135,13 @@ public final class CatalogTable extends NativeObject {
                 snapshotCommitterNative(nativeHandle, runtime.toJson(), maxPendingCommits));
     }
 
+    /** Opens an independently owned coordinator in this table's snapshot namespace. */
+    public synchronized DbCoordinator coordinator(Config runtime) {
+        Objects.requireNonNull(runtime, "runtime");
+        ensureOpen();
+        return coordinatorNative(nativeHandle, runtime.toJson());
+    }
+
     @Override
     public synchronized void close() {
         super.close();
@@ -167,6 +175,8 @@ public final class CatalogTable extends NativeObject {
 
     private static native long snapshotCommitterNative(
             long nativeHandle, String runtimeJson, int maxPendingCommits);
+
+    private static native DbCoordinator coordinatorNative(long nativeHandle, String runtimeJson);
 
     static native String buildWritePlanNative(long nativeHandle, int totalBuckets);
 

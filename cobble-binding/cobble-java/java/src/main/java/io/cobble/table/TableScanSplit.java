@@ -45,6 +45,18 @@ public final class TableScanSplit implements Serializable {
         return (ScanCursor) openScanner(config, fieldNames, readAheadBytes, false);
     }
 
+    /**
+     * Open a direct encoded scan cursor for selected semantic fields.
+     *
+     * <p>The projected columns and row-existence semantics match {@link #openScanner(Config, List,
+     * int)}, while entry buffers are exposed by {@link DirectScanCursor} rather than copied into
+     * byte arrays.
+     */
+    public DirectScanCursor openDirectScanner(
+            Config config, List<String> fieldNames, int readAheadBytes) {
+        return (DirectScanCursor) openScanner(config, fieldNames, readAheadBytes, true);
+    }
+
     private NativeObject openScanner(
             Config config, List<String> fieldNames, int readAheadBytes, boolean direct) {
         if (config == null) {
@@ -93,8 +105,7 @@ public final class TableScanSplit implements Serializable {
         List<String> fieldNames = new ArrayList<String>(schema.fields().size());
         for (DataField field : schema.fields()) fieldNames.add(field.name());
         Table.Compiled compiled = Table.Compiled.from(schema, totalBuckets);
-        DirectScanCursor cursor =
-                (DirectScanCursor) openScanner(config, fieldNames, readAheadBytes, true);
+        DirectScanCursor cursor = openDirectScanner(config, fieldNames, readAheadBytes);
         return new TableScanCursor(
                 cursor, cursor, entry -> Table.decodeDirectScannedRowOwned(compiled, entry));
     }
