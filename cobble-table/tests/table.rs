@@ -341,14 +341,14 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
         total_buckets: 1,
         ..Config::default()
     };
-    let writer_builder = || {
-        TableWriterBuilder::new(config.clone())
-            .table_name("events")
+    let db_builder = || {
+        DbBuilder::new(config.clone())
             .db_id("owned-shard")
             .bucket_ranges(vec![0..=0])
     };
     let schema = runtime_schema(LogicalType::string().nullable());
-    let writer = writer_builder().create(schema.clone()).unwrap();
+    let writer_db = Arc::new(db_builder().open().unwrap());
+    let writer = Table::create(Arc::clone(&writer_db), "events", schema.clone()).unwrap();
     let empty = writer.snapshot_and_wait().unwrap();
     let empty_reader = ReadOnlyTableBuilder::new(config.clone())
         .table_name("events")
@@ -415,7 +415,8 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
         vec![vec![updated[1].clone(), updated[0].clone()]]
     );
 
-    let resumed = writer_builder().resume().unwrap();
+    let resumed_db = Arc::new(db_builder().resume().unwrap());
+    let resumed = Table::open(resumed_db, "events").unwrap();
     assert_eq!(resumed.schema(), &schema);
     assert_eq!(resumed.get(&key).unwrap(), Some(updated));
     assert!(resumed.shard_snapshot_metadata(latest.snapshot_id).is_ok());
@@ -432,6 +433,73 @@ fn standalone_table_shard_owns_storage_snapshots_and_cursors() {
 }
 
 #[test]
+fn single_bucket_writer_uses_stable_identity_and_empty_baseline() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        total_buckets: 2,
+        ..Config::default()
+    };
+    let schema = runtime_schema(LogicalType::string().nullable());
+    let writer = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .create(schema.clone())
+        .unwrap();
+    let row = (0_i64..)
+        .map(|id| vec![Value::Int64(id), Value::String("source".into())])
+        .find(|row| build_key(&writer, &row[..1]).bucket() == 0)
+        .unwrap();
+    let key = build_key(&writer, &row[..1]);
+    writer.put(&row).unwrap();
+    let source = writer.snapshot_and_wait().unwrap();
+    assert_eq!(source.db_id, "bucket-0");
+    assert!(source.manifest_path.contains("bucket-0"));
+    drop(writer);
+
+    let resumed = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .resume_from_snapshot(source.snapshot_id)
+        .unwrap();
+    assert_eq!(resumed.get(&key).unwrap(), Some(row));
+    drop(resumed);
+
+    // Reopening through create selects retained empty snapshot 0 for overwrite.
+    let overwrite = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .create(schema.clone())
+        .unwrap();
+    assert_eq!(overwrite.get(&key).unwrap(), None);
+    drop(overwrite);
+
+    assert!(
+        TableWriterBuilder::new(config)
+            .table_name("events")
+            .create(schema)
+            .is_err()
+    );
+}
+
+#[test]
+fn table_writer_builder_requires_bucket_before_storage_io() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        total_buckets: 1,
+        ..Config::default()
+    };
+    assert!(
+        TableWriterBuilder::new(config)
+            .table_name("events")
+            .create(runtime_schema(LogicalType::string().nullable()))
+            .is_err()
+    );
+    assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+}
+
+#[test]
 fn standalone_table_global_reader_routes_pins_and_validates_schema() {
     let root = tempfile::tempdir().unwrap();
     let config = Config {
@@ -440,18 +508,22 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
         ..Config::default()
     };
     let schema = runtime_schema(LogicalType::string().nullable());
-    let left = TableWriterBuilder::new(config.clone())
-        .table_name("events")
-        .db_id("left")
-        .bucket_ranges(vec![0..=1])
-        .create(schema.clone())
-        .unwrap();
-    let right = TableWriterBuilder::new(config.clone())
-        .table_name("events")
-        .db_id("right")
-        .bucket_ranges(vec![2..=3])
-        .create(schema.clone())
-        .unwrap();
+    let left_db = Arc::new(
+        DbBuilder::new(config.clone())
+            .db_id("left")
+            .bucket_ranges(vec![0..=1])
+            .open()
+            .unwrap(),
+    );
+    let left = Table::create(Arc::clone(&left_db), "events", schema.clone()).unwrap();
+    let right_db = Arc::new(
+        DbBuilder::new(config.clone())
+            .db_id("right")
+            .bucket_ranges(vec![2..=3])
+            .open()
+            .unwrap(),
+    );
+    let right = Table::create(Arc::clone(&right_db), "events", schema.clone()).unwrap();
     let rows = (0..16)
         .map(|id| vec![Value::Int64(id), Value::String(format!("row-{id}"))])
         .collect::<Vec<_>>();
@@ -613,12 +685,20 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
 
     // Commit preparation rejects incompatible shard metadata before publishing a mixed snapshot.
     drop(right);
-    let incompatible = TableWriterBuilder::new(config.clone())
-        .table_name("events")
-        .db_id("incompatible")
-        .bucket_ranges(vec![2..=3])
-        .create(runtime_schema(LogicalType::int64().nullable()))
-        .unwrap();
+    drop(right_db);
+    let incompatible_db = Arc::new(
+        DbBuilder::new(config.clone())
+            .db_id("incompatible")
+            .bucket_ranges(vec![2..=3])
+            .open()
+            .unwrap(),
+    );
+    let incompatible = Table::create(
+        incompatible_db,
+        "events",
+        runtime_schema(LogicalType::int64().nullable()),
+    )
+    .unwrap();
     let committer = TableSnapshotCommitter::new(
         Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(&config)).unwrap()),
         4,

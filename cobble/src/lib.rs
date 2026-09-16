@@ -173,6 +173,7 @@ pub use merge_operator::{
 };
 pub use metrics_manager::MetricsManager;
 pub use metrics_registry::{HistogramSnapshot, MetricSample, MetricValue};
+pub use paths::bucket_snapshot_manifest_path;
 pub use read_only_db::ReadOnlyDb;
 pub use read_only_db_builder::ReadOnlyDbBuilder;
 pub use reader::{GlobalSnapshotSummary, Reader, ReaderConfig};

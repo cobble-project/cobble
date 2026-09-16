@@ -159,13 +159,7 @@ public final class CatalogTable extends NativeObject {
     private static native String refreshWriterNative(long nativeHandle, long tableHandle);
 
     static native Table writerOpenNative(
-            long nativeHandle,
-            String runtimeJson,
-            String dbId,
-            int[] rangeStartsInclusive,
-            int[] rangeEndsInclusive,
-            int mode,
-            long snapshotId);
+            long nativeHandle, String runtimeJson, int mode, long snapshotId, int bucket);
 
     private static native long readerOpenNative(
             long nativeHandle, String runtimeJson, long snapshotId);

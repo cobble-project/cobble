@@ -5,93 +5,120 @@ import io.cobble.NativeLoader;
 
 import java.util.Objects;
 
-/** Configures and terminally opens one catalog-scoped writable table shard. */
+/** Configures and terminally opens one writable table shard. */
 public final class TableWriterBuilder {
     private static final int OPEN = 0;
-    private static final int RESUME = 1;
-    private static final int OPEN_FROM_SNAPSHOT = 2;
-    private static final int RESUME_FROM_SNAPSHOT = 3;
+    private static final int RESUME_FROM_SNAPSHOT = 1;
 
     private final CatalogTable catalogTable;
     private final TableWritePlan plan;
     private final Config runtime;
-    private String dbId;
-    private int[] rangeStarts = new int[0];
-    private int[] rangeEnds = new int[0];
+    private final boolean standalone;
+    private String tableName;
+    private Integer bucket;
 
-    private TableWriterBuilder(CatalogTable catalogTable, TableWritePlan plan, Config runtime) {
+    private TableWriterBuilder(
+            CatalogTable catalogTable, TableWritePlan plan, Config runtime, boolean standalone) {
         this.catalogTable = catalogTable;
         this.plan = plan;
         this.runtime = Objects.requireNonNull(runtime, "runtime");
+        this.standalone = standalone;
     }
 
     static TableWriterBuilder fromCatalog(CatalogTable table, Config runtime) {
-        return new TableWriterBuilder(Objects.requireNonNull(table, "table"), null, runtime);
+        return new TableWriterBuilder(Objects.requireNonNull(table, "table"), null, runtime, false);
     }
 
     static TableWriterBuilder fromPlan(TableWritePlan plan, Config runtime) {
-        return new TableWriterBuilder(null, Objects.requireNonNull(plan, "plan"), runtime);
+        return new TableWriterBuilder(null, Objects.requireNonNull(plan, "plan"), runtime, false);
     }
 
-    /** Sets the durable shard database identity. */
-    public TableWriterBuilder dbId(String value) {
-        dbId = Objects.requireNonNull(value, "dbId");
+    static TableWriterBuilder fromStandalone(Config runtime) {
+        return new TableWriterBuilder(null, null, runtime, true);
+    }
+
+    /** Selects exactly one isolated physical bucket for this writer. */
+    public TableWriterBuilder bucket(int value) {
+        if (value < 0 || value > 65535) {
+            throw new IllegalArgumentException("bucket must be in [0, 65535]");
+        }
+        bucket = Integer.valueOf(value);
         return this;
     }
 
-    /** Sets the inclusive bucket ranges owned by this shard. */
-    public TableWriterBuilder bucketRanges(int[] startsInclusive, int[] endsInclusive) {
-        Objects.requireNonNull(startsInclusive, "startsInclusive");
-        Objects.requireNonNull(endsInclusive, "endsInclusive");
-        rangeStarts = startsInclusive.clone();
-        rangeEnds = endsInclusive.clone();
+    /** Sets the physical table name for a standalone writer. */
+    public TableWriterBuilder tableName(String value) {
+        if (!standalone) {
+            throw new IllegalStateException(
+                    "catalog-bound TableWriterBuilder cannot change tableName");
+        }
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException("tableName must not be empty");
+        }
+        tableName = value;
         return this;
     }
 
-    /** Opens a new writable shard. */
+    /** Opens this bucket at its empty baseline, creating that baseline when absent. */
+    public Table create(TableSchema schema) {
+        if (!standalone) {
+            throw new IllegalStateException("catalog-bound TableWriterBuilder requires open()");
+        }
+        Objects.requireNonNull(schema, "schema");
+        if (tableName == null) {
+            throw new IllegalStateException("standalone TableWriterBuilder requires tableName");
+        }
+        int selectedBucket = requireBucket();
+        NativeLoader.load();
+        return Table.writerCreateNative(
+                runtime.toJson(), tableName, TableJson.toJson(schema), selectedBucket);
+    }
+
+    /** Opens this catalog bucket at its empty baseline, creating that baseline when absent. */
     public Table open() {
         return open(OPEN, -1L);
     }
 
-    /** Resumes a writable shard. */
-    public Table resume() {
-        return open(RESUME, -1L);
-    }
-
-    /** Opens a new writable shard at a selected snapshot boundary. */
-    public Table openFromSnapshot(long snapshotId) {
-        validateSnapshotId(snapshotId);
-        return open(OPEN_FROM_SNAPSHOT, snapshotId);
-    }
-
-    /** Resumes a writable shard at a selected snapshot boundary. */
+    /** Resumes this bucket from its exact committed snapshot boundary. */
     public Table resumeFromSnapshot(long snapshotId) {
         validateSnapshotId(snapshotId);
+        if (standalone) return resumeStandalone(snapshotId);
         return open(RESUME_FROM_SNAPSHOT, snapshotId);
     }
 
     private Table open(int mode, long snapshotId) {
+        if (standalone) {
+            throw new IllegalStateException(
+                    "standalone TableWriterBuilder requires create(schema)");
+        }
+        int selectedBucket = requireBucket();
         NativeLoader.load();
         if (catalogTable == null) {
             return TableWritePlan.writerOpenNative(
-                    plan.nativePlanJson(),
-                    runtime.toJson(),
-                    dbId,
-                    rangeStarts,
-                    rangeEnds,
-                    mode,
-                    snapshotId);
+                    plan.nativePlanJson(), runtime.toJson(), mode, snapshotId, selectedBucket);
         }
         synchronized (catalogTable) {
             return CatalogTable.writerOpenNative(
                     catalogTable.nativeHandleForBuilder(),
                     runtime.toJson(),
-                    dbId,
-                    rangeStarts,
-                    rangeEnds,
                     mode,
-                    snapshotId);
+                    snapshotId,
+                    selectedBucket);
         }
+    }
+
+    private Table resumeStandalone(long snapshotId) {
+        if (tableName == null) {
+            throw new IllegalStateException("standalone TableWriterBuilder requires tableName");
+        }
+        int selectedBucket = requireBucket();
+        NativeLoader.load();
+        return Table.writerResumeNative(runtime.toJson(), tableName, selectedBucket, snapshotId);
+    }
+
+    private int requireBucket() {
+        if (bucket == null) throw new IllegalStateException("TableWriterBuilder requires bucket");
+        return bucket.intValue();
     }
 
     private static void validateSnapshotId(long snapshotId) {

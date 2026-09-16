@@ -105,8 +105,14 @@ its Primary roles are ignored. Runtime configuration supplies all Primary volume
 and Low), Cache, and READONLY, retaining their configured priorities. READONLY source paths remain
 unchanged. Table directories follow stable IDs, so renaming a table does not move its files or
 change its snapshot location.
-For catalog-backed writers, `open()` creates a shard and `resume()` applies the loaded table
-definition. Explicit snapshot restores and readers use the schema stored in that snapshot.
+Every writer builder requires `.bucket(id)` and opens exactly one Db with identity `bucket-<id>`.
+For catalog-backed writers, `open()` initializes or resumes the retained empty snapshot 0;
+use it for a first write or overwrite. `resume_from_snapshot(committed_shard_snapshot_id)`
+restores committed data for append and applies the captured catalog definition. Standalone
+`create(schema)` also starts from the empty baseline; standalone snapshot resumes use the stored
+schema. File and snapshot IDs do not rewind. Fixed snapshot readers always use the stored schema.
+Writers require local/shared filesystem META storage with working file locks; keep automatic
+snapshot pruning disabled so the empty baseline and historical snapshots remain available.
 
 ## Global snapshots
 
@@ -135,12 +141,12 @@ let payload = serde_json::to_vec(&plan)?;
 // On a worker, after receiving the payload:
 let plan: cobble_table::TableWritePlan = serde_json::from_slice(&payload)?;
 let writer = plan.writer_builder(runtime_config)?
-    .db_id("shard-0")
-    .bucket_ranges(vec![0..=127])
+    .bucket(0)
     .open()?;
 ```
 
-The plan fixes the schema, table identity, bucket count, and shared storage routes. A worker does
+Open one writer for each bucket assigned to a worker. The plan fixes the schema, table identity,
+bucket count, and shared storage routes. A worker does
 not reload the latest Catalog definition. Credentials are excluded from the serialized plan;
 workers supply them through matching volume descriptors in their runtime config. Shared-volume
 descriptors supply credentials only: the plan determines Meta/Snapshot/WAL locations, while runtime
@@ -172,4 +178,3 @@ scanning finishes; serializing a plan does not retain them.
 The plan carries the table definition from the reader view selected by `scan_plan()`.
 Workers use that definition without rereading shard metadata for consistency checks. Execution delegates shard opening and
 bucket traversal to the core `ScanSplit` / `ScanSplitScanner`, adding only typed row decoding.
-

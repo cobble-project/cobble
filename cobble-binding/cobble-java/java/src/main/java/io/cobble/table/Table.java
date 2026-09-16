@@ -67,6 +67,11 @@ public final class Table extends NativeObject {
         initializeDirectBufferPool(nativeHandle);
     }
 
+    /** Starts a standalone writer for one isolated bucket. */
+    public static TableWriterBuilder writerBuilder(io.cobble.Config runtime) {
+        return TableWriterBuilder.fromStandalone(Objects.requireNonNull(runtime, "runtime"));
+    }
+
     /** Creates a table, or opens an existing table when its semantic schema is identical. */
     public static Table create(io.cobble.Db db, String name, TableSchema schema) {
         Objects.requireNonNull(db, "db");
@@ -726,6 +731,12 @@ public final class Table extends NativeObject {
     }
 
     private static native Table createNative(long dbHandle, String name, String schemaJson);
+
+    static native Table writerCreateNative(
+            String runtimeJson, String name, String schemaJson, int bucket);
+
+    static native Table writerResumeNative(
+            String runtimeJson, String name, int bucket, long snapshotId);
 
     private static native Table openNative(long dbHandle, String name);
 

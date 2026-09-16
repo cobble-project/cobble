@@ -31,11 +31,5 @@ public final class TableWritePlan implements Serializable {
     }
 
     static native Table writerOpenNative(
-            String planJson,
-            String runtimeJson,
-            String dbId,
-            int[] rangeStartsInclusive,
-            int[] rangeEndsInclusive,
-            int mode,
-            long snapshotId);
+            String planJson, String runtimeJson, int mode, long snapshotId, int bucket);
 }

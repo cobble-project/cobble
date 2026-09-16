@@ -44,7 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Cross-JVM table writer, reader, snapshot-commit, and typed split-scan coverage. */
 public class TableCrossProcessTest {
-    private static final int TOTAL_BUCKETS = 4;
+    private static final int TOTAL_BUCKETS = 2;
     private static final int ROWS = 8192;
     private static final long VALUE_A = 100L;
     private static final long VALUE_B = 3_000_000_000L;
@@ -84,9 +84,8 @@ public class TableCrossProcessTest {
                                 shared,
                                 root.resolve("writer-a0"),
                                 planAFile,
-                                "shard-a0",
                                 0,
-                                1,
+                                -1L,
                                 VALUE_A,
                                 false,
                                 false,
@@ -97,9 +96,8 @@ public class TableCrossProcessTest {
                                 shared,
                                 root.resolve("writer-a1"),
                                 planAFile,
-                                "shard-a1",
-                                2,
-                                3,
+                                1,
+                                -1L,
                                 VALUE_A,
                                 false,
                                 false,
@@ -145,9 +143,8 @@ public class TableCrossProcessTest {
                                     shared,
                                     root.resolve("writer-a0"),
                                     planBFile,
-                                    "shard-a0",
                                     0,
-                                    1,
+                                    reportA0.snapshot.snapshotId,
                                     VALUE_B,
                                     true,
                                     true,
@@ -158,9 +155,8 @@ public class TableCrossProcessTest {
                                     shared,
                                     root.resolve("writer-a1"),
                                     planBFile,
-                                    "shard-a1",
-                                    2,
-                                    3,
+                                    1,
+                                    reportA1.snapshot.snapshotId,
                                     VALUE_B,
                                     true,
                                     true,
@@ -241,23 +237,20 @@ public class TableCrossProcessTest {
             Path shared = path(args, 1);
             Path local = path(args, 2);
             TableWritePlan plan = readObject(path(args, 3), TableWritePlan.class);
-            String dbId = args[4];
-            int start = Integer.parseInt(args[5]);
-            int end = Integer.parseInt(args[6]);
-            long valueBase = Long.parseLong(args[7]);
-            boolean resume = Boolean.parseBoolean(args[8]);
-            boolean widened = Boolean.parseBoolean(args[9]);
-            Path report = path(args, 10);
+            int bucket = Integer.parseInt(args[4]);
+            long sourceSnapshotId = Long.parseLong(args[5]);
+            long valueBase = Long.parseLong(args[6]);
+            boolean resume = Boolean.parseBoolean(args[7]);
+            boolean widened = Boolean.parseBoolean(args[8]);
+            Path report = path(args, 9);
             Config config = runtimeConfig(shared, local);
-            io.cobble.table.TableWriterBuilder builder =
-                    plan.writerBuilder(config)
-                            .dbId(dbId)
-                            .bucketRanges(new int[] {start}, new int[] {end});
-            try (Table table = resume ? builder.resume() : builder.open()) {
+            io.cobble.table.TableWriterBuilder builder = plan.writerBuilder(config).bucket(bucket);
+            try (Table table =
+                    resume ? builder.resumeFromSnapshot(sourceSnapshotId) : builder.open()) {
                 Set<Long> ids = new HashSet<Long>();
                 for (long id = 0L; id < ROWS; id++) {
                     TableKey key = table.keyBuilder().push(Value.int64(id)).build();
-                    if (key.bucket() < start || key.bucket() > end) continue;
+                    if (key.bucket() != bucket) continue;
                     table.put(
                             Arrays.asList(
                                     Value.int64(id),
@@ -347,9 +340,8 @@ public class TableCrossProcessTest {
             Path shared,
             Path local,
             Path plan,
-            String dbId,
-            int start,
-            int end,
+            int bucket,
+            long sourceSnapshotId,
             long valueBase,
             boolean resume,
             boolean widened,
@@ -360,9 +352,8 @@ public class TableCrossProcessTest {
                 shared.toString(),
                 local.toString(),
                 plan.toString(),
-                dbId,
-                Integer.toString(start),
-                Integer.toString(end),
+                Integer.toString(bucket),
+                Long.toString(sourceSnapshotId),
                 Long.toString(valueBase),
                 Boolean.toString(resume),
                 Boolean.toString(widened),

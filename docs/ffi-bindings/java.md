@@ -164,8 +164,7 @@ or `loadTable`. Open writers and readers through the returned `CatalogTable`:
 ```java
 runtimeConfig.totalBuckets(1);
 try (CatalogTable table = catalog.loadTable(identifier);
-        Table writer = table.writerBuilder(runtimeConfig).dbId("shard-0")
-                .bucketRanges(new int[] {0}, new int[] {0}).open();
+        Table writer = table.writerBuilder(runtimeConfig).bucket(0).open();
         TableSnapshotCommitter committer = table.snapshotCommitter(runtimeConfig, 8)) {
     writer.put(row);
     committer.submit(1L, writer.snapshot()); // A global commit requires all shard reports.
@@ -175,8 +174,12 @@ try (CatalogTable table = catalog.loadTable(identifier);
 }
 ```
 
-The example uses one bucket. Set each writer's `bucketRanges` to its assigned buckets; use
-`resume()` instead of `open()` to resume an existing shard. `materializeTable(db)` uses an existing Db.
+Every writer requires `.bucket(id)` and owns exactly one bucket, with database identity
+`bucket-<id>`. A worker assigned multiple buckets opens one writer per bucket.
+Use `resumeFromSnapshot(committedShardSnapshotId)` for append; `open()` initializes or resumes
+the retained empty snapshot 0, for a first write or overwrite. Snapshot and file IDs do not rewind.
+Writers require local/shared filesystem META storage with working file locks and disabled
+automatic snapshot pruning. `materializeTable(db)` is a separate lower-level API using an existing Db.
 
 To read one fixed shard snapshot through the catalog:
 
@@ -197,7 +200,7 @@ Java serialization:
 TableWritePlan plan = table.newWriteBuilder().totalBuckets(16).build();
 // On a worker, after deserializing the plan:
 try (Table writer = plan.writerBuilder(runtimeConfig)
-        .dbId("shard-0").bucketRanges(new int[] {0}, new int[] {3}).open()) {
+        .bucket(0).open()) {
     writer.put(row);
 }
 ```

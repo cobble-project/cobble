@@ -760,10 +760,10 @@ class DbBindingTest {
         GlobalSnapshot initialGlobalSnapshot;
         GlobalSnapshot globalSnapshot;
         TableWritePlan portablePlan;
-        String portableDbId = "portable-catalog-writer";
         TableScanPlan readerPlan;
-        String ownedDbId = "catalog-owned-writer";
+        String ownedDbId = "bucket-0";
         ShardSnapshot ownedSnapshot;
+        ShardSnapshot portableSnapshot;
         try (FileCatalog catalog = FileCatalog.open(config, "warehouse");
                 Db db = Db.open(config)) {
             catalog.createNamespace(namespace);
@@ -786,11 +786,7 @@ class DbBindingTest {
                     portablePlan = (TableWritePlan) input.readObject();
                 }
                 GlobalSnapshot ownedGlobal;
-                Table owned =
-                        initial.writerBuilder(config)
-                                .dbId(ownedDbId)
-                                .bucketRanges(new int[] {0}, new int[] {0})
-                                .open();
+                Table owned = initial.writerBuilder(config).bucket(0).open();
                 try (TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2)) {
                     owned.put(oldRow);
                     PendingSnapshot<ShardSnapshot> pendingSnapshot = owned.startAsyncSnapshot();
@@ -810,7 +806,10 @@ class DbBindingTest {
                     owned.close();
                 }
                 assertThrows(IllegalStateException.class, owned::startAsyncSnapshot);
-                try (Table resumed = initial.writerBuilder(config).dbId(ownedDbId).resume();
+                try (Table resumed =
+                                initial.writerBuilder(config)
+                                        .bucket(0)
+                                        .resumeFromSnapshot(ownedSnapshot.snapshotId);
                         TableSnapshotCommitter committer = initial.snapshotCommitter(config, 2);
                         TableReader current =
                                 initial.readerBuilder(config).currentGlobalSnapshot().open();
@@ -836,8 +835,8 @@ class DbBindingTest {
                 }
                 try (Table atSnapshot =
                         initial.writerBuilder(config)
-                                .dbId(ownedDbId)
-                                .openFromSnapshot(ownedSnapshot.snapshotId)) {
+                                .bucket(0)
+                                .resumeFromSnapshot(ownedSnapshot.snapshotId)) {
                     assertEquals(
                             oldRow,
                             atSnapshot.get(
@@ -849,7 +848,7 @@ class DbBindingTest {
                 }
                 try (Table resumedAtSnapshot =
                         initial.writerBuilder(config)
-                                .dbId(ownedDbId)
+                                .bucket(0)
                                 .resumeFromSnapshot(ownedSnapshot.snapshotId)) {
                     assertEquals(
                             oldRow,
@@ -860,23 +859,22 @@ class DbBindingTest {
                                             .push(oldRow.get(1))
                                             .build()));
                 }
-                try (Table generatedIdWriter =
-                        initial.writerBuilder(config)
-                                .bucketRanges(new int[] {0}, new int[] {0})
-                                .open()) {
-                    generatedIdWriter.put(oldRow);
+                try (Table baselineWriter = initial.writerBuilder(config).bucket(0).open()) {
+                    baselineWriter.put(oldRow);
                     assertEquals(
                             oldRow,
-                            generatedIdWriter.get(
-                                    generatedIdWriter
+                            baselineWriter.get(
+                                    baselineWriter
                                             .keyBuilder()
                                             .push(oldRow.get(0))
                                             .push(oldRow.get(1))
                                             .build()));
                 }
-                TableWriterBuilder closedBuilder = initial.writerBuilder(config);
+                TableWriterBuilder closedBuilder = initial.writerBuilder(config).bucket(0);
                 try (Table survivesCatalogClose =
-                                initial.writerBuilder(config).dbId(ownedDbId).resume();
+                                initial.writerBuilder(config)
+                                        .bucket(0)
+                                        .resumeFromSnapshot(ownedSnapshot.snapshotId);
                         TableReader readerSurvivesCatalogClose =
                                 initial.readerBuilder(config).currentGlobalSnapshot().open()) {
                     initial.close();
@@ -1133,17 +1131,17 @@ class DbBindingTest {
                 snapshotTable.close();
             }
         }
-        try (Table portable =
-                portablePlan
-                        .writerBuilder(config)
-                        .dbId(portableDbId)
-                        .bucketRanges(new int[] {0}, new int[] {0})
-                        .open()) {
+        try (Table portable = portablePlan.writerBuilder(config).bucket(0).open()) {
             assertEquals(LogicalTypes.int8(), portable.schema().fields().get(2).logicalType());
             portable.put(oldRow);
-            assertTrue(portable.snapshot().dataSizeBytes > 0L);
+            portableSnapshot = portable.snapshot();
+            assertTrue(portableSnapshot.dataSizeBytes > 0L);
         }
-        try (Table resumed = portablePlan.writerBuilder(config).dbId(portableDbId).resume()) {
+        try (Table resumed =
+                portablePlan
+                        .writerBuilder(config)
+                        .bucket(0)
+                        .resumeFromSnapshot(portableSnapshot.snapshotId)) {
             assertEquals(LogicalTypes.int8(), resumed.schema().fields().get(2).logicalType());
             assertEquals(
                     oldRow,

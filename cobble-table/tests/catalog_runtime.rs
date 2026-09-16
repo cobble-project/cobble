@@ -61,7 +61,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     shared.secret_key = Some("catalog-runtime-secret".into());
     let catalog_config = Config {
         volumes: vec![shared],
-        total_buckets: 4,
+        total_buckets: 2,
         ..Config::default()
     };
     let mut runtime_volumes =
@@ -81,7 +81,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     ));
     let runtime = Config {
         volumes: runtime_volumes,
-        total_buckets: 4,
+        total_buckets: 2,
         ..Config::default()
     };
     let catalog = FileCatalog::open(&catalog_config, FileCatalogConfig::new("warehouse")).unwrap();
@@ -99,7 +99,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let users = catalog
         .create_table(users_id.clone(), schema.clone())
         .unwrap();
-    let write_plan = users.new_write_builder().total_buckets(4).build().unwrap();
+    let write_plan = users.new_write_builder().total_buckets(2).build().unwrap();
     assert!(
         users
             .writer_builder(runtime.clone())
@@ -121,23 +121,26 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let left = users
         .writer_builder(runtime.clone())
         .unwrap()
-        .db_id("shard-0")
-        .bucket_ranges(vec![0..=1])
+        .bucket(0)
         .open()
         .unwrap();
     let right = users
         .writer_builder(runtime.clone())
         .unwrap()
-        .db_id("shard-1")
-        .bucket_ranges(vec![2..=3])
+        .bucket(1)
         .open()
         .unwrap();
     // Repeating a shard ID in another table must not share its metadata or CURRENT.
-    let other = events
+    let other_left = events
         .writer_builder(runtime.clone())
         .unwrap()
-        .db_id("shard-0")
-        .bucket_ranges(vec![0..=3])
+        .bucket(0)
+        .open()
+        .unwrap();
+    let other_right = events
+        .writer_builder(runtime.clone())
+        .unwrap()
+        .bucket(1)
         .open()
         .unwrap();
     let rows = (0..16)
@@ -154,30 +157,37 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .map(|row| key(left.key_builder(), &row[0]))
         .collect::<Vec<_>>();
     for (row, key) in rows.iter().zip(&keys) {
-        if key.bucket() < 2 {
+        if key.bucket() == 0 {
             left.put(row).unwrap();
         } else {
             right.put(row).unwrap();
         }
-        other
-            .put(&[
-                row[0].clone(),
-                Value::String("event".into()),
-                row[2].clone(),
-            ])
-            .unwrap();
+        let event_row = [
+            row[0].clone(),
+            Value::String("event".into()),
+            row[2].clone(),
+        ];
+        if key.bucket() == 0 {
+            other_left.put(&event_row).unwrap();
+        } else {
+            other_right.put(&event_row).unwrap();
+        }
     }
     let left_snapshot = left.snapshot_and_wait().unwrap();
     let right_snapshot = right.snapshot_and_wait().unwrap();
     let coordinator = Arc::new(users.coordinator(runtime.clone()).unwrap());
     let committer = users.snapshot_committer(runtime.clone(), 2).unwrap();
     let first = committer
-        .commit_batch(1, vec![left_snapshot.clone(), right_snapshot])
+        .commit_batch(1, vec![left_snapshot.clone(), right_snapshot.clone()])
         .unwrap()
         .unwrap();
     let other_committer = events.snapshot_committer(runtime.clone(), 2).unwrap();
+    let other_snapshots = [
+        other_left.snapshot_and_wait().unwrap(),
+        other_right.snapshot_and_wait().unwrap(),
+    ];
     other_committer
-        .commit_batch(1, vec![other.snapshot_and_wait().unwrap()])
+        .commit_batch(1, other_snapshots.to_vec())
         .unwrap()
         .unwrap();
     let user_root = warehouse.join(format!(
@@ -198,7 +208,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             ))
             .exists()
     );
-    let properties = std::fs::read_to_string(user_root.join("shard-0/PROPERTIES")).unwrap();
+    let properties = std::fs::read_to_string(user_root.join("bucket-0/PROPERTIES")).unwrap();
     assert!(properties.contains(&format!("file://{}", external.display())));
     // A combined source/cache volume retains the source root but scopes its writable cache.
     assert!(properties.contains(&format!(
@@ -250,7 +260,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             rows[0][2].clone(),
         ])
     );
-    drop(other);
+    drop(other_left);
+    drop(other_right);
     let evolved_events = catalog
         .evolve_schema(
             &events_id,
@@ -269,9 +280,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .unwrap()
         .register_schema_transform("test.table.transform", string_to_binary_factory)
         .unwrap()
-        .db_id("shard-0")
-        .bucket_ranges(vec![0..=3])
-        .resume()
+        .bucket(keys[0].bucket())
+        .resume_from_snapshot(other_snapshots[keys[0].bucket() as usize].snapshot_id)
         .unwrap();
     assert_eq!(
         evolved_event_writer.get(&keys[0]).unwrap(),
@@ -302,8 +312,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             rows[0][2].clone(),
         ])
     );
-    let left_index = keys.iter().position(|key| key.bucket() < 2).unwrap();
-    let right_index = keys.iter().position(|key| key.bucket() >= 2).unwrap();
+    let left_index = keys.iter().position(|key| key.bucket() == 0).unwrap();
+    let right_index = keys.iter().position(|key| key.bucket() == 1).unwrap();
     let shard_reader = users
         .readonly_table_builder(runtime.clone())
         .unwrap()
@@ -344,17 +354,17 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
             "file://{}",
             root.path().join("materialization-runtime").display()
         )),
-        total_buckets: 4,
+        total_buckets: 2,
         ..Config::default()
     };
     let replay_builder = DbBuilder::new(materialization_runtime.clone())
         .db_id("replay-shard")
-        .bucket_ranges(vec![0..=1]);
+        .bucket_ranges(vec![0..=0]);
     register_schema_transforms(&replay_builder).unwrap();
     let replay_db = Arc::new(replay_builder.open().unwrap());
     let mapping_builder = DbBuilder::new(materialization_runtime)
         .db_id("mapping-retry")
-        .bucket_ranges(vec![2..=3]);
+        .bucket_ranges(vec![1..=1]);
     register_schema_transforms(&mapping_builder).unwrap();
     let mapping_db = Arc::new(mapping_builder.open().unwrap());
     let replay_initial = catalog
@@ -514,15 +524,18 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         serde_json::from_str::<cobble_table::TableWritePlan>(&write_plan_json).unwrap();
     let mut worker_runtime = runtime.clone();
     worker_runtime.total_buckets = 1;
+    let worker_bucket = 1;
     let worker = worker_plan
         .writer_builder(worker_runtime.clone())
         .unwrap()
-        .db_id("worker-shard")
-        .bucket_ranges(vec![0..=3])
+        .bucket(worker_bucket)
         .open()
         .unwrap();
     assert_eq!(worker.schema(), &schema);
-    let worker_index = keys.iter().position(|key| key.bucket() != 0).unwrap();
+    let worker_index = keys
+        .iter()
+        .position(|key| key.bucket() == worker_bucket)
+        .unwrap();
     let worker_key = key(worker.key_builder(), &rows[worker_index][0]);
     assert_eq!(worker_key.bucket(), keys[worker_index].bucket());
     worker.put(&rows[worker_index]).unwrap();
@@ -531,9 +544,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let worker_historical = worker_plan
         .writer_builder(worker_runtime)
         .unwrap()
-        .db_id("worker-shard")
-        .bucket_ranges(vec![0..=3])
-        .open_from_snapshot(worker_snapshot.snapshot_id)
+        .bucket(worker_bucket)
+        .resume_from_snapshot(worker_snapshot.snapshot_id)
         .unwrap();
     assert_eq!(worker_historical.schema(), &schema);
     assert_eq!(
@@ -545,9 +557,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let resumed = evolved
         .writer_builder(runtime.clone())
         .unwrap()
-        .db_id("shard-0")
-        .bucket_ranges(vec![0..=1])
-        .resume()
+        .bucket(0)
+        .resume_from_snapshot(left_snapshot.snapshot_id)
         .unwrap();
     let mut expected = rows[left_index].clone();
     let Value::Int8(score) = rows[left_index][2] else {
@@ -568,9 +579,8 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let resumed_right = evolved
         .writer_builder(runtime.clone())
         .unwrap()
-        .db_id("shard-1")
-        .bucket_ranges(vec![2..=3])
-        .resume()
+        .bucket(1)
+        .resume_from_snapshot(right_snapshot.snapshot_id)
         .unwrap();
     let resumed_right_snapshot = resumed_right.snapshot_and_wait().unwrap();
     drop(resumed_right);
@@ -712,12 +722,11 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     assert_eq!(scanned_rows, transformed_rows);
 
     // An explicit historical restore must not apply the catalog's latest schema.
-    let restored = evolved
-        .writer_builder(runtime.clone())
+    let restored = users
+        .readonly_table_builder(runtime.clone())
         .unwrap()
-        .db_id(&left_snapshot.db_id)
-        .bucket_ranges(vec![0..=1])
-        .open_from_snapshot(left_snapshot.snapshot_id)
+        .shard_snapshot(&left_snapshot.db_id, left_snapshot.snapshot_id)
+        .open()
         .unwrap();
     assert_eq!(restored.schema(), &schema);
     assert_eq!(

@@ -1,17 +1,16 @@
 use crate::db::db_arc_from_handle_or_throw;
 use crate::table::table_open_response;
 use crate::util::{
-    decode_bucket_ranges, decode_java_string, decode_optional_java_string, decode_u32,
-    decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
-    to_java_string_or_throw,
+    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
+    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use cobble_table::catalog::{
     Catalog, CatalogSchemaId, CatalogTable as RustCatalogTable, FileCatalog as RustFileCatalog,
     FileCatalogConfig,
 };
-use cobble_table::{SchemaChange, TableWritePlan, TableWriterBuilder};
+use cobble_table::{SchemaChange, TableSchema, TableWritePlan, TableWriterBuilder};
 use jni::JNIEnv;
-use jni::objects::{JClass, JIntArray, JObject, JString, JValue};
+use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 use std::sync::Arc;
 
@@ -346,11 +345,9 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_writerOpenNative(
     _class: JClass,
     native_handle: jlong,
     runtime_json: JString,
-    db_id: JString,
-    range_starts: JIntArray,
-    range_ends: JIntArray,
     mode: jint,
     snapshot_id: jlong,
+    bucket: jint,
 ) -> jobject {
     let Some(table) = catalog_table_from_handle_or_throw(&mut env, native_handle) else {
         return std::ptr::null_mut();
@@ -366,15 +363,7 @@ pub extern "system" fn Java_io_cobble_table_CatalogTable_writerOpenNative(
         Ok(builder) => builder,
         Err(error) => return throw_state_and_null(&mut env, error),
     };
-    writer_open(
-        &mut env,
-        builder,
-        db_id,
-        range_starts,
-        range_ends,
-        mode,
-        snapshot_id,
-    )
+    writer_open(&mut env, builder, mode, snapshot_id, bucket)
 }
 
 #[unsafe(no_mangle)]
@@ -411,11 +400,9 @@ pub extern "system" fn Java_io_cobble_table_TableWritePlan_writerOpenNative(
     _class: JClass,
     plan_json: JString,
     runtime_json: JString,
-    db_id: JString,
-    range_starts: JIntArray,
-    range_ends: JIntArray,
     mode: jint,
     snapshot_id: jlong,
+    bucket: jint,
 ) -> jobject {
     let plan: TableWritePlan = match parse_json(&mut env, plan_json, "table write plan") {
         Some(plan) => plan,
@@ -432,46 +419,24 @@ pub extern "system" fn Java_io_cobble_table_TableWritePlan_writerOpenNative(
         Ok(builder) => builder,
         Err(error) => return throw_state_and_null(&mut env, error),
     };
-    writer_open(
-        &mut env,
-        builder,
-        db_id,
-        range_starts,
-        range_ends,
-        mode,
-        snapshot_id,
-    )
+    writer_open(&mut env, builder, mode, snapshot_id, bucket)
 }
 
 fn writer_open(
     env: &mut JNIEnv,
     builder: TableWriterBuilder,
-    db_id: JString,
-    range_starts: JIntArray,
-    range_ends: JIntArray,
     mode: jint,
     snapshot_id: jlong,
+    bucket: jint,
 ) -> jobject {
-    let db_id = match decode_optional_java_string(env, db_id) {
+    let bucket = match decode_u16("bucket", bucket) {
         Ok(value) => value,
         Err(error) => return throw_argument_and_null(env, error),
     };
-    let ranges = match decode_bucket_ranges(env, range_starts, range_ends) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(env, error),
-    };
-    let builder = match db_id {
-        Some(db_id) => builder.db_id(db_id).bucket_ranges(ranges),
-        None => builder.bucket_ranges(ranges),
-    };
+    let builder = builder.bucket(bucket);
     let opened = match mode {
         0 => builder.open(),
-        1 => builder.resume(),
-        2 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
-            Ok(snapshot_id) => builder.open_from_snapshot(snapshot_id),
-            Err(error) => return throw_argument_and_null(env, error),
-        },
-        3 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        1 => match decode_u64_from_jlong("snapshotId", snapshot_id) {
             Ok(snapshot_id) => builder.resume_from_snapshot(snapshot_id),
             Err(error) => return throw_argument_and_null(env, error),
         },
@@ -480,6 +445,82 @@ fn writer_open(
     match opened {
         Ok(table) => crate::table::table_to_java(env, table),
         Err(error) => throw_state_and_null(env, error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_writerCreateNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    runtime_json: JString,
+    name: JString,
+    schema_json: JString,
+    bucket: jint,
+) -> jobject {
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return std::ptr::null_mut();
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let Some(schema): Option<TableSchema> = parse_json(&mut env, schema_json, "table schema")
+    else {
+        return std::ptr::null_mut();
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let builder = TableWriterBuilder::new(runtime)
+        .table_name(name)
+        .bucket(bucket);
+    let opened = builder.create(schema);
+    match opened {
+        Ok(table) => crate::table::table_to_java(&mut env, table),
+        Err(error) => throw_state_and_null(&mut env, error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_writerResumeNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    runtime_json: JString,
+    name: JString,
+    bucket: jint,
+    snapshot_id: jlong,
+) -> jobject {
+    let runtime_json = match decode_java_string(&mut env, runtime_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let Some(runtime) = parse_config_json(&mut env, &runtime_json) else {
+        return std::ptr::null_mut();
+    };
+    let name = match decode_java_string(&mut env, name) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let bucket = match decode_u16("bucket", bucket) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_null(&mut env, error),
+    };
+    match TableWriterBuilder::new(runtime)
+        .table_name(name)
+        .bucket(bucket)
+        .resume_from_snapshot(snapshot_id)
+    {
+        Ok(table) => crate::table::table_to_java(&mut env, table),
+        Err(error) => throw_state_and_null(&mut env, error),
     }
 }
 

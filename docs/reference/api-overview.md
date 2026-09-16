@@ -245,7 +245,7 @@ exclusive-end semantics as raw `Db`.
 
 | Type | Description |
 |------|-------------|
-| `TableWriterBuilder` | Open a writable shard and return a `Table` |
+| `TableWriterBuilder` | Require one bucket ID and open its fixed-identity writable `Table` |
 | `ReadOnlyTableBuilder` | Open a fixed shard snapshot and return a `ReadOnlyTable` |
 | `TableReaderBuilder` | Open a fixed or current global snapshot and return a `TableReader` |
 | `Table` | Typed reads, writes, and snapshots over a shared `Arc<Db>` |
