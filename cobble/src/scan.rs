@@ -165,8 +165,8 @@ impl ScanSplit {
 
     /// Create a scanner from a configured snapshot builder.
     ///
-    /// The split supplies its source database id and snapshot id; callers use
-    /// the builder to install runtime schema wiring before that snapshot opens.
+    /// The split supplies its authoritative shard manifest; callers use the
+    /// builder to install runtime schema wiring before that snapshot opens.
     pub fn create_scanner_with_builder(
         &self,
         builder: ReadOnlyDbBuilder,
@@ -180,9 +180,7 @@ impl ScanSplit {
         builder: ReadOnlyDbBuilder,
         options: Option<&ScanOptions>,
     ) -> Result<ScanSplitScanner> {
-        let db = builder
-            .db_id(self.shard.db_id.clone())
-            .open(self.shard.snapshot_id)?;
+        let db = builder.open_shard_snapshot(&self.shard)?;
         let buckets: Vec<u16> = self
             .shard
             .ranges

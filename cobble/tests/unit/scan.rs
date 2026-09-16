@@ -1,8 +1,9 @@
 use super::*;
-use crate::config::VolumeDescriptor;
+use crate::config::{VolumeDescriptor, VolumeUsageKind};
 use crate::coordinator::{CoordinatorConfig, DbCoordinator};
 use crate::{Db, ScanOptions, WriteBatch, WriteOptions};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 fn cleanup_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
@@ -75,14 +76,36 @@ fn test_scan_plan_basic() {
     assert_eq!(splits.len(), 1);
 
     // Create scanner from split.
+    let runtime_config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}/runtime", root),
+                vec![
+                    VolumeUsageKind::PrimaryDataPriorityHigh,
+                    VolumeUsageKind::Meta,
+                ],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}/db", root),
+                vec![VolumeUsageKind::Readonly],
+            ),
+        ],
+        num_columns: 1,
+        total_buckets: 4,
+        ..Config::default()
+    };
     let scanner = splits[0]
-        .create_scanner(config, &ScanOptions::default())
+        .create_scanner(runtime_config, &ScanOptions::default())
         .unwrap();
     let results: Vec<_> = scanner.map(|r| r.unwrap()).collect();
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].1.as_ref(), b"key1");
     assert_eq!(results[1].1.as_ref(), b"key2");
     assert_eq!(results[2].1.as_ref(), b"key3");
+    assert!(
+        !Path::new(&format!("{}/runtime/{}", root, splits[0].shard.db_id)).exists(),
+        "a read-only scan must not create a runtime database directory"
+    );
 
     cleanup_root(root);
 }

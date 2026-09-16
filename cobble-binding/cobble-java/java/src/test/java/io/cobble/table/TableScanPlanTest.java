@@ -15,16 +15,80 @@ import java.io.ObjectOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TableScanPlanTest {
+
+    @Test
+    void scansShardManifestPathsOutsideTheRuntimeRoot() throws Exception {
+        Path root = Files.createTempDirectory("cobble-java-table-scan-shards-");
+        Config coordinatorConfig =
+                new Config().addVolume(root.toString()).numColumns(1).totalBuckets(2);
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(2, "value", LogicalTypes.string())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        List<ShardSnapshot> shards = new ArrayList<ShardSnapshot>();
+        List<List<Value>> expected = new ArrayList<List<Value>>();
+        for (int bucket = 0; bucket < 2; bucket++) {
+            Config bucketConfig =
+                    new Config()
+                            .addVolume(root.resolve("bucket-" + bucket).toString())
+                            .numColumns(1)
+                            .totalBuckets(2);
+            try (Db db = Db.open(bucketConfig, bucket, bucket);
+                    Table table = Table.create(db, "data", schema)) {
+                long id = bucket;
+                while (table.keyBuilder().push(Value.int64(id)).build().bucket() != bucket) id++;
+                List<Value> row = Arrays.asList(Value.int64(id), Value.string("bucket-" + bucket));
+                table.put(row);
+                expected.add(row);
+                shards.add(table.snapshot());
+            }
+        }
+        GlobalSnapshot global;
+        try (TableSnapshotCommitter committer =
+                TableSnapshotCommitter.open(coordinatorConfig, 2, 1)) {
+            global = committer.commitBatch(1L, shards);
+        }
+        Path runtimeRoot = root.resolve("runtime-without-shards");
+        Config runtimeConfig =
+                new Config().addVolume(runtimeRoot.toString()).numColumns(1).totalBuckets(2);
+        TableScanPlan plan =
+                roundTrip(TableScanPlan.forSnapshot(coordinatorConfig, "data", global.id));
+        List<List<Value>> rows = new ArrayList<List<Value>>();
+        for (TableScanSplit split : plan.splits()) {
+            try (TableScanCursor cursor = split.openTypedScanner(runtimeConfig, 4096)) {
+                List<Value> row;
+                while ((row = cursor.nextRow()) != null) rows.add(row);
+            }
+        }
+        assertEquals(expected.size(), rows.size());
+        assertTrue(rows.containsAll(expected));
+        try (TableReader reader = TableReader.open(coordinatorConfig, "data", global.id)) {
+            for (List<Value> row : expected) {
+                assertEquals(row, reader.get(reader.keyBuilder().push(row.get(0)).build()));
+            }
+        }
+        for (ShardSnapshot shard : shards) {
+            assertFalse(
+                    Files.exists(runtimeRoot.resolve(shard.dbId)),
+                    "read-only scan must not create a runtime database directory");
+        }
+    }
 
     @Test
     void plansSerializableProjectedTableScan() throws Exception {

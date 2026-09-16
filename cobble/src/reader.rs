@@ -68,6 +68,7 @@ impl ReaderConfig {
 struct BucketSnapshotKey {
     db_id: String,
     snapshot_id: u64,
+    manifest_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,10 +525,11 @@ impl Reader {
             "{}-{}",
             key.db_id, key.snapshot_id
         )));
-        let db = Arc::new(ReadOnlyDb::open_internal(
+        let db = Arc::new(ReadOnlyDb::open_from_manifest_path_internal(
             self.config.clone(),
             key.snapshot_id,
             key.db_id.clone(),
+            &key.manifest_path,
             self.block_cache.clone(),
             shard_metrics_manager,
             self.resolver.clone(),
@@ -701,9 +703,16 @@ fn build_bucket_map(
 ) -> Result<Vec<Option<Arc<BucketSnapshotKey>>>> {
     let mut mapping = vec![None; bucket_slots_for_total(manifest.total_buckets)];
     for snapshot in &manifest.shard_snapshots {
+        if snapshot.manifest_path.trim().is_empty() {
+            return Err(Error::IoError(format!(
+                "Bucket snapshot {}:{} is missing its manifest path",
+                snapshot.db_id, snapshot.snapshot_id
+            )));
+        }
         let key = Arc::new(BucketSnapshotKey {
             db_id: snapshot.db_id.clone(),
             snapshot_id: snapshot.snapshot_id,
+            manifest_path: snapshot.manifest_path.clone(),
         });
         for range in &snapshot.ranges {
             validate_range(range, manifest.total_buckets)?;

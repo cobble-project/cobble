@@ -1022,6 +1022,15 @@ impl FileManager {
         options: FileManagerOptions,
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
+        Self::new_with_directory_creation(data_volumes, options, metrics_manager, true)
+    }
+
+    fn new_with_directory_creation(
+        data_volumes: Vec<DataVolume>,
+        options: FileManagerOptions,
+        metrics_manager: Arc<MetricsManager>,
+        create_directories: bool,
+    ) -> Result<Self> {
         if !(0.0..=1.0).contains(&options.primary_volume_write_stop_watermark)
             || !(0.0..=1.0).contains(&options.primary_volume_offload_trigger_watermark)
         {
@@ -1063,11 +1072,13 @@ impl FileManager {
         let data_volumes = data_volumes.into_iter().map(Arc::new).collect::<Vec<_>>();
         let meta_volume = Self::choose_meta_volume(&data_volumes)?;
         let data_volumes = Self::sort_data_volumes(data_volumes);
-        for volume in &data_volumes {
-            if volume.readonly_source {
-                continue;
+        if create_directories {
+            for volume in &data_volumes {
+                if volume.readonly_source {
+                    continue;
+                }
+                Self::ensure_volume_dirs(volume.fs(), &options)?;
             }
-            Self::ensure_volume_dirs(volume.fs(), &options)?;
         }
         let offload_runtime = Arc::new(OffloadRuntime::new_with_policy_kind(
             &data_volumes,
@@ -1114,6 +1125,25 @@ impl FileManager {
         db_id: &str,
         metrics_manager: Arc<MetricsManager>,
     ) -> Result<Self> {
+        Self::from_config_with_directory_creation(config, db_id, metrics_manager, true)
+    }
+
+    /// Builds a manager for reading existing files without creating a database
+    /// directory beneath the configured runtime volumes.
+    pub(crate) fn from_config_readonly(
+        config: &Config,
+        db_id: &str,
+        metrics_manager: Arc<MetricsManager>,
+    ) -> Result<Self> {
+        Self::from_config_with_directory_creation(config, db_id, metrics_manager, false)
+    }
+
+    fn from_config_with_directory_creation(
+        config: &Config,
+        db_id: &str,
+        metrics_manager: Arc<MetricsManager>,
+        create_directories: bool,
+    ) -> Result<Self> {
         let data_volumes = Self::data_volumes_from_config_with_metrics(config, Some(db_id))?;
         let options = FileManagerOptions {
             base_dir: db_id.to_string(),
@@ -1128,7 +1158,12 @@ impl FileManager {
             vlog_low_priority_primary_enabled: config.vlog_low_priority_primary_enabled,
             ..FileManagerOptions::default()
         };
-        Self::new(data_volumes, options, metrics_manager)
+        Self::new_with_directory_creation(
+            data_volumes,
+            options,
+            metrics_manager,
+            create_directories,
+        )
     }
 
     pub(crate) fn data_volumes_from_config(config: &Config) -> Result<Vec<DataVolume>> {

@@ -1,4 +1,5 @@
 use crate::cache::BlockCache;
+use crate::coordinator::ShardSnapshotRef;
 use crate::error::Result;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
@@ -78,6 +79,41 @@ impl ReadOnlyDbBuilder {
             self.config,
             snapshot_id,
             db_id,
+            self.block_cache,
+            metrics_manager,
+            self.resolver,
+            self.transforms,
+        )
+    }
+
+    /// Opens the exact shard snapshot recorded by a global snapshot manifest.
+    ///
+    /// The manifest path is authoritative and may be under any subdirectory
+    /// of the configured source volumes. Callers must still provide storage
+    /// routes and credentials covering that shard's metadata and data files.
+    pub fn open_shard_snapshot(self, shard: &ShardSnapshotRef) -> Result<ReadOnlyDb> {
+        if shard.manifest_path.trim().is_empty() {
+            return Err(crate::Error::ConfigError(format!(
+                "Shard snapshot {}:{} is missing its manifest path",
+                shard.db_id, shard.snapshot_id
+            )));
+        }
+        if let Some(db_id) = self.db_id.as_ref()
+            && db_id != &shard.db_id
+        {
+            return Err(crate::Error::ConfigError(format!(
+                "ReadOnlyDbBuilder db_id {} does not match shard snapshot db_id {}",
+                db_id, shard.db_id
+            )));
+        }
+        let metrics_manager = self
+            .metrics_manager
+            .unwrap_or_else(|| Arc::new(MetricsManager::new(&shard.db_id)));
+        ReadOnlyDb::open_from_manifest_path_internal(
+            self.config,
+            shard.snapshot_id,
+            shard.db_id.clone(),
+            &shard.manifest_path,
             self.block_cache,
             metrics_manager,
             self.resolver,

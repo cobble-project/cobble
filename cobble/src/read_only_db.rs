@@ -16,7 +16,7 @@ use crate::schema::{Schema, SchemaManager, SchemaTransformRegistry};
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
-    load_manifest_for_snapshot,
+    load_manifest_chain_from_path, load_manifest_for_snapshot,
 };
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::{build_commit_short_id, build_version_string};
@@ -158,9 +158,103 @@ impl ReadOnlyDb {
             build_commit_short_id()
         );
         metrics_registry::init_metrics();
-        let file_manager =
-            FileManager::from_config(&config, &snapshot_db_id, Arc::clone(&metrics_manager))?;
+        let file_manager = FileManager::from_config_readonly(
+            &config,
+            &snapshot_db_id,
+            Arc::clone(&metrics_manager),
+        )?;
         let file_manager = Arc::new(file_manager);
+        let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
+        let schema_manager = Arc::new(
+            SchemaManager::from_manifest(&file_manager, &manifest, resolver)?
+                .with_transform_registry(transforms)?,
+        );
+        Self::open_from_loaded_manifest(
+            config,
+            file_manager,
+            snapshot_db_id,
+            block_cache,
+            metrics_manager,
+            manifest,
+            schema_manager,
+        )
+    }
+
+    // This mirrors `open_internal`'s configurable read-only initialization while selecting an
+    // explicit manifest source, so keep its runtime wiring arguments separate.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_from_manifest_path_internal(
+        config: Config,
+        snapshot_id: u64,
+        snapshot_db_id: String,
+        manifest_path: &str,
+        block_cache: Option<BlockCache>,
+        metrics_manager: Arc<MetricsManager>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
+    ) -> Result<Self> {
+        let config = config.normalize_volume_paths()?;
+        info!(
+            "Cobble read-only db ({}, Rev:{}) start.",
+            build_version_string(),
+            build_commit_short_id()
+        );
+        metrics_registry::init_metrics();
+        let file_manager = FileManager::from_config_readonly(
+            &config,
+            &snapshot_db_id,
+            Arc::clone(&metrics_manager),
+        )?;
+        let file_manager = Arc::new(file_manager);
+        let manifest_chain = load_manifest_chain_from_path(&file_manager, manifest_path)?;
+        let manifest = manifest_chain
+            .last()
+            .map(|entry| entry.manifest.clone())
+            .ok_or_else(|| {
+                Error::IoError(format!("Snapshot manifest not found: {}", manifest_path))
+            })?;
+        if manifest.id != snapshot_id {
+            return Err(Error::InvalidState(format!(
+                "Shard snapshot manifest {} has id {}, expected {}",
+                manifest_path, manifest.id, snapshot_id
+            )));
+        }
+        let schema_manager = Arc::new(
+            SchemaManager::from_snapshot_source_manifests(
+                &file_manager,
+                manifest_path,
+                manifest_chain.iter().map(|entry| &entry.manifest),
+                resolver,
+            )?
+            .with_transform_registry(transforms)?,
+        );
+        Self::open_from_loaded_manifest(
+            config,
+            file_manager,
+            snapshot_db_id,
+            block_cache,
+            metrics_manager,
+            manifest,
+            schema_manager,
+        )
+    }
+
+    fn open_from_loaded_manifest(
+        config: Config,
+        file_manager: Arc<FileManager>,
+        snapshot_db_id: String,
+        block_cache: Option<BlockCache>,
+        metrics_manager: Arc<MetricsManager>,
+        manifest: crate::snapshot::ManifestSnapshot,
+        schema_manager: Arc<SchemaManager>,
+    ) -> Result<Self> {
+        let snapshot_id = manifest.id;
+        if manifest.bucket_ranges.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "Snapshot {} manifest missing bucket_ranges",
+                snapshot_id
+            )));
+        }
         let block_cache_size = config.block_cache_size_bytes()?;
         let value_separation_threshold = config.value_separation_threshold_bytes()?;
         let time_provider = config.time_provider.create();
@@ -171,23 +265,7 @@ impl ReadOnlyDb {
             },
             Arc::clone(&time_provider),
         ));
-        let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
-        if manifest.bucket_ranges.is_empty() {
-            return Err(Error::InvalidState(format!(
-                "Snapshot {} manifest missing bucket_ranges",
-                snapshot_id
-            )));
-        }
         let bucket_ranges = manifest.bucket_ranges.clone();
-        let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
-            manifest.bucket_ranges.clone()
-        } else {
-            manifest.lsm_tree_bucket_ranges.clone()
-        };
-        let schema_manager = Arc::new(
-            SchemaManager::from_manifest(&file_manager, &manifest, resolver)?
-                .with_transform_registry(transforms)?,
-        );
         let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, true)?;
         let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, true)?;
         let tree_scopes = build_tree_scopes_from_manifest(&manifest);

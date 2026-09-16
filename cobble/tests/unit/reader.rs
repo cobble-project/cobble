@@ -492,7 +492,7 @@ fn test_read_proxy_routes_and_evicts() {
                     column_families: default_column_families(),
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
-                    manifest_path: path_a,
+                    manifest_path: path_a.clone(),
                     timestamp_seconds: 0,
                     data_size_bytes: 0,
                     incremental_data_size_bytes: 0,
@@ -503,7 +503,7 @@ fn test_read_proxy_routes_and_evicts() {
                     column_families: default_column_families(),
                     db_id: db_b.clone(),
                     snapshot_id: snap_b,
-                    manifest_path: path_b,
+                    manifest_path: path_b.clone(),
                     timestamp_seconds: 0,
                     data_size_bytes: 0,
                     incremental_data_size_bytes: 0,
@@ -531,6 +531,7 @@ fn test_read_proxy_routes_and_evicts() {
             .contains_key(&Arc::new(BucketSnapshotKey {
                 db_id: db_a.clone(),
                 snapshot_id: snap_a,
+                manifest_path: path_a.clone(),
             }))
     );
 
@@ -546,6 +547,7 @@ fn test_read_proxy_routes_and_evicts() {
             .contains_key(&Arc::new(BucketSnapshotKey {
                 db_id: db_a,
                 snapshot_id: snap_a,
+                manifest_path: path_a,
             }))
     );
     assert!(
@@ -556,6 +558,7 @@ fn test_read_proxy_routes_and_evicts() {
             .contains_key(&Arc::new(BucketSnapshotKey {
                 db_id: db_b,
                 snapshot_id: snap_b,
+                manifest_path: path_b,
             }))
     );
 
@@ -643,6 +646,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
             .contains_key(&Arc::new(BucketSnapshotKey {
                 db_id: db_a.clone(),
                 snapshot_id: snap_a,
+                manifest_path: path_a.clone(),
             }))
     );
 
@@ -656,7 +660,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
                     column_families: default_column_families(),
                     db_id: db_a.clone(),
                     snapshot_id: snap_a,
-                    manifest_path: path_a,
+                    manifest_path: path_a.clone(),
                     timestamp_seconds: 0,
                     data_size_bytes: 0,
                     incremental_data_size_bytes: 0,
@@ -667,7 +671,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
                     column_families: default_column_families(),
                     db_id: db_c.clone(),
                     snapshot_id: snap_c,
-                    manifest_path: path_c,
+                    manifest_path: path_c.clone(),
                     timestamp_seconds: 0,
                     data_size_bytes: 0,
                     incremental_data_size_bytes: 0,
@@ -685,6 +689,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
         .get(&Arc::new(BucketSnapshotKey {
             db_id: db_a.clone(),
             snapshot_id: snap_a,
+            manifest_path: path_a.clone(),
         }))
         .cloned()
         .unwrap();
@@ -697,6 +702,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
         .get(&Arc::new(BucketSnapshotKey {
             db_id: db_a.clone(),
             snapshot_id: snap_a,
+            manifest_path: path_a.clone(),
         }))
         .cloned()
         .unwrap();
@@ -712,6 +718,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
             .contains_key(&Arc::new(BucketSnapshotKey {
                 db_id: db_c,
                 snapshot_id: snap_c,
+                manifest_path: path_c,
             }))
     );
     assert!(
@@ -722,6 +729,7 @@ fn test_read_proxy_refreshes_on_pointer_change() {
             .contains_key(&Arc::new(BucketSnapshotKey {
                 db_id: db_a,
                 snapshot_id: snap_a,
+                manifest_path: path_a,
             }))
     );
 
