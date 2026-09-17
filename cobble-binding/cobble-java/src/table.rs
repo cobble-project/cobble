@@ -1,4 +1,5 @@
 use crate::db::db_arc_from_handle_or_throw;
+use crate::metrics::metrics_json;
 use crate::read_only_db::{
     read_only_db_arc_from_handle_or_throw, read_only_db_from_handle_or_throw,
 };
@@ -286,6 +287,18 @@ pub extern "system" fn Java_io_cobble_table_Table_refreshNative(
         table.schema(),
         table.schema_binding(),
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_metricsJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+) -> jstring {
+    let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    to_java_string_or_throw(&mut env, metrics_json(table.metrics()))
 }
 
 #[unsafe(no_mangle)]

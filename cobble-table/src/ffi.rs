@@ -70,6 +70,10 @@ impl TableHandle {
         self.table.db().total_buckets()
     }
 
+    pub fn metrics(&self) -> Vec<cobble::MetricSample> {
+        self.table.metrics()
+    }
+
     pub fn direct_buffer_pool_config(&self) -> Result<(usize, usize)> {
         cobble::ffi::db_direct_buffer_pool_config(self.table.db()).map_err(Into::into)
     }

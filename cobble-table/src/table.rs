@@ -193,6 +193,14 @@ impl Table {
         &self.compiled.schema
     }
 
+    /// Return metrics for this table's backing database shard.
+    ///
+    /// Metrics are collected at database scope and include all column families; they are not
+    /// filtered to this table's physical column family.
+    pub fn metrics(&self) -> Vec<cobble::MetricSample> {
+        self.db.metrics()
+    }
+
     /// Start building one primary key in schema order.
     pub fn key_builder(&self) -> TableKeyBuilder {
         TableKeyBuilder {

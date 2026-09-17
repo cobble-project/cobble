@@ -1248,8 +1248,14 @@ class DbBindingTest {
     void nativeMetricsAreExposedAsTypedImmutableSamples() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-metrics-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema schema =
+                new TableSchema(
+                        Collections.singletonList(new DataField(1, "id", LogicalTypes.int64())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
 
-        try (Db db = Db.open(config)) {
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "metrics", schema)) {
             List<MetricSample> metrics = db.metrics();
             assertFalse(metrics.isEmpty());
             MetricSample sample = metrics.get(0);
@@ -1259,6 +1265,14 @@ class DbBindingTest {
             assertThrows(
                     UnsupportedOperationException.class,
                     () -> sample.labels().put("unexpected", "value"));
+            List<MetricSample> tableMetrics = table.metrics();
+            assertFalse(tableMetrics.isEmpty());
+            assertTrue(
+                    tableMetrics.stream()
+                            .allMatch(metric -> db.id().equals(metric.labels().get("db_id"))));
+            assertThrows(UnsupportedOperationException.class, tableMetrics::clear);
+            table.close();
+            assertThrows(IllegalStateException.class, table::metrics);
         }
     }
 

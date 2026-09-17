@@ -63,6 +63,14 @@ fn table_runtime_create_open_and_typed_rows() {
     );
     {
         let table = Table::create(Arc::clone(&db), "events", schema.clone()).unwrap();
+        let metrics = table.metrics();
+        assert!(!metrics.is_empty());
+        assert!(metrics.iter().all(|sample| {
+            sample
+                .labels
+                .iter()
+                .any(|(key, value)| key == "db_id" && value == db.id())
+        }));
         assert_eq!(
             Table::create(Arc::clone(&db), "events", schema.clone())
                 .unwrap()

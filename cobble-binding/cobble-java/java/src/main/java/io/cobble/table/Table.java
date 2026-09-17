@@ -3,6 +3,7 @@ package io.cobble.table;
 import io.cobble.Db;
 import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
+import io.cobble.MetricSample;
 import io.cobble.NativeObject;
 import io.cobble.PendingSnapshot;
 import io.cobble.ReadOptions;
@@ -101,6 +102,16 @@ public final class Table extends NativeObject {
     public String name() {
         ensureUsable();
         return name;
+    }
+
+    /**
+     * Returns an immutable snapshot of metrics for this table's backing database shard.
+     *
+     * <p>Metrics include all column families in that shard and are not filtered to this table.
+     */
+    public List<MetricSample> metrics() {
+        ensureUsable();
+        return parseMetricSamples(metricsJson(nativeHandle));
     }
 
     public TableSchema schema() {
@@ -743,6 +754,8 @@ public final class Table extends NativeObject {
     private static native void disposeNative(long nativeHandle);
 
     private static native String refreshNative(long nativeHandle);
+
+    private static native String metricsJson(long nativeHandle);
 
     private static native long asyncSnapshotNative(
             long nativeHandle, CompletableFuture<String> snapshotJsonFuture);
