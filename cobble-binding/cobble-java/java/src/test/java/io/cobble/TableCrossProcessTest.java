@@ -395,6 +395,10 @@ public class TableCrossProcessTest {
     private Child startChild(String command, String... args) throws IOException {
         List<String> commandLine = new ArrayList<String>();
         commandLine.add(javaExecutable());
+        // Child JVMs do not inherit Surefire's module access flags. Java 8 has no modules.
+        if (!System.getProperty("java.specification.version").startsWith("1.")) {
+            commandLine.add("--add-exports=java.base/sun.nio.ch=ALL-UNNAMED");
+        }
         String profile = nativeProfile();
         if (profile != null) commandLine.add("-Dcobble.native.profile=" + profile);
         commandLine.add("-cp");
