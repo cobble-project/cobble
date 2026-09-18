@@ -38,7 +38,13 @@ jobs:
           import sys
           
           release_version = sys.argv[1]
-          publish_crates = ["cobble", "cobble-data-structure", "cobble-web-monitor", "cobble-cli"]
+          publish_crates = [
+              "cobble",
+              "cobble-data-structure",
+              "cobble-table",
+              "cobble-web-monitor",
+              "cobble-cli",
+          ]
           
           metadata = json.loads(
               subprocess.check_output(
@@ -73,6 +79,7 @@ jobs:
           crates=(
             "cobble"
             "cobble-data-structure"
+            "cobble-table"
             "cobble-web-monitor"
             "cobble-cli"
           )
