@@ -201,6 +201,67 @@ class TableScanPlanTest {
         assertThrows(IllegalStateException.class, cursor::nextRow);
     }
 
+    @Test
+    void nativeReadProvidersUseFixedTableSnapshotsAndEnforceCapabilities() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-native-read-provider-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(2, "value", LogicalTypes.string())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        List<Value> expected = Arrays.asList(Value.int64(7), Value.string("seven"));
+        GlobalSnapshot snapshot;
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "data", schema)) {
+            table.put(expected);
+            try (TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 1, 1)) {
+                snapshot = committer.commitBatch(1L, Collections.singletonList(db.snapshot()));
+            }
+        }
+
+        try (TableReader reader = TableReader.open(config, "data", snapshot.id);
+                NativeTableReadProvider provider = new NativeTableReadProvider(reader);
+                TableReadSession<List<Value>, TableKey> session = provider.open()) {
+            TableKey key = provider.keyBuilder().push(Value.int64(7)).build();
+            assertEquals(expected, session.lookup(key).iterator().next().value());
+            assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> session.scan(new TableReadRange(0, Integer.MAX_VALUE), null));
+            session.close();
+            assertThrows(IllegalStateException.class, () -> session.lookup(key));
+        }
+
+        TableScanSplit split =
+                TableScanPlan.forSnapshot(config, "data", snapshot.id).splits().get(0);
+        try (NativeTableScanReadProvider provider = new NativeTableScanReadProvider(config, split);
+                TableReadSession<List<Value>, Void> session = provider.open()) {
+            assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> session.scan(new TableReadRange(0, 0), null));
+            assertThrows(
+                    UnsupportedOperationException.class,
+                    () ->
+                            session.scan(
+                                    new TableReadRange(0, Integer.MAX_VALUE),
+                                    new TableReadPosition(0, new byte[] {1}, 0)));
+            try (TableReadCursor<List<Value>> cursor =
+                    session.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
+                TableReadEntry<List<Value>> entry = cursor.next();
+                assertNotNull(entry);
+                assertEquals(expected, entry.value());
+                assertTrue(entry.countsPhysicalEntry());
+                assertNull(cursor.next());
+            }
+            session.close();
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> session.scan(new TableReadRange(0, Integer.MAX_VALUE), null));
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static <T> T roundTrip(T value) throws Exception {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();

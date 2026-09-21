@@ -18,7 +18,7 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
     private boolean iteratorCreated = false;
 
     // Used by standalone snapshot scanners constructed through JNI.
-    private DirectScanCursor(long nativeHandle) {
+    DirectScanCursor(long nativeHandle) {
         this(nativeHandle, DEFAULT_POOL);
     }
 

@@ -167,6 +167,26 @@ public final class ScanSplit implements Serializable {
         return new ScanCursor(h);
     }
 
+    /**
+     * Open this fixed raw split as a zero-copy direct cursor.
+     *
+     * <p>The native scanner captures {@code options} while opening, so callers may close the
+     * options after this method returns. Entry views remain valid only until cursor advance or
+     * close.
+     */
+    public DirectScanCursor openDirectScannerWithOptions(Config config, ScanOptions options) {
+        if (config == null) {
+            throw new IllegalArgumentException("config must not be null");
+        }
+        NativeLoader.load();
+        long soh = options == null ? 0L : options.getNativeHandle();
+        long h = openSplitScanCursorFromJson(config.toJson(), toJson(), soh);
+        if (h == 0L) {
+            throw new IllegalStateException("failed to open direct split scan cursor");
+        }
+        return new DirectScanCursor(h);
+    }
+
     private static byte[] copyOrNull(byte[] value) {
         if (value == null) {
             return null;

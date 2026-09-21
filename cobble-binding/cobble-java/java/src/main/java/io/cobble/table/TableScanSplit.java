@@ -5,31 +5,102 @@ import io.cobble.DirectScanCursor;
 import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 import io.cobble.ScanCursor;
+import io.cobble.ShardSnapshot;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import java.io.ObjectStreamException;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
-/** Serializable table-aware scan assignment for one shard snapshot. */
-public final class TableScanSplit implements Serializable {
+/**
+ * Serializable scan assignment for one fixed shard snapshot.
+ *
+ * <p>Use {@link TableScanPlan#open(Config, TableScanSplit)} for format-independent typed reads. The
+ * encoded and direct scanner methods are specific to native Cobble tables.
+ */
+public class TableScanSplit implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final String splitJson;
-    private transient TableSchema schema;
-    private transient int totalBuckets;
+    private TableSchema schema;
+    private int totalBuckets;
+    private final String formatId;
+    private final String columnFamily;
+    private final ShardSnapshot shardSnapshot;
+    private final String metadataJson;
 
     TableScanSplit(String splitJson) {
         if (splitJson == null || splitJson.trim().isEmpty()) {
             throw new IllegalArgumentException("splitJson must not be empty");
         }
         this.splitJson = splitJson;
+        JsonObject value = JsonParser.parseString(splitJson).getAsJsonObject();
+        this.formatId = TableMetadata.FORMAT;
+        this.columnFamily = value.get("name").getAsString();
+        this.shardSnapshot =
+                ShardSnapshot.fromJson(value.getAsJsonObject("split").get("shard").toString());
+        this.metadataJson = value.get("metadata").toString();
         loadMetadata();
+    }
+
+    /** Creates a plugin assignment retaining the exact metadata of its fixed shard. */
+    protected TableScanSplit(
+            String formatId,
+            String columnFamily,
+            ShardSnapshot shardSnapshot,
+            String metadataJson) {
+        this.splitJson = null;
+        this.formatId = requireText(formatId, "formatId");
+        this.columnFamily = requireText(columnFamily, "columnFamily");
+        this.shardSnapshot = Objects.requireNonNull(shardSnapshot, "shardSnapshot").copy();
+        this.metadataJson = requireText(metadataJson, "metadataJson");
+    }
+
+    public final String formatId() {
+        return formatId;
+    }
+
+    public final String columnFamily() {
+        return columnFamily;
+    }
+
+    public final ShardSnapshot shardSnapshot() {
+        return shardSnapshot.copy();
+    }
+
+    public final String metadataJson() {
+        return metadataJson;
+    }
+
+    static String requireText(String value, String name) {
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException(name + " must not be empty");
+        }
+        return value;
+    }
+
+    private void requireNative() {
+        if (splitJson == null) {
+            throw new UnsupportedOperationException(
+                    "format '" + formatId + "' requires the plan's plugin reader");
+        }
+    }
+
+    /** Schema pinned into this fixed scan assignment. */
+    public TableSchema schema() {
+        requireNative();
+        return schema;
+    }
+
+    /** Total bucket count pinned into this fixed scan assignment. */
+    public int totalBuckets() {
+        requireNative();
+        return totalBuckets;
     }
 
     /**
@@ -59,6 +130,7 @@ public final class TableScanSplit implements Serializable {
 
     private NativeObject openScanner(
             Config config, List<String> fieldNames, int readAheadBytes, boolean direct) {
+        requireNative();
         if (config == null) {
             throw new IllegalArgumentException("config must not be null");
         }
@@ -102,16 +174,13 @@ public final class TableScanSplit implements Serializable {
      * #openScanner(Config, List, int)}, which retains the raw projected connector path.
      */
     public TableScanCursor openTypedScanner(Config config, int readAheadBytes) {
+        requireNative();
         List<String> fieldNames = new ArrayList<String>(schema.fields().size());
         for (DataField field : schema.fields()) fieldNames.add(field.name());
         Table.Compiled compiled = Table.Compiled.from(schema, totalBuckets);
         DirectScanCursor cursor = openDirectScanner(config, fieldNames, readAheadBytes);
         return new TableScanCursor(
                 cursor, cursor, entry -> Table.decodeDirectScannedRowOwned(compiled, entry));
-    }
-
-    private Object readResolve() throws ObjectStreamException {
-        return new TableScanSplit(splitJson);
     }
 
     private void loadMetadata() {

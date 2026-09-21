@@ -77,6 +77,11 @@ public final class ShardSnapshot implements Serializable {
         return GSON.fromJson(json, ShardSnapshot.class);
     }
 
+    /** Returns an independent copy suitable for retaining in a fixed read plan. */
+    public ShardSnapshot copy() {
+        return fromJson(GSON.toJson(this));
+    }
+
     static String listToJson(List<ShardSnapshot> snapshots) {
         return GSON.toJson(snapshots);
     }

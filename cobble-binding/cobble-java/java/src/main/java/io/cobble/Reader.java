@@ -154,6 +154,29 @@ public final class Reader extends NativeObject {
         return new ScanCursor(handle);
     }
 
+    /**
+     * Open a zero-copy direct scan cursor with heap key bounds and explicit options.
+     *
+     * <p>Each returned entry is valid only until the cursor advances or closes. The native scan
+     * iterator captures the options while opening, so callers may close {@code options} once this
+     * method returns.
+     */
+    public DirectScanCursor scanDirectWithOptions(
+            int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive, ScanOptions options) {
+        long scanOptionsHandle = options == null ? 0L : options.nativeHandle;
+        long handle =
+                openScanCursor(
+                        nativeHandle,
+                        bucket,
+                        startKeyInclusive,
+                        endKeyExclusive,
+                        scanOptionsHandle);
+        if (handle == 0L) {
+            throw new IllegalStateException("failed to open reader direct scan cursor");
+        }
+        return new DirectScanCursor(handle);
+    }
+
     /** Return mode string: {@code current} or {@code snapshot}. */
     public String readMode() {
         return readMode(nativeHandle);

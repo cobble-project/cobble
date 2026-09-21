@@ -39,6 +39,11 @@ public final class GlobalSnapshot implements Serializable {
         return GSON.fromJson(json, GlobalSnapshot.class);
     }
 
+    /** Returns an independent copy suitable for retaining in a fixed read plan. */
+    public GlobalSnapshot copy() {
+        return fromJson(GSON.toJson(this));
+    }
+
     public static List<GlobalSnapshot> listFromJson(String json) {
         GlobalSnapshot[] snapshots = GSON.fromJson(json, GlobalSnapshot[].class);
         List<GlobalSnapshot> out = new ArrayList<GlobalSnapshot>();

@@ -9,16 +9,6 @@ use jni::objects::{AutoLocal, JClass, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jint, jlong, jobject, jstring};
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableScanPlan_openCurrentNative(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
-    table_name: JString,
-) -> jstring {
-    open_plan(&mut env, config_json, table_name, None)
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_TableScanPlan_openSnapshotNative(
     mut env: JNIEnv,
     _class: JClass,
@@ -33,7 +23,7 @@ pub extern "system" fn Java_io_cobble_table_TableScanPlan_openSnapshotNative(
             return std::ptr::null_mut();
         }
     };
-    open_plan(&mut env, config_json, table_name, Some(snapshot_id))
+    open_plan(&mut env, config_json, table_name, snapshot_id)
 }
 
 #[unsafe(no_mangle)]
@@ -146,7 +136,7 @@ fn open_plan(
     env: &mut JNIEnv,
     config_json: JString,
     table_name: JString,
-    snapshot_id: Option<u64>,
+    snapshot_id: u64,
 ) -> jstring {
     let config_json = match decode_java_string(env, config_json) {
         Ok(value) => value,
@@ -166,10 +156,7 @@ fn open_plan(
         }
     };
     let builder = TableReaderBuilder::new(config).table_name(table_name);
-    let reader = match snapshot_id {
-        Some(id) => builder.global_snapshot(id).open(),
-        None => builder.current_global_snapshot().open(),
-    };
+    let reader = builder.global_snapshot(snapshot_id).open();
     let plan = match reader.and_then(|reader| reader.scan_plan()) {
         Ok(value) => value,
         Err(error) => {
