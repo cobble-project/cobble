@@ -54,6 +54,128 @@ import static org.junit.jupiter.api.Assertions.*;
 class DbBindingTest {
 
     @Test
+    void tableOrdinaryPointReadsUseDirectIoWithoutUnsafeAccess() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-table-direct-point-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(2, "payload", LogicalTypes.binary())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        List<Value> row = Arrays.asList(Value.int64(1), Value.binary(new byte[] {4, 5, 6}));
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "direct", schema)) {
+            table.put(row);
+            TableKey key = table.keyBuilder().push(row.get(0)).build();
+            assertEquals(row, table.get(key));
+            assertEquals(Arrays.asList(row, row), table.multiGet(Arrays.asList(key, key)));
+            try (TableProjection projection =
+                    table.projectByNames(Collections.singletonList("payload"))) {
+                assertEquals(Collections.singletonList(row.get(1)), projection.get(key));
+                assertEquals(
+                        Arrays.asList(
+                                Collections.singletonList(row.get(1)),
+                                Collections.singletonList(row.get(1))),
+                        projection.multiGet(Arrays.asList(key, key)));
+            }
+        }
+    }
+
+    @Test
+    void tableDirectDefaultKeepsLargeOwnedAndBorrowedRowsIndependent() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-table-direct-owned-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(2, "payload", LogicalTypes.binary()),
+                                new DataField(
+                                        3,
+                                        "nested",
+                                        LogicalTypes.struct(
+                                                new RecordType(
+                                                        Collections.singletonList(
+                                                                new DataField(
+                                                                        4,
+                                                                        "blob",
+                                                                        LogicalTypes.binary())))))),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        List<Value> first =
+                Arrays.asList(
+                        Value.int64(1),
+                        Value.binary(largeValueBytes("first", 1, 5000)),
+                        Value.struct(
+                                Collections.singletonList(
+                                        Value.binary(largeValueBytes("nested-first", 1, 5000)))));
+        List<Value> second =
+                Arrays.asList(
+                        Value.int64(2),
+                        Value.binary(largeValueBytes("second", 2, 6000)),
+                        Value.struct(
+                                Collections.singletonList(
+                                        Value.binary(largeValueBytes("nested-second", 2, 6000)))));
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "large", schema)) {
+            table.put(first);
+            table.put(second);
+            TableKey firstKey = table.keyBuilder().push(first.get(0)).build();
+            TableKey secondKey = table.keyBuilder().push(second.get(0)).build();
+            List<Value> retained = table.get(firstKey);
+            assertEquals(second, table.get(secondKey));
+            assertEquals(first, retained);
+            assertEquals(
+                    Arrays.asList(first, second, first, null),
+                    table.multiGet(
+                            Arrays.asList(
+                                    firstKey,
+                                    secondKey,
+                                    firstKey,
+                                    table.keyBuilder().push(Value.int64(99)).build())));
+            try (TableProjection projection =
+                    table.projectByNames(Arrays.asList("nested", "payload"))) {
+                assertEquals(Arrays.asList(first.get(2), first.get(1)), projection.get(firstKey));
+                assertEquals(
+                        Arrays.asList(
+                                Arrays.asList(first.get(2), first.get(1)),
+                                Arrays.asList(second.get(2), second.get(1))),
+                        projection.multiGet(Arrays.asList(firstKey, secondKey)));
+            }
+            ByteBuffer keyBuffer = ByteBuffer.allocateDirect(128);
+            try (DirectTableRow borrowedFirst = table.getDirect(firstKey, keyBuffer);
+                    DirectTableRow borrowedSecond = table.getDirect(secondKey, keyBuffer)) {
+                assertEquals(first, borrowedFirst.values());
+                assertEquals(second, borrowedSecond.values());
+            }
+            CompletableFuture<Void> left =
+                    CompletableFuture.runAsync(
+                            () -> {
+                                for (int i = 0; i < 20; i++) {
+                                    assertEquals(first, table.get(firstKey));
+                                    assertEquals(
+                                            Arrays.asList(first, second),
+                                            table.multiGet(Arrays.asList(firstKey, secondKey)));
+                                }
+                            });
+            CompletableFuture<Void> right =
+                    CompletableFuture.runAsync(
+                            () -> {
+                                for (int i = 0; i < 20; i++) {
+                                    assertEquals(second, table.get(secondKey));
+                                    assertEquals(
+                                            Arrays.asList(second, first),
+                                            table.multiGet(Arrays.asList(secondKey, firstKey)));
+                                }
+                            });
+            CompletableFuture.allOf(left, right).get();
+            assertEquals(first, retained);
+        }
+    }
+
+    @Test
     void tableSnapshotCommitterCoordinatesInterleavedAndBatchSnapshots() throws Exception {
         Path dataDir = Files.createTempDirectory("cobble-java-table-snapshot-committer-");
         Config config = new Config().addVolume(dataDir.toString()).totalBuckets(4);
@@ -510,6 +632,24 @@ class DbBindingTest {
                                         readOnlyKey2,
                                         readOnlyKey3,
                                         readOnlyMissing)));
+                CompletableFuture<Void> firstReader =
+                        CompletableFuture.runAsync(
+                                () -> {
+                                    for (int i = 0; i < 20; i++) {
+                                        assertEquals(row2, readOnly.get(readOnlyKey2));
+                                    }
+                                });
+                CompletableFuture<Void> secondReader =
+                        CompletableFuture.runAsync(
+                                () -> {
+                                    for (int i = 0; i < 20; i++) {
+                                        assertEquals(
+                                                Arrays.asList(row3, row2),
+                                                readOnly.multiGet(
+                                                        Arrays.asList(readOnlyKey3, readOnlyKey2)));
+                                    }
+                                });
+                CompletableFuture.allOf(firstReader, secondReader).get();
                 try (TableProjection projection =
                                 readOnly.projectByNames(Arrays.asList("payload", "tenant"));
                         TableProjection keyProjection =
@@ -2743,12 +2883,34 @@ class DbBindingTest {
                 byte[] key =
                         String.format("direct-raw-scan-%02d", i).getBytes(StandardCharsets.UTF_8);
                 byte[] value0 =
-                        i == 4
+                        i == 4 || i == 5
                                 ? largeValueBytes("direct-raw-scan-large", i, 4096)
                                 : ("direct-raw-scan-value-" + i).getBytes(StandardCharsets.UTF_8);
                 byte[] value1 = ("direct-raw-scan-side-" + i).getBytes(StandardCharsets.UTF_8);
                 db.put(0, key, 0, value0);
                 db.put(0, key, 1, value1);
+            }
+
+            try (ScanOptions options = new ScanOptions().columns(0, 1);
+                    DirectScanCursor retainedCursor =
+                            db.scanDirectWithOptions(
+                                    0,
+                                    "direct-raw-scan-04".getBytes(StandardCharsets.UTF_8),
+                                    "direct-raw-scan-05".getBytes(StandardCharsets.UTF_8),
+                                    options);
+                    DirectScanCursor otherCursor =
+                            db.scanDirectWithOptions(
+                                    0,
+                                    "direct-raw-scan-05".getBytes(StandardCharsets.UTF_8),
+                                    "direct-raw-scan-06".getBytes(StandardCharsets.UTF_8),
+                                    options)) {
+                DirectScanEntry retained = retainedCursor.nextEntry();
+                assertNotNull(retained);
+                ByteBuffer retainedValue = retained.columnsView().get(0);
+                assertNotNull(otherCursor.nextEntry());
+                assertArrayEquals(
+                        largeValueBytes("direct-raw-scan-large", 4, 4096),
+                        readDirectBytes(retainedValue));
             }
 
             byte[] start = "direct-raw-scan-02".getBytes(StandardCharsets.UTF_8);
@@ -2782,7 +2944,7 @@ class DbBindingTest {
                                     .getBytes(StandardCharsets.UTF_8),
                             seenKeys.get(i));
                     byte[] expectedValue0 =
-                            expected == 4
+                            expected == 4 || expected == 5
                                     ? largeValueBytes("direct-raw-scan-large", expected, 4096)
                                     : ("direct-raw-scan-value-" + expected)
                                             .getBytes(StandardCharsets.UTF_8);

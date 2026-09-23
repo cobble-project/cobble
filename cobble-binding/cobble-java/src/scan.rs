@@ -1,7 +1,7 @@
 use crate::util::{
     decode_column_index, decode_java_bytes, decode_java_string, decode_optional_java_bytes,
-    decode_u16, parse_config_json, throw_illegal_argument, throw_illegal_state,
-    write_payload_to_io_or_cached_overflow,
+    decode_u16, parse_config_json, take_owned_overflow_direct_buffer, throw_illegal_argument,
+    throw_illegal_state, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use cobble_binding::{
@@ -9,7 +9,7 @@ use cobble_binding::{
 };
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString};
-use jni::sys::{jint, jlong};
+use jni::sys::{jint, jlong, jobject};
 use size::Size;
 
 pub(crate) struct ScanOptionsHandle {
@@ -663,6 +663,20 @@ pub extern "system" fn Java_io_cobble_DirectScanCursor_nextEntryDirectInternal(
         }
     };
     cursor.next_entry_direct(&mut env, io_address, io_capacity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DirectScanCursor_takeOwnedOverflowNative(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    match take_owned_overflow_direct_buffer(&mut env) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            throw_illegal_state(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -2,6 +2,7 @@ package io.cobble.table;
 
 import io.cobble.Config;
 import io.cobble.Db;
+import io.cobble.DirectColumns;
 import io.cobble.GlobalSnapshot;
 
 import org.junit.jupiter.api.Test;
@@ -23,6 +24,57 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TableFormatPluginRegistryTest {
     @TempDir Path dataDir;
+
+    @Test
+    void customPointDecoderFallsBackToOwnedColumns() throws Exception {
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        byte[] key = new byte[] {1};
+        try (Db db = Db.open(config)) {
+            db.put(0, key, 0, new byte[] {9});
+            TableFormatBinding binding =
+                    new TableFormatBinding() {
+                        @Override
+                        public TableReadSchema schema() {
+                            return null;
+                        }
+
+                        @Override
+                        public List<DataField> keyFields() {
+                            return Collections.emptyList();
+                        }
+
+                        @Override
+                        public TableReadCapabilities capabilities() {
+                            return new TableReadCapabilities(true, false, false);
+                        }
+
+                        @Override
+                        public int[] physicalColumns() {
+                            return new int[] {0};
+                        }
+
+                        @Override
+                        public TablePhysicalKey encodeKey(List<Value> values) {
+                            return new TablePhysicalKey(0, key);
+                        }
+
+                        @Override
+                        public List<List<Value>> decode(
+                                int bucket, byte[] physicalKey, byte[][] columns) {
+                            assertEquals(0, bucket);
+                            assertArrayEquals(key, physicalKey);
+                            assertArrayEquals(new byte[] {9}, columns[0]);
+                            return Collections.singletonList(
+                                    Collections.singletonList(Value.int64(9)));
+                        }
+                    };
+            try (DirectColumns columns = db.getDirectColumnsWithOptions(0, key, null)) {
+                assertEquals(
+                        Collections.singletonList(Collections.singletonList(Value.int64(9))),
+                        binding.decodePointDirect(0, key, columns));
+            }
+        }
+    }
 
     @Test
     void nativeFactoryPlansFixedSnapshotAndEmptyProjectionRetainsRows() throws Exception {
@@ -96,6 +148,17 @@ class TableFormatPluginRegistryTest {
                 roundTrip(plan.project(Arrays.asList("value", "id"))),
                 split,
                 Arrays.asList(Value.string("one"), Value.int64(1)));
+        try (PhysicalTableReadSession session =
+                new PhysicalTableReadSession(
+                        config, snapshot, new NativeTableFormatPlugin().bind(snapshot))) {
+            assertEquals(
+                    Arrays.asList(Value.int64(1), Value.string("one")),
+                    session.lookup(Collections.singletonList(Value.int64(1)))
+                            .iterator()
+                            .next()
+                            .value());
+            assertTrue(session.lookup(Collections.singletonList(Value.int64(99))).isEmpty());
+        }
     }
 
     @Test

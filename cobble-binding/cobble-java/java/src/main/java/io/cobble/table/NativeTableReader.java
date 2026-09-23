@@ -7,8 +7,6 @@ import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -131,13 +129,14 @@ final class NativeTableReader extends NativeObject {
 
     public synchronized List<Value> get(TableKey key) {
         access();
-        TableReaderView current = view;
         Table.TableState currentState = state;
-        byte[][] columns =
-                current.get(key.bucket(), key.encodedInternal(), currentState.readOptions);
-        return columns == null
-                ? null
-                : Table.assembleRow(currentState.compiled, key.valuesInternal(), columns);
+        try (DirectColumns columns =
+                DirectColumns.read(directReader, key.bucket(), key.encodedInternal())) {
+            return columns == null
+                    ? null
+                    : Table.assembleDirectRowOwned(
+                            currentState.compiled, key.valuesInternal(), columns);
+        }
     }
 
     /**
@@ -162,17 +161,23 @@ final class NativeTableReader extends NativeObject {
             buckets[i] = key.bucket();
             encoded[i] = key.encodedInternal();
         }
-        byte[][][] columns = current.multiGet(buckets, encoded, currentState.readOptions);
-        List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
-        for (int i = 0; i < columns.length; i++)
-            rows.add(
-                    columns[i] == null
-                            ? null
-                            : Table.assembleRow(
-                                    currentState.compiled,
-                                    keys.get(i).valuesInternal(),
-                                    columns[i]));
-        return Collections.unmodifiableList(rows);
+        return DirectColumns.readBatch(
+                new DirectColumns.BatchReader() {
+                    @Override
+                    public int read(ByteBuffer io) {
+                        return current.multiGetEncodedDirect(io, currentState.readOptions);
+                    }
+
+                    @Override
+                    public ByteBuffer takeOverflowBuffer() {
+                        return current.takeDirectOverflowBuffer();
+                    }
+                },
+                buckets,
+                encoded,
+                (index, columns) ->
+                        Table.assembleDirectRowOwned(
+                                currentState.compiled, keys.get(index).valuesInternal(), columns));
     }
 
     public synchronized TableProjection projectByNames(List<String> fields) {

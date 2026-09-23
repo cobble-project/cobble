@@ -1,7 +1,9 @@
 package io.cobble.table;
 
+import io.cobble.DirectColumns;
 import io.cobble.DirectScanEntry;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 
 /**
@@ -26,6 +28,20 @@ public interface TableFormatBinding {
     /** Decodes owned physical columns returned by a point read. */
     List<List<Value>> decode(int bucket, byte[] physicalKey, byte[][] physicalColumns)
             throws Exception;
+
+    /** Decodes transient direct columns from a point read into owned logical values. */
+    default List<List<Value>> decodePointDirect(
+            int bucket, byte[] physicalKey, DirectColumns physicalColumns) throws Exception {
+        byte[][] copied = new byte[physicalColumns.size()][];
+        for (int i = 0; i < copied.length; i++) {
+            ByteBuffer value = physicalColumns.get(i);
+            if (value != null) {
+                copied[i] = new byte[value.remaining()];
+                value.get(copied[i]);
+            }
+        }
+        return decode(bucket, physicalKey, copied);
+    }
 
     /**
      * Decodes one transient direct physical row. Returned values must not retain direct buffers.

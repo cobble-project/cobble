@@ -3,18 +3,14 @@ use crate::scan::{
     ScanCursorHandle, decode_scan_open_bounds_args, scan_options_from_handle_or_throw,
 };
 use crate::table::table_open_response;
-use crate::table_direct::{encode_direct_get, take_direct_overflow};
+use crate::table_direct::{encode_direct_get, encode_direct_multi_get, take_direct_overflow};
 use crate::util::{
-    decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, to_java_optional_bytes_2d,
-    to_java_optional_bytes_3d,
+    decode_java_string, parse_config_json, throw_illegal_argument, throw_illegal_state,
 };
 use cobble_binding::Config;
 use cobble_table::{TableReader, TableReaderBuilder, ffi};
 use jni::JNIEnv;
-use jni::objects::{
-    JByteArray, JByteBuffer, JClass, JIntArray, JObject, JObjectArray, JString, JValue,
-};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
 
 struct TableReaderHandle(TableReader);
@@ -255,50 +251,6 @@ pub extern "system" fn Java_io_cobble_table_NativeTableReader_cloneViewNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReaderView_get(
-    mut env: JNIEnv,
-    _class: JClass,
-    view_handle: jlong,
-    bucket: jint,
-    key: JByteArray,
-    read_options_handle: jlong,
-) -> jobject {
-    let Some(view) = view_from_handle_or_throw(&mut env, view_handle) else {
-        return std::ptr::null_mut();
-    };
-    let bucket = match decode_u16("bucket", bucket) {
-        Ok(value) => value,
-        Err(error) => {
-            throw_illegal_argument(&mut env, error);
-            return std::ptr::null_mut();
-        }
-    };
-    let key = match decode_java_bytes(&mut env, key) {
-        Ok(value) => value,
-        Err(error) => {
-            throw_illegal_argument(&mut env, error);
-            return std::ptr::null_mut();
-        }
-    };
-    let Some(options) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
-        return std::ptr::null_mut();
-    };
-    match view.get(bucket, &key, options.read_options()) {
-        Ok(Some(columns)) => {
-            to_java_optional_bytes_2d(&mut env, &columns).unwrap_or_else(|error| {
-                throw_illegal_state(&mut env, error.to_string());
-                std::ptr::null_mut()
-            })
-        }
-        Ok(None) => std::ptr::null_mut(),
-        Err(error) => {
-            throw_illegal_state(&mut env, error.to_string());
-            std::ptr::null_mut()
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_TableReaderView_getEncodedDirectNative(
     mut env: JNIEnv,
     _class: JClass,
@@ -328,41 +280,22 @@ pub extern "system" fn Java_io_cobble_table_TableReaderView_takeDirectOverflowNa
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReaderView_multiGet<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_io_cobble_table_TableReaderView_multiGetEncodedDirectNative(
+    mut env: JNIEnv,
     _class: JClass,
     view_handle: jlong,
-    buckets: JIntArray<'local>,
-    keys: JObjectArray<'local>,
+    buffer: JByteBuffer,
     read_options_handle: jlong,
-) -> jobject {
+) -> jint {
     let Some(view) = view_from_handle_or_throw(&mut env, view_handle) else {
-        return std::ptr::null_mut();
-    };
-    let keys = match decode_multi_get_keys(&mut env, &buckets, &keys) {
-        Ok(value) => value,
-        Err(error) => {
-            throw_illegal_argument(&mut env, error);
-            return std::ptr::null_mut();
-        }
+        return 0;
     };
     let Some(options) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
-        return std::ptr::null_mut();
+        return 0;
     };
-    let borrowed = keys
-        .iter()
-        .map(|(bucket, key)| (*bucket, key.as_slice()))
-        .collect::<Vec<_>>();
-    match view.multi_get(&borrowed, options.read_options()) {
-        Ok(columns) => to_java_optional_bytes_3d(&mut env, &columns).unwrap_or_else(|error| {
-            throw_illegal_state(&mut env, error);
-            std::ptr::null_mut()
-        }),
-        Err(error) => {
-            throw_illegal_state(&mut env, error.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    encode_direct_multi_get(&mut env, buffer, |keys| {
+        view.multi_get(keys, options.read_options())
+    })
 }
 
 #[unsafe(no_mangle)]

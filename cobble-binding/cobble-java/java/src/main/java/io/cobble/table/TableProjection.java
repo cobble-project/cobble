@@ -30,6 +30,8 @@ public final class TableProjection implements AutoCloseable {
     private final boolean hasValueFields;
     private final ReadOptions readOptions;
     private final ScanOptions scanOptions;
+    private final DirectColumns.Reader directReader;
+    private final DirectColumns.BatchReader directBatchReader;
     private final NativeObject retainedOwner;
     private volatile boolean closed;
 
@@ -108,6 +110,8 @@ public final class TableProjection implements AutoCloseable {
             }
             this.readOptions = readOptions;
             this.scanOptions = scanOptions;
+            this.directReader = reads.directReader(readOptions);
+            this.directBatchReader = reads.directBatchReader(readOptions);
         } catch (RuntimeException error) {
             if (scanOptions != null) scanOptions.close();
             if (readOptions != null) readOptions.close();
@@ -119,8 +123,10 @@ public final class TableProjection implements AutoCloseable {
     public List<Value> get(TableKey key) {
         ensureUsable();
         Objects.requireNonNull(key, "key");
-        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), readOptions);
-        return columns == null ? null : decodeRow(key.valuesInternal(), columns);
+        try (DirectColumns columns =
+                DirectColumns.read(directReader, key.bucket(), key.encodedInternal())) {
+            return columns == null ? null : decodeDirectRow(key.valuesInternal(), columns);
+        }
     }
 
     /** Reads projected rows in input order, preserving duplicates and misses. */
@@ -134,14 +140,12 @@ public final class TableProjection implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = reads.multiGet(buckets, keys, readOptions);
-        List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
-        for (int i = 0; i < columns.length; i++)
-            rows.add(
-                    columns[i] == null
-                            ? null
-                            : decodeRow(primaryKeys.get(i).valuesInternal(), columns[i]));
-        return Collections.unmodifiableList(rows);
+        return DirectColumns.readBatch(
+                directBatchReader,
+                buckets,
+                keys,
+                (index, columns) ->
+                        decodeDirectRow(primaryKeys.get(index).valuesInternal(), columns));
     }
 
     /** Opens a projected typed scan over one bucket. */
@@ -194,6 +198,10 @@ public final class TableProjection implements AutoCloseable {
         List<Value> keyValues =
                 hasKeyFields ? KeyCodec.decodeOwned(compiled.keyTypes, entry.getKey()) : null;
         DirectColumns columns = hasValueFields ? entry.columnsView() : null;
+        return decodeDirectRow(keyValues, columns);
+    }
+
+    private List<Value> decodeDirectRow(List<Value> keyValues, DirectColumns columns) {
         List<Value> row = new ArrayList<Value>(sources.length);
         for (Source source : sources) {
             if (source.keyIndex >= 0) {
@@ -205,22 +213,6 @@ public final class TableProjection implements AutoCloseable {
                 row.add(
                         ValueCodec.decodeOwned(
                                 compiled.valueTypes.get(source.physicalColumn), value));
-            }
-        }
-        return Collections.unmodifiableList(row);
-    }
-
-    private List<Value> decodeRow(List<Value> keyValues, byte[][] columns) {
-        List<Value> row = new ArrayList<Value>(sources.length);
-        for (Source source : sources) {
-            if (source.keyIndex >= 0) {
-                row.add(keyValues.get(source.keyIndex));
-            } else {
-                byte[] value = columns[source.projectedColumn];
-                if (value == null)
-                    throw new IllegalStateException("table row is missing a value column");
-                ByteBuffer encoded = ByteBuffer.wrap(value);
-                row.add(ValueCodec.decode(compiled.valueTypes.get(source.physicalColumn), encoded));
             }
         }
         return Collections.unmodifiableList(row);

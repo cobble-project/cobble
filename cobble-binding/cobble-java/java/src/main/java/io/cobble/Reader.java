@@ -1,5 +1,6 @@
 package io.cobble;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 
 /**
@@ -127,6 +128,29 @@ public final class Reader extends NativeObject {
         return get(nativeHandle, bucket, key, readOptionsHandle);
     }
 
+    /** Returns transient direct columns; close the result after decoding. */
+    public DirectColumns getDirectColumnsWithOptions(int bucket, byte[] key, ReadOptions options) {
+        return DirectColumns.read(
+                new DirectColumns.Reader() {
+                    @Override
+                    public int read(int requestedBucket, ByteBuffer io, int keyLength) {
+                        return getEncodedDirectNative(
+                                nativeHandle,
+                                requestedBucket,
+                                io,
+                                keyLength,
+                                options == null ? 0L : options.nativeHandle);
+                    }
+
+                    @Override
+                    public ByteBuffer takeOverflowBuffer() {
+                        return takeDirectOverflowNative();
+                    }
+                },
+                bucket,
+                key);
+    }
+
     /**
      * Read several keys in one batch from a consistent snapshot.
      *
@@ -243,6 +267,15 @@ public final class Reader extends NativeObject {
 
     private static native byte[][] get(
             long nativeHandle, int bucket, byte[] key, long readOptionsHandle);
+
+    private static native int getEncodedDirectNative(
+            long nativeHandle,
+            int bucket,
+            ByteBuffer buffer,
+            int keyLength,
+            long readOptionsHandle);
+
+    private static native ByteBuffer takeDirectOverflowNative();
 
     private static native byte[][][] multiGet(
             long nativeHandle, int[] buckets, byte[][] keys, long readOptionsHandle);

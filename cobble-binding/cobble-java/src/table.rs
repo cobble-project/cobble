@@ -4,11 +4,11 @@ use crate::read_only_db::{
     read_only_db_arc_from_handle_or_throw, read_only_db_from_handle_or_throw,
 };
 use crate::read_options::read_options_from_handle_or_throw;
-use crate::table_direct::{encode_direct_get, take_direct_overflow};
+use crate::table_direct::{encode_direct_get, encode_direct_multi_get, take_direct_overflow};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_optional_java_bytes,
     decode_u16, decode_u64_from_jlong, throw_illegal_argument, throw_illegal_state,
-    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
+    to_java_string_or_throw,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use crate::{
@@ -370,40 +370,6 @@ pub extern "system" fn Java_io_cobble_table_Table_getShardSnapshotJsonNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_Table_getNative(
-    mut env: JNIEnv,
-    _class: JClass,
-    native_handle: jlong,
-    bucket: jint,
-    key: JByteArray,
-) -> jobject {
-    let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
-        return std::ptr::null_mut();
-    };
-    let bucket = match decode_u16("bucket", bucket) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    let key = match decode_java_bytes(&mut env, key) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    match table.access().get(bucket, &key) {
-        Ok(Some(columns)) => {
-            to_java_optional_bytes_2d(&mut env, &columns).unwrap_or_else(|error| {
-                throw_illegal_state(&mut env, error);
-                std::ptr::null_mut()
-            })
-        }
-        Ok(None) => std::ptr::null_mut(),
-        Err(error) => {
-            throw_illegal_state(&mut env, error.to_string());
-            std::ptr::null_mut()
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_getEncodedDirectNative(
     mut env: JNIEnv,
     _class: JClass,
@@ -425,42 +391,30 @@ pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_getEncodedDirectNative
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_multiGetEncodedDirectNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    db_handle: jlong,
+    buffer: JByteBuffer,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(db) = read_only_db_from_handle_or_throw(&mut env, db_handle) else {
+        return 0;
+    };
+    let Some(options) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
+        return 0;
+    };
+    encode_direct_multi_get(&mut env, buffer, |keys| {
+        db.multi_get_with_options(keys, options.read_options())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_ReadOnlyTable_takeDirectOverflowNative(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jobject {
     take_direct_overflow(&mut env)
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_Table_multiGetNative<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass,
-    native_handle: jlong,
-    buckets: JIntArray<'local>,
-    keys: JObjectArray<'local>,
-) -> jobject {
-    let Some(table) = table_handle_from_handle_or_throw(&mut env, native_handle) else {
-        return std::ptr::null_mut();
-    };
-    let keys = match decode_multi_get_keys(&mut env, &buckets, &keys) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    let borrowed = keys
-        .iter()
-        .map(|(bucket, key)| (*bucket, key.as_slice()))
-        .collect::<Vec<_>>();
-    match table.access().multi_get(&borrowed) {
-        Ok(rows) => to_java_optional_bytes_3d(&mut env, &rows).unwrap_or_else(|error| {
-            throw_illegal_state(&mut env, error);
-            std::ptr::null_mut()
-        }),
-        Err(error) => {
-            throw_illegal_state(&mut env, error.to_string());
-            std::ptr::null_mut()
-        }
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -659,68 +613,41 @@ pub extern "system" fn Java_io_cobble_table_Table_deleteBatchTableNative<'local>
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReadView_get(
+pub extern "system" fn Java_io_cobble_table_TableReadView_getEncodedDirectNative(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
     bucket: jint,
-    key: JByteArray,
-) -> jobject {
+    buffer: JByteBuffer,
+    key_length: jint,
+) -> jint {
     let Some(view) = read_handle_from_handle_or_throw(&mut env, native_handle) else {
-        return std::ptr::null_mut();
+        return 0;
     };
-    let bucket = match decode_u16("bucket", bucket) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    let key = match decode_java_bytes(&mut env, key) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    match view.access.get(bucket, &key) {
-        Ok(Some(columns)) => {
-            to_java_optional_bytes_2d(&mut env, &columns).unwrap_or_else(|error| {
-                throw_illegal_state(&mut env, error);
-                std::ptr::null_mut()
-            })
-        }
-        Ok(None) => std::ptr::null_mut(),
-        Err(error) => {
-            throw_illegal_state(&mut env, error.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    encode_direct_get(&mut env, bucket, buffer, key_length, |bucket, key| {
+        view.access.get(bucket, key)
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReadView_multiGet<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_io_cobble_table_TableReadView_multiGetEncodedDirectNative(
+    mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
-    buckets: JIntArray<'local>,
-    keys: JObjectArray<'local>,
-) -> jobject {
+    buffer: JByteBuffer,
+) -> jint {
     let Some(view) = read_handle_from_handle_or_throw(&mut env, native_handle) else {
-        return std::ptr::null_mut();
+        return 0;
     };
-    let keys = match decode_multi_get_keys(&mut env, &buckets, &keys) {
-        Ok(value) => value,
-        Err(error) => return throw_argument_and_null(&mut env, error),
-    };
-    let borrowed = keys
-        .iter()
-        .map(|(bucket, key)| (*bucket, key.as_slice()))
-        .collect::<Vec<_>>();
-    match view.access.multi_get(&borrowed) {
-        Ok(rows) => to_java_optional_bytes_3d(&mut env, &rows).unwrap_or_else(|error| {
-            throw_illegal_state(&mut env, error);
-            std::ptr::null_mut()
-        }),
-        Err(error) => {
-            throw_illegal_state(&mut env, error.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    encode_direct_multi_get(&mut env, buffer, |keys| view.access.multi_get(keys))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_TableReadView_takeDirectOverflowNative(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    take_direct_overflow(&mut env)
 }
 
 #[unsafe(no_mangle)]

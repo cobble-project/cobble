@@ -1,10 +1,13 @@
 package io.cobble.table;
 
+import io.cobble.DirectColumns;
 import io.cobble.DirectScanCursor;
 import io.cobble.NativeObject;
 import io.cobble.ReadOnlyDb;
 import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
+
+import java.nio.ByteBuffer;
 
 final class TableReadBackend {
     private final NativeObject owner;
@@ -35,16 +38,48 @@ final class TableReadBackend {
         return new TableReadBackend(view, null, null, view);
     }
 
-    byte[][] get(int bucket, byte[] key, ReadOptions options) {
-        if (readOnly != null) return readOnly.getWithOptions(bucket, key, options);
-        if (tableView != null) return tableView.get(bucket, key);
-        return readerView.get(bucket, key, options);
+    DirectColumns.Reader directReader(ReadOptions options) {
+        return new DirectColumns.Reader() {
+            @Override
+            public int read(int bucket, ByteBuffer io, int keyLength) {
+                if (readOnly != null)
+                    return ReadOnlyTable.getEncodedDirectNative(
+                            readOnly.getNativeHandle(),
+                            bucket,
+                            io,
+                            keyLength,
+                            options.getNativeHandle());
+                if (tableView != null) return tableView.getEncodedDirect(bucket, io, keyLength);
+                return readerView.getEncodedDirect(bucket, io, keyLength, options);
+            }
+
+            @Override
+            public ByteBuffer takeOverflowBuffer() {
+                if (readOnly != null) return ReadOnlyTable.takeDirectOverflowNative();
+                if (tableView != null) return tableView.takeDirectOverflowBuffer();
+                return readerView.takeDirectOverflowBuffer();
+            }
+        };
     }
 
-    byte[][][] multiGet(int[] buckets, byte[][] keys, ReadOptions options) {
-        if (readOnly != null) return readOnly.multiGetWithOptions(buckets, keys, options);
-        if (tableView != null) return tableView.multiGet(buckets, keys);
-        return readerView.multiGet(buckets, keys, options);
+    DirectColumns.BatchReader directBatchReader(ReadOptions options) {
+        return new DirectColumns.BatchReader() {
+            @Override
+            public int read(ByteBuffer io) {
+                if (readOnly != null)
+                    return ReadOnlyTable.multiGetEncodedDirectNative(
+                            readOnly.getNativeHandle(), io, options.getNativeHandle());
+                if (tableView != null) return tableView.multiGetEncodedDirect(io);
+                return readerView.multiGetEncodedDirect(io, options);
+            }
+
+            @Override
+            public ByteBuffer takeOverflowBuffer() {
+                if (readOnly != null) return ReadOnlyTable.takeDirectOverflowNative();
+                if (tableView != null) return tableView.takeDirectOverflowBuffer();
+                return readerView.takeDirectOverflowBuffer();
+            }
+        };
     }
 
     DirectScanCursor scan(

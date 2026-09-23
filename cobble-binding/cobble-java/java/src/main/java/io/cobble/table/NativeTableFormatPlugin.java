@@ -149,6 +149,13 @@ public final class NativeTableFormatPlugin implements TableFormatPlugin {
         }
 
         @Override
+        public List<List<Value>> decodePointDirect(
+                int bucket, byte[] key, io.cobble.DirectColumns columns) {
+            List<Value> keys = KeyCodec.decodeOwned(compiled.keyTypes, ByteBuffer.wrap(key));
+            return Collections.singletonList(Table.assembleDirectRowOwned(compiled, keys, columns));
+        }
+
+        @Override
         public List<List<Value>> decodeDirect(
                 io.cobble.DirectScanEntry entry, int bucket, byte[] ownedPhysicalKey) {
             return Collections.singletonList(Table.decodeDirectScannedRowOwned(compiled, entry));

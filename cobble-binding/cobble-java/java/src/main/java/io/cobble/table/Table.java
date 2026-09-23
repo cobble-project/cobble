@@ -59,6 +59,8 @@ public final class Table extends NativeObject {
     private static native int getEncodedDirectNative(
             long handle, int bucket, ByteBuffer ioBuffer, int keyLength);
 
+    private static native int multiGetEncodedDirectNative(long handle, ByteBuffer ioBuffer);
+
     private static native ByteBuffer takeDirectOverflowNative();
 
     private Table(long nativeHandle, String name, OpenInfo openInfo) {
@@ -311,8 +313,12 @@ public final class Table extends NativeObject {
     public List<Value> get(TableKey key) {
         TableState state = state();
         Objects.requireNonNull(key, "key");
-        byte[][] columns = getNative(nativeHandle, key.bucket(), key.encodedInternal());
-        return columns == null ? null : assembleRow(state.compiled, key.valuesInternal(), columns);
+        try (DirectColumns columns =
+                DirectColumns.read(directReader, key.bucket(), key.encodedInternal())) {
+            return columns == null
+                    ? null
+                    : assembleDirectRowOwned(state.compiled, key.valuesInternal(), columns);
+        }
     }
 
     /** Reads keys in one native multi-get while preserving input order and duplicates. */
@@ -326,17 +332,23 @@ public final class Table extends NativeObject {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = multiGetNative(nativeHandle, buckets, keys);
-        List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
-        for (int i = 0; i < columns.length; i++)
-            rows.add(
-                    columns[i] == null
-                            ? null
-                            : assembleRow(
-                                    state.compiled,
-                                    primaryKeys.get(i).valuesInternal(),
-                                    columns[i]));
-        return Collections.unmodifiableList(rows);
+        return DirectColumns.readBatch(
+                new DirectColumns.BatchReader() {
+                    @Override
+                    public int read(ByteBuffer io) {
+                        return multiGetEncodedDirectNative(nativeHandle, io);
+                    }
+
+                    @Override
+                    public ByteBuffer takeOverflowBuffer() {
+                        return takeDirectOverflowNative();
+                    }
+                },
+                buckets,
+                keys,
+                (index, columns) ->
+                        assembleDirectRowOwned(
+                                state.compiled, primaryKeys.get(index).valuesInternal(), columns));
     }
 
     /**
@@ -501,14 +513,13 @@ public final class Table extends NativeObject {
         return row;
     }
 
-    static List<Value> decodeDirectScannedRowOwned(Compiled compiled, DirectScanEntry entry) {
-        List<Value> keyValues = KeyCodec.decodeOwned(compiled.keyTypes, entry.getKey());
-        DirectColumns columns = entry.columnsView();
+    static List<Value> assembleDirectRowOwned(
+            Compiled compiled, List<Value> primaryKey, DirectColumns columns) {
         if (columns.size() != compiled.physicalColumns)
             throw new IllegalStateException("table row has an incompatible physical layout");
         ArrayList<Value> row = emptyRow(compiled.schema.fields().size());
         for (int i = 0; i < compiled.keyPositions.length; i++)
-            row.set(compiled.keyPositions[i], keyValues.get(i));
+            row.set(compiled.keyPositions[i], primaryKey.get(i));
         for (int i = 0; i < compiled.valuePositions.length; i++) {
             ByteBuffer value = columns.get(i);
             if (value == null)
@@ -518,6 +529,11 @@ public final class Table extends NativeObject {
                     ValueCodec.decodeOwned(compiled.valueTypes.get(i), value));
         }
         return Collections.unmodifiableList(row);
+    }
+
+    static List<Value> decodeDirectScannedRowOwned(Compiled compiled, DirectScanEntry entry) {
+        List<Value> keyValues = KeyCodec.decodeOwned(compiled.keyTypes, entry.getKey());
+        return assembleDirectRowOwned(compiled, keyValues, entry.columnsView());
     }
 
     private static void requireRow(Compiled compiled, List<Value> row) {
@@ -761,11 +777,6 @@ public final class Table extends NativeObject {
             long nativeHandle, CompletableFuture<String> snapshotJsonFuture);
 
     private static native String getShardSnapshotJsonNative(long nativeHandle, long snapshotId);
-
-    private static native byte[][] getNative(long nativeHandle, int bucket, byte[] key);
-
-    private static native byte[][][] multiGetNative(
-            long nativeHandle, int[] buckets, byte[][] keys);
 
     private static native long createReadViewNative(long nativeHandle, String[] fieldNames);
 

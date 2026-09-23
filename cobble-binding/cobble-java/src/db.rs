@@ -1450,6 +1450,12 @@ pub(crate) fn encode_optional_columns_to_direct_buffer<'local>(
 }
 
 fn encode_optional_columns_payload(columns: &[Option<bytes::Bytes>]) -> Result<Vec<u8>, String> {
+    let mut encoded = Vec::with_capacity(optional_columns_payload_len(columns)?);
+    append_optional_columns_payload(&mut encoded, columns);
+    Ok(encoded)
+}
+
+fn optional_columns_payload_len(columns: &[Option<bytes::Bytes>]) -> Result<usize, String> {
     let mut total = 4usize;
     for column in columns {
         total = total
@@ -1462,7 +1468,10 @@ fn encode_optional_columns_payload(columns: &[Option<bytes::Bytes>]) -> Result<V
                 .ok_or_else(|| "encoded column size overflow".to_string())?;
         }
     }
-    let mut encoded = Vec::with_capacity(total);
+    Ok(total)
+}
+
+fn append_optional_columns_payload(encoded: &mut Vec<u8>, columns: &[Option<bytes::Bytes>]) {
     encoded.extend_from_slice(&(columns.len() as u32).to_be_bytes());
     for column in columns {
         match column {
@@ -1474,7 +1483,6 @@ fn encode_optional_columns_payload(columns: &[Option<bytes::Bytes>]) -> Result<V
             }
         }
     }
-    Ok(encoded)
 }
 
 /// Encodes a multi-get result into a single contiguous payload for direct-buffer transfer.
@@ -1486,32 +1494,34 @@ fn encode_optional_columns_payload(columns: &[Option<bytes::Bytes>]) -> Result<V
 ///     i32 row_payload_length   // 0 = not found
 ///     [row payload bytes]      // same format as encode_optional_columns_payload
 /// ```
-fn encode_multi_get_payload(rows: &[Option<Vec<Option<bytes::Bytes>>>]) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_multi_get_payload(
+    rows: &[Option<Vec<Option<bytes::Bytes>>>],
+) -> Result<Vec<u8>, String> {
     let mut total = 4usize; // num_keys
-    let mut row_payloads = Vec::with_capacity(rows.len());
     for row in rows {
-        match row {
-            None => {
-                total = total
-                    .checked_add(4)
-                    .ok_or("encoded multi-get size overflow")?;
-                row_payloads.push(Vec::new());
-            }
-            Some(columns) => {
-                let payload = encode_optional_columns_payload(columns.as_slice())?;
-                total = total
-                    .checked_add(4)
-                    .and_then(|v| v.checked_add(payload.len()))
-                    .ok_or("encoded multi-get row size overflow")?;
-                row_payloads.push(payload);
-            }
-        }
+        let row_len = match row {
+            Some(columns) => optional_columns_payload_len(columns)?,
+            None => 0,
+        };
+        total = total
+            .checked_add(4)
+            .and_then(|v| v.checked_add(row_len))
+            .ok_or("encoded multi-get size overflow")?;
     }
     let mut encoded = Vec::with_capacity(total);
     encoded.extend_from_slice(&(rows.len() as u32).to_be_bytes());
-    for payload in &row_payloads {
-        encoded.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(payload);
+    for row in rows {
+        let Some(columns) = row else {
+            encoded.extend_from_slice(&0u32.to_be_bytes());
+            continue;
+        };
+        let row_length_offset = encoded.len();
+        encoded.extend_from_slice(&0u32.to_be_bytes());
+        // Write directly into the batch without a temporary allocation and copy per row.
+        append_optional_columns_payload(&mut encoded, columns);
+        let row_length = (encoded.len() - row_length_offset - 4) as u32;
+        encoded[row_length_offset..row_length_offset + 4]
+            .copy_from_slice(&row_length.to_be_bytes());
     }
     Ok(encoded)
 }

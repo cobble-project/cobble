@@ -1,6 +1,7 @@
 package io.cobble.table;
 
 import io.cobble.Config;
+import io.cobble.DirectColumns;
 import io.cobble.DirectScanCursor;
 import io.cobble.ReadOptions;
 import io.cobble.Reader;
@@ -165,15 +166,20 @@ final class PhysicalTableReadSession implements TableReadSession<List<Value>, Li
                 || encoded.bucket() >= ownedBuckets.length
                 || !ownedBuckets[encoded.bucket()]) return Collections.emptyList();
         byte[] keyBytes = encoded.bytes();
-        byte[][] columns;
+        List<List<Value>> rows;
+        long bytes;
+        DirectColumns columns;
         try {
-            columns = physical.getWithOptions(encoded.bucket(), keyBytes, readOptions);
+            columns = physical.getDirectColumnsWithOptions(encoded.bucket(), keyBytes, readOptions);
         } catch (RuntimeException error) {
             if (binding.isMissingColumnFamily(error)) return Collections.emptyList();
             throw error;
         }
         if (columns == null) return Collections.emptyList();
-        List<List<Value>> rows = binding.decode(encoded.bucket(), keyBytes, columns);
+        try (DirectColumns ignored = columns) {
+            bytes = physicalBytes(keyBytes, columns);
+            rows = binding.decodePointDirect(encoded.bucket(), keyBytes.clone(), columns);
+        }
         if (rows.size() > 1) {
             throw new IllegalStateException("exact lookup decoded more than one logical row");
         }
@@ -182,7 +188,7 @@ final class PhysicalTableReadSession implements TableReadSession<List<Value>, Li
                 new TableReadEntry<List<Value>>(
                         new TableReadPosition(encoded.bucket(), keyBytes, 1),
                         rows.get(0),
-                        physicalBytes(keyBytes, columns),
+                        bytes,
                         true));
     }
 
@@ -277,10 +283,11 @@ final class PhysicalTableReadSession implements TableReadSession<List<Value>, Li
         if (closed) throw new IllegalStateException("physical table read session is closed");
     }
 
-    private static long physicalBytes(byte[] key, byte[][] columns) {
+    private static long physicalBytes(byte[] key, DirectColumns columns) {
         long result = key.length;
-        for (byte[] column : columns) {
-            if (column != null) result += column.length;
+        for (int i = 0; i < columns.size(); i++) {
+            java.nio.ByteBuffer column = columns.get(i);
+            if (column != null) result += column.remaining();
         }
         return result;
     }

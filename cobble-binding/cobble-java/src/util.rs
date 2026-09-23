@@ -495,6 +495,22 @@ pub(crate) fn take_last_overflow_direct_buffer<'local>(
     })
 }
 
+/// Transfers the cached overflow buffer to a Java-owned read lease. The next read allocates a
+/// fresh overflow slot, so reentrant reads cannot overwrite a still-live table row.
+pub(crate) fn take_owned_overflow_direct_buffer<'local>(
+    env: &mut JNIEnv<'local>,
+) -> Result<jobject, String> {
+    LAST_OVERFLOW_DIRECT_BUFFER.with(|slot| {
+        let Some(global) = slot.borrow_mut().take() else {
+            return Ok(std::ptr::null_mut());
+        };
+        let local = env
+            .new_local_ref(global.as_obj())
+            .map_err(|err| err.to_string())?;
+        Ok(local.into_raw())
+    })
+}
+
 thread_local! {
     static LAST_OVERFLOW_DIRECT_BUFFER: RefCell<Option<GlobalRef>> = const { RefCell::new(None) };
 }

@@ -7,8 +7,6 @@ import io.cobble.ReadOptions;
 import io.cobble.ScanOptions;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -126,8 +124,12 @@ public final class ReadOnlyTable implements AutoCloseable {
     public List<Value> get(TableKey key) {
         ensureUsable();
         Objects.requireNonNull(key, "key");
-        byte[][] columns = reads.get(key.bucket(), key.encodedInternal(), readOptions);
-        return columns == null ? null : Table.assembleRow(compiled, key.valuesInternal(), columns);
+        try (DirectColumns columns =
+                DirectColumns.read(directReader, key.bucket(), key.encodedInternal())) {
+            return columns == null
+                    ? null
+                    : Table.assembleDirectRowOwned(compiled, key.valuesInternal(), columns);
+        }
     }
 
     /**
@@ -152,15 +154,24 @@ public final class ReadOnlyTable implements AutoCloseable {
             buckets[i] = key.bucket();
             keys[i] = key.encodedInternal();
         }
-        byte[][][] columns = reads.multiGet(buckets, keys, readOptions);
-        List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
-        for (int i = 0; i < columns.length; i++)
-            rows.add(
-                    columns[i] == null
-                            ? null
-                            : Table.assembleRow(
-                                    compiled, primaryKeys.get(i).valuesInternal(), columns[i]));
-        return Collections.unmodifiableList(rows);
+        return DirectColumns.readBatch(
+                new DirectColumns.BatchReader() {
+                    @Override
+                    public int read(ByteBuffer io) {
+                        return multiGetEncodedDirectNative(
+                                db.getNativeHandle(), io, readOptions.getNativeHandle());
+                    }
+
+                    @Override
+                    public ByteBuffer takeOverflowBuffer() {
+                        return takeDirectOverflowNative();
+                    }
+                },
+                buckets,
+                keys,
+                (index, columns) ->
+                        Table.assembleDirectRowOwned(
+                                compiled, primaryKeys.get(index).valuesInternal(), columns));
     }
 
     /** Opens a typed scan over all rows in one bucket. */
@@ -205,8 +216,10 @@ public final class ReadOnlyTable implements AutoCloseable {
 
     private static native String openNative(long dbHandle, String name);
 
-    private static native int getEncodedDirectNative(
+    static native int getEncodedDirectNative(
             long dbHandle, int bucket, ByteBuffer buffer, int keyLength, long options);
 
-    private static native ByteBuffer takeDirectOverflowNative();
+    static native int multiGetEncodedDirectNative(long dbHandle, ByteBuffer buffer, long options);
+
+    static native ByteBuffer takeDirectOverflowNative();
 }

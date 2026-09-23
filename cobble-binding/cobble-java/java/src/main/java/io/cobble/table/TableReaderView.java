@@ -12,17 +12,13 @@ final class TableReaderView extends NativeObject {
         super(nativeHandle);
     }
 
-    byte[][] get(int bucket, byte[] key, ReadOptions options) {
-        return get(nativeHandle, bucket, key, options.getNativeHandle());
-    }
-
-    byte[][][] multiGet(int[] buckets, byte[][] keys, ReadOptions options) {
-        return multiGet(nativeHandle, buckets, keys, options.getNativeHandle());
-    }
-
     int getEncodedDirect(int bucket, ByteBuffer buffer, int keyLength, ReadOptions options) {
         return getEncodedDirectNative(
                 nativeHandle, bucket, buffer, keyLength, options.getNativeHandle());
+    }
+
+    int multiGetEncodedDirect(ByteBuffer buffer, ReadOptions options) {
+        return multiGetEncodedDirectNative(nativeHandle, buffer, options.getNativeHandle());
     }
 
     ByteBuffer takeDirectOverflowBuffer() {
@@ -46,13 +42,11 @@ final class TableReaderView extends NativeObject {
     @Override
     protected native void disposeInternal(long nativeHandle);
 
-    private static native byte[][] get(long nativeHandle, int bucket, byte[] key, long options);
-
-    private static native byte[][][] multiGet(
-            long nativeHandle, int[] buckets, byte[][] keys, long options);
-
     private static native int getEncodedDirectNative(
             long nativeHandle, int bucket, ByteBuffer buffer, int keyLength, long options);
+
+    private static native int multiGetEncodedDirectNative(
+            long nativeHandle, ByteBuffer buffer, long options);
 
     private static native ByteBuffer takeDirectOverflowNative();
 

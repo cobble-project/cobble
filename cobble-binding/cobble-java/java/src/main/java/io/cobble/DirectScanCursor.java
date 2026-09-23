@@ -13,7 +13,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class DirectScanCursor extends NativeObject implements Iterable<DirectScanEntry> {
     private static final DirectBufferPool DEFAULT_POOL = DirectBufferPool.defaults();
     private final DirectBufferPool pool;
-    private final ByteBuffer ioBuffer;
+    private final ByteBuffer pooledBuffer;
+    private ByteBuffer ioBuffer;
     private final AtomicBoolean ioBufferReleased = new AtomicBoolean(false);
     private boolean iteratorCreated = false;
 
@@ -25,7 +26,8 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
     DirectScanCursor(long nativeHandle, DirectBufferPool pool) {
         super(nativeHandle);
         this.pool = pool;
-        this.ioBuffer = pool.acquire();
+        this.pooledBuffer = pool.acquire();
+        this.ioBuffer = pooledBuffer;
     }
 
     public DirectScanEntry nextEntry() {
@@ -38,9 +40,15 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         if (encodedLength == 0) {
             return null;
         }
-        ByteBuffer resultBuffer =
-                DirectIoUtils.resolveEncodedBuffer(
-                        ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
+        ByteBuffer resultBuffer = ioBuffer;
+        if (encodedLength < 0) {
+            resultBuffer = takeOwnedOverflowNative();
+            if (resultBuffer == null) {
+                throw new IllegalStateException("missing owned overflow direct buffer from JNI");
+            }
+            ioBuffer = resultBuffer;
+            releasePooledBuffer();
+        }
         return DirectScanEntry.decode(resultBuffer, Math.abs(encodedLength));
     }
 
@@ -81,10 +89,13 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         try {
             super.close();
         } finally {
-            if (ioBufferReleased.compareAndSet(false, true)) {
-                pool.release(ioBuffer);
-            }
+            releasePooledBuffer();
+            ioBuffer = null;
         }
+    }
+
+    private void releasePooledBuffer() {
+        if (ioBufferReleased.compareAndSet(false, true)) pool.release(pooledBuffer);
     }
 
     @Override
@@ -92,4 +103,6 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
 
     private static native int nextEntryDirectInternal(
             long nativeHandle, long ioAddress, int ioCapacity);
+
+    private static native ByteBuffer takeOwnedOverflowNative();
 }

@@ -1,13 +1,67 @@
-use crate::db::{direct_buffer_pool_config_array, encode_optional_columns_to_direct_buffer};
+use crate::db::{
+    direct_buffer_pool_config_array, encode_multi_get_payload,
+    encode_optional_columns_to_direct_buffer,
+};
 use crate::table::table_handle_from_handle_or_throw;
 use crate::util::{
-    decode_u16, take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
+    decode_packed_multi_get_keys, decode_u16, take_owned_overflow_direct_buffer,
+    throw_illegal_argument, throw_illegal_state, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use jni::JNIEnv;
 use jni::objects::{JByteBuffer, JClass};
 use jni::sys::{jint, jintArray, jlong, jobject};
 use std::fmt::Display;
+
+pub(crate) fn encode_direct_multi_get<E>(
+    env: &mut JNIEnv,
+    buffer: JByteBuffer,
+    get: impl FnOnce(&[(u16, &[u8])]) -> Result<Vec<Option<Vec<Option<Bytes>>>>, E>,
+) -> jint
+where
+    E: Display,
+{
+    let decoded = (|| {
+        let capacity = env
+            .get_direct_buffer_capacity(&buffer)
+            .map_err(|e| e.to_string())?;
+        let address = env
+            .get_direct_buffer_address(&buffer)
+            .map_err(|e| e.to_string())?;
+        let input = unsafe { std::slice::from_raw_parts(address, capacity) };
+        let keys = decode_packed_multi_get_keys(input)?;
+        Ok::<_, String>((capacity, address, keys))
+    })();
+    let (capacity, address, keys) = match decoded {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(env, error);
+            return 0;
+        }
+    };
+    let rows = match get(&keys) {
+        Ok(rows) => rows,
+        Err(error) => {
+            throw_illegal_state(env, error.to_string());
+            return 0;
+        }
+    };
+    drop(keys);
+    let payload = match encode_multi_get_payload(&rows) {
+        Ok(payload) => payload,
+        Err(error) => {
+            throw_illegal_state(env, error);
+            return 0;
+        }
+    };
+    match write_payload_to_io_or_cached_overflow(env, address, capacity, &payload) {
+        Ok(length) => length,
+        Err(error) => {
+            throw_illegal_state(env, error);
+            0
+        }
+    }
+}
 
 pub(crate) fn encode_direct_get<E>(
     env: &mut JNIEnv,
@@ -53,7 +107,7 @@ where
 }
 
 pub(crate) fn take_direct_overflow(env: &mut JNIEnv) -> jobject {
-    match take_last_overflow_direct_buffer(env) {
+    match take_owned_overflow_direct_buffer(env) {
         Ok(buffer) => buffer,
         Err(error) => {
             throw_illegal_state(env, error);
@@ -95,6 +149,19 @@ pub extern "system" fn Java_io_cobble_table_Table_getEncodedDirectNative(
     encode_direct_get(&mut env, bucket, buffer, key_length, |bucket, key| {
         table.access().get(bucket, key)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_Table_multiGetEncodedDirectNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    buffer: JByteBuffer,
+) -> jint {
+    let Some(table) = table_handle_from_handle_or_throw(&mut env, handle) else {
+        return 0;
+    };
+    encode_direct_multi_get(&mut env, buffer, |keys| table.access().multi_get(keys))
 }
 
 #[unsafe(no_mangle)]

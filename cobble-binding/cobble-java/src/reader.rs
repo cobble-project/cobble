@@ -1,5 +1,6 @@
 use crate::read_options::read_options_from_handle_or_throw;
 use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
+use crate::table_direct::{encode_direct_get, take_direct_overflow};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
     decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
@@ -8,7 +9,7 @@ use crate::util::{
 use cobble_binding::{Config, GlobalSnapshotManifest, Reader, ReaderBuilder, ReaderConfig};
 use cobble_table::register_schema_transforms;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jint, jlong, jobject, jstring};
 
 #[unsafe(no_mangle)]
@@ -280,6 +281,41 @@ pub extern "system" fn Java_io_cobble_Reader_get(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_getEncodedDirectNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    bucket: jint,
+    buffer: JByteBuffer,
+    key_length: jint,
+    read_options_handle: jlong,
+) -> jint {
+    let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
+        return 0;
+    };
+    if read_options_handle == 0 {
+        encode_direct_get(&mut env, bucket, buffer, key_length, |bucket, key| {
+            reader.get(bucket, key)
+        })
+    } else {
+        let Some(options) = read_options_from_handle_or_throw(&mut env, read_options_handle) else {
+            return 0;
+        };
+        encode_direct_get(&mut env, bucket, buffer, key_length, |bucket, key| {
+            reader.get_with_options(bucket, key, options.read_options())
+        })
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_takeDirectOverflowNative(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    take_direct_overflow(&mut env)
 }
 
 #[unsafe(no_mangle)]
