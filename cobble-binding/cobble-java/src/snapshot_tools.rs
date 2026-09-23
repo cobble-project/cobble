@@ -3,7 +3,10 @@ use crate::util::{
     decode_java_string, decode_u64_from_jlong, parse_config_json, throw_illegal_argument,
     throw_illegal_state,
 };
-use cobble_binding::{load_shard_snapshot_metadata, prune_shard_snapshot};
+use cobble_binding::{
+    DbCoordinator, ShardSnapshotMetadata, load_global_snapshot_metadata,
+    load_shard_snapshot_metadata, prune_shard_snapshot,
+};
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jlong, jstring};
@@ -92,6 +95,105 @@ pub extern "system" fn Java_io_cobble_SnapshotTools_loadShardSnapshotFromJson(
         },
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SnapshotTools_loadGlobalSnapshotFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    manifest_path: JString,
+) -> jstring {
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return std::ptr::null_mut();
+    };
+    let manifest_path = match decode_java_string(&mut env, manifest_path) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    match load_global_snapshot_metadata(&config, &manifest_path) {
+        Ok(snapshot) => match serde_json::to_string(&snapshot) {
+            Ok(json) => to_java_string_or_throw(&mut env, json),
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SnapshotTools_buildGlobalSnapshotFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    total_buckets: jni::sys::jint,
+    snapshot_id: jlong,
+    shards_json: JString,
+) -> jstring {
+    let total_buckets = match crate::util::decode_u32("totalBuckets", total_buckets) {
+        Ok(value) if value > 0 => value,
+        Ok(_) => {
+            throw_illegal_argument(&mut env, "totalBuckets must be > 0".to_string());
+            return std::ptr::null_mut();
+        }
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let shards_json = match decode_java_string(&mut env, shards_json) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let shards: Vec<ShardSnapshotMetadata> =
+        match serde_json::from_str::<Vec<ShardSnapshotMetadata>>(&shards_json) {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) => {
+                throw_illegal_argument(&mut env, "shards must not be empty".to_string());
+                return std::ptr::null_mut();
+            }
+            Err(err) => {
+                throw_illegal_argument(&mut env, format!("invalid shard metadata json: {err}"));
+                return std::ptr::null_mut();
+            }
+        };
+    match DbCoordinator::build_global_snapshot(total_buckets, shards, snapshot_id) {
+        Ok(snapshot) => match serde_json::to_string(&snapshot) {
+            Ok(json) => to_java_string_or_throw(&mut env, json),
+            Err(err) => {
+                throw_illegal_state(&mut env, err.to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(err) => {
+            throw_illegal_argument(&mut env, err.to_string());
             std::ptr::null_mut()
         }
     }

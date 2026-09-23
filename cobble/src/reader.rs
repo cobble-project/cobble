@@ -125,10 +125,7 @@ impl Reader {
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
         transforms: Arc<SchemaTransformRegistry>,
     ) -> Result<Self> {
-        let block_cache_size =
-            crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
-                .map_err(Error::ConfigError)?;
-        let mut config = Config {
+        let config = Config {
             volumes: read_config.volumes.clone(),
             total_buckets: read_config.total_buckets,
             block_cache_size: read_config.block_cache_size,
@@ -155,10 +152,73 @@ impl Reader {
         let fs = registry.get_or_register_volume(meta_volume)?;
         let manifest_name = snapshot_manifest_name(global_snapshot_id);
         let global_snapshot = load_global_snapshot_by_name(&fs, &manifest_name)?;
+        Self::fixed_from_manifest(
+            read_config,
+            config,
+            fs,
+            global_snapshot,
+            Some(manifest_name),
+            resolver,
+            transforms,
+        )
+    }
+
+    pub(crate) fn open_from_global_snapshot_with_resolver_and_transforms(
+        read_config: ReaderConfig,
+        global_snapshot: GlobalSnapshotManifest,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
+    ) -> Result<Self> {
+        global_snapshot.validate_version()?;
+        let config = Config {
+            volumes: read_config.volumes.clone(),
+            total_buckets: read_config.total_buckets,
+            block_cache_size: read_config.block_cache_size,
+            block_cache_hybrid_enabled: read_config.block_cache_hybrid_enabled,
+            block_cache_hybrid_disk_size: read_config.block_cache_hybrid_disk_size,
+            ..Config::default()
+        }
+        .normalize_volume_paths()?;
+        if config.volumes.is_empty() {
+            return Err(Error::ConfigError("No volumes configured".to_string()));
+        }
+        // Fixed externally-described views never read CURRENT, but retain a metadata filesystem
+        // for the reader's normal storage and cache setup.
+        let registry = FileSystemRegistry::new();
+        let meta_volume = config
+            .volumes
+            .iter()
+            .find(|volume| volume.supports(VolumeUsageKind::Meta))
+            .unwrap_or_else(|| config.volumes.first().expect("No meta volume exists"));
+        let fs = registry.get_or_register_volume(meta_volume)?;
+        Self::fixed_from_manifest(
+            read_config,
+            config,
+            fs,
+            global_snapshot,
+            None,
+            resolver,
+            transforms,
+        )
+    }
+
+    fn fixed_from_manifest(
+        read_config: ReaderConfig,
+        mut config: Config,
+        fs: Arc<dyn FileSystem>,
+        global_snapshot: GlobalSnapshotManifest,
+        last_pointer: Option<String>,
+        resolver: Option<Arc<dyn MergeOperatorResolver>>,
+        transforms: Arc<SchemaTransformRegistry>,
+    ) -> Result<Self> {
+        let block_cache_size =
+            crate::util::size_to_usize("reader.block_cache_size", read_config.block_cache_size)
+                .map_err(Error::ConfigError)?;
         // A global manifest is authoritative for bucket routing. In particular,
         // callers may use a reader config inherited from a differently sized
         // writer without changing the key hash used for this fixed view.
         config.total_buckets = global_snapshot.total_buckets;
+        let snapshot_id = global_snapshot.id;
         let bucket_map = build_bucket_map(&global_snapshot)?;
         let db_id = Uuid::new_v4().to_string();
         let block_cache = if block_cache_size > 0 {
@@ -183,10 +243,10 @@ impl Reader {
             fs,
             db_id,
             metrics_manager,
-            last_pointer: Some(manifest_name),
+            last_pointer,
             last_pointer_modified: None,
             auto_refresh: false,
-            fixed_snapshot_id: Some(global_snapshot_id),
+            fixed_snapshot_id: Some(snapshot_id),
             reload_tolerance: read_config.reload_tolerance,
             last_refresh_at: None,
             resolver,

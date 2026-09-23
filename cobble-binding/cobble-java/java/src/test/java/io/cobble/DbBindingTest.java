@@ -1176,6 +1176,15 @@ class DbBindingTest {
                     ValueCodec.encode(LogicalTypes.int64(), Value.int64(42L)), entry.columns[0]);
             assertNull(cursor.nextEntry());
         }
+        try (Reader reader = Reader.open(config, globalSnapshot);
+                ScanOptions options = new ScanOptions().columnFamily(physicalName);
+                ScanCursor cursor = reader.scanWithOptions(0, null, null, options)) {
+            ScanCursor.Entry entry = cursor.nextEntry();
+            assertNotNull(entry);
+            assertArrayEquals(
+                    ValueCodec.encode(LogicalTypes.int64(), Value.int64(42L)), entry.columns[0]);
+            assertNull(cursor.nextEntry());
+        }
     }
 
     @Test
@@ -1824,11 +1833,11 @@ class DbBindingTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> SnapshotTools.loadShardSnapshot(config, "", manifestPath));
-        IllegalStateException relativePath =
+        IllegalArgumentException relativePath =
                 assertThrows(
-                        IllegalStateException.class,
+                        IllegalArgumentException.class,
                         () -> SnapshotTools.loadShardSnapshot(config, dbId, "snapshot/SNAPSHOT-0"));
-        assertTrue(relativePath.getMessage().contains("manifest path must be absolute"));
+        assertTrue(relativePath.getMessage().contains("manifestPath must be absolute"));
 
         try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
             PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();

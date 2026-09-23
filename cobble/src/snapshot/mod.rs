@@ -26,7 +26,9 @@ pub(crate) use manifest::{
     load_manifest_entry, load_manifest_for_snapshot, snapshot_manifest_name,
 };
 pub(crate) use memtable::ActiveMemtableSnapshotData;
-pub use metadata::{ShardSnapshotMetadata, load_shard_snapshot_metadata};
+pub use metadata::{
+    ShardSnapshotMetadata, load_global_snapshot_metadata, load_shard_snapshot_metadata,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

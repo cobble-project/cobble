@@ -80,6 +80,23 @@ public final class Reader extends NativeObject {
         return new Reader(nativeHandle);
     }
 
+    /**
+     * Open a reader from an already resolved global snapshot manifest. Opening does not read
+     * CURRENT or a global manifest file, and reads do not auto-refresh. Explicit {@link #refresh()}
+     * still forces a CURRENT refresh. Config must provide access to the shard volumes.
+     */
+    public static Reader open(Config config, GlobalSnapshot snapshot) {
+        if (config == null || snapshot == null) {
+            throw new IllegalArgumentException("config and snapshot must not be null");
+        }
+        NativeLoader.load();
+        long nativeHandle = openHandleFromGlobalSnapshot(config.toJson(), snapshot.toJson());
+        if (nativeHandle == 0L) {
+            throw new IllegalStateException("failed to open reader from global snapshot");
+        }
+        return new Reader(nativeHandle);
+    }
+
     /** Force refresh from global snapshot pointer. */
     public void refresh() {
         refresh(nativeHandle);
@@ -126,7 +143,9 @@ public final class Reader extends NativeObject {
         return multiGet(nativeHandle, buckets, keys, readOptionsHandle);
     }
 
-    /** Open a high-throughput native scan cursor within [startKeyInclusive, endKeyExclusive). */
+    /**
+     * Open a scan cursor within [startKeyInclusive, endKeyExclusive); null bounds are unbounded.
+     */
     public ScanCursor scan(int bucket, byte[] startKeyInclusive, byte[] endKeyExclusive) {
         return scanWithOptions(bucket, startKeyInclusive, endKeyExclusive, null);
     }
@@ -155,7 +174,8 @@ public final class Reader extends NativeObject {
     }
 
     /**
-     * Open a zero-copy direct scan cursor with heap key bounds and explicit options.
+     * Open a zero-copy direct scan cursor with heap key bounds and explicit options. Null bounds
+     * are unbounded.
      *
      * <p>Each returned entry is valid only until the cursor advances or closes. The native scan
      * iterator captures the options while opening, so callers may close {@code options} once this
@@ -215,6 +235,9 @@ public final class Reader extends NativeObject {
     private static native long openHandle(String configPath, long globalSnapshotId);
 
     private static native long openHandleFromJson(String configJson, long globalSnapshotId);
+
+    private static native long openHandleFromGlobalSnapshot(
+            String configJson, String globalSnapshotJson);
 
     private static native void refresh(long nativeHandle);
 

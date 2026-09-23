@@ -15,6 +15,10 @@ public final class GlobalSnapshot implements Serializable {
     private static final long serialVersionUID = 534597938344L;
     private static final Gson GSON = new GsonBuilder().create();
 
+    /** Persisted global-manifest format version required by fixed readers. */
+    @SerializedName("version")
+    public int version = 2;
+
     /** Global snapshot id. */
     @SerializedName("id")
     public long id;
@@ -39,9 +43,14 @@ public final class GlobalSnapshot implements Serializable {
         return GSON.fromJson(json, GlobalSnapshot.class);
     }
 
+    /** Serializes this fixed manifest for a reader opened without coordinator metadata lookup. */
+    public String toJson() {
+        return GSON.toJson(this);
+    }
+
     /** Returns an independent copy suitable for retaining in a fixed read plan. */
     public GlobalSnapshot copy() {
-        return fromJson(GSON.toJson(this));
+        return fromJson(toJson());
     }
 
     public static List<GlobalSnapshot> listFromJson(String json) {

@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::schema::SchemaTransformRegistry;
-use crate::{Reader, ReaderConfig};
+use crate::{GlobalSnapshotManifest, Reader, ReaderConfig};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -46,6 +46,19 @@ impl ReaderBuilder {
         Reader::open_with_resolver_and_transforms(
             self.config,
             global_snapshot_id,
+            self.resolver,
+            self.transforms,
+        )
+    }
+
+    /// Opens an already resolved fixed global snapshot with the registered transforms.
+    pub fn open_from_global_snapshot(
+        self,
+        global_snapshot: GlobalSnapshotManifest,
+    ) -> Result<Reader> {
+        Reader::open_from_global_snapshot_with_resolver_and_transforms(
+            self.config,
+            global_snapshot,
             self.resolver,
             self.transforms,
         )

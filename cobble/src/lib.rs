@@ -184,7 +184,9 @@ pub use schema::{
     SnapshotColumnFamily, TransformSpec,
 };
 pub use single_db::SingleDb;
-pub use snapshot::{ShardSnapshotMetadata, load_shard_snapshot_metadata};
+pub use snapshot::{
+    ShardSnapshotMetadata, load_global_snapshot_metadata, load_shard_snapshot_metadata,
+};
 pub use snapshot_tool::prune_shard_snapshot;
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};

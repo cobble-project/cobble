@@ -1,5 +1,6 @@
 use super::manifest::{ManifestPayload, decode_manifest};
 use crate::config::{Config, VolumeUsageKind};
+use crate::coordinator::GlobalSnapshotManifest;
 use crate::error::{Error, Result};
 use crate::file::{FileSystemRegistry, MetadataReader};
 use crate::paths::schema_file_path_from_snapshot_manifest_path;
@@ -100,6 +101,31 @@ pub fn load_shard_snapshot_metadata(
         schema_id,
         column_families: snapshot_column_families_from_payload(schema_payload.as_ref(), schema_id)?,
     })
+}
+
+/// Load one persisted global snapshot manifest without opening shards or a writable coordinator.
+///
+/// This is intentionally metadata-only so external checkpoint resolvers can validate and reuse an
+/// already materialized global manifest without constructing a reader or mutating storage.
+pub fn load_global_snapshot_metadata(
+    config: &Config,
+    manifest_path: &str,
+) -> Result<GlobalSnapshotManifest> {
+    if !is_absolute_storage_path(manifest_path) {
+        return Err(Error::ConfigError(
+            "global snapshot manifest path must be absolute".to_string(),
+        ));
+    }
+    let (metadata_volume, relative_manifest_path) =
+        metadata_volume_and_relative_path(config, manifest_path)?;
+    let filesystem = FileSystemRegistry::new().get_or_register_volume(metadata_volume)?;
+    let payload = MetadataReader::new(filesystem.open_read(&relative_manifest_path)?).read_all()?;
+    let manifest: GlobalSnapshotManifest =
+        serde_json::from_slice(payload.as_ref()).map_err(|err| {
+            Error::IoError(format!("Failed to decode global snapshot manifest: {err}"))
+        })?;
+    manifest.validate_version()?;
+    Ok(manifest)
 }
 
 fn metadata_volume_and_relative_path<'a>(

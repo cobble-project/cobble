@@ -1,11 +1,11 @@
 use crate::read_options::read_options_from_handle_or_throw;
-use crate::scan::{ScanCursorHandle, decode_scan_open_args};
+use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
 use crate::util::{
     decode_java_bytes, decode_java_string, decode_multi_get_keys, decode_u16,
     decode_u64_from_jlong, parse_config_json, throw_illegal_argument, throw_illegal_state,
     to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
 };
-use cobble_binding::{Config, Reader, ReaderBuilder, ReaderConfig};
+use cobble_binding::{Config, GlobalSnapshotManifest, Reader, ReaderBuilder, ReaderConfig};
 use cobble_table::register_schema_transforms;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
@@ -137,6 +137,54 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromJson(
         }
     };
     Box::into_raw(Box::new(reader)) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Reader_openHandleFromGlobalSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    global_snapshot_json: JString,
+) -> jlong {
+    let json = match decode_java_string(&mut env, config_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let Some(config) = parse_config_json(&mut env, &json) else {
+        return 0;
+    };
+    let json = match decode_java_string(&mut env, global_snapshot_json) {
+        Ok(json) => json,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let snapshot = match serde_json::from_str::<GlobalSnapshotManifest>(&json) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            throw_illegal_argument(
+                &mut env,
+                format!("invalid fixed global snapshot manifest: {err}"),
+            );
+            return 0;
+        }
+    };
+    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config));
+    if let Err(err) = register_schema_transforms(&builder) {
+        throw_illegal_state(&mut env, err.to_string());
+        return 0;
+    }
+    match builder.open_from_global_snapshot(snapshot) {
+        Ok(reader) => Box::into_raw(Box::new(reader)) as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
 }
 
 fn open_table_reader(config: Config, snapshot_id: u64) -> cobble_binding::Result<Reader> {
@@ -291,7 +339,7 @@ pub extern "system" fn Java_io_cobble_Reader_openScanCursor(
     let Some(reader) = reader_from_handle_or_throw(&mut env, native_handle) else {
         return 0;
     };
-    let Some(args) = decode_scan_open_args(
+    let Some(args) = decode_scan_open_bounds_args(
         &mut env,
         bucket,
         start_key_inclusive,
@@ -300,28 +348,21 @@ pub extern "system" fn Java_io_cobble_Reader_openScanCursor(
     ) else {
         return 0;
     };
-    let iter = match args.scan_options_handle {
-        Some(scan_options_handle) => match reader.scan_with_options(
-            args.bucket,
-            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
-            scan_options_handle.scan_options(),
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                throw_illegal_state(&mut env, err.to_string());
-                return 0;
-            }
-        },
-        None => match reader.scan(
-            args.bucket,
-            args.start_key_inclusive.as_slice()..args.end_key_exclusive.as_slice(),
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                throw_illegal_state(&mut env, err.to_string());
-                return 0;
-            }
-        },
+    let options = args
+        .scan_options_handle
+        .map(|handle| handle.scan_options().clone())
+        .unwrap_or_default();
+    let iter = match reader.scan_with_options_bounds(
+        args.bucket,
+        args.start_key_inclusive.as_deref(),
+        args.end_key_exclusive.as_deref(),
+        &options,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            return 0;
+        }
     };
     Box::into_raw(Box::new(ScanCursorHandle::from_static_iter(iter))) as jlong
 }

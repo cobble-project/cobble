@@ -318,6 +318,25 @@ fn schema_transforms_survive_lazy_shards_eviction_and_refresh() {
             );
             assert_eq!(reader.cache.lock().unwrap().len(), 1);
         }
+        // An externally supplied fixed global manifest uses exactly the same lazy shard cache.
+        // It has no typed-table metadata dependency and repeated routed reads reuse the opened DB.
+        let fixed_manifest = reader.current_global_snapshot().clone();
+        let mut manifest_reader = ReaderBuilder::new(reader_config.clone())
+            .register_schema_transform("render", move |_spec| Ok(render))
+            .unwrap()
+            .open_from_global_snapshot(fixed_manifest)
+            .unwrap();
+        assert_eq!(manifest_reader.cache.lock().unwrap().len(), 0);
+        for bucket in [0, 1, 0] {
+            assert_eq!(
+                manifest_reader
+                    .get_with_options(bucket, &keys[0], &read)
+                    .unwrap(),
+                Some(old_row.clone()),
+                "in-memory manifest bucket {bucket}, format {file_type:?}"
+            );
+            assert_eq!(manifest_reader.cache.lock().unwrap().len(), 1);
+        }
         assert_eq!(
             reader
                 .multi_get_with_options(&[(1, &keys[0]), (0, &keys[0]), (1, &keys[10])], &read)

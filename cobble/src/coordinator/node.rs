@@ -130,7 +130,11 @@ impl DbCoordinator {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn build_global_snapshot(
+    /// Build a fixed global manifest from complete shard metadata without opening a coordinator.
+    ///
+    /// This is shared by coordinator commits and language bindings that need an in-memory,
+    /// validated manifest for an externally supplied checkpoint.
+    pub fn build_global_snapshot(
         total_buckets: u32,
         shard_snapshots: Vec<ShardSnapshotMetadata>,
         id: u64,
