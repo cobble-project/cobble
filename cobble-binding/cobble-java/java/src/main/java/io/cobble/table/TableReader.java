@@ -1,277 +1,282 @@
 package io.cobble.table;
 
 import io.cobble.Config;
-import io.cobble.DirectColumns;
-import io.cobble.DirectScanCursor;
-import io.cobble.NativeLoader;
-import io.cobble.NativeObject;
+import io.cobble.GlobalSnapshot;
+import io.cobble.Reader;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * Typed reader over one current or fixed global table snapshot.
+ * Public reader for a current or fixed Cobble table snapshot.
  *
- * <p>Current readers check for new commits on read access at the configured refresh interval. Fixed
- * readers never advance. Schema access does not perform I/O. Existing projections, cursors, and
- * direct rows remain usable after this reader refreshes or closes and must be closed separately.
+ * <p>The native implementation remains an internal {@link NativeTableReader}; external formats will
+ * use this same facade through their fixed read sessions. Native direct reads, projections,
+ * refresh, and multi-get retain their existing implementation and lifetime semantics.
  */
-public final class TableReader extends NativeObject {
-    private final String name;
-    private final long refreshIntervalNanos;
-    private volatile Table.TableState state;
-    private TableReaderView view;
-    private long nextRefreshNanos;
-    private final DirectColumns.Reader directReader =
-            new DirectColumns.Reader() {
-                @Override
-                public int read(int bucket, ByteBuffer ioBuffer, int keyLength) {
-                    return view.getEncodedDirect(bucket, ioBuffer, keyLength, state.readOptions);
-                }
+public final class TableReader implements AutoCloseable {
+    private final NativeTableReader nativeReader;
+    private final TableReadSnapshot snapshot;
+    private final TableReadSession<List<Value>, List<Value>> session;
+    private boolean closed;
 
-                @Override
-                public ByteBuffer takeOverflowBuffer() {
-                    return view.takeDirectOverflowBuffer();
-                }
-            };
-
-    private TableReader(long nativeHandle, String name) {
-        super(nativeHandle);
-        this.name = name;
-        long viewHandle = acquireViewNative(nativeHandle, 0L);
-        if (viewHandle == 0L)
-            throw new IllegalStateException("failed to acquire table reader view");
-        TableReaderView initial = new TableReaderView(viewHandle);
-        try {
-            Table.OpenInfo info =
-                    TableJson.openInfoFromJson(describeViewNative(initial.getNativeHandle()));
-            state = Table.TableState.createReadOnly(name, info);
-            refreshIntervalNanos = refreshIntervalNanosNative(nativeHandle);
-            nextRefreshNanos = System.nanoTime() + Math.max(0L, refreshIntervalNanos);
-            view = initial;
-        } catch (RuntimeException error) {
-            initial.close();
-            throw error;
-        }
+    private TableReader(NativeTableReader nativeReader) {
+        this.nativeReader = Objects.requireNonNull(nativeReader, "nativeReader");
+        this.snapshot = null;
+        this.session = null;
     }
 
-    static TableReader fromNativeHandle(long nativeHandle, String name) {
-        if (nativeHandle == 0L) throw new IllegalStateException("failed to open table reader");
-        try {
-            return new TableReader(nativeHandle, name);
-        } catch (RuntimeException error) {
-            disposeHandleNative(nativeHandle);
-            throw error;
-        }
+    private TableReader(
+            TableReadSnapshot snapshot, TableReadSession<List<Value>, List<Value>> session) {
+        this.nativeReader = null;
+        this.snapshot = Objects.requireNonNull(snapshot, "snapshot");
+        this.session = Objects.requireNonNull(session, "session");
     }
 
     public static TableReader openCurrent(Config config, String tableName) {
         Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(tableName, "tableName");
-        NativeLoader.load();
-        long handle = openCurrentNative(config.toJson(), tableName);
-        return fromNativeHandle(handle, tableName);
+        try (Reader reader = Reader.openCurrent(config)) {
+            GlobalSnapshot snapshot = reader.currentGlobalSnapshot();
+            if (snapshot == null) {
+                throw new IllegalArgumentException("no committed snapshot for '" + tableName + "'");
+            }
+            TableReadSnapshot description =
+                    TableReadSnapshot.forGlobal(config, snapshot, tableName);
+            if (TableMetadata.FORMAT.equals(description.formatId())) {
+                return new TableReader(NativeTableReader.openCurrent(config, tableName));
+            }
+            return openFixed(config, description);
+        }
     }
 
     public static TableReader open(Config config, String tableName, long snapshotId) {
         Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(tableName, "tableName");
-        NativeLoader.load();
-        long handle = openNative(config.toJson(), tableName, snapshotId);
-        return fromNativeHandle(handle, tableName);
+        if (snapshotId < 0L) throw new IllegalArgumentException("snapshotId must be >= 0");
+        try (Reader reader = Reader.open(config, snapshotId)) {
+            GlobalSnapshot snapshot = reader.currentGlobalSnapshot();
+            if (snapshot == null) {
+                throw new IllegalArgumentException("no committed snapshot for '" + tableName + "'");
+            }
+            TableReadSnapshot description =
+                    TableReadSnapshot.forGlobal(config, snapshot, tableName);
+            if (TableMetadata.FORMAT.equals(description.formatId())) {
+                return new TableReader(NativeTableReader.open(config, tableName, snapshotId));
+            }
+            return openFixed(config, description);
+        }
     }
 
-    public String name() {
-        ensureUsable();
-        return name;
+    /** Opens a fixed external read through the installed table-format plugin. */
+    public static TableReader open(Config config, TablePathRequest request) throws Exception {
+        TableReadSnapshot snapshot = TableFormatPluginRegistry.resolvePath(config, request);
+        return openFixed(config, snapshot);
     }
 
-    public TableSchema schema() {
-        return state().compiled.schema;
-    }
-
-    public TableKeyBuilder keyBuilder() {
-        return new TableKeyBuilder(state().compiled);
-    }
-
-    /** Checks for a newer committed snapshot; returns false for fixed or unchanged readers. */
-    public synchronized boolean refresh() {
-        ensureUsable();
-        refreshNative(nativeHandle);
-        boolean changed = installChangedView();
-        scheduleNext();
-        return changed;
-    }
-
-    public synchronized List<Value> get(TableKey key) {
-        access();
-        TableReaderView current = view;
-        Table.TableState currentState = state;
-        byte[][] columns =
-                current.get(key.bucket(), key.encodedInternal(), currentState.readOptions);
-        return columns == null
-                ? null
-                : Table.assembleRow(currentState.compiled, key.valuesInternal(), columns);
+    /** Opens an already-resolved, fixed snapshot description without reselecting a path. */
+    public static TableReader open(Config config, TableReadSnapshot snapshot) {
+        Objects.requireNonNull(config, "config");
+        return openFixed(config, Objects.requireNonNull(snapshot, "snapshot"));
     }
 
     /**
-     * Reads one row through direct I/O and decodes a borrowed typed view.
+     * Opens an already-resolved fixed description with its known format implementation.
      *
-     * <p>Binary values, including nested binary values, remain valid only until the returned row is
-     * closed. The key buffer is overwritten from position zero.
+     * <p>This is for integrations that package a format implementation without registering a second
+     * service provider. The implementation must exactly match the persisted format ID.
      */
-    public synchronized DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
-        access();
-        return Table.readDirectRow(state.compiled, key, keyBuffer, directReader);
-    }
-
-    public synchronized List<List<Value>> multiGet(List<TableKey> keys) {
-        access();
-        TableReaderView current = view;
-        Table.TableState currentState = state;
-        int[] buckets = new int[keys.size()];
-        byte[][] encoded = new byte[keys.size()][];
-        for (int i = 0; i < keys.size(); i++) {
-            TableKey key = Objects.requireNonNull(keys.get(i), "primaryKey");
-            buckets[i] = key.bucket();
-            encoded[i] = key.encodedInternal();
+    public static TableReader open(
+            Config config, TableReadSnapshot snapshot, TableFormatPlugin plugin) {
+        Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(snapshot, "snapshot");
+        Objects.requireNonNull(plugin, "plugin");
+        if (!snapshot.formatId().equals(plugin.formatId())) {
+            throw new IllegalArgumentException(
+                    "format plugin '"
+                            + plugin.formatId()
+                            + "' does not match fixed snapshot format '"
+                            + snapshot.formatId()
+                            + "'");
         }
-        byte[][][] columns = current.multiGet(buckets, encoded, currentState.readOptions);
-        List<List<Value>> rows = new ArrayList<List<Value>>(columns.length);
-        for (int i = 0; i < columns.length; i++)
-            rows.add(
-                    columns[i] == null
-                            ? null
-                            : Table.assembleRow(
-                                    currentState.compiled,
-                                    keys.get(i).valuesInternal(),
-                                    columns[i]));
-        return Collections.unmodifiableList(rows);
+        return openFixed(config, snapshot, plugin);
     }
 
-    public synchronized TableProjection projectByNames(List<String> fields) {
-        access();
-        TableReaderView retained = view.copy();
-        Table.TableState currentState = state;
+    private static TableReader openFixed(Config config, TableReadSnapshot snapshot) {
+        if (TableMetadata.FORMAT.equals(snapshot.formatId())) {
+            GlobalSnapshot global = snapshot.globalSnapshot();
+            if (global == null) {
+                throw new IllegalArgumentException(
+                        "native table reads require a fixed global snapshot");
+            }
+            return new TableReader(
+                    NativeTableReader.open(config, snapshot.columnFamily(), global.id));
+        }
+        TableFormatPlugin plugin = TableFormatPluginRegistry.resolve(snapshot.formatId());
+        return openFixed(config, snapshot, plugin);
+    }
+
+    private static TableReader openFixed(
+            Config config, TableReadSnapshot snapshot, TableFormatPlugin plugin) {
         try {
-            return new TableProjection(
-                    TableReadBackend.readerView(retained),
-                    name,
-                    currentState.compiled,
-                    currentState.columnFamilyOptionsJson,
-                    currentState.physicalColumns,
-                    fields,
-                    retained);
+            if (TableMetadata.FORMAT.equals(snapshot.formatId())) {
+                // Keep the native typed controller: it owns schema-transform registration,
+                // retained projections, and current-view refresh. NativeTableReader exposes the
+                // same NativeBinding for the facade's schema and key contract.
+                plugin.bind(snapshot);
+                io.cobble.GlobalSnapshot global = snapshot.globalSnapshot();
+                if (global == null) {
+                    throw new IllegalArgumentException(
+                            "native table reads require a fixed global snapshot");
+                }
+                return new TableReader(
+                        NativeTableReader.open(config, snapshot.columnFamily(), global.id));
+            }
+            TableFormatBinding binding = plugin.bind(snapshot);
+            return new TableReader(
+                    snapshot, new PhysicalTableReadSession(config, snapshot, binding));
         } catch (RuntimeException error) {
-            retained.close();
             throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("failed to open fixed table reader", error);
         }
     }
 
-    public synchronized TableScanCursor scan(int bucket) {
-        return scanBounds(bucket, null, null);
+    static TableReader fromNativeHandle(long nativeHandle, String name) {
+        return new TableReader(NativeTableReader.fromNativeHandle(nativeHandle, name));
     }
 
-    public synchronized TableScanCursor scanBounds(int bucket, TableKey start, TableKey end) {
-        access();
-        Table.TableState currentState = state;
-        Table.validateBound(bucket, start);
-        Table.validateBound(bucket, end);
-        TableReaderView retained = view.copy();
-        try {
-            DirectScanCursor cursor =
-                    retained.scan(
-                            bucket,
-                            start == null ? null : start.encodedInternal(),
-                            end == null ? null : end.encodedInternal(),
-                            currentState.scanOptions);
-            return new TableScanCursor(
-                    retained,
-                    cursor,
-                    entry -> Table.decodeDirectScannedRowOwned(currentState.compiled, entry),
-                    retained);
-        } catch (RuntimeException error) {
-            retained.close();
-            throw error;
+    /** Logical read schema. Unlike native write schemas, this does not require a primary key. */
+    public TableReadSchema schema() {
+        ensureOpen();
+        return nativeReader == null ? session.schema() : nativeReader.binding().schema();
+    }
+
+    /** Native table schema, including primary-key metadata required by write-aware callers. */
+    public TableSchema tableSchema() {
+        ensureOpen();
+        requireNative();
+        return nativeReader.tableSchema();
+    }
+
+    public TableReadCapabilities capabilities() {
+        ensureOpen();
+        return nativeReader == null
+                ? session.capabilities()
+                : nativeReader.binding().capabilities();
+    }
+
+    /** Full-key fields in the exact order accepted by {@link #lookup(List)}. */
+    public List<DataField> keyFields() {
+        ensureOpen();
+        return nativeReader == null ? session.keyFields() : nativeReader.binding().keyFields();
+    }
+
+    /** Opens a logical scan on this reader's fixed snapshot. */
+    public TableReadCursor<List<Value>> scan(TableReadRange range, TableReadPosition position)
+            throws Exception {
+        ensureOpen();
+        Objects.requireNonNull(range, "range");
+        if (nativeReader == null) return session.scan(range, position);
+        return scanPlan().scan(configForNative(), range, position);
+    }
+
+    /** Exact lookup by the format's documented full-key field order. */
+    public java.util.Collection<TableReadEntry<List<Value>>> lookup(List<Value> fullKey)
+            throws Exception {
+        ensureOpen();
+        if (nativeReader != null) {
+            TableKeyBuilder builder = nativeReader.keyBuilder();
+            for (Value value : Objects.requireNonNull(fullKey, "fullKey")) builder.push(value);
+            TableKey key = builder.build();
+            List<Value> row = nativeReader.get(key);
+            return row == null
+                    ? java.util.Collections.<TableReadEntry<List<Value>>>emptyList()
+                    : java.util.Collections.singletonList(
+                            new TableReadEntry<List<Value>>(
+                                    new TableReadPosition(key.bucket(), null, 1), row));
         }
+        return session.lookup(Objects.requireNonNull(fullKey, "fullKey"));
     }
 
-    /** Builds a portable full-scan plan pinned to this reader's current loaded snapshot. */
-    public synchronized TableScanPlan scanPlan() {
-        access();
-        return view.scanPlan();
+    public String name() {
+        ensureOpen();
+        return nativeReader == null ? snapshot.columnFamily() : nativeReader.name();
+    }
+
+    public TableKeyBuilder keyBuilder() {
+        requireNative();
+        return nativeReader.keyBuilder();
+    }
+
+    public boolean refresh() {
+        ensureOpen();
+        return nativeReader != null && nativeReader.refresh();
+    }
+
+    public List<Value> get(TableKey key) {
+        requireNative();
+        return nativeReader.get(key);
+    }
+
+    public DirectTableRow getDirect(TableKey key, ByteBuffer keyBuffer) {
+        requireNative();
+        return nativeReader.getDirect(key, keyBuffer);
+    }
+
+    public List<List<Value>> multiGet(List<TableKey> keys) {
+        requireNative();
+        return nativeReader.multiGet(keys);
+    }
+
+    public TableProjection projectByNames(List<String> fields) {
+        requireNative();
+        return nativeReader.projectByNames(fields);
+    }
+
+    public TableScanCursor scan(int bucket) {
+        requireNative();
+        return nativeReader.scan(bucket);
+    }
+
+    public TableScanCursor scanBounds(int bucket, TableKey start, TableKey end) {
+        requireNative();
+        return nativeReader.scanBounds(bucket, start, end);
+    }
+
+    public TableScanPlan scanPlan() {
+        ensureOpen();
+        if (nativeReader != null) return nativeReader.scanPlan();
+        long dataSizeBytes = 0L;
+        for (TableReadSnapshot.ShardDescriptor shard : snapshot.shards()) {
+            dataSizeBytes = Math.addExact(dataSizeBytes, shard.snapshot().dataSizeBytes);
+        }
+        return TableScanPlan.forRead(
+                snapshot, session.schema(), session.capabilities(), dataSizeBytes);
+    }
+
+    private Config configForNative() {
+        return nativeReader.config();
     }
 
     @Override
-    public synchronized void close() {
-        if (!isDisposed() && view != null) view.close();
-        if (!isDisposed() && state != null) state.close();
-        super.close();
+    public void close() {
+        if (closed) return;
+        closed = true;
+        if (nativeReader != null) nativeReader.close();
+        else session.close();
     }
 
-    @Override
-    protected native void disposeInternal(long nativeHandle);
-
-    private void access() {
-        ensureUsable();
-        if (refreshIntervalNanos >= 0L && System.nanoTime() - nextRefreshNanos >= 0L) {
-            refreshNative(nativeHandle);
-            installChangedView();
-            scheduleNext();
+    private void requireNative() {
+        ensureOpen();
+        if (nativeReader == null) {
+            throw new UnsupportedOperationException(
+                    "format '"
+                            + snapshot.formatId()
+                            + "' does not expose native direct table APIs");
         }
     }
 
-    private boolean installChangedView() {
-        long candidateHandle = acquireViewNative(nativeHandle, view.getNativeHandle());
-        if (candidateHandle == 0L) return false;
-        TableReaderView candidate = new TableReaderView(candidateHandle);
-        try {
-            Table.TableState candidateState =
-                    Table.TableState.createReadOnly(
-                            name, TableJson.openInfoFromJson(describeViewNative(candidateHandle)));
-            TableReaderView previousView = view;
-            Table.TableState previousState = state;
-            view = candidate;
-            state = candidateState;
-            previousView.close();
-            previousState.close();
-            return true;
-        } catch (RuntimeException error) {
-            candidate.close();
-            throw error;
-        }
+    private void ensureOpen() {
+        if (closed) throw new IllegalStateException("table reader is closed");
     }
-
-    private void scheduleNext() {
-        nextRefreshNanos = System.nanoTime() + Math.max(0L, refreshIntervalNanos);
-    }
-
-    private Table.TableState state() {
-        ensureUsable();
-        return state;
-    }
-
-    private void ensureUsable() {
-        if (isDisposed() || nativeHandle == 0L)
-            throw new IllegalStateException("table reader is closed");
-    }
-
-    static native long cloneViewNative(long viewHandle);
-
-    private static native long openCurrentNative(String configJson, String tableName);
-
-    private static native long openNative(String configJson, String tableName, long snapshotId);
-
-    private static native void disposeHandleNative(long nativeHandle);
-
-    private static native long acquireViewNative(long nativeHandle, long currentViewHandle);
-
-    private static native String describeViewNative(long viewHandle);
-
-    private static native boolean refreshNative(long nativeHandle);
-
-    private static native long refreshIntervalNanosNative(long nativeHandle);
 }

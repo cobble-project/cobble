@@ -1,6 +1,8 @@
 package io.cobble.table;
 
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * A resource-owning logical read session provided by a {@link TableReadProvider}.
@@ -12,6 +14,11 @@ public interface TableReadSession<R, K> extends AutoCloseable {
     TableReadSchema schema();
 
     TableReadCapabilities capabilities();
+
+    /** Full-key fields in the exact order required by {@link #lookup(Object)}, when supported. */
+    default List<DataField> keyFields() {
+        return Collections.emptyList();
+    }
 
     /**
      * Opens a scan at the supplied position, or at its beginning.

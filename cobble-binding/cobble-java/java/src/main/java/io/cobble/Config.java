@@ -228,6 +228,11 @@ public final class Config {
         return this;
     }
 
+    /** Returns an independent configuration copy without sharing volume credentials or maps. */
+    public Config copy() {
+        return GSON.fromJson(GSON.toJson(this), Config.class);
+    }
+
     public Config numColumns(int value) {
         numColumns = value;
         return this;

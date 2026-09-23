@@ -9,12 +9,27 @@ public final class TableReadPosition {
     private final int intraEntryOffset;
 
     public TableReadPosition(int bucket, byte[] physicalKey, int intraEntryOffset) {
+        this(bucket, physicalKey, intraEntryOffset, true);
+    }
+
+    /**
+     * Retains a cursor-private key without copying it. Callers must not mutate the key after this
+     * method returns; public {@link #physicalKey()} remains defensive.
+     */
+    static TableReadPosition owned(int bucket, byte[] physicalKey, int intraEntryOffset) {
+        return new TableReadPosition(bucket, physicalKey, intraEntryOffset, false);
+    }
+
+    private TableReadPosition(
+            int bucket, byte[] physicalKey, int intraEntryOffset, boolean copyPhysicalKey) {
         if (intraEntryOffset < 0) {
             throw new IllegalArgumentException("intraEntryOffset must be >= 0");
         }
         this.bucket = bucket;
         this.physicalKey =
-                physicalKey == null ? null : Arrays.copyOf(physicalKey, physicalKey.length);
+                physicalKey == null || !copyPhysicalKey
+                        ? physicalKey
+                        : Arrays.copyOf(physicalKey, physicalKey.length);
         this.intraEntryOffset = intraEntryOffset;
     }
 

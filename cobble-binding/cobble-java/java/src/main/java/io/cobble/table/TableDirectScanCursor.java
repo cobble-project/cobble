@@ -27,7 +27,11 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
                 throws Exception;
     }
 
-    /** Decodes one transient physical entry into owned logical rows. */
+    /**
+     * Decodes one transient physical entry into owned logical rows. The key is a decoder-private
+     * heap copy and may be handled as an ordinary byte array, but direct entry views remain valid
+     * only for this callback.
+     */
     @FunctionalInterface
     public interface EntryDecoder<R> {
         List<R> decode(DirectScanEntry entry, byte[] ownedKey) throws Exception;
@@ -35,6 +39,7 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
 
     private final List<Integer> buckets;
     private final TableReadPosition resume;
+    private final byte[] resumeKey;
     private final byte[] endExclusive;
     private final BucketCursorOpener opener;
     private final EntryDecoder<R> decoder;
@@ -59,6 +64,7 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
             boolean fixedCursor) {
         this.buckets = Collections.unmodifiableList(new ArrayList<Integer>(buckets));
         this.resume = resume;
+        this.resumeKey = resume == null ? null : resume.physicalKey();
         this.endExclusive = copy(endExclusive);
         this.opener = opener;
         this.decoder = Objects.requireNonNull(decoder, "decoder");
@@ -88,7 +94,10 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
                 true);
     }
 
-    /** Traverses fixed buckets, reopening a direct cursor only when moving to the next bucket. */
+    /**
+     * Traverses fixed buckets, reopening a direct cursor only when moving to the next bucket.
+     * {@code endExclusive} may be null for an unbounded upper scan range.
+     */
     public static <R> TableDirectScanCursor<R> buckets(
             List<Integer> buckets,
             TableReadPosition resume,
@@ -111,7 +120,7 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
         return new TableDirectScanCursor<R>(
                 buckets,
                 resume,
-                Objects.requireNonNull(endExclusive, "endExclusive"),
+                endExclusive,
                 Objects.requireNonNull(opener, "opener"),
                 decoder,
                 null,
@@ -153,7 +162,7 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
                     boolean countPhysicalEntry = physicalEntryPending;
                     physicalEntryPending = false;
                     return new TableReadEntry<R>(
-                            new TableReadPosition(entryBucket, entryKey, emittedOffset),
+                            TableReadPosition.owned(entryBucket, entryKey, emittedOffset),
                             rows.get(emittedOffset - 1),
                             countPhysicalEntry ? entryBytes : 0L,
                             countPhysicalEntry);
@@ -176,9 +185,7 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
                 if (fixedCursor || bucketIndex >= buckets.size()) return false;
                 int bucket = buckets.get(bucketIndex).intValue();
                 byte[] start =
-                        resume != null && bucket == resume.bucket()
-                                ? resume.physicalKey()
-                                : new byte[0];
+                        resume != null && bucket == resume.bucket() ? resumeKey : new byte[0];
                 cursor = opener.open(bucket, start, endExclusive);
                 if (cursor == null) {
                     bucketIndex++;
@@ -196,11 +203,13 @@ public final class TableDirectScanCursor<R> implements TableReadCursor<R> {
             if (entryBucket < 0 && !fixedCursor) entryBucket = buckets.get(bucketIndex).intValue();
             entryKey = copy(entry.getKey());
             entryBytes = physicalBytes(entry, entryKey);
-            rows = Objects.requireNonNull(decoder.decode(entry, entryKey), "decoded rows");
+            // Positions share entryKey across expanded logical rows. Keep decoders isolated from
+            // that durable state because their public contract permits ordinary byte[] handling.
+            rows = Objects.requireNonNull(decoder.decode(entry, copy(entryKey)), "decoded rows");
             rowOffset = 0;
             if (resume != null
                     && entryBucket == resume.bucket()
-                    && Arrays.equals(entryKey, resume.physicalKey())) {
+                    && Arrays.equals(entryKey, resumeKey)) {
                 rowOffset = resume.intraEntryOffset();
                 if (rowOffset > rows.size()) {
                     throw new IllegalArgumentException(

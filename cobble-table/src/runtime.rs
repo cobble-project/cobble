@@ -928,11 +928,7 @@ fn required_reader_table_name(
 
 pub(crate) struct GlobalReaderState {
     total_buckets: u32,
-    state: Mutex<GlobalReaderInner>,
-}
-
-struct GlobalReaderInner {
-    reader: Reader,
+    reader: Mutex<Reader>,
     name: String,
     metadata: TableMetadata,
 }
@@ -942,11 +938,9 @@ impl GlobalReaderState {
         let total_buckets = reader.current_global_snapshot().total_buckets;
         Self {
             total_buckets,
-            state: Mutex::new(GlobalReaderInner {
-                reader,
-                name,
-                metadata,
-            }),
+            reader: Mutex::new(reader),
+            name,
+            metadata,
         }
     }
 
@@ -960,8 +954,8 @@ impl GlobalReaderState {
         key: &[u8],
         options: &ReadOptions,
     ) -> Result<Option<Vec<Option<bytes::Bytes>>>> {
-        let mut state = lock_global_state(&self.state)?;
-        Ok(state.reader.get_with_options(bucket, key, options)?)
+        let mut reader = lock_physical_reader(&self.reader)?;
+        Ok(reader.get_with_options(bucket, key, options)?)
     }
 
     pub(crate) fn multi_get(
@@ -969,8 +963,8 @@ impl GlobalReaderState {
         keys: &[(u16, &[u8])],
         options: &ReadOptions,
     ) -> Result<Vec<Option<Vec<Option<bytes::Bytes>>>>> {
-        let mut state = lock_global_state(&self.state)?;
-        Ok(state.reader.multi_get_with_options(keys, options)?)
+        let mut reader = lock_physical_reader(&self.reader)?;
+        Ok(reader.multi_get_with_options(keys, options)?)
     }
 
     pub(crate) fn scan(
@@ -980,37 +974,35 @@ impl GlobalReaderState {
         end: Option<&[u8]>,
         options: &ScanOptions,
     ) -> Result<DbIterator> {
-        let mut state = lock_global_state(&self.state)?;
-        Ok(state
-            .reader
-            .scan_with_options_bounds(bucket, start, end, options)?)
+        let mut reader = lock_physical_reader(&self.reader)?;
+        Ok(reader.scan_with_options_bounds(bucket, start, end, options)?)
     }
 
     pub(crate) fn scan_plan(&self) -> Result<crate::TableScanPlan> {
-        let state = lock_global_state(&self.state)?;
-        let snapshot = state.reader.current_global_snapshot().clone();
+        let reader = lock_physical_reader(&self.reader)?;
+        let snapshot = reader.current_global_snapshot();
         crate::TableScanPlan::from_global_reader(
-            state.name.clone(),
-            state.metadata.clone(),
+            self.name.clone(),
+            self.metadata.clone(),
             snapshot.id,
             snapshot.total_buckets,
-            snapshot.shard_snapshots,
-            state.reader.config().clone(),
+            snapshot.shard_snapshots.clone(),
+            reader.config().clone(),
         )
     }
 
     fn refreshed_snapshot(&self) -> Result<Option<(Reader, String, Option<TableId>)>> {
-        let state = lock_global_state(&self.state)?;
-        Ok(state.reader.refreshed_snapshot()?.map(|reader| {
-            (
-                reader,
-                state.name.clone(),
-                state
-                    .metadata
-                    .catalog_binding
-                    .map(|binding| binding.table_id),
-            )
-        }))
+        Ok(lock_physical_reader(&self.reader)?
+            .refreshed_snapshot()?
+            .map(|reader| {
+                (
+                    reader,
+                    self.name.clone(),
+                    self.metadata
+                        .catalog_binding
+                        .map(|binding| binding.table_id),
+                )
+            }))
     }
 }
 
@@ -1024,10 +1016,8 @@ fn global_metadata(reader: &Reader, name: &str) -> Result<TableMetadata> {
     load_table_metadata_for_shard(reader.config(), shard, name)
 }
 
-fn lock_global_state(
-    state: &Mutex<GlobalReaderInner>,
-) -> Result<std::sync::MutexGuard<'_, GlobalReaderInner>> {
-    state
+fn lock_physical_reader(reader: &Mutex<Reader>) -> Result<std::sync::MutexGuard<'_, Reader>> {
+    reader
         .lock()
         .map_err(|_| TableError::internal("table reader core lock poisoned"))
 }

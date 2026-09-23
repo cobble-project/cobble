@@ -16,11 +16,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class TableReadFormatRegistryTest {
+class TableFormatPluginRegistryTest {
     @TempDir Path dataDir;
 
     @Test
@@ -47,15 +48,20 @@ class TableReadFormatRegistryTest {
         global.shardSnapshots.get(0).columnFamilies.clear();
         assertEquals("cobble-table", snapshot.formatId());
 
-        TableScanPlan plan = roundTrip(TableReadFormatRegistry.plan(config, snapshot));
+        TableScanPlan plan;
+        try (TableReader reader = TableReader.open(config, "data", global.id)) {
+            plan = roundTrip(reader.scanPlan());
+        }
         assertEquals(Arrays.asList("id", "value"), names(plan.readSchema()));
         assertEquals(1, plan.splits().size());
         assertEquals(global.id, plan.snapshotId());
         assertEquals(1, plan.totalBuckets());
-        assertEquals(
-                plan.readSchema().fields(),
-                TableScanPlan.forSnapshot(config, "data", global.id).readSchema().fields());
-        assertEquals(global.id, TableScanPlan.forCurrentSnapshot(config, "data").snapshotId());
+        try (TableReader reader = TableReader.open(config, "data", global.id)) {
+            assertEquals(plan.readSchema().fields(), reader.scanPlan().readSchema().fields());
+        }
+        try (TableReader reader = TableReader.openCurrent(config, "data")) {
+            assertEquals(global.id, reader.scanPlan().snapshotId());
+        }
         TableScanSplit split = roundTrip(plan.splits().get(0));
         assertEquals("cobble-table", split.formatId());
 
@@ -66,6 +72,12 @@ class TableReadFormatRegistryTest {
                 IllegalArgumentException.class,
                 () -> plan.project(Collections.singletonList("missing")));
         assertThrows(IllegalArgumentException.class, () -> plan.project(Arrays.asList("id", "id")));
+        io.cobble.ShardSnapshot foreignShard = split.shardSnapshot();
+        foreignShard.snapshotId++;
+        TableScanSplit foreign =
+                new TableScanSplit(
+                        split.formatId(), split.columnFamily(), foreignShard, split.metadataJson());
+        assertThrows(IllegalArgumentException.class, () -> countPlan.open(config, foreign));
         try (TableReadProvider<List<Value>, ?> provider = countPlan.open(config, split);
                 TableReadSession<List<Value>, ?> session = provider.open();
                 TableReadCursor<List<Value>> cursor =
@@ -88,15 +100,57 @@ class TableReadFormatRegistryTest {
 
     @Test
     void registryRejectsUnknownAndDuplicateFormatIds() {
-        TableReadFormatRegistry.Registry registry =
-                TableReadFormatRegistry.fromFactories(
+        TableFormatPluginRegistry.Registry registry =
+                TableFormatPluginRegistry.fromPlugins(
                         Collections.singletonList(new StubFactory("one")));
         assertThrows(IllegalArgumentException.class, () -> registry.resolve("missing"));
         assertThrows(
                 IllegalStateException.class,
                 () ->
-                        TableReadFormatRegistry.fromFactories(
+                        TableFormatPluginRegistry.fromPlugins(
                                 Arrays.asList(new StubFactory("one"), new StubFactory("one"))));
+    }
+
+    @Test
+    void pathResolutionTreatsPlainAndFileUriAsTheSameNativeRoot() throws Exception {
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema schema =
+                new TableSchema(
+                        Collections.singletonList(new DataField(1, "id", LogicalTypes.int64())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "data", schema);
+                TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 1, 1)) {
+            table.put(Collections.singletonList(Value.int64(1)));
+            committer.commitBatch(1L, Collections.singletonList(db.snapshot()));
+        }
+
+        try (TableReader reader =
+                TableReader.open(
+                        config,
+                        new TablePathRequest(
+                                dataDir.toUri().toString(),
+                                "data",
+                                null,
+                                Collections.<String, String>emptyMap()))) {
+            assertEquals("cobble-table", reader.scanPlan().formatId());
+            assertEquals(
+                    Collections.singletonList(Value.int64(1)),
+                    reader.get(reader.keyBuilder().push(Value.int64(1)).build()));
+        }
+
+        Config empty = new Config().addVolume(dataDir.resolve("empty").toString());
+        assertThrows(
+                TablePathMissingSnapshotException.class,
+                () ->
+                        TableReader.open(
+                                empty,
+                                new TablePathRequest(
+                                        dataDir.resolve("empty").toUri().toString(),
+                                        "data",
+                                        null,
+                                        Collections.<String, String>emptyMap())));
     }
 
     @Test
@@ -115,9 +169,10 @@ class TableReadFormatRegistryTest {
                 global = committer.commitBatch(1L, Collections.singletonList(db.snapshot()));
             }
         }
-        TableScanPlan plan =
-                TableReadFormatRegistry.plan(
-                        config, TableReadSnapshot.forGlobal(config, global, "data"));
+        TableScanPlan plan;
+        try (TableReader reader = TableReader.open(config, "data", global.id)) {
+            plan = reader.scanPlan();
+        }
         try (TableReadProvider<List<Value>, ?> provider = plan.open(config, plan.splits().get(0));
                 TableReadSession<List<Value>, ?> session = provider.open()) {
             TableReadCursor<List<Value>> cursor =
@@ -149,7 +204,10 @@ class TableReadFormatRegistryTest {
             }
         }
 
-        TableScanPlan plan = TableScanPlan.forSnapshot(config, "data", global.id);
+        TableScanPlan plan;
+        try (TableReader reader = TableReader.open(config, "data", global.id)) {
+            plan = reader.scanPlan();
+        }
         try (TableReadProvider<List<Value>, ?> provider = plan.open(config, plan.splits().get(0));
                 TableReadSession<List<Value>, ?> session = provider.open();
                 TableReadCursor<List<Value>> cursor =
@@ -166,6 +224,26 @@ class TableReadFormatRegistryTest {
 
         TableScanSplit split = plan.splits().get(0);
         java.util.List<String> names = Arrays.asList("id", "payload");
+        byte[][] decoderKeyBeforeMutation = new byte[1][];
+        try (io.cobble.DirectScanCursor direct = split.openDirectScanner(config, names, 0);
+                TableDirectScanCursor<List<Value>> cursor =
+                        TableDirectScanCursor.fixed(
+                                direct,
+                                (entry, key) -> {
+                                    decoderKeyBeforeMutation[0] = Arrays.copyOf(key, key.length);
+                                    key[0] ^= 1;
+                                    return Arrays.asList(
+                                            Collections.singletonList(Value.int64(10)),
+                                            Collections.singletonList(Value.int64(20)));
+                                })) {
+            TableReadEntry<List<Value>> first = cursor.next();
+            TableReadEntry<List<Value>> second = cursor.next();
+            byte[] firstPublicKey = first.position().physicalKey();
+            assertArrayEquals(decoderKeyBeforeMutation[0], firstPublicKey);
+            assertArrayEquals(second.position().physicalKey(), firstPublicKey);
+            firstPublicKey[0] ^= 1;
+            assertArrayEquals(second.position().physicalKey(), first.position().physicalKey());
+        }
         try (io.cobble.DirectScanCursor direct = split.openDirectScanner(config, names, 0)) {
             TableDirectScanCursor<List<Value>> cursor =
                     TableDirectScanCursor.fixed(
@@ -205,6 +283,84 @@ class TableReadFormatRegistryTest {
                                         Collections.singletonList(Collections.<Value>emptyList())));
     }
 
+    @Test
+    void physicalRangeTraversalSortsAndDeduplicatesReorderedShardRanges() {
+        io.cobble.ShardSnapshot.Range late = new io.cobble.ShardSnapshot.Range();
+        late.start = 2;
+        late.end = 3;
+        io.cobble.ShardSnapshot.Range early = new io.cobble.ShardSnapshot.Range();
+        early.start = 0;
+        early.end = 2;
+        assertEquals(
+                Arrays.asList(0, 1, 2, 3),
+                PhysicalTableReadSession.selectedBuckets(
+                        4, new TableReadRange(0, Integer.MAX_VALUE), Arrays.asList(late, early)));
+    }
+
+    @Test
+    void physicalConfigPreservesRealVolumesAndDerivesOnlyMissingSnapshotRoot() throws Exception {
+        Config storage = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema schema =
+                new TableSchema(
+                        Collections.singletonList(new DataField(1, "id", LogicalTypes.int64())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        GlobalSnapshot global;
+        try (Db db = Db.open(storage);
+                Table table = Table.create(db, "data", schema);
+                TableSnapshotCommitter committer = TableSnapshotCommitter.open(storage, 1, 1)) {
+            table.put(Collections.singletonList(Value.int64(1)));
+            global = committer.commitBatch(1L, Collections.singletonList(db.snapshot()));
+        }
+        TableReadSnapshot snapshot = TableReadSnapshot.forGlobal(storage, global, "data");
+
+        Config preserved = storage.copy();
+        Config.VolumeDescriptor unrelated =
+                Config.VolumeDescriptor.singleVolume(dataDir.resolve("other-volume").toString());
+        unrelated.accessId = "other-access";
+        unrelated.secretKey = "other-secret";
+        preserved.addVolume(unrelated);
+        Config unchanged = PhysicalTableReadSession.physicalConfig(preserved, snapshot);
+        assertEquals(2, unchanged.volumes.size());
+        assertEquals("other-access", unchanged.volumes.get(1).accessId);
+
+        Config leafInput = new Config();
+        Config.VolumeDescriptor leaf =
+                Config.VolumeDescriptor.singleVolume(dataDir.resolve("_metadata").toString());
+        leaf.accessId = "checkpoint-access";
+        leaf.secretKey = "checkpoint-secret";
+        leafInput.addVolume(leaf);
+        Config derived = PhysicalTableReadSession.physicalConfig(leafInput, snapshot);
+        assertEquals(2, derived.volumes.size());
+        Config.VolumeDescriptor derivedRoot = derived.volumes.get(1);
+        assertEquals(
+                dataDir.toAbsolutePath().normalize(),
+                Path.of(derivedRoot.baseDir).toAbsolutePath().normalize());
+        assertEquals("checkpoint-access", derivedRoot.accessId);
+        assertEquals("checkpoint-secret", derivedRoot.secretKey);
+
+        Config manifestInput = new Config();
+        Config.VolumeDescriptor manifestVolume =
+                Config.VolumeDescriptor.singleVolume(global.shardSnapshots.get(0).manifestPath);
+        manifestVolume.accessId = "manifest-access";
+        manifestVolume.secretKey = "manifest-secret";
+        manifestInput.addVolume(manifestVolume);
+        Config repaired = PhysicalTableReadSession.physicalConfig(manifestInput, snapshot);
+        assertEquals(1, repaired.volumes.size());
+        Config.VolumeDescriptor repairedRoot = repaired.volumes.get(0);
+        assertEquals(
+                dataDir.toAbsolutePath().normalize(),
+                Path.of(repairedRoot.baseDir).toAbsolutePath().normalize());
+        assertEquals("manifest-access", repairedRoot.accessId);
+        assertEquals("manifest-secret", repairedRoot.secretKey);
+        try (io.cobble.Reader view = io.cobble.Reader.open(repaired, global);
+                io.cobble.ScanOptions scan = new io.cobble.ScanOptions().columnFamily("data");
+                io.cobble.DirectScanCursor cursor =
+                        view.scanDirectWithOptions(0, null, null, scan)) {
+            assertTrue(cursor.nextEntry() != null, "derived root must open the shard manifest");
+        }
+    }
+
     private static List<String> names(TableReadSchema schema) {
         java.util.ArrayList<String> names = new java.util.ArrayList<String>();
         for (DataField field : schema.fields()) names.add(field.name());
@@ -235,7 +391,7 @@ class TableReadFormatRegistryTest {
         }
     }
 
-    private static final class StubFactory implements TableReadFormatFactory {
+    private static final class StubFactory implements TableFormatPlugin {
         private final String formatId;
 
         private StubFactory(String formatId) {
@@ -248,12 +404,7 @@ class TableReadFormatRegistryTest {
         }
 
         @Override
-        public TableScanPlan plan(Config config, TableReadSnapshot snapshot) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public TableReadProvider<List<Value>, ?> open(Config config, TableScanSplit split) {
+        public TableFormatBinding bind(TableReadSnapshot snapshot) {
             throw new UnsupportedOperationException();
         }
     }

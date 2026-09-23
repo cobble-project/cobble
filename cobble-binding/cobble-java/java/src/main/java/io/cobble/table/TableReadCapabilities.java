@@ -1,7 +1,10 @@
 package io.cobble.table;
 
+import java.io.Serializable;
+
 /** Declares the operations and ordering guarantees made by a table read provider. */
-public final class TableReadCapabilities {
+public final class TableReadCapabilities implements Serializable {
+    private static final long serialVersionUID = 1L;
     private final boolean scan;
     private final boolean exactLookup;
     private final boolean restartableScan;

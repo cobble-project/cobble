@@ -67,8 +67,10 @@ class TableScanPlanTest {
         Path runtimeRoot = root.resolve("runtime-without-shards");
         Config runtimeConfig =
                 new Config().addVolume(runtimeRoot.toString()).numColumns(1).totalBuckets(2);
-        TableScanPlan plan =
-                roundTrip(TableScanPlan.forSnapshot(coordinatorConfig, "data", global.id));
+        TableScanPlan plan;
+        try (TableReader reader = TableReader.open(coordinatorConfig, "data", global.id)) {
+            plan = roundTrip(reader.scanPlan());
+        }
         List<List<Value>> rows = new ArrayList<List<Value>>();
         for (TableScanSplit split : plan.splits()) {
             try (TableScanCursor cursor = split.openTypedScanner(runtimeConfig, 4096)) {
@@ -120,7 +122,9 @@ class TableScanPlanTest {
             try (TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 1, 1)) {
                 global = committer.commitBatch(1L, Collections.singletonList(shard));
             }
-            plan = TableScanPlan.forSnapshot(config, "data", global.id);
+            try (TableReader reader = TableReader.open(config, "data", global.id)) {
+                plan = reader.scanPlan();
+            }
 
             table.put(
                     Arrays.asList(
@@ -136,7 +140,9 @@ class TableScanPlanTest {
         assertEquals(schema, plan.schema());
         assertEquals(global.id, plan.snapshotId());
         assertEquals(1, plan.totalBuckets());
-        assertEquals(latest.id, TableScanPlan.forCurrentSnapshot(config, "data").snapshotId());
+        try (TableReader reader = TableReader.openCurrent(config, "data")) {
+            assertEquals(latest.id, reader.scanPlan().snapshotId());
+        }
 
         plan = roundTrip(plan);
 
@@ -202,7 +208,7 @@ class TableScanPlanTest {
     }
 
     @Test
-    void nativeReadProvidersUseFixedTableSnapshotsAndEnforceCapabilities() throws Exception {
+    void nativeReaderUsesFixedTableSnapshotsAndUnifiedCapabilities() throws Exception {
         Path dataDir = Files.createTempDirectory("cobble-java-native-read-provider-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
         TableSchema schema =
@@ -222,20 +228,17 @@ class TableScanPlanTest {
             }
         }
 
-        try (TableReader reader = TableReader.open(config, "data", snapshot.id);
-                NativeTableReadProvider provider = new NativeTableReadProvider(reader);
-                TableReadSession<List<Value>, TableKey> session = provider.open()) {
-            TableKey key = provider.keyBuilder().push(Value.int64(7)).build();
-            assertEquals(expected, session.lookup(key).iterator().next().value());
-            assertThrows(
-                    UnsupportedOperationException.class,
-                    () -> session.scan(new TableReadRange(0, Integer.MAX_VALUE), null));
-            session.close();
-            assertThrows(IllegalStateException.class, () -> session.lookup(key));
+        TableReader reader = TableReader.open(config, "data", snapshot.id);
+        TableScanSplit split = reader.scanPlan().splits().get(0);
+        List<Value> key = Collections.singletonList(Value.int64(7));
+        assertEquals(expected, reader.lookup(key).iterator().next().value());
+        try (TableReadCursor<List<Value>> cursor =
+                reader.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
+            assertEquals(expected, cursor.next().value());
         }
+        reader.close();
+        assertThrows(IllegalStateException.class, () -> reader.lookup(key));
 
-        TableScanSplit split =
-                TableScanPlan.forSnapshot(config, "data", snapshot.id).splits().get(0);
         try (NativeTableScanReadProvider provider = new NativeTableScanReadProvider(config, split);
                 TableReadSession<List<Value>, Void> session = provider.open()) {
             assertThrows(

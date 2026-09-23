@@ -218,8 +218,7 @@ widen fields. Apply the returned catalog version with `refreshWriter(writer)`; f
 changes, call `writer.refreshSchema()`. Rebuild projections after refreshing, and do not refresh
 concurrently with writer operations. Custom transforms are not supported in Java.
 
-For distributed scans, call `reader.scanPlan()` to capture the reader's selected snapshot,
-or use `TableScanPlan.forCurrentSnapshot(config, name)` / `forSnapshot(config, name, id)`.
+For distributed scans, call `reader.scanPlan()` to capture the reader's selected fixed snapshot.
 Send the serializable plan or its splits to workers and call
 `split.openTypedScanner(config, readAheadBytes)` on each worker. Use
 `openScanner(config, fieldNames, readAheadBytes)` when encoded rows are preferred.

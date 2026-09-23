@@ -14,6 +14,11 @@ final class TableReadProjection {
         return new Provider(provider, schema, projection.clone());
     }
 
+    static TableReadCursor<List<Value>> cursor(
+            TableReadCursor<List<Value>> delegate, int[] projection) {
+        return new Cursor(delegate, projection.clone());
+    }
+
     private static final class Provider implements TableReadProvider<List<Value>, Object> {
         private final TableReadProvider<List<Value>, ?> delegate;
         private final TableReadSchema schema;

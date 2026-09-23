@@ -9,13 +9,15 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
 /** Hydrated, fixed snapshot metadata for one selected column family. */
-public final class TableReadSnapshot {
+public final class TableReadSnapshot implements Serializable {
+    private static final long serialVersionUID = 1L;
     private final GlobalSnapshot globalSnapshot;
     private final List<ShardDescriptor> shards;
     private final String columnFamily;
@@ -26,7 +28,7 @@ public final class TableReadSnapshot {
             List<ShardDescriptor> shards,
             String columnFamily,
             String formatId) {
-        this.globalSnapshot = globalSnapshot == null ? null : globalSnapshot.copy();
+        this.globalSnapshot = Objects.requireNonNull(globalSnapshot, "globalSnapshot").copy();
         this.shards = Collections.unmodifiableList(new ArrayList<ShardDescriptor>(shards));
         this.columnFamily = TableScanSplit.requireText(columnFamily, "columnFamily");
         this.formatId = TableScanSplit.requireText(formatId, "formatId");
@@ -43,15 +45,6 @@ public final class TableReadSnapshot {
         if (globalSnapshot == null)
             throw new IllegalArgumentException("globalSnapshot must not be null");
         return create(config, globalSnapshot, globalSnapshot.shardSnapshots, columnFamily);
-    }
-
-    /** Selects one column family from an already-fixed shard snapshot. */
-    public static TableReadSnapshot forShard(
-            Config config, ShardSnapshot shardSnapshot, String columnFamily) {
-        if (config == null) throw new IllegalArgumentException("config must not be null");
-        if (shardSnapshot == null)
-            throw new IllegalArgumentException("shardSnapshot must not be null");
-        return create(config, null, Collections.singletonList(shardSnapshot), columnFamily);
     }
 
     private static TableReadSnapshot create(
@@ -157,9 +150,9 @@ public final class TableReadSnapshot {
         return TableScanSplit.requireText(format.getAsString(), "snapshot format id");
     }
 
-    /** Nullable for a one-shard read location. Native planning requires a global snapshot. */
+    /** Fixed global routing metadata for this read. */
     public GlobalSnapshot globalSnapshot() {
-        return globalSnapshot == null ? null : globalSnapshot.copy();
+        return globalSnapshot.copy();
     }
 
     public String columnFamily() {
@@ -178,7 +171,8 @@ public final class TableReadSnapshot {
     }
 
     /** One hydrated shard plus its own captured descriptor JSON. */
-    public static final class ShardDescriptor {
+    public static final class ShardDescriptor implements Serializable {
+        private static final long serialVersionUID = 1L;
         private final ShardSnapshot snapshot;
         private final String metadataJson;
 

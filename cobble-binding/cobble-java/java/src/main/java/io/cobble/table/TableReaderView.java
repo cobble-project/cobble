@@ -36,7 +36,7 @@ final class TableReaderView extends NativeObject {
     }
 
     TableReaderView copy() {
-        return new TableReaderView(TableReader.cloneViewNative(nativeHandle));
+        return new TableReaderView(NativeTableReader.cloneViewNative(nativeHandle));
     }
 
     TableScanPlan scanPlan() {

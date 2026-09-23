@@ -1,8 +1,6 @@
 package io.cobble.table;
 
 import io.cobble.Config;
-import io.cobble.DbCoordinator;
-import io.cobble.GlobalSnapshot;
 import io.cobble.NativeLoader;
 
 import com.google.gson.JsonArray;
@@ -22,6 +20,8 @@ public final class TableScanPlan implements Serializable {
 
     private final String formatId;
     private final TableSchema nativeSchema;
+    private final TableReadSnapshot snapshot;
+    private final TableReadCapabilities capabilities;
     private final TableReadSchema sourceSchema;
     private final TableReadSchema readSchema;
     private final List<TableScanSplit> splits;
@@ -33,6 +33,8 @@ public final class TableScanPlan implements Serializable {
     private TableScanPlan(
             String formatId,
             TableSchema nativeSchema,
+            TableReadSnapshot snapshot,
+            TableReadCapabilities capabilities,
             TableReadSchema sourceSchema,
             TableReadSchema readSchema,
             List<? extends TableScanSplit> splits,
@@ -42,6 +44,8 @@ public final class TableScanPlan implements Serializable {
             long dataSizeBytes) {
         this.formatId = TableScanSplit.requireText(formatId, "formatId");
         this.nativeSchema = nativeSchema;
+        this.snapshot = snapshot;
+        this.capabilities = capabilities;
         this.sourceSchema = Objects.requireNonNull(sourceSchema, "sourceSchema");
         this.readSchema = Objects.requireNonNull(readSchema, "readSchema");
         this.splits = Collections.unmodifiableList(new ArrayList<TableScanSplit>(splits));
@@ -60,35 +64,39 @@ public final class TableScanPlan implements Serializable {
         this.dataSizeBytes = dataSizeBytes;
     }
 
-    /** Constructs a plugin plan. Read schemas deliberately do not require primary keys. */
+    /** Constructs portable assignments for a fixed external read description. */
     public static TableScanPlan forRead(
-            String formatId,
+            TableReadSnapshot snapshot,
             TableReadSchema schema,
-            long snapshotId,
-            int totalBuckets,
-            long dataSizeBytes,
-            List<? extends TableScanSplit> splits) {
+            TableReadCapabilities capabilities,
+            long dataSizeBytes) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        Objects.requireNonNull(capabilities, "capabilities");
+        List<TableScanSplit> splits = new ArrayList<TableScanSplit>();
+        for (TableReadSnapshot.ShardDescriptor shard : snapshot.shards()) {
+            splits.add(
+                    new TableScanSplit(
+                            snapshot.formatId(),
+                            snapshot.columnFamily(),
+                            shard.snapshot(),
+                            shard.metadataJson()));
+        }
+        io.cobble.GlobalSnapshot global = snapshot.globalSnapshot();
+        if (global == null) {
+            throw new IllegalArgumentException("portable table reads require a global snapshot");
+        }
         return new TableScanPlan(
-                formatId,
+                snapshot.formatId(),
                 null,
+                snapshot,
+                capabilities,
                 schema,
                 schema,
                 splits,
                 identityProjection(schema),
-                snapshotId,
-                totalBuckets,
+                global.id,
+                global.totalBuckets,
                 dataSizeBytes);
-    }
-
-    /** Resolves the format of the current snapshot, then pins that snapshot for every split. */
-    public static TableScanPlan forCurrentSnapshot(Config config, String tableName) {
-        return open(config, tableName, null);
-    }
-
-    /** Resolves the format of one fixed committed snapshot. */
-    public static TableScanPlan forSnapshot(Config config, String tableName, long snapshotId) {
-        if (snapshotId < 0) throw new IllegalArgumentException("snapshotId must be >= 0");
-        return open(config, tableName, snapshotId);
     }
 
     /** Full native table schema, including write keys; unavailable for external read formats. */
@@ -143,6 +151,8 @@ public final class TableScanPlan implements Serializable {
         return new TableScanPlan(
                 formatId,
                 nativeSchema,
+                snapshot,
+                capabilities,
                 sourceSchema,
                 new TableReadSchema(fields),
                 splits,
@@ -158,6 +168,8 @@ public final class TableScanPlan implements Serializable {
         return new TableScanPlan(
                 formatId,
                 nativeSchema,
+                snapshot,
+                capabilities,
                 sourceSchema,
                 readSchema,
                 Collections.singletonList(split),
@@ -172,18 +184,56 @@ public final class TableScanPlan implements Serializable {
             throws Exception {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(split, "split");
+        requireAssignedSplit(split);
         if (!formatId.equals(split.formatId()))
             throw new IllegalArgumentException("split format differs from plan format");
-        return TableReadProjection.apply(
-                TableReadFormatRegistry.resolve(formatId).open(config, split),
-                readSchema,
-                projection);
+        if (snapshot == null) {
+            return TableReadProjection.apply(
+                    new NativeTableScanReadProvider(config, split), readSchema, projection);
+        }
+        TableFormatPlugin plugin = TableFormatPluginRegistry.resolve(formatId);
+        return new PhysicalProvider(
+                config, snapshot, plugin, capabilities, split, readSchema, projection);
+    }
+
+    /** Opens a sequential logical cursor across this plan's assigned fixed splits. */
+    public TableReadCursor<List<Value>> scan(
+            Config config, TableReadRange range, TableReadPosition position) throws Exception {
+        return new PlannedCursor(this, config, range, position);
     }
 
     private void requireAssignedSplit(TableScanSplit split) {
-        if (!splits.contains(Objects.requireNonNull(split, "split"))) {
+        TableScanSplit requested = Objects.requireNonNull(split, "split");
+        for (TableScanSplit assigned : splits) {
+            if (sameSplit(assigned, requested)) return;
+        }
+        {
             throw new IllegalArgumentException("split is not part of this plan");
         }
+    }
+
+    private static boolean sameSplit(TableScanSplit left, TableScanSplit right) {
+        if (!left.formatId().equals(right.formatId())
+                || !left.columnFamily().equals(right.columnFamily())
+                || !left.metadataJson().equals(right.metadataJson())) {
+            return false;
+        }
+        io.cobble.ShardSnapshot leftShard = left.shardSnapshot();
+        io.cobble.ShardSnapshot rightShard = right.shardSnapshot();
+        return leftShard.dbId.equals(rightShard.dbId)
+                && leftShard.snapshotId == rightShard.snapshotId
+                && leftShard.manifestPath.equals(rightShard.manifestPath)
+                && sameRanges(leftShard.ranges, rightShard.ranges);
+    }
+
+    private static boolean sameRanges(
+            List<io.cobble.ShardSnapshot.Range> left, List<io.cobble.ShardSnapshot.Range> right) {
+        if (left.size() != right.size()) return false;
+        for (int index = 0; index < left.size(); index++) {
+            if (left.get(index).start != right.get(index).start
+                    || left.get(index).end != right.get(index).end) return false;
+        }
+        return true;
     }
 
     private int sourceIndex(String name) {
@@ -200,25 +250,191 @@ public final class TableScanPlan implements Serializable {
         return indexes;
     }
 
-    private static TableScanPlan open(Config config, String tableName, Long id) {
-        Objects.requireNonNull(config, "config");
-        TableScanSplit.requireText(tableName, "tableName");
-        GlobalSnapshot snapshot;
-        try (DbCoordinator coordinator = DbCoordinator.open(config)) {
-            snapshot =
-                    id == null
-                            ? coordinator.loadCurrentGlobalSnapshot()
-                            : coordinator.getGlobalSnapshot(id);
+    private static final class PlannedCursor implements TableReadCursor<List<Value>> {
+        private final TableScanPlan plan;
+        private final Config config;
+        private final TableReadRange range;
+        private TableReadPosition position;
+        private boolean resumeLocated;
+        private int splitIndex;
+        private TableReadProvider<List<Value>, ?> provider;
+        private TableReadSession<List<Value>, ?> session;
+        private TableReadCursor<List<Value>> cursor;
+        private boolean closed;
+
+        private PlannedCursor(
+                TableScanPlan plan,
+                Config config,
+                TableReadRange range,
+                TableReadPosition position) {
+            this.plan = Objects.requireNonNull(plan, "plan");
+            this.config = Objects.requireNonNull(config, "config");
+            this.range = Objects.requireNonNull(range, "range");
+            this.position = position;
+            this.resumeLocated = position == null;
         }
-        if (snapshot == null)
-            throw new IllegalArgumentException("no committed snapshot for '" + tableName + "'");
-        try {
-            return TableReadFormatRegistry.plan(
-                    config, TableReadSnapshot.forGlobal(config, snapshot, tableName));
-        } catch (RuntimeException error) {
-            throw error;
-        } catch (Exception error) {
-            throw new IllegalStateException("failed to plan format-aware snapshot scan", error);
+
+        @Override
+        public TableReadEntry<List<Value>> next() throws Exception {
+            while (!closed) {
+                if (cursor == null && !openNextSplit()) return null;
+                TableReadEntry<List<Value>> entry = cursor.next();
+                if (entry != null) {
+                    position = entry.position();
+                    return entry;
+                }
+                closeCurrent();
+            }
+            return null;
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            closeCurrent();
+        }
+
+        private boolean openNextSplit() throws Exception {
+            while (splitIndex < plan.splits.size()) {
+                TableScanSplit split = plan.splits.get(splitIndex++);
+                if (!intersects(split, range)) continue;
+                if (!resumeLocated && !ownsBucket(split, position.bucket())) continue;
+                try {
+                    provider = plan.open(config, split);
+                    session = provider.open();
+                    cursor = session.scan(range, resumeLocated ? null : position);
+                    resumeLocated = true;
+                    return true;
+                } catch (Exception error) {
+                    closeCurrent();
+                    throw error;
+                }
+            }
+            if (!resumeLocated) {
+                throw new IllegalArgumentException("resume position is outside the scan plan");
+            }
+            return false;
+        }
+
+        private static boolean ownsBucket(TableScanSplit split, int bucket) {
+            for (io.cobble.ShardSnapshot.Range range : split.shardSnapshot().ranges) {
+                if (bucket >= range.start && bucket <= range.end) return true;
+            }
+            return false;
+        }
+
+        private static boolean intersects(TableScanSplit split, TableReadRange requested) {
+            for (io.cobble.ShardSnapshot.Range range : split.shardSnapshot().ranges) {
+                if (range.start <= requested.lastBucket() && range.end >= requested.firstBucket()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void closeCurrent() {
+            try {
+                if (cursor != null) cursor.close();
+            } finally {
+                try {
+                    if (session != null) session.close();
+                } finally {
+                    if (provider != null) provider.close();
+                    cursor = null;
+                    session = null;
+                    provider = null;
+                }
+            }
+        }
+    }
+
+    private static final class PhysicalProvider implements TableReadProvider<List<Value>, Void> {
+        private final Config config;
+        private final TableReadSnapshot snapshot;
+        private final TableFormatPlugin plugin;
+        private final TableReadCapabilities capabilities;
+        private final TableScanSplit split;
+        private final TableReadSchema schema;
+        private final int[] projection;
+
+        private PhysicalProvider(
+                Config config,
+                TableReadSnapshot snapshot,
+                TableFormatPlugin plugin,
+                TableReadCapabilities capabilities,
+                TableScanSplit split,
+                TableReadSchema schema,
+                int[] projection) {
+            this.config = config.copy();
+            this.snapshot = snapshot;
+            this.plugin = plugin;
+            this.capabilities = capabilities;
+            this.split = split;
+            this.schema = schema;
+            this.projection = projection.clone();
+        }
+
+        @Override
+        public TableReadCapabilities capabilities() {
+            return capabilities;
+        }
+
+        @Override
+        public TableReadSession<List<Value>, Void> open() throws Exception {
+            TableFormatBinding binding = plugin.bind(snapshot);
+            return new SplitSession(
+                    new PhysicalTableReadSession(config, snapshot, binding),
+                    split,
+                    schema,
+                    projection);
+        }
+
+        @Override
+        public void close() {}
+    }
+
+    private static final class SplitSession implements TableReadSession<List<Value>, Void> {
+        private final PhysicalTableReadSession delegate;
+        private final TableScanSplit split;
+        private final TableReadSchema schema;
+        private final int[] projection;
+
+        private SplitSession(
+                PhysicalTableReadSession delegate,
+                TableScanSplit split,
+                TableReadSchema schema,
+                int[] projection) {
+            this.delegate = delegate;
+            this.split = split;
+            this.schema = schema;
+            this.projection = projection;
+        }
+
+        @Override
+        public TableReadSchema schema() {
+            return schema;
+        }
+
+        @Override
+        public TableReadCapabilities capabilities() {
+            return delegate.capabilities();
+        }
+
+        @Override
+        public TableReadCursor<List<Value>> scan(TableReadRange range, TableReadPosition position)
+                throws Exception {
+            return TableReadProjection.cursor(
+                    delegate.scan(range, position, split.shardSnapshot().ranges), projection);
+        }
+
+        @Override
+        public java.util.Collection<TableReadEntry<List<Value>>> lookup(Void unused) {
+            throw new UnsupportedOperationException("scan assignments do not support lookup");
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
         }
     }
 
@@ -241,6 +457,8 @@ public final class TableScanPlan implements Serializable {
         return new TableScanPlan(
                 TableMetadata.FORMAT,
                 schema,
+                null,
+                null,
                 readSchema,
                 readSchema,
                 splits,

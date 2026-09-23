@@ -63,7 +63,7 @@ fn open_reader(env: &mut JNIEnv, config: Config, name: String, snapshot_id: Opti
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_openCurrentNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_openCurrentNative(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
@@ -90,7 +90,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_openCurrentNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_openNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_openNative(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
@@ -125,7 +125,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_openNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_disposeInternal(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_disposeInternal(
     mut env: JNIEnv,
     _object: JObject,
     native_handle: jlong,
@@ -142,7 +142,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_disposeInternal(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_disposeHandleNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_disposeHandleNative(
     _env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
@@ -154,7 +154,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_disposeHandleNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_refreshIntervalNanosNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_refreshIntervalNanosNative(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
@@ -169,7 +169,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_refreshIntervalNanosNati
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_acquireViewNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_acquireViewNative(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
@@ -190,7 +190,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_acquireViewNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_describeViewNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_describeViewNative(
     mut env: JNIEnv,
     _class: JClass,
     view_handle: jlong,
@@ -207,7 +207,7 @@ pub extern "system" fn Java_io_cobble_table_TableReader_describeViewNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_refreshNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_refreshNative(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
@@ -243,7 +243,7 @@ pub extern "system" fn Java_io_cobble_table_TableReaderView_disposeInternal(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_table_TableReader_cloneViewNative(
+pub extern "system" fn Java_io_cobble_table_NativeTableReader_cloneViewNative(
     mut env: JNIEnv,
     _class: JClass,
     view_handle: jlong,
