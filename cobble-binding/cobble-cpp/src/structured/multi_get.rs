@@ -21,7 +21,7 @@ struct KeyDescriptor {
 }
 
 pub(crate) struct NativeStructuredMultiGetResult {
-    rows: Vec<Option<Vec<Option<StructuredColumnValue>>>>,
+    pub(crate) rows: Vec<Option<Vec<Option<StructuredColumnValue>>>>,
 }
 
 /// Borrows all key payloads for one synchronous structured multi-get crossing.
@@ -142,7 +142,7 @@ pub(crate) fn native_structured_single_db_multi_get_into(
     encode_multi_get(&keys, &rows, output)
 }
 
-fn encode_multi_get(
+pub(crate) fn encode_multi_get(
     keys: &[(u16, &[u8])],
     rows: &[Option<Vec<Option<StructuredColumnValue>>>],
     output: &mut [u8],

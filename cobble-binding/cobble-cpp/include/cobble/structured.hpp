@@ -5,6 +5,8 @@
 #include <cobble/structured/multi_get.hpp>
 #include <cobble/structured/options.hpp>
 #include <cobble/structured/priority_queue.hpp>
+#include <cobble/structured/read_only_db.hpp>
+#include <cobble/structured/reader.hpp>
 #include <cobble/structured/row.hpp>
 #include <cobble/structured/scan.hpp>
 #include <cobble/structured/scan_plan.hpp>

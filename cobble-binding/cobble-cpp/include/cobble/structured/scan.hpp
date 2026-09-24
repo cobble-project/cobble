@@ -29,6 +29,8 @@ private:
   std::unique_ptr<Impl> impl_;
   friend class Db;
   friend class SingleDb;
+  friend class Reader;
+  friend class ReadOnlyDb;
   friend struct ScanSplit;
 };
 
@@ -79,6 +81,8 @@ private:
   std::unique_ptr<Impl> impl_;
   friend class Db;
   friend class SingleDb;
+  friend class Reader;
+  friend class ReadOnlyDb;
   friend struct ScanSplit;
 };
 

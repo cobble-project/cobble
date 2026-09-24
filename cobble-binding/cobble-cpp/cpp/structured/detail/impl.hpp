@@ -22,6 +22,20 @@ struct SingleDb::Impl {
   rust::Box<structured_ffi::NativeStructuredSingleDb> native;
 };
 
+struct Reader::Impl {
+  explicit Impl(rust::Box<structured_ffi::NativeStructuredReader> value)
+      : native(std::move(value)) {}
+  rust::Box<structured_ffi::NativeStructuredReader> native;
+  ReadOptions default_read_options;
+};
+
+struct ReadOnlyDb::Impl {
+  explicit Impl(rust::Box<structured_ffi::NativeStructuredReadOnlyDb> value)
+      : native(std::move(value)) {}
+  rust::Box<structured_ffi::NativeStructuredReadOnlyDb> native;
+  ReadOptions default_read_options;
+};
+
 struct ReadOptions::Impl {
   explicit Impl(rust::Box<structured_ffi::NativeStructuredReadOptions> value)
       : native(std::move(value)) {}
@@ -65,8 +79,8 @@ struct OwnedPriorityQueueBatch::Impl {
 };
 
 struct PriorityQueue::Impl {
-  using Owner = std::variant<std::shared_ptr<Db::Impl>,
-                             std::shared_ptr<SingleDb::Impl>>;
+  using Owner =
+      std::variant<std::shared_ptr<Db::Impl>, std::shared_ptr<SingleDb::Impl>>;
 
   Impl(Owner value,
        rust::Box<structured_ffi::NativeStructuredPriorityQueue> queue)

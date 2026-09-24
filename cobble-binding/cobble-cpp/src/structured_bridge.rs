@@ -122,6 +122,8 @@ pub(crate) mod ffi {
     extern "Rust" {
         type NativeStructuredDb;
         type NativeStructuredSingleDb;
+        type NativeStructuredReader;
+        type NativeStructuredReadOnlyDb;
         type NativeStructuredReadOptions;
         type NativeStructuredScanOptions;
         type NativeStructuredRow;
@@ -134,6 +136,117 @@ pub(crate) mod ffi {
         type NativePriorityQueueCursor;
         type NativePendingShardSnapshot;
         type NativePendingSnapshot;
+
+        fn native_structured_reader_open_current(
+            config_json: &str,
+        ) -> Result<Box<NativeStructuredReader>>;
+        fn native_structured_reader_open_current_file(
+            config_path: &str,
+        ) -> Result<Box<NativeStructuredReader>>;
+        fn native_structured_reader_open(
+            config_json: &str,
+            snapshot_id: u64,
+        ) -> Result<Box<NativeStructuredReader>>;
+        fn native_structured_reader_open_file(
+            config_path: &str,
+            snapshot_id: u64,
+        ) -> Result<Box<NativeStructuredReader>>;
+        fn native_structured_reader_refresh(reader: &mut NativeStructuredReader) -> Result<()>;
+        fn native_structured_reader_get(
+            reader: &mut NativeStructuredReader,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeStructuredReadOptions,
+        ) -> Result<Box<NativeStructuredRow>>;
+        fn native_structured_reader_get_into(
+            reader: &mut NativeStructuredReader,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_reader_multi_get(
+            reader: &mut NativeStructuredReader,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+        ) -> Result<Box<NativeStructuredMultiGetResult>>;
+        fn native_structured_reader_multi_get_into(
+            reader: &mut NativeStructuredReader,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_reader_scan(
+            reader: &mut NativeStructuredReader,
+            bucket: u16,
+            start: &[u8],
+            end: &[u8],
+            options: &NativeStructuredScanOptions,
+        ) -> Result<Box<NativeStructuredScanCursor>>;
+        fn native_structured_reader_current_schema(
+            reader: &NativeStructuredReader,
+        ) -> NativeStructuredSchema;
+        fn native_structured_reader_mode(reader: &NativeStructuredReader) -> u8;
+        fn native_structured_reader_has_configured_snapshot(
+            reader: &NativeStructuredReader,
+        ) -> bool;
+        fn native_structured_reader_configured_snapshot(reader: &NativeStructuredReader) -> u64;
+        fn native_structured_reader_current_global_snapshot(
+            reader: &NativeStructuredReader,
+        ) -> NativeSnapshot;
+        fn native_structured_reader_list_global_snapshots(
+            reader: &NativeStructuredReader,
+        ) -> Result<Vec<NativeSnapshot>>;
+
+        fn native_structured_read_only_db_open(
+            config_json: &str,
+            snapshot_id: u64,
+            db_id: &str,
+        ) -> Result<Box<NativeStructuredReadOnlyDb>>;
+        fn native_structured_read_only_db_open_file(
+            config_path: &str,
+            snapshot_id: u64,
+            db_id: &str,
+        ) -> Result<Box<NativeStructuredReadOnlyDb>>;
+        fn native_structured_read_only_db_id(db: &NativeStructuredReadOnlyDb) -> &str;
+        fn native_structured_read_only_db_current_schema(
+            db: &NativeStructuredReadOnlyDb,
+        ) -> NativeStructuredSchema;
+        fn native_structured_read_only_db_get(
+            db: &NativeStructuredReadOnlyDb,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeStructuredReadOptions,
+        ) -> Result<Box<NativeStructuredRow>>;
+        fn native_structured_read_only_db_get_into(
+            db: &NativeStructuredReadOnlyDb,
+            bucket: u16,
+            key: &[u8],
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_read_only_db_multi_get(
+            db: &NativeStructuredReadOnlyDb,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+        ) -> Result<Box<NativeStructuredMultiGetResult>>;
+        fn native_structured_read_only_db_multi_get_into(
+            db: &NativeStructuredReadOnlyDb,
+            descriptor_address: usize,
+            count: u64,
+            options: &NativeStructuredReadOptions,
+            output: &mut [u8],
+        ) -> Result<NativeBufferResult>;
+        fn native_structured_read_only_db_scan(
+            db: &NativeStructuredReadOnlyDb,
+            bucket: u16,
+            start: &[u8],
+            end: &[u8],
+            options: &NativeStructuredScanOptions,
+        ) -> Result<Box<NativeStructuredScanCursor>>;
 
         fn native_structured_db_new_priority_queue(
             db: &mut NativeStructuredDb,

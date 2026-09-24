@@ -114,7 +114,9 @@ fn native_shard_snapshot_ref(value: cobble_binding::ShardSnapshotRef) -> ffi::Na
     }
 }
 
-fn native_snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::NativeSnapshot {
+pub(crate) fn native_snapshot(
+    value: cobble_binding::GlobalSnapshotManifest,
+) -> ffi::NativeSnapshot {
     ffi::NativeSnapshot {
         version: value.version,
         id: value.id,

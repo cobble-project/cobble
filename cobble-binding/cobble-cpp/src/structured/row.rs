@@ -52,7 +52,7 @@ pub(crate) fn native_structured_single_db_get_into(
     encode_get(bucket, key, columns.as_deref(), output)
 }
 
-fn encode_get(
+pub(crate) fn encode_get(
     bucket: u16,
     key: &[u8],
     columns: Option<&[Option<StructuredColumnValue>]>,

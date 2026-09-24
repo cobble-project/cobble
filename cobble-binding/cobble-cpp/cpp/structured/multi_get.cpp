@@ -1,5 +1,7 @@
 #include <cobble/structured/db.hpp>
 #include <cobble/structured/multi_get.hpp>
+#include <cobble/structured/read_only_db.hpp>
+#include <cobble/structured/reader.hpp>
 #include <cobble/structured/single_db.hpp>
 
 #include <cstddef>
@@ -275,6 +277,103 @@ BufferResult SingleDb::MultiGetInto(std::span<const MultiGetKey> keys,
                                     MutableBytesView output) const {
   const ReadOptions options;
   return MultiGetInto(keys, output, options);
+}
+
+BufferResult Reader::GetInto(BucketId bucket, BytesView key,
+                             MutableBytesView output,
+                             const ReadOptions &options) {
+  return detail::ToBufferResult(detail::Translate([&] {
+    return structured_ffi::native_structured_reader_get_into(
+        *impl_->native, bucket, detail::RustBytes(key), *options.impl_->native,
+        rust::Slice<Byte>(output.data(), output.size()));
+  }));
+}
+
+BufferResult Reader::GetInto(BucketId bucket, BytesView key,
+                             MutableBytesView output) {
+  return GetInto(bucket, key, output, impl_->default_read_options);
+}
+
+OwnedMultiGetResult Reader::MultiGet(std::span<const MultiGetKey> keys,
+                                     const ReadOptions &options) {
+  const auto descriptors = Descriptors(keys);
+  auto native = detail::Translate([&] {
+    return structured_ffi::native_structured_reader_multi_get(
+        *impl_->native, Address(descriptors), Count(keys.size(), "key count"),
+        *options.impl_->native);
+  });
+  return OwnedMultiGetResult(
+      std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
+}
+
+OwnedMultiGetResult Reader::MultiGet(std::span<const MultiGetKey> keys) {
+  return MultiGet(keys, impl_->default_read_options);
+}
+
+BufferResult Reader::MultiGetInto(std::span<const MultiGetKey> keys,
+                                  MutableBytesView output,
+                                  const ReadOptions &options) {
+  const auto descriptors = Descriptors(keys);
+  return detail::ToBufferResult(detail::Translate([&] {
+    return structured_ffi::native_structured_reader_multi_get_into(
+        *impl_->native, Address(descriptors), Count(keys.size(), "key count"),
+        *options.impl_->native,
+        rust::Slice<Byte>(output.data(), output.size()));
+  }));
+}
+
+BufferResult Reader::MultiGetInto(std::span<const MultiGetKey> keys,
+                                  MutableBytesView output) {
+  return MultiGetInto(keys, output, impl_->default_read_options);
+}
+
+BufferResult ReadOnlyDb::GetInto(BucketId bucket, BytesView key,
+                                 MutableBytesView output,
+                                 const ReadOptions &options) const {
+  return detail::ToBufferResult(detail::Translate([&] {
+    return structured_ffi::native_structured_read_only_db_get_into(
+        *impl_->native, bucket, detail::RustBytes(key), *options.impl_->native,
+        rust::Slice<Byte>(output.data(), output.size()));
+  }));
+}
+
+BufferResult ReadOnlyDb::GetInto(BucketId bucket, BytesView key,
+                                 MutableBytesView output) const {
+  return GetInto(bucket, key, output, impl_->default_read_options);
+}
+
+OwnedMultiGetResult ReadOnlyDb::MultiGet(std::span<const MultiGetKey> keys,
+                                         const ReadOptions &options) const {
+  const auto descriptors = Descriptors(keys);
+  auto native = detail::Translate([&] {
+    return structured_ffi::native_structured_read_only_db_multi_get(
+        *impl_->native, Address(descriptors), Count(keys.size(), "key count"),
+        *options.impl_->native);
+  });
+  return OwnedMultiGetResult(
+      std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
+}
+
+OwnedMultiGetResult
+ReadOnlyDb::MultiGet(std::span<const MultiGetKey> keys) const {
+  return MultiGet(keys, impl_->default_read_options);
+}
+
+BufferResult ReadOnlyDb::MultiGetInto(std::span<const MultiGetKey> keys,
+                                      MutableBytesView output,
+                                      const ReadOptions &options) const {
+  const auto descriptors = Descriptors(keys);
+  return detail::ToBufferResult(detail::Translate([&] {
+    return structured_ffi::native_structured_read_only_db_multi_get_into(
+        *impl_->native, Address(descriptors), Count(keys.size(), "key count"),
+        *options.impl_->native,
+        rust::Slice<Byte>(output.data(), output.size()));
+  }));
+}
+
+BufferResult ReadOnlyDb::MultiGetInto(std::span<const MultiGetKey> keys,
+                                      MutableBytesView output) const {
+  return MultiGetInto(keys, output, impl_->default_read_options);
 }
 
 } // namespace cobble::structured

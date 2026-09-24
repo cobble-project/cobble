@@ -24,11 +24,13 @@ The raw API includes:
   metrics.
 
 The separate `<cobble/structured.hpp>` entry point adds typed BYTES/LIST
-`structured::Db` and `structured::SingleDb` APIs without changing the raw
+`structured::Db`, `structured::SingleDb`, `structured::Reader`, and
+`structured::ReadOnlyDb` APIs without changing the raw
 umbrella or ABI. This surface includes point CRUD, reusable projected reads,
 detached staged schema evolution, typed snapshot/lifecycle controls, recovery,
 sharded rescaling, one-crossing batch and multi-get operations, owned and
-caller-buffer scans, typed distributed scan plans, and detached priority queues.
+caller-buffer scans, current/pinned or fixed-snapshot reads, typed distributed
+scan plans, and detached priority queues.
 
 ## Requirements
 

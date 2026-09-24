@@ -102,6 +102,8 @@ add_library(cobble_cpp SHARED cpp/convert.cpp cpp/error.cpp cpp/options.cpp
                               cpp/structured/single_db.cpp
                               cpp/structured/lifecycle.cpp
                               cpp/structured/priority_queue.cpp)
+target_sources(cobble_cpp PRIVATE cpp/structured/reader.cpp
+                                  cpp/structured/read_only_db.cpp)
 add_library(cobble::cobble ALIAS cobble_cpp)
 add_dependencies(cobble_cpp cobble_cpp_cargo)
 
@@ -201,6 +203,15 @@ if(COBBLE_CPP_BUILD_TESTS)
            COMMAND cobble_cpp_structured_batch_scan_capability_test)
   set_tests_properties(cobble_cpp_structured_batch_scan_capability
                        PROPERTIES TIMEOUT 300)
+
+  add_executable(cobble_cpp_structured_read_surface_capability_test
+                 tests/structured_read_surface_capability_test.cpp)
+  target_link_libraries(cobble_cpp_structured_read_surface_capability_test
+                        PRIVATE cobble::cobble)
+  add_test(NAME cobble_cpp_structured_read_surface_capability
+           COMMAND cobble_cpp_structured_read_surface_capability_test)
+  set_tests_properties(cobble_cpp_structured_read_surface_capability
+                       PROPERTIES TIMEOUT 240)
 
   add_executable(cobble_cpp_structured_priority_queue_capability_test
                  tests/structured_priority_queue_capability_test.cpp)

@@ -31,6 +31,8 @@ private:
 
   friend class Db;
   friend class SingleDb;
+  friend class Reader;
+  friend class ReadOnlyDb;
 };
 
 } // namespace cobble::structured

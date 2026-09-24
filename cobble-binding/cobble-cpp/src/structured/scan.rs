@@ -166,6 +166,19 @@ pub(crate) fn native_structured_scan_cursor_from_split(
     })
 }
 
+pub(crate) fn native_structured_scan_cursor_from_iterator(
+    bucket: u16,
+    iterator: StructuredDbIterator,
+) -> Box<NativeStructuredScanCursor> {
+    Box::new(NativeStructuredScanCursor {
+        iterator: NativeStructuredIterator::Db { bucket, iterator },
+        pending_row: None,
+        pending_batch: None,
+        // The core iterator owns its snapshot, schema, and file guards.
+        _owner: None,
+    })
+}
+
 pub(crate) fn native_structured_scan_cursor_next_owned(
     cursor: &mut NativeStructuredScanCursor,
     max_rows: u64,
