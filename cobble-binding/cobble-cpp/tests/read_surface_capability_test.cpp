@@ -62,6 +62,36 @@ SnapshotSet TakeSnapshots(cobble::Db& left, cobble::Db& right) {
   return {left.TakeSnapshot(), right.TakeSnapshot()};
 }
 
+cobble::GlobalSnapshot VerifyLightweightMetadata(
+    const std::string& config, const std::filesystem::path& config_path,
+    const std::filesystem::path& db_root, const cobble::Db& left,
+    const cobble::ShardSnapshot& shard, const cobble::GlobalSnapshot& global) {
+  const auto global_path =
+      db_root / "snapshot" / ("SNAPSHOT-" + std::to_string(global.id));
+  const auto data_dir = db_root / left.Id() / "data";
+  COBBLE_CHECK(std::filesystem::is_directory(data_dir));
+  cobble_test::ScopedRename unavailable(data_dir,
+                                        data_dir.string() + ".hidden");
+  const auto loaded_shard =
+      cobble::LoadShardSnapshotMetadata(config, left.Id(), shard.manifest_path);
+  const auto loaded_shard_file = cobble::LoadShardSnapshotMetadataFile(
+      config_path.string(), left.Id(), shard.manifest_path);
+  COBBLE_CHECK(loaded_shard.has_schema_metadata);
+  COBBLE_CHECK(loaded_shard.schema_id == shard.schema_id);
+  COBBLE_CHECK(loaded_shard.schema_column_families.size() ==
+               shard.schema_column_families.size());
+  COBBLE_CHECK(loaded_shard_file.snapshot_id == shard.snapshot_id);
+  const auto loaded =
+      cobble::LoadGlobalSnapshotMetadata(config, FileUrl(global_path));
+  const auto loaded_file = cobble::LoadGlobalSnapshotMetadataFile(
+      config_path.string(), FileUrl(global_path));
+  COBBLE_CHECK(loaded.id == global.id && loaded_file.id == global.id);
+  COBBLE_CHECK(loaded.shards.size() == 2);
+  COBBLE_CHECK(!loaded.shards.front().has_schema_metadata);
+  unavailable.Restore();
+  return loaded;
+}
+
 void VerifyCoverageValidation(const cobble::DbCoordinator& coordinator,
                               const SnapshotSet& snapshots) {
   const std::array valid = {snapshots.left, snapshots.right};
@@ -222,9 +252,29 @@ void VerifyPlanAndSplit(const std::string& config,
 void VerifyReaders(const std::string& config,
                    const std::filesystem::path& config_path,
                    cobble::DbCoordinator& coordinator, cobble::Db& left,
-                   cobble::Db& right, const cobble::GlobalSnapshot& first) {
+                   cobble::Db& right, const cobble::GlobalSnapshot& first,
+                   const cobble::GlobalSnapshot& loaded) {
   auto pinned = cobble::Reader::OpenFile(config_path.string(), first.id);
   auto current = cobble::Reader::OpenCurrent(config);
+  const auto global_path = config_path.parent_path() / "database" / "snapshot" /
+                           ("SNAPSHOT-" + std::to_string(first.id));
+  auto wrong_size_config = config;
+  const auto bucket_count = wrong_size_config.find("\"total_buckets\":4");
+  COBBLE_CHECK(bucket_count != std::string::npos);
+  wrong_size_config.replace(bucket_count, sizeof("\"total_buckets\":4") - 1,
+                            "\"total_buckets\":1");
+  cobble_test::ScopedRename unavailable(global_path,
+                                        global_path.string() + ".hidden");
+  auto from_object = cobble::Reader::Open(wrong_size_config, loaded);
+  auto from_object_file =
+      cobble::Reader::OpenFile(config_path.string(), loaded);
+  COBBLE_CHECK(from_object.CurrentGlobalSnapshot().id == first.id);
+  COBBLE_CHECK(from_object.ConfiguredSnapshotId() == first.id);
+  COBBLE_CHECK(String(from_object.Get(2, Bytes("version")).column(0)) ==
+               "old-right");
+  COBBLE_CHECK(String(from_object_file.Get(0, Bytes("version")).column(0)) ==
+               "old-left");
+  unavailable.Restore();
   COBBLE_CHECK(pinned.Mode() == cobble::ReaderMode::kSnapshot);
   COBBLE_CHECK(pinned.ConfiguredSnapshotId() == first.id);
   COBBLE_CHECK(current.Mode() == cobble::ReaderMode::kCurrent);
@@ -269,6 +319,8 @@ void VerifyReaders(const std::string& config,
 
   ExpectError(cobble::ErrorCode::kInvalidState, [&] { pinned.Refresh(); });
   COBBLE_CHECK(String(pinned.Get(0, Bytes("version")).column(0)) == "old-left");
+  COBBLE_CHECK(String(from_object.Get(0, Bytes("version")).column(0)) ==
+               "old-left");
   current.Refresh();
   COBBLE_CHECK(current.CurrentGlobalSnapshot().id == second.id);
   COBBLE_CHECK(String(current.Get(0, Bytes("version")).column(0)) ==
@@ -310,9 +362,13 @@ int main() {
     COBBLE_CHECK(coordinator.LoadCurrentGlobalSnapshot()->id == first.id);
     COBBLE_CHECK(coordinator.RetainSnapshot(first.id));
 
+    const auto loaded = VerifyLightweightMetadata(config, config_path,
+                                                  directory.path() / "database",
+                                                  left, snapshots.left, first);
+
     VerifyReadOnly(config, config_path, left, snapshots.left);
-    VerifyPlanAndSplit(config, config_path, first);
-    VerifyReaders(config, config_path, coordinator, left, right, first);
+    VerifyPlanAndSplit(config, config_path, loaded);
+    VerifyReaders(config, config_path, coordinator, left, right, first, loaded);
 
     COBBLE_CHECK(coordinator.ExpireSnapshot(first.id));
     COBBLE_CHECK(coordinator.ListGlobalSnapshots().size() == 1);

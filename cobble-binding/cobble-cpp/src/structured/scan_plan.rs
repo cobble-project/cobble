@@ -1,12 +1,9 @@
-use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
-
 use cobble_binding::Config;
 use cobble_binding::structured::StructuredScanSplit;
 
 use crate::structured_bridge::ffi;
 
-use super::conversion::{format_error, input_error};
+use super::conversion::{format_error, input_error, shard_snapshot_reference};
 use super::scan::{NativeStructuredScanCursor, native_structured_scan_cursor_from_split};
 use super::{BridgeResult, NativeStructuredScanOptions};
 
@@ -48,7 +45,7 @@ fn native_split(value: StructuredScanSplit) -> BridgeResult<ffi::NativeStructure
 
 fn split(value: ffi::NativeStructuredScanSplit) -> BridgeResult<StructuredScanSplit> {
     Ok(StructuredScanSplit {
-        shard: shard(value.shard)?,
+        shard: shard_snapshot_reference(value.shard)?,
         start: value.has_start.then_some(value.start),
         end: value.has_end.then_some(value.end),
         start_bucket: value.has_start_after.then_some(value.start_after_bucket),
@@ -153,56 +150,4 @@ fn native_shard(value: cobble_binding::ShardSnapshotRef) -> ffi::NativeShardSnap
         schema_id: 0,
         schema_families: Vec::new(),
     }
-}
-
-fn shard(value: ffi::NativeShardSnapshot) -> BridgeResult<cobble_binding::ShardSnapshotRef> {
-    if value.db_id.is_empty() || value.manifest_path.is_empty() {
-        return Err(input_error(
-            "structured split shard db_id and manifest_path must not be empty",
-        ));
-    }
-    Ok(cobble_binding::ShardSnapshotRef {
-        ranges: ranges(value.ranges)?,
-        column_family_ids: families(value.families)?,
-        db_id: value.db_id,
-        snapshot_id: value.snapshot_id,
-        manifest_path: value.manifest_path,
-        timestamp_seconds: value.timestamp_seconds,
-        data_size_bytes: value.data_size_bytes,
-        incremental_data_size_bytes: value.incremental_data_size_bytes,
-    })
-}
-
-fn ranges(values: Vec<ffi::NativeBucketRange>) -> BridgeResult<Vec<RangeInclusive<u16>>> {
-    if values.is_empty() {
-        return Err(input_error(
-            "structured split shard ranges must not be empty",
-        ));
-    }
-    values
-        .into_iter()
-        .map(|range| {
-            if range.start_inclusive > range.end_inclusive {
-                return Err(input_error("structured split shard range is reversed"));
-            }
-            Ok(range.start_inclusive..=range.end_inclusive)
-        })
-        .collect()
-}
-
-fn families(values: Vec<ffi::NativeFamily>) -> BridgeResult<BTreeMap<String, u8>> {
-    let mut by_name = BTreeMap::new();
-    let mut by_id = BTreeMap::new();
-    for family in values {
-        if family.name.is_empty() {
-            return Err(input_error("column family name must not be empty"));
-        }
-        if by_name.insert(family.name.clone(), family.id).is_some() {
-            return Err(input_error("duplicate column family name"));
-        }
-        if by_id.insert(family.id, family.name).is_some() {
-            return Err(input_error("duplicate column family id"));
-        }
-    }
-    Ok(by_name)
 }

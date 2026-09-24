@@ -42,6 +42,24 @@ Reader Reader::OpenFile(std::string_view config_path, SnapshotId snapshot) {
   return Reader(std::make_unique<Impl>(std::move(native)));
 }
 
+Reader Reader::Open(std::string_view config_json,
+                    const GlobalSnapshot& snapshot) {
+  auto native = detail::Translate([&] {
+    return ffi::native_reader_open_from_global_snapshot(
+        detail::RustStr(config_json), detail::ToNativeGlobalSnapshot(snapshot));
+  });
+  return Reader(std::make_unique<Impl>(std::move(native)));
+}
+
+Reader Reader::OpenFile(std::string_view config_path,
+                        const GlobalSnapshot& snapshot) {
+  auto native = detail::Translate([&] {
+    return ffi::native_reader_open_from_global_snapshot_file(
+        detail::RustStr(config_path), detail::ToNativeGlobalSnapshot(snapshot));
+  });
+  return Reader(std::make_unique<Impl>(std::move(native)));
+}
+
 void Reader::Refresh() {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Reader has been moved from");

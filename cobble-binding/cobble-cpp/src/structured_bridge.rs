@@ -151,6 +151,14 @@ pub(crate) mod ffi {
             config_path: &str,
             snapshot_id: u64,
         ) -> Result<Box<NativeStructuredReader>>;
+        fn native_structured_reader_open_from_global_snapshot(
+            config_json: &str,
+            global_snapshot: NativeSnapshot,
+        ) -> Result<Box<NativeStructuredReader>>;
+        fn native_structured_reader_open_from_global_snapshot_file(
+            config_path: &str,
+            global_snapshot: NativeSnapshot,
+        ) -> Result<Box<NativeStructuredReader>>;
         fn native_structured_reader_refresh(reader: &mut NativeStructuredReader) -> Result<()>;
         fn native_structured_reader_get(
             reader: &mut NativeStructuredReader,

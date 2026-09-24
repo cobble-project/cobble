@@ -1,10 +1,11 @@
 use cobble_binding::ReaderConfig;
-use cobble_binding::structured::StructuredReader;
+use cobble_binding::structured::{StructuredReader, StructuredReaderBuilder};
 
 use crate::structured_bridge::ffi;
 
 use super::conversion::{
-    format_error, input_error, native_schema, parse_config_file, parse_config_json,
+    format_error, global_snapshot_manifest, input_error, native_schema, parse_config_file,
+    parse_config_json,
 };
 use super::multi_get::{NativeStructuredMultiGetResult, borrowed_keys, encode_multi_get};
 use super::row::encode_get;
@@ -55,6 +56,31 @@ pub(crate) fn native_structured_reader_open_file(
     snapshot_id: u64,
 ) -> BridgeResult<Box<NativeStructuredReader>> {
     open(parse_config_file(config_path)?, Some(snapshot_id))
+}
+
+fn open_from_global_snapshot(
+    config: cobble_binding::Config,
+    global_snapshot: ffi::NativeSnapshot,
+) -> BridgeResult<Box<NativeStructuredReader>> {
+    opendal::install_default();
+    let reader = StructuredReaderBuilder::new(ReaderConfig::from_config(&config))
+        .open_from_global_snapshot(global_snapshot_manifest(global_snapshot)?)
+        .map_err(format_error)?;
+    Ok(Box::new(NativeStructuredReader { reader }))
+}
+
+pub(crate) fn native_structured_reader_open_from_global_snapshot(
+    config_json: &str,
+    global_snapshot: ffi::NativeSnapshot,
+) -> BridgeResult<Box<NativeStructuredReader>> {
+    open_from_global_snapshot(parse_config_json(config_json)?, global_snapshot)
+}
+
+pub(crate) fn native_structured_reader_open_from_global_snapshot_file(
+    config_path: &str,
+    global_snapshot: ffi::NativeSnapshot,
+) -> BridgeResult<Box<NativeStructuredReader>> {
+    open_from_global_snapshot(parse_config_file(config_path)?, global_snapshot)
 }
 
 pub(crate) fn native_structured_reader_refresh(

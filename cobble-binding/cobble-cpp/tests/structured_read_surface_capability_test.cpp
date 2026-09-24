@@ -108,6 +108,26 @@ int main() {
         coordinator.MaterializeGlobalSnapshot(4, 100, first_shards);
     COBBLE_CHECK(coordinator.RetainSnapshot(first.id));
 
+    const auto db_root = directory.path() / "database";
+    const auto global_path =
+        db_root / "snapshot" / ("SNAPSHOT-" + std::to_string(first.id));
+    const auto data_dir = db_root / left.Id() / "data";
+    COBBLE_CHECK(std::filesystem::is_directory(data_dir));
+    cobble::GlobalSnapshot loaded;
+    {
+      cobble_test::ScopedRename unavailable(data_dir,
+                                            data_dir.string() + ".hidden");
+      const auto loaded_shard = cobble::LoadShardSnapshotMetadata(
+          config, left.Id(), left_first.manifest_path);
+      COBBLE_CHECK(loaded_shard.has_schema_metadata);
+      COBBLE_CHECK(loaded_shard.schema_id == left_first.schema_id);
+      loaded = cobble::LoadGlobalSnapshotMetadataFile(path.string(),
+                                                      FileUrl(global_path));
+      COBBLE_CHECK(loaded.id == first.id);
+      COBBLE_CHECK(!loaded.shards.front().has_schema_metadata);
+      unavailable.Restore();
+    }
+
     auto fixed = cobble::structured::ReadOnlyDb::OpenFile(
         path.string(), left_first.snapshot_id, left.Id());
     COBBLE_CHECK(fixed.Id() == left.Id());
@@ -133,6 +153,23 @@ int main() {
 
     auto pinned = cobble::structured::Reader::OpenFile(path.string(), first.id);
     auto current = cobble::structured::Reader::OpenCurrent(config);
+    auto wrong_size_config = config;
+    const auto bucket_count = wrong_size_config.find("\"total_buckets\":4");
+    COBBLE_CHECK(bucket_count != std::string::npos);
+    wrong_size_config.replace(bucket_count, sizeof("\"total_buckets\":4") - 1,
+                              "\"total_buckets\":1");
+    cobble_test::ScopedRename unavailable(global_path,
+                                          global_path.string() + ".hidden");
+    auto from_object =
+        cobble::structured::Reader::Open(wrong_size_config, loaded);
+    auto from_object_file =
+        cobble::structured::Reader::OpenFile(path.string(), loaded);
+    COBBLE_CHECK(from_object.ConfiguredSnapshotId() == first.id);
+    COBBLE_CHECK(String(from_object.Get(2, Bytes("right")).Bytes(0)) ==
+                 "old-right");
+    COBBLE_CHECK(String(from_object_file.Get(0, Bytes("both")).Bytes(0)) ==
+                 "old");
+    unavailable.Restore();
     COBBLE_CHECK(pinned.Mode() == cobble::structured::ReaderMode::kSnapshot);
     COBBLE_CHECK(pinned.ConfiguredSnapshotId() == first.id);
     COBBLE_CHECK(current.Mode() == cobble::structured::ReaderMode::kCurrent);
@@ -176,6 +213,8 @@ int main() {
     }
     COBBLE_CHECK(rejected);
     COBBLE_CHECK(String(pinned.Get(0, Bytes("both")).Bytes(0)) == "old");
+    COBBLE_CHECK(String(from_object.Get(0, Bytes("both")).Bytes(0)) == "old");
+    COBBLE_CHECK(from_object.Get(0, Bytes("both")).ColumnCount() == 2);
     current.Refresh();
     COBBLE_CHECK(current.CurrentGlobalSnapshot().id == second.id);
     COBBLE_CHECK(current.CurrentSchema().Type("default", 2).kind ==

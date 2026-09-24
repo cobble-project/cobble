@@ -53,6 +53,42 @@ GlobalSnapshot ToGlobalSnapshot(const ffi::NativeSnapshot& native) {
 
 }  // namespace detail
 
+ShardSnapshot LoadShardSnapshotMetadata(std::string_view config_json,
+                                        std::string_view db_id,
+                                        std::string_view manifest_path) {
+  return detail::ToShardSnapshot(detail::Translate([&] {
+    return ffi::native_load_shard_snapshot_metadata(
+        detail::RustStr(config_json), detail::RustStr(db_id),
+        detail::RustStr(manifest_path));
+  }));
+}
+
+ShardSnapshot LoadShardSnapshotMetadataFile(std::string_view config_path,
+                                            std::string_view db_id,
+                                            std::string_view manifest_path) {
+  return detail::ToShardSnapshot(detail::Translate([&] {
+    return ffi::native_load_shard_snapshot_metadata_file(
+        detail::RustStr(config_path), detail::RustStr(db_id),
+        detail::RustStr(manifest_path));
+  }));
+}
+
+GlobalSnapshot LoadGlobalSnapshotMetadata(std::string_view config_json,
+                                          std::string_view manifest_path) {
+  return detail::ToGlobalSnapshot(detail::Translate([&] {
+    return ffi::native_load_global_snapshot_metadata(
+        detail::RustStr(config_json), detail::RustStr(manifest_path));
+  }));
+}
+
+GlobalSnapshot LoadGlobalSnapshotMetadataFile(std::string_view config_path,
+                                              std::string_view manifest_path) {
+  return detail::ToGlobalSnapshot(detail::Translate([&] {
+    return ffi::native_load_global_snapshot_metadata_file(
+        detail::RustStr(config_path), detail::RustStr(manifest_path));
+  }));
+}
+
 struct PendingSnapshot::Impl {
   explicit Impl(rust::Box<ffi::NativePendingSnapshot> native_snapshot)
       : native(std::move(native_snapshot)) {}

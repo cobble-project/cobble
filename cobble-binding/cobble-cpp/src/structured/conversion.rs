@@ -1,4 +1,4 @@
-use std::ops::RangeInclusive;
+use std::{collections::BTreeMap, ops::RangeInclusive};
 
 use cobble_binding::structured::{
     ListConfig, ListRetainMode, StructuredColumnType, StructuredSchema, StructuredWriteOptions,
@@ -23,6 +23,73 @@ pub(crate) fn parse_config_json(value: &str) -> BridgeResult<Config> {
 
 pub(crate) fn parse_config_file(value: &str) -> BridgeResult<Config> {
     Config::from_path(value).map_err(format_error)
+}
+
+fn snapshot_families(values: Vec<ffi::NativeFamily>) -> BridgeResult<BTreeMap<String, u8>> {
+    let mut by_name = BTreeMap::new();
+    let mut by_id = BTreeMap::new();
+    for family in values {
+        if family.name.is_empty() {
+            return Err(input_error("column family name must not be empty"));
+        }
+        if by_name.insert(family.name.clone(), family.id).is_some() {
+            return Err(input_error("duplicate column family name"));
+        }
+        if by_id.insert(family.id, family.name).is_some() {
+            return Err(input_error("duplicate column family id"));
+        }
+    }
+    Ok(by_name)
+}
+
+pub(crate) fn shard_snapshot_reference(
+    value: ffi::NativeShardSnapshot,
+) -> BridgeResult<cobble_binding::ShardSnapshotRef> {
+    if value.db_id.is_empty() || value.manifest_path.is_empty() {
+        return Err(input_error(
+            "shard db_id and manifest_path must not be empty",
+        ));
+    }
+    if value.ranges.is_empty() {
+        return Err(input_error("shard ranges must not be empty"));
+    }
+    let ranges = value
+        .ranges
+        .into_iter()
+        .map(|range| {
+            if range.start_inclusive > range.end_inclusive {
+                return Err(input_error("shard range is reversed"));
+            }
+            Ok(range.start_inclusive..=range.end_inclusive)
+        })
+        .collect::<BridgeResult<_>>()?;
+    Ok(cobble_binding::ShardSnapshotRef {
+        ranges,
+        column_family_ids: snapshot_families(value.families)?,
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+    })
+}
+
+pub(crate) fn global_snapshot_manifest(
+    value: ffi::NativeSnapshot,
+) -> BridgeResult<cobble_binding::GlobalSnapshotManifest> {
+    Ok(cobble_binding::GlobalSnapshotManifest {
+        version: value.version,
+        id: value.id,
+        total_buckets: value.total_buckets,
+        column_family_ids: snapshot_families(value.families)?,
+        shard_snapshots: value
+            .shards
+            .into_iter()
+            .map(shard_snapshot_reference)
+            .collect::<BridgeResult<_>>()?,
+        watermark_seconds: value.watermark_seconds,
+    })
 }
 
 pub(crate) fn recovery_mode(value: u8) -> BridgeResult<RecoveryMode> {

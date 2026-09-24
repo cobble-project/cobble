@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <cobble/types.hpp>
@@ -51,6 +52,19 @@ struct GlobalSnapshot {
   std::vector<ShardSnapshot> shards;
   std::uint32_t watermark_seconds;
 };
+
+// Metadata-only reads: no DB, SST files, or coordinator are opened. Paths must
+// be absolute and inside a configured metadata volume.
+[[nodiscard]] COBBLE_CPP_API ShardSnapshot
+LoadShardSnapshotMetadata(std::string_view config_json, std::string_view db_id,
+                          std::string_view manifest_path);
+[[nodiscard]] COBBLE_CPP_API ShardSnapshot LoadShardSnapshotMetadataFile(
+    std::string_view config_path, std::string_view db_id,
+    std::string_view manifest_path);
+[[nodiscard]] COBBLE_CPP_API GlobalSnapshot LoadGlobalSnapshotMetadata(
+    std::string_view config_json, std::string_view manifest_path);
+[[nodiscard]] COBBLE_CPP_API GlobalSnapshot LoadGlobalSnapshotMetadataFile(
+    std::string_view config_path, std::string_view manifest_path);
 
 class COBBLE_CPP_API PendingSnapshot final {
  public:

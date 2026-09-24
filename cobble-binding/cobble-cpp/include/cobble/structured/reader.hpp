@@ -24,6 +24,11 @@ class COBBLE_CPP_API Reader final {
                                    SnapshotId global_snapshot);
   [[nodiscard]] static Reader OpenFile(std::string_view config_path,
                                        SnapshotId global_snapshot);
+  // Uses the supplied fixed manifest directly; does not reload its global file.
+  [[nodiscard]] static Reader Open(std::string_view config_json,
+                                   const GlobalSnapshot &global_snapshot);
+  [[nodiscard]] static Reader OpenFile(std::string_view config_path,
+                                       const GlobalSnapshot &global_snapshot);
 
   Reader(Reader &&) noexcept;
   Reader &operator=(Reader &&) noexcept;

@@ -17,7 +17,8 @@ The raw API includes:
 - typed shard snapshots, active snapshot switching, and bucket
   expand/adopt/shrink operations;
 - current or pinned multi-shard `Reader` handles and exact-snapshot
-  `ReadOnlyDb` handles;
+  `ReadOnlyDb` handles, plus metadata-only snapshot loading and fixed readers
+  opened from an existing typed global snapshot;
 - typed `DbCoordinator` global-snapshot materialization and binary-safe scan
   plans, splits, and resumable split scanners;
 - typed raw schema inspection/evolution, lifecycle controls, and labeled

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace cobble_test {
 
@@ -58,6 +59,39 @@ class TempDirectory {
 
  private:
   std::filesystem::path path_;
+};
+
+// Reversible fixture rename used to prove metadata reads do not open data
+// files.
+class ScopedRename {
+ public:
+  ScopedRename(std::filesystem::path original, std::filesystem::path hidden)
+      : original_(std::move(original)), hidden_(std::move(hidden)) {
+    std::filesystem::rename(original_, hidden_);
+    active_ = true;
+  }
+
+  ~ScopedRename() {
+    if (active_) {
+      std::error_code ignored;
+      std::filesystem::rename(hidden_, original_, ignored);
+    }
+  }
+
+  ScopedRename(const ScopedRename&) = delete;
+  ScopedRename& operator=(const ScopedRename&) = delete;
+
+  void Restore() {
+    if (active_) {
+      std::filesystem::rename(hidden_, original_);
+      active_ = false;
+    }
+  }
+
+ private:
+  std::filesystem::path original_;
+  std::filesystem::path hidden_;
+  bool active_ = false;
 };
 
 }  // namespace cobble_test

@@ -23,6 +23,10 @@ Schema ToSchema(const structured_ffi::NativeStructuredSchema &native);
 ShardSnapshot ToShardSnapshot(
     const structured_ffi::NativeShardSnapshot &native);
 GlobalSnapshot ToGlobalSnapshot(const structured_ffi::NativeSnapshot &native);
+structured_ffi::NativeShardSnapshot ToNativeShardSnapshot(
+    const ShardSnapshot &snapshot);
+structured_ffi::NativeSnapshot ToNativeGlobalSnapshot(
+    const GlobalSnapshot &snapshot);
 std::vector<MetricSample> ToMetrics(
     rust::Vec<structured_ffi::NativeMetric> native);
 BufferResult ToBufferResult(const structured_ffi::NativeBufferResult &native);

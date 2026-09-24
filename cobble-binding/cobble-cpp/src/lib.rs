@@ -69,7 +69,9 @@ use sharded_db::*;
 use snapshot::{
     NativePendingShardSnapshot, NativePendingSnapshot, native_database_get_snapshot_typed,
     native_database_list_snapshots_typed, native_database_start_snapshot,
-    native_database_take_snapshot, native_pending_shard_snapshot_id,
+    native_database_take_snapshot, native_load_global_snapshot_metadata,
+    native_load_global_snapshot_metadata_file, native_load_shard_snapshot_metadata,
+    native_load_shard_snapshot_metadata_file, native_pending_shard_snapshot_id,
     native_pending_shard_snapshot_wait, native_pending_snapshot_id, native_pending_snapshot_wait,
     native_sharded_database_cancel_snapshot, native_sharded_database_expire_snapshot,
     native_sharded_database_get_shard_snapshot, native_sharded_database_retain_snapshot,
@@ -639,6 +641,14 @@ mod ffi {
             config_path: &str,
             snapshot_id: u64,
         ) -> Result<Box<NativeReader>>;
+        fn native_reader_open_from_global_snapshot(
+            config_json: &str,
+            global_snapshot: NativeSnapshot,
+        ) -> Result<Box<NativeReader>>;
+        fn native_reader_open_from_global_snapshot_file(
+            config_path: &str,
+            global_snapshot: NativeSnapshot,
+        ) -> Result<Box<NativeReader>>;
         fn native_reader_refresh(reader: &mut NativeReader) -> Result<()>;
         fn native_reader_get(
             reader: &mut NativeReader,
@@ -673,6 +683,25 @@ mod ffi {
         fn native_reader_list_global_snapshots(
             reader: &NativeReader,
         ) -> Result<Vec<NativeSnapshot>>;
+
+        fn native_load_shard_snapshot_metadata(
+            config_json: &str,
+            db_id: &str,
+            manifest_path: &str,
+        ) -> Result<NativeShardSnapshot>;
+        fn native_load_shard_snapshot_metadata_file(
+            config_path: &str,
+            db_id: &str,
+            manifest_path: &str,
+        ) -> Result<NativeShardSnapshot>;
+        fn native_load_global_snapshot_metadata(
+            config_json: &str,
+            manifest_path: &str,
+        ) -> Result<NativeSnapshot>;
+        fn native_load_global_snapshot_metadata_file(
+            config_path: &str,
+            manifest_path: &str,
+        ) -> Result<NativeSnapshot>;
 
         fn native_coordinator_open(config_json: &str) -> Result<Box<NativeCoordinator>>;
         fn native_coordinator_open_file(config_path: &str) -> Result<Box<NativeCoordinator>>;

@@ -18,6 +18,7 @@ BufferResult ToBufferResult(const ffi::NativeBufferResult& native);
 rust::Vec<ffi::NativeRange> ToNativeRanges(std::span<const BucketRange> ranges);
 ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native);
 GlobalSnapshot ToGlobalSnapshot(const ffi::NativeSnapshot& native);
+ffi::NativeSnapshot ToNativeGlobalSnapshot(const GlobalSnapshot& snapshot);
 ffi::NativeShardSnapshot ToNativeShardSnapshot(const ShardSnapshot& snapshot);
 rust::Vec<ffi::NativeShardSnapshot> ToNativeShardSnapshots(
     std::span<const ShardSnapshot> snapshots);

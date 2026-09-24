@@ -25,42 +25,9 @@ std::vector<Byte> CopyBytes(BytesView value) {
   return {value.begin(), value.end()};
 }
 
-structured_ffi::NativeShardSnapshot ToNative(const ShardSnapshot &value) {
-  structured_ffi::NativeShardSnapshot result;
-  result.ranges.reserve(value.ranges.size());
-  for (const auto &range : value.ranges) {
-    structured_ffi::NativeBucketRange item;
-    item.start_inclusive = range.start_inclusive;
-    item.end_inclusive = range.end_inclusive;
-    result.ranges.push_back(std::move(item));
-  }
-  result.families.reserve(value.column_families.size());
-  for (const auto &family : value.column_families) {
-    structured_ffi::NativeFamily item;
-    item.name = rust::String(family.name);
-    item.id = family.id;
-    result.families.push_back(std::move(item));
-  }
-  result.db_id = rust::String(value.db_id);
-  result.snapshot_id = value.snapshot_id;
-  result.manifest_path = rust::String(value.manifest_path);
-  result.timestamp_seconds = value.timestamp_seconds;
-  result.data_size_bytes = value.data_size_bytes;
-  result.incremental_data_size_bytes = value.incremental_data_size_bytes;
-  result.has_schema_metadata = value.has_schema_metadata;
-  result.schema_id = value.schema_id;
-  result.schema_families.reserve(value.schema_column_families.size());
-  for (const auto &family : value.schema_column_families) {
-    result.schema_families.push_back({rust::String(family.name), family.id,
-                                      family.num_columns, family.value_has_ttl,
-                                      rust::String(family.metadata_json)});
-  }
-  return result;
-}
-
 structured_ffi::NativeStructuredScanSplit ToNative(const ScanSplit &value) {
   structured_ffi::NativeStructuredScanSplit result;
-  result.shard = ToNative(value.shard);
+  result.shard = detail::ToNativeShardSnapshot(value.shard);
   result.has_start = value.start_inclusive.has_value();
   result.start = value.start_inclusive ? ToRustBytes(*value.start_inclusive)
                                        : rust::Vec<Byte>{};

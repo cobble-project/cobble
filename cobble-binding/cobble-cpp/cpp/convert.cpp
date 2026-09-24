@@ -139,6 +139,20 @@ rust::Vec<ffi::NativeShardSnapshot> ToNativeShardSnapshots(
   return native;
 }
 
+ffi::NativeSnapshot ToNativeGlobalSnapshot(const GlobalSnapshot& snapshot) {
+  ffi::NativeSnapshot native;
+  native.version = snapshot.version;
+  native.id = snapshot.id;
+  native.total_buckets = snapshot.total_buckets;
+  native.families.reserve(snapshot.column_families.size());
+  for (const auto& family : snapshot.column_families) {
+    native.families.push_back({RustString(family.name), family.id});
+  }
+  native.shards = ToNativeShardSnapshots(snapshot.shards);
+  native.watermark_seconds = snapshot.watermark_seconds;
+  return native;
+}
+
 ffi::NativeScanSplit ToNativeScanSplit(const ScanSplit& split) {
   ffi::NativeScanSplit native;
   native.shard = ToNativeShardSnapshot(split.shard);

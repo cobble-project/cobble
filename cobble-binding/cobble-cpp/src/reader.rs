@@ -1,4 +1,4 @@
-use cobble_binding::{Config, Reader, ReaderConfig};
+use cobble_binding::{Config, Reader, ReaderBuilder, ReaderConfig};
 
 use crate::{
     BridgeResult,
@@ -9,7 +9,7 @@ use crate::{
     multi_get::{NativeMultiGetResult, borrowed_keys},
     options::{checked_u64, to_read_options, to_scan_options, to_single_column_read_options},
     scan::{NativeScanCursor, native_scan_cursor_from_db_iterator},
-    snapshot::snapshot,
+    snapshot::{global_snapshot_manifest, snapshot},
 };
 
 pub(crate) struct NativeReader {
@@ -61,6 +61,33 @@ pub(crate) fn native_reader_open_file(
         Config::from_path(config_path).map_err(format_cobble_error)?,
         Some(snapshot_id),
     )
+}
+
+pub(crate) fn native_reader_open_from_global_snapshot(
+    config_json: &str,
+    global_snapshot: ffi::NativeSnapshot,
+) -> BridgeResult<Box<NativeReader>> {
+    let config = Config::from_json_str(config_json).map_err(format_cobble_error)?;
+    open_from_global_snapshot(config, global_snapshot)
+}
+
+pub(crate) fn native_reader_open_from_global_snapshot_file(
+    config_path: &str,
+    global_snapshot: ffi::NativeSnapshot,
+) -> BridgeResult<Box<NativeReader>> {
+    let config = Config::from_path(config_path).map_err(format_cobble_error)?;
+    open_from_global_snapshot(config, global_snapshot)
+}
+
+fn open_from_global_snapshot(
+    config: Config,
+    global_snapshot: ffi::NativeSnapshot,
+) -> BridgeResult<Box<NativeReader>> {
+    opendal::install_default();
+    let reader = ReaderBuilder::new(ReaderConfig::from_config(&config))
+        .open_from_global_snapshot(global_snapshot_manifest(global_snapshot)?)
+        .map_err(format_cobble_error)?;
+    Ok(Box::new(NativeReader { reader }))
 }
 
 pub(crate) fn native_reader_refresh(reader: &mut NativeReader) -> BridgeResult<()> {

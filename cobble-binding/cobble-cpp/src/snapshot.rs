@@ -197,6 +197,69 @@ pub(crate) fn shard_snapshot_reference(
     })
 }
 
+pub(crate) fn global_snapshot_manifest(
+    value: ffi::NativeSnapshot,
+) -> BridgeResult<cobble_binding::GlobalSnapshotManifest> {
+    Ok(cobble_binding::GlobalSnapshotManifest {
+        version: value.version,
+        id: value.id,
+        total_buckets: value.total_buckets,
+        column_family_ids: native_families(value.families)?,
+        shard_snapshots: value
+            .shards
+            .into_iter()
+            .map(shard_snapshot_reference)
+            .collect::<BridgeResult<_>>()?,
+        watermark_seconds: value.watermark_seconds,
+    })
+}
+
+pub(crate) fn native_load_shard_snapshot_metadata(
+    config_json: &str,
+    db_id: &str,
+    manifest_path: &str,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    let config = cobble_binding::Config::from_json_str(config_json).map_err(format_cobble_error)?;
+    opendal::install_default();
+    cobble_binding::load_shard_snapshot_metadata(&config, db_id, manifest_path)
+        .map(shard_snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_load_shard_snapshot_metadata_file(
+    config_path: &str,
+    db_id: &str,
+    manifest_path: &str,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    let config = cobble_binding::Config::from_path(config_path).map_err(format_cobble_error)?;
+    opendal::install_default();
+    cobble_binding::load_shard_snapshot_metadata(&config, db_id, manifest_path)
+        .map(shard_snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_load_global_snapshot_metadata(
+    config_json: &str,
+    manifest_path: &str,
+) -> BridgeResult<ffi::NativeSnapshot> {
+    let config = cobble_binding::Config::from_json_str(config_json).map_err(format_cobble_error)?;
+    opendal::install_default();
+    cobble_binding::load_global_snapshot_metadata(&config, manifest_path)
+        .map(snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_load_global_snapshot_metadata_file(
+    config_path: &str,
+    manifest_path: &str,
+) -> BridgeResult<ffi::NativeSnapshot> {
+    let config = cobble_binding::Config::from_path(config_path).map_err(format_cobble_error)?;
+    opendal::install_default();
+    cobble_binding::load_global_snapshot_metadata(&config, manifest_path)
+        .map(snapshot)
+        .map_err(format_cobble_error)
+}
+
 pub(crate) fn native_sharded_database_snapshot(
     db: &crate::sharded_db::NativeShardedDatabase,
 ) -> BridgeResult<u64> {

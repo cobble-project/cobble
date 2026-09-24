@@ -47,6 +47,49 @@ rust::Vec<structured_ffi::NativeBucketRange> ToNativeRanges(
   return native;
 }
 
+structured_ffi::NativeShardSnapshot ToNativeShardSnapshot(
+    const ShardSnapshot &snapshot) {
+  structured_ffi::NativeShardSnapshot native;
+  native.ranges = ToNativeRanges(snapshot.ranges);
+  native.families.reserve(snapshot.column_families.size());
+  for (const auto &family : snapshot.column_families) {
+    native.families.push_back({rust::String(family.name), family.id});
+  }
+  native.db_id = rust::String(snapshot.db_id);
+  native.snapshot_id = snapshot.snapshot_id;
+  native.manifest_path = rust::String(snapshot.manifest_path);
+  native.timestamp_seconds = snapshot.timestamp_seconds;
+  native.data_size_bytes = snapshot.data_size_bytes;
+  native.incremental_data_size_bytes = snapshot.incremental_data_size_bytes;
+  native.has_schema_metadata = snapshot.has_schema_metadata;
+  native.schema_id = snapshot.schema_id;
+  native.schema_families.reserve(snapshot.schema_column_families.size());
+  for (const auto &family : snapshot.schema_column_families) {
+    native.schema_families.push_back({rust::String(family.name), family.id,
+                                      family.num_columns, family.value_has_ttl,
+                                      rust::String(family.metadata_json)});
+  }
+  return native;
+}
+
+structured_ffi::NativeSnapshot ToNativeGlobalSnapshot(
+    const GlobalSnapshot &snapshot) {
+  structured_ffi::NativeSnapshot native;
+  native.version = snapshot.version;
+  native.id = snapshot.id;
+  native.total_buckets = snapshot.total_buckets;
+  native.families.reserve(snapshot.column_families.size());
+  for (const auto &family : snapshot.column_families) {
+    native.families.push_back({rust::String(family.name), family.id});
+  }
+  native.shards.reserve(snapshot.shards.size());
+  for (const auto &shard : snapshot.shards) {
+    native.shards.push_back(ToNativeShardSnapshot(shard));
+  }
+  native.watermark_seconds = snapshot.watermark_seconds;
+  return native;
+}
+
 rust::Vec<structured_ffi::NativeBytesDescriptor> ToNativeElements(
     std::span<const BytesView> elements) {
   rust::Vec<structured_ffi::NativeBytesDescriptor> native;

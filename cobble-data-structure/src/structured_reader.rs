@@ -68,6 +68,15 @@ impl StructuredReaderBuilder {
         self.open_inner(Some(global_snapshot_id))
     }
 
+    /// Opens a fixed view from an already resolved global snapshot without reloading its manifest.
+    pub fn open_from_global_snapshot(
+        self,
+        global_snapshot: GlobalSnapshotManifest,
+    ) -> Result<StructuredReader> {
+        let reader = self.inner.open_from_global_snapshot(global_snapshot)?;
+        StructuredReader::from_reader(reader, self.volumes, self.resolver, self.factories)
+    }
+
     pub fn open_current(self) -> Result<StructuredReader> {
         self.open_inner(None)
     }
