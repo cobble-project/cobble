@@ -29,6 +29,7 @@ Thus, it really fits the needs of modern distributed systems that require a vers
 - **Row-level TTL support** with configurable time providers
 - **Data structures support** with typed row encoding/decoding and structured APIs
 - **Java bindings** for JVM-based applications
+- **C++ bindings** for native C++20 applications
 - **Web monitoring dashboard** for operational visibility
 
 ## Documentation Structure
@@ -38,5 +39,5 @@ Thus, it really fits the needs of modern distributed systems that require a vers
 | [**Getting Started**](getting-started/) | Configuration, basic usage, and integration guides |
 | [**Architecture**](architecture/) | Internal design, data structures, and algorithms |
 | [**Reference**](reference/) | Complete configuration reference and API documentation |
-| [**FFI Bindings**](ffi-bindings/) | Using Cobble from other languages (Java, …) |
+| [**FFI Bindings**](ffi-bindings/) | Using Cobble from Java and C++ |
 | [**Tools**](tools/) | Operational tooling: CLI commands and Web Monitor |
