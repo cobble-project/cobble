@@ -109,4 +109,4 @@ std::vector<GlobalSnapshot> Reader::ListGlobalSnapshots() const {
   return result;
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

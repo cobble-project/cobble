@@ -20,8 +20,7 @@ Db Db::Open(std::string_view config_json) {
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::Open(std::string_view config_json,
-            std::span<const BucketRange> ranges) {
+Db Db::Open(std::string_view config_json, std::span<const BucketRange> ranges) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_open_ranges(
         detail::RustStr(config_json), detail::ToNativeRanges(ranges));
@@ -31,8 +30,7 @@ Db Db::Open(std::string_view config_json,
 
 Db Db::OpenFile(std::string_view config_path) {
   auto native = detail::Translate([&] {
-    return ffi::native_sharded_database_open_file(
-        detail::RustStr(config_path));
+    return ffi::native_sharded_database_open_file(detail::RustStr(config_path));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
@@ -50,20 +48,19 @@ Db Db::OpenFromSnapshot(std::string_view config_json, SnapshotId snapshot,
                         std::string_view existing_db_id, RecoveryMode mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_open_from_snapshot(
-        detail::RustStr(config_json), snapshot,
-        detail::RustStr(existing_db_id), static_cast<std::uint8_t>(mode));
+        detail::RustStr(config_json), snapshot, detail::RustStr(existing_db_id),
+        static_cast<std::uint8_t>(mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::OpenFromSnapshotFile(std::string_view config_path,
-                            SnapshotId snapshot,
+Db Db::OpenFromSnapshotFile(std::string_view config_path, SnapshotId snapshot,
                             std::string_view existing_db_id,
                             RecoveryMode mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_open_from_snapshot_file(
-        detail::RustStr(config_path), snapshot,
-        detail::RustStr(existing_db_id), static_cast<std::uint8_t>(mode));
+        detail::RustStr(config_path), snapshot, detail::RustStr(existing_db_id),
+        static_cast<std::uint8_t>(mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
@@ -78,8 +75,7 @@ Db Db::RestoreNew(std::string_view config_json, SnapshotId source_snapshot,
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::RestoreNewFile(std::string_view config_path,
-                      SnapshotId source_snapshot,
+Db Db::RestoreNewFile(std::string_view config_path, SnapshotId source_snapshot,
                       std::string_view source_db_id) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_restore_new_file(
@@ -110,15 +106,15 @@ Db Db::RestoreNewFromManifestFile(std::string_view config_path,
 Db Db::Resume(std::string_view config_json, std::string_view existing_db_id,
               RecoveryMode mode) {
   auto native = detail::Translate([&] {
-    return ffi::native_sharded_database_resume(
-        detail::RustStr(config_json), detail::RustStr(existing_db_id),
-        static_cast<std::uint8_t>(mode));
+    return ffi::native_sharded_database_resume(detail::RustStr(config_json),
+                                               detail::RustStr(existing_db_id),
+                                               static_cast<std::uint8_t>(mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::ResumeFile(std::string_view config_path,
-                  std::string_view existing_db_id, RecoveryMode mode) {
+Db Db::ResumeFile(std::string_view config_path, std::string_view existing_db_id,
+                  RecoveryMode mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_resume_file(
         detail::RustStr(config_path), detail::RustStr(existing_db_id),
@@ -128,24 +124,22 @@ Db Db::ResumeFile(std::string_view config_path,
 }
 
 Db Db::ResumeFromSnapshot(std::string_view config_json, SnapshotId snapshot,
-                          std::string_view existing_db_id,
-                          RecoveryMode mode) {
+                          std::string_view existing_db_id, RecoveryMode mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_resume_from_snapshot(
-        detail::RustStr(config_json), snapshot,
-        detail::RustStr(existing_db_id), static_cast<std::uint8_t>(mode));
+        detail::RustStr(config_json), snapshot, detail::RustStr(existing_db_id),
+        static_cast<std::uint8_t>(mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::ResumeFromSnapshotFile(std::string_view config_path,
-                              SnapshotId snapshot,
+Db Db::ResumeFromSnapshotFile(std::string_view config_path, SnapshotId snapshot,
                               std::string_view existing_db_id,
                               RecoveryMode mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_resume_from_snapshot_file(
-        detail::RustStr(config_path), snapshot,
-        detail::RustStr(existing_db_id), static_cast<std::uint8_t>(mode));
+        detail::RustStr(config_path), snapshot, detail::RustStr(existing_db_id),
+        static_cast<std::uint8_t>(mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
@@ -165,9 +159,9 @@ void Db::Put(BucketId bucket, BytesView key, ColumnIndex column,
   }
   const auto native_options = detail::ToNative(options);
   detail::Translate([&] {
-    ffi::native_sharded_database_put(
-        *impl_->native, bucket, detail::RustBytes(key), column,
-        detail::RustBytes(value), native_options);
+    ffi::native_sharded_database_put(*impl_->native, bucket,
+                                     detail::RustBytes(key), column,
+                                     detail::RustBytes(value), native_options);
   });
 }
 
@@ -178,9 +172,8 @@ void Db::Delete(BucketId bucket, BytesView key, ColumnIndex column,
   }
   const auto native_options = detail::ToNative(options);
   detail::Translate([&] {
-    ffi::native_sharded_database_delete(*impl_->native, bucket,
-                                         detail::RustBytes(key), column,
-                                         native_options);
+    ffi::native_sharded_database_delete(
+        *impl_->native, bucket, detail::RustBytes(key), column, native_options);
   });
 }
 
@@ -237,8 +230,7 @@ BufferResult Db::GetColumnInto(BucketId bucket, BytesView key,
   }));
 }
 
-ScanCursor Db::Scan(BucketId bucket,
-                    std::optional<BytesView> start_inclusive,
+ScanCursor Db::Scan(BucketId bucket, std::optional<BytesView> start_inclusive,
                     std::optional<BytesView> end_exclusive,
                     const ScanOptions& options) const {
   if (!impl_) {

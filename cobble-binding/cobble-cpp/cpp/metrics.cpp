@@ -15,8 +15,7 @@ std::vector<MetricSample> detail::ToMetrics(
     std::vector<MetricLabel> labels;
     labels.reserve(sample.labels.size());
     for (const auto& label : sample.labels) {
-      labels.push_back(
-          {std::string(label.key), std::string(label.value)});
+      labels.push_back({std::string(label.key), std::string(label.value)});
     }
 
     MetricValue value;
@@ -28,8 +27,8 @@ std::vector<MetricSample> detail::ToMetrics(
         value = GaugeValue{sample.gauge};
         break;
       case 2:
-        value = HistogramValue{sample.count, sample.sum, sample.min,
-                               sample.max};
+        value =
+            HistogramValue{sample.count, sample.sum, sample.min, sample.max};
         break;
       default:
         throw Error(ErrorCode::kInvalidState,

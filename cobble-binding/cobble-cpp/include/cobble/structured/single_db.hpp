@@ -19,7 +19,7 @@
 namespace cobble::structured {
 
 class COBBLE_CPP_API SingleDb final {
-public:
+ public:
   [[nodiscard]] static SingleDb Open(std::string_view config_json);
   [[nodiscard]] static SingleDb OpenFile(std::string_view config_path);
 
@@ -55,17 +55,17 @@ public:
   void Write(WriteBatch &batch) const;
   [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
                                              const ReadOptions &options) const;
-  [[nodiscard]] OwnedMultiGetResult
-  MultiGet(std::span<const MultiGetKey> keys) const;
+  [[nodiscard]] OwnedMultiGetResult MultiGet(
+      std::span<const MultiGetKey> keys) const;
   [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
                                           MutableBytesView output,
                                           const ReadOptions &options) const;
   [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
                                           MutableBytesView output) const;
-  [[nodiscard]] ScanCursor
-  Scan(BucketId bucket, std::optional<BytesView> start_inclusive = std::nullopt,
-       std::optional<BytesView> end_exclusive = std::nullopt,
-       const ScanOptions &options = {}) const;
+  [[nodiscard]] ScanCursor Scan(
+      BucketId bucket, std::optional<BytesView> start_inclusive = std::nullopt,
+      std::optional<BytesView> end_exclusive = std::nullopt,
+      const ScanOptions &options = {}) const;
   [[nodiscard]] PriorityQueue NewPriorityQueue(std::string_view name);
   [[nodiscard]] PriorityQueue GetPriorityQueue(std::string_view name) const;
   [[nodiscard]] PriorityQueue GetOrNewPriorityQueue(std::string_view name);
@@ -84,7 +84,7 @@ public:
   [[nodiscard]] std::size_t LoadReadonlyFilesToPrimary() const;
   void Close() const;
 
-private:
+ private:
   struct Impl;
   explicit SingleDb(std::shared_ptr<Impl>) noexcept;
   std::shared_ptr<Impl> impl_;
@@ -94,4 +94,4 @@ private:
   friend class PriorityQueue;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

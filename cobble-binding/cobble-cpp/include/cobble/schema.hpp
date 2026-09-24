@@ -39,8 +39,7 @@ class COBBLE_CPP_API SchemaBuilder final {
   SchemaBuilder(const SchemaBuilder&) = delete;
   SchemaBuilder& operator=(const SchemaBuilder&) = delete;
 
-  void SetColumnOperator(std::optional<std::string> family,
-                         std::size_t column,
+  void SetColumnOperator(std::optional<std::string> family, std::size_t column,
                          const MergeOperatorSpec& merge_operator);
   // The optional default value is copied into the persisted schema evolution.
   void AddColumn(std::size_t column,

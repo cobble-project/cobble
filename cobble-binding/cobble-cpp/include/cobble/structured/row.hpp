@@ -10,7 +10,7 @@ namespace cobble::structured {
 // Move-only owner of Rust Bytes. Returned views remain valid until this row is
 // destroyed or moved from, without copying BYTES or LIST element payloads.
 class COBBLE_CPP_API OwnedRow final {
-public:
+ public:
   OwnedRow(OwnedRow &&) noexcept;
   OwnedRow &operator=(OwnedRow &&) noexcept;
   ~OwnedRow();
@@ -27,7 +27,7 @@ public:
   [[nodiscard]] BytesView ListElement(std::size_t column,
                                       std::size_t element) const;
 
-private:
+ private:
   struct Impl;
   explicit OwnedRow(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
@@ -38,4 +38,4 @@ private:
   friend class ReadOnlyDb;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

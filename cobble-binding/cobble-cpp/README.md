@@ -38,6 +38,27 @@ scan plans, and detached priority queues.
 - CMake 3.22 or newer
 - A C++20 compiler
 
+## Formatting
+
+Before submitting C++ changes, run the format check with **clang-format 20.1.8**,
+the version pinned in CI. Install it in an activated Python virtual environment:
+
+```bash
+python -m pip install clang-format==20.1.8
+```
+
+From the repository root (Bash or Git Bash), check all tracked C++ sources and
+headers, including tests and examples:
+
+```bash
+git ls-files -z 'cobble-binding/cobble-cpp/*.cpp' \
+  'cobble-binding/cobble-cpp/*.hpp' 'cobble-binding/cobble-cpp/*.h' |
+  xargs -0 clang-format --dry-run --Werror
+```
+
+Replace `--dry-run --Werror` with `-i` to apply formatting. Add new files to Git
+before checking. The binding's `.clang-format` defines the shared style.
+
 ## Build
 
 ```bash

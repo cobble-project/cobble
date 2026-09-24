@@ -65,4 +65,4 @@ BytesView OwnedRow::ListElement(std::size_t column, std::size_t element) const {
   }));
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

@@ -12,19 +12,19 @@ namespace cobble::structured::detail {
 
 using cobble::detail::Translate;
 
-structured_ffi::NativeWriteOptions
-ToNative(const cobble::WriteOptions &options);
-rust::Vec<structured_ffi::NativeBucketRange>
-ToNativeRanges(std::span<const BucketRange> ranges);
-rust::Vec<structured_ffi::NativeBytesDescriptor>
-ToNativeElements(std::span<const BytesView> elements);
+structured_ffi::NativeWriteOptions ToNative(
+    const cobble::WriteOptions &options);
+rust::Vec<structured_ffi::NativeBucketRange> ToNativeRanges(
+    std::span<const BucketRange> ranges);
+rust::Vec<structured_ffi::NativeBytesDescriptor> ToNativeElements(
+    std::span<const BytesView> elements);
 structured_ffi::NativeListConfig ToNative(const ListConfig &config);
 Schema ToSchema(const structured_ffi::NativeStructuredSchema &native);
-ShardSnapshot
-ToShardSnapshot(const structured_ffi::NativeShardSnapshot &native);
+ShardSnapshot ToShardSnapshot(
+    const structured_ffi::NativeShardSnapshot &native);
 GlobalSnapshot ToGlobalSnapshot(const structured_ffi::NativeSnapshot &native);
-std::vector<MetricSample>
-ToMetrics(rust::Vec<structured_ffi::NativeMetric> native);
+std::vector<MetricSample> ToMetrics(
+    rust::Vec<structured_ffi::NativeMetric> native);
 BufferResult ToBufferResult(const structured_ffi::NativeBufferResult &native);
 
 inline rust::Slice<const Byte> RustBytes(BytesView value) noexcept {
@@ -39,4 +39,4 @@ inline BytesView ToView(rust::Slice<const Byte> value) noexcept {
   return cobble::detail::ToView(value);
 }
 
-} // namespace cobble::structured::detail
+}  // namespace cobble::structured::detail

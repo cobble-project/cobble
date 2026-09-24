@@ -30,9 +30,8 @@ struct COBBLE_CPP_API ScanSplit {
   [[nodiscard]] static ScanSplit FromJson(std::string_view json);
   [[nodiscard]] ScanCursor OpenScanner(std::string_view config_json,
                                        const ScanOptions &options = {}) const;
-  [[nodiscard]] ScanCursor
-  OpenScannerFile(std::string_view config_path,
-                  const ScanOptions &options = {}) const;
+  [[nodiscard]] ScanCursor OpenScannerFile(
+      std::string_view config_path, const ScanOptions &options = {}) const;
 };
 
 struct ScanSplitPartition {
@@ -41,7 +40,7 @@ struct ScanSplitPartition {
 };
 
 class COBBLE_CPP_API ScanPlan final {
-public:
+ public:
   [[nodiscard]] static ScanPlan FromGlobalSnapshot(GlobalSnapshot snapshot);
   ScanPlan &WithStart(BytesView start_inclusive);
   ScanPlan &WithEnd(BytesView end_exclusive);
@@ -49,11 +48,11 @@ public:
   ScanPlan &WithoutEnd() noexcept;
   [[nodiscard]] std::vector<ScanSplit> Splits() const;
 
-private:
+ private:
   explicit ScanPlan(GlobalSnapshot snapshot);
   GlobalSnapshot snapshot_;
   std::optional<std::vector<Byte>> start_inclusive_;
   std::optional<std::vector<Byte>> end_exclusive_;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

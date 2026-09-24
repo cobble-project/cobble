@@ -75,9 +75,8 @@ void VerifyCoverageValidation(const cobble::DbCoordinator& coordinator,
 
   auto gap = valid;
   gap[1].ranges = {{3, 3}};
-  ExpectError(cobble::ErrorCode::kInput, [&] {
-    (void)coordinator.MaterializeGlobalSnapshot(4, 1, gap);
-  });
+  ExpectError(cobble::ErrorCode::kInput,
+              [&] { (void)coordinator.MaterializeGlobalSnapshot(4, 1, gap); });
 
   auto overlap = valid;
   overlap[1].ranges = {{1, 3}};
@@ -135,14 +134,13 @@ void VerifyReadOnly(const std::string& config,
 
   COBBLE_CHECK(db.CurrentSchema().column_families.size() == 1);
   const auto metrics = db.Metrics();
-  COBBLE_CHECK(std::any_of(metrics.begin(), metrics.end(),
-                           [](const cobble::MetricSample& sample) {
-                             return !sample.name.empty();
-                           }));
+  COBBLE_CHECK(std::any_of(
+      metrics.begin(), metrics.end(),
+      [](const cobble::MetricSample& sample) { return !sample.name.empty(); }));
 
   auto surviving = [&] {
-    auto temporary = cobble::ReadOnlyDb::Open(
-        config, snapshot.snapshot_id, source.Id());
+    auto temporary =
+        cobble::ReadOnlyDb::Open(config, snapshot.snapshot_id, source.Id());
     return temporary.Scan(0, std::nullopt, std::nullopt);
   }();
   COBBLE_CHECK(!Collect(std::move(surviving)).empty());
@@ -157,9 +155,9 @@ void VerifyPlanAndSplit(const std::string& config,
   binary_plan.WithStart(binary_start).WithEnd(binary_end);
   const auto binary_splits = binary_plan.Splits();
   COBBLE_CHECK(binary_splits.size() == 2);
-  COBBLE_CHECK(*binary_splits[0].start_inclusive ==
-               std::vector<cobble::Byte>(binary_start.begin(),
-                                         binary_start.end()));
+  COBBLE_CHECK(
+      *binary_splits[0].start_inclusive ==
+      std::vector<cobble::Byte>(binary_start.begin(), binary_start.end()));
   COBBLE_CHECK(*binary_splits[0].end_exclusive ==
                std::vector<cobble::Byte>(binary_end.begin(), binary_end.end()));
 
@@ -171,8 +169,7 @@ void VerifyPlanAndSplit(const std::string& config,
   auto encoded = splits[0];
   encoded.start_inclusive = std::vector<cobble::Byte>{0xFC, 0x01};
   encoded.end_exclusive = std::vector<cobble::Byte>{0xFE, 0x02};
-  encoded.start_after_exclusive =
-      cobble::ScanSplitBoundary{0, {0xFF, 0x05}};
+  encoded.start_after_exclusive = cobble::ScanSplitBoundary{0, {0xFF, 0x05}};
   encoded.end_at_inclusive = cobble::ScanSplitBoundary{1, {0xF8, 0x07}};
   const auto encoded_json = encoded.ToJson();
   const auto rebound = cobble::ScanSplit::FromJson(encoded_json);
@@ -185,17 +182,16 @@ void VerifyPlanAndSplit(const std::string& config,
   auto malformed_json = encoded_json;
   const auto start_bucket = malformed_json.find("\"start_bucket\":0");
   COBBLE_CHECK(start_bucket != std::string::npos);
-  malformed_json.replace(
-      start_bucket, std::string_view("\"start_bucket\":0").size(),
-      "\"start_bucket\":null");
-  ExpectError(cobble::ErrorCode::kInput, [&] {
-    (void)cobble::ScanSplit::FromJson(malformed_json);
-  });
+  malformed_json.replace(start_bucket,
+                         std::string_view("\"start_bucket\":0").size(),
+                         "\"start_bucket\":null");
+  ExpectError(cobble::ErrorCode::kInput,
+              [&] { (void)cobble::ScanSplit::FromJson(malformed_json); });
 
   const auto all = Collect(splits[0].OpenScanner(config));
-  COBBLE_CHECK((all == std::vector<std::pair<cobble::BucketId, std::string>>{
-                           {0, "a"}, {0, "b"}, {0, "version"},
-                           {1, "a"}, {1, "b"}}));
+  COBBLE_CHECK(
+      (all == std::vector<std::pair<cobble::BucketId, std::string>>{
+                  {0, "a"}, {0, "b"}, {0, "version"}, {1, "a"}, {1, "b"}}));
 
   const auto partition = splits[0].SplitAfter(0, Bytes("a"));
   auto before = Collect(partition.before.OpenScannerFile(config_path.string()));
@@ -205,15 +201,13 @@ void VerifyPlanAndSplit(const std::string& config,
 
   auto multi_range = splits[0];
   multi_range.shard.ranges = {{0, 0}, {1, 1}};
-  ExpectError(cobble::ErrorCode::kInput, [&] {
-    (void)multi_range.SplitAfter(0, Bytes("a"));
-  });
+  ExpectError(cobble::ErrorCode::kInput,
+              [&] { (void)multi_range.SplitAfter(0, Bytes("a")); });
 
   cobble::ScanOptions unsupported;
   unsupported.stop_at_block_boundary = true;
-  ExpectError(cobble::ErrorCode::kInput, [&] {
-    (void)splits[0].OpenScanner(config, unsupported);
-  });
+  ExpectError(cobble::ErrorCode::kInput,
+              [&] { (void)splits[0].OpenScanner(config, unsupported); });
 
   auto caller_buffer = splits[1].OpenScanner(config);
   std::array<cobble::Byte, 1> tiny{};
@@ -273,10 +267,8 @@ void VerifyReaders(const std::string& config,
   const auto second =
       coordinator.MaterializeGlobalSnapshot(4, first.id + 1, shards);
 
-  ExpectError(cobble::ErrorCode::kInvalidState,
-              [&] { pinned.Refresh(); });
-  COBBLE_CHECK(String(pinned.Get(0, Bytes("version")).column(0)) ==
-               "old-left");
+  ExpectError(cobble::ErrorCode::kInvalidState, [&] { pinned.Refresh(); });
+  COBBLE_CHECK(String(pinned.Get(0, Bytes("version")).column(0)) == "old-left");
   current.Refresh();
   COBBLE_CHECK(current.CurrentGlobalSnapshot().id == second.id);
   COBBLE_CHECK(String(current.Get(0, Bytes("version")).column(0)) ==
@@ -326,7 +318,8 @@ int main() {
     COBBLE_CHECK(coordinator.ListGlobalSnapshots().size() == 1);
     left.Close();
     right.Close();
-    std::cout << "verified C++ Reader, ReadOnlyDb, coordinator, and scan splits\n";
+    std::cout
+        << "verified C++ Reader, ReadOnlyDb, coordinator, and scan splits\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "read surface capability test failed: " << error.what()

@@ -38,12 +38,11 @@ class COBBLE_CPP_API Reader final {
   void Refresh();
   [[nodiscard]] OwnedRow Get(BucketId bucket, BytesView key,
                              const ReadOptions& options = {});
-  [[nodiscard]] BufferResult GetColumnInto(
-      BucketId bucket, BytesView key, MutableBytesView output,
-      const ReadOptions& options);
-  [[nodiscard]] OwnedMultiGetResult MultiGet(
-      std::span<const MultiGetKey> keys,
-      const ReadOptions& options = {});
+  [[nodiscard]] BufferResult GetColumnInto(BucketId bucket, BytesView key,
+                                           MutableBytesView output,
+                                           const ReadOptions& options);
+  [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
+                                             const ReadOptions& options = {});
   // Reader's core API is explicitly bounded: [start_inclusive, end_exclusive).
   [[nodiscard]] ScanCursor Scan(BucketId bucket, BytesView start_inclusive,
                                 BytesView end_exclusive,

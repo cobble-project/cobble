@@ -44,19 +44,18 @@ std::string StructuredKey(std::size_t row) {
 
 std::string StructuredValue(std::size_t row) {
   std::string value = "structured-row=" + std::to_string(row) + ";";
-  value.resize(kStructuredValueBytes,
-               static_cast<char>('A' + (row % 26)));
+  value.resize(kStructuredValueBytes, static_cast<char>('A' + (row % 26)));
   return value;
 }
 
 std::array<std::string, 3> StructuredList(std::size_t row) {
-  return {"group=" + std::to_string(row % 17),
-          "row=" + std::to_string(row),
+  return {"group=" + std::to_string(row % 17), "row=" + std::to_string(row),
           std::string(48, static_cast<char>('0' + (row % 10)))};
 }
 
 std::optional<std::string> Environment(const char* name) {
-  if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+  if (const char* value = std::getenv(name);
+      value != nullptr && *value != '\0') {
     return value;
   }
   return std::nullopt;
@@ -116,8 +115,7 @@ std::string S3BaseDir(std::string endpoint, std::string_view bucket,
   }
   COBBLE_CHECK(!endpoint.empty());
   return "s3://" + endpoint + "/" + std::string(bucket) + "/" +
-         std::string(prefix) +
-         "?endpoint_scheme=" + scheme +
+         std::string(prefix) + "?endpoint_scheme=" + scheme +
          "&region=us-east-1&disable_config_load=true"
          "&disable_ec2_metadata=true&enable_virtual_host_style=false";
 }
@@ -196,8 +194,7 @@ void VerifyRawS3(std::string_view endpoint, std::string_view bucket,
 }
 
 void VerifyStructuredS3(std::string_view endpoint, std::string_view bucket,
-                        std::string_view access_id,
-                        std::string_view secret_key,
+                        std::string_view access_id, std::string_view secret_key,
                         std::string_view prefix) {
   const auto config =
       ConfigJson(endpoint, bucket, access_id, secret_key, prefix);
@@ -233,8 +230,7 @@ void VerifyStructuredS3(std::string_view endpoint, std::string_view bucket,
   db.Close();
 
   auto resumed = cobble::structured::Db::ResumeFromSnapshot(
-      config, snapshot.snapshot_id, db_id,
-      cobble::RecoveryMode::kSnapshotOnly);
+      config, snapshot.snapshot_id, db_id, cobble::RecoveryMode::kSnapshotOnly);
   for (std::size_t row = 0; row < kStructuredRowCount; row += 29) {
     const auto result = resumed.Get(0, Bytes(StructuredKey(row)));
     COBBLE_CHECK(result.Found());
@@ -256,8 +252,7 @@ void VerifyStructuredS3(std::string_view endpoint, std::string_view bucket,
       for (std::size_t index = 0; index < rows.RowCount(); ++index) {
         COBBLE_CHECK(String(rows.Key(index)) == StructuredKey(expected));
         COBBLE_CHECK(rows.ColumnCount(index) == 2);
-        COBBLE_CHECK(String(rows.Bytes(index, 0)) ==
-                     StructuredValue(expected));
+        COBBLE_CHECK(String(rows.Bytes(index, 0)) == StructuredValue(expected));
         const auto expected_list = StructuredList(expected);
         COBBLE_CHECK(rows.ListSize(index, 1) == expected_list.size());
         for (std::size_t element = 0; element < expected_list.size();
@@ -285,13 +280,14 @@ int main() {
     const auto access_id = Environment("COBBLE_S3_ACCESS_ID");
     const auto secret_key = Environment("COBBLE_S3_SECRET_KEY");
     if (!endpoint || !bucket || !access_id || !secret_key) {
-      std::cout << "skipping C++ S3 E2E test: COBBLE_S3_* variables are not fully set\n";
+      std::cout << "skipping C++ S3 E2E test: COBBLE_S3_* variables are not "
+                   "fully set\n";
       return 0;
     }
 
-    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto base_prefix =
-        "cobble-cpp-s3-e2e-" + std::to_string(nonce);
+    const auto nonce =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto base_prefix = "cobble-cpp-s3-e2e-" + std::to_string(nonce);
     VerifyRawS3(*endpoint, *bucket, *access_id, *secret_key,
                 base_prefix + "/raw");
     VerifyStructuredS3(*endpoint, *bucket, *access_id, *secret_key,

@@ -21,8 +21,7 @@ ScanOptions::ScanOptions(const ScanOptions &other)
       }))
                         : nullptr) {}
 ScanOptions &ScanOptions::operator=(const ScanOptions &other) {
-  if (this == &other)
-    return *this;
+  if (this == &other) return *this;
   ScanOptions copy(other);
   impl_.swap(copy.impl_);
   return *this;
@@ -31,8 +30,8 @@ ScanOptions::ScanOptions(ScanOptions &&) noexcept = default;
 ScanOptions &ScanOptions::operator=(ScanOptions &&) noexcept = default;
 ScanOptions::~ScanOptions() = default;
 
-ScanOptions &
-ScanOptions::SetColumnFamily(std::optional<std::string_view> family) {
+ScanOptions &ScanOptions::SetColumnFamily(
+    std::optional<std::string_view> family) {
   if (!impl_)
     throw Error(ErrorCode::kInvalidState, "ScanOptions has been moved from");
   const auto value = family.value_or(std::string_view{});
@@ -231,4 +230,4 @@ ScanCursor SingleDb::Scan(BucketId bucket,
   return ScanCursor(std::make_unique<ScanCursor::Impl>(std::move(native)));
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

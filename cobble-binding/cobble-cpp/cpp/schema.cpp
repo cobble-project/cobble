@@ -59,9 +59,9 @@ SchemaBuilder::SchemaBuilder(SchemaBuilder&&) noexcept = default;
 SchemaBuilder& SchemaBuilder::operator=(SchemaBuilder&&) noexcept = default;
 SchemaBuilder::~SchemaBuilder() = default;
 
-void SchemaBuilder::SetColumnOperator(
-    std::optional<std::string> family, std::size_t column,
-    const MergeOperatorSpec& merge_operator) {
+void SchemaBuilder::SetColumnOperator(std::optional<std::string> family,
+                                      std::size_t column,
+                                      const MergeOperatorSpec& merge_operator) {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState,
                 "SchemaBuilder has already been consumed");
@@ -70,17 +70,17 @@ void SchemaBuilder::SetColumnOperator(
   const auto metadata_view = OptionalStringView(merge_operator.metadata_json);
   detail::Translate([&] {
     ffi::native_schema_builder_set_column_operator(
-        *impl_->native, family.has_value(), detail::RustStr(family_view), column,
-        detail::RustStr(merge_operator.id),
+        *impl_->native, family.has_value(), detail::RustStr(family_view),
+        column, detail::RustStr(merge_operator.id),
         merge_operator.metadata_json.has_value(),
         detail::RustStr(metadata_view));
   });
 }
 
-void SchemaBuilder::AddColumn(
-    std::size_t column, std::optional<MergeOperatorSpec> merge_operator,
-    std::optional<BytesView> default_value,
-    std::optional<std::string> family) {
+void SchemaBuilder::AddColumn(std::size_t column,
+                              std::optional<MergeOperatorSpec> merge_operator,
+                              std::optional<BytesView> default_value,
+                              std::optional<std::string> family) {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState,
                 "SchemaBuilder has already been consumed");
@@ -91,8 +91,7 @@ void SchemaBuilder::AddColumn(
                      : std::string_view{};
   const std::optional<std::string> empty_metadata;
   const std::optional<std::string>& metadata =
-      merge_operator ? merge_operator->metadata_json
-                     : empty_metadata;
+      merge_operator ? merge_operator->metadata_json : empty_metadata;
   const auto metadata_view = OptionalStringView(metadata);
   const auto default_view = default_value.value_or(BytesView{});
   detail::Translate([&] {
@@ -113,8 +112,9 @@ void SchemaBuilder::DeleteColumn(std::optional<std::string> family,
   }
   const auto family_view = OptionalStringView(family);
   detail::Translate([&] {
-    ffi::native_schema_builder_delete_column(
-        *impl_->native, family.has_value(), detail::RustStr(family_view), column);
+    ffi::native_schema_builder_delete_column(*impl_->native, family.has_value(),
+                                             detail::RustStr(family_view),
+                                             column);
   });
 }
 

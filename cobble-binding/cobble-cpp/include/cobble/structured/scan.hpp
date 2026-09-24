@@ -11,7 +11,7 @@
 namespace cobble::structured {
 
 class COBBLE_CPP_API ScanOptions final {
-public:
+ public:
   ScanOptions();
   ScanOptions(const ScanOptions &);
   ScanOptions &operator=(const ScanOptions &);
@@ -24,7 +24,7 @@ public:
   ScanOptions &SetPreloadScanCursorBlock(bool enabled);
   ScanOptions &SetStopAtBlockBoundary(bool enabled);
 
-private:
+ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class Db;
@@ -35,7 +35,7 @@ private:
 };
 
 class COBBLE_CPP_API OwnedBatch final {
-public:
+ public:
   OwnedBatch(OwnedBatch &&) noexcept;
   OwnedBatch &operator=(OwnedBatch &&) noexcept;
   ~OwnedBatch();
@@ -55,7 +55,7 @@ public:
   [[nodiscard]] BytesView ListElement(std::size_t row, std::size_t column,
                                       std::size_t element) const;
 
-private:
+ private:
   struct Impl;
   explicit OwnedBatch(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
@@ -63,7 +63,7 @@ private:
 };
 
 class COBBLE_CPP_API ScanCursor final {
-public:
+ public:
   ScanCursor(ScanCursor &&) noexcept;
   ScanCursor &operator=(ScanCursor &&) noexcept;
   ~ScanCursor();
@@ -75,7 +75,7 @@ public:
                                            MutableBytesView output);
   void ResumeAfterBlockBoundary();
 
-private:
+ private:
   struct Impl;
   explicit ScanCursor(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
@@ -86,4 +86,4 @@ private:
   friend struct ScanSplit;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

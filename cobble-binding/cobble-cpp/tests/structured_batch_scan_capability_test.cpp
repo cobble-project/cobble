@@ -46,14 +46,16 @@ void CheckCsrb(const std::vector<cobble::Byte> &buffer,
   COBBLE_CHECK(ReadU32(bytes, 12) == expected_rows);
 }
 
-template <typename Database> void AddSchema(Database &db) {
+template <typename Database>
+void AddSchema(Database &db) {
   auto edit = db.UpdateSchema();
   edit.AddListColumn(std::nullopt, 1,
                      cobble::structured::ListConfig{.max_elements = 8});
   (void)edit.Commit();
 }
 
-template <typename Database> void VerifyBatchAndMultiGet(Database &db) {
+template <typename Database>
+void VerifyBatchAndMultiGet(Database &db) {
   AddSchema(db);
 
   cobble::structured::WriteBatch owned;
@@ -86,7 +88,7 @@ template <typename Database> void VerifyBatchAndMultiGet(Database &db) {
         static_cast<cobble::BucketId>(index % 4), Bytes(keys.back()), 0,
         Bytes(values.back())));
   }
-  db.Write(operations); // synchronous borrowed high-throughput path
+  db.Write(operations);  // synchronous borrowed high-throughput path
 
   const std::array multi = {
       cobble::structured::MultiGetKey{0, Bytes("key-0")},
@@ -169,7 +171,8 @@ template <typename Database> void VerifyBatchAndMultiGet(Database &db) {
   COBBLE_CHECK(empty_row.ListElement(1, 0).empty());
 }
 
-template <typename Database> void VerifyScan(Database &db) {
+template <typename Database>
+void VerifyScan(Database &db) {
   cobble::structured::ScanOptions projected;
   const std::array<std::size_t, 1> columns = {0};
   projected.SetColumns(columns);
@@ -182,8 +185,7 @@ template <typename Database> void VerifyScan(Database &db) {
       COBBLE_CHECK(batch.ColumnCount(row) == 1);
       seen.insert(String(batch.Key(row)));
     }
-    if (batch.End())
-      break;
+    if (batch.End()) break;
     COBBLE_CHECK(!batch.StoppedAtBlockBoundary());
   }
   COBBLE_CHECK(seen.size() == 80);
@@ -210,8 +212,7 @@ template <typename Database> void VerifyScan(Database &db) {
     auto batch = boundary_cursor.Next(19);
     for (std::size_t row = 0; row < batch.RowCount(); ++row)
       COBBLE_CHECK(boundary_seen.insert(String(batch.Key(row))).second);
-    if (batch.End())
-      break;
+    if (batch.End()) break;
     if (batch.StoppedAtBlockBoundary())
       boundary_cursor.ResumeAfterBlockBoundary();
   }
@@ -317,8 +318,7 @@ void VerifySingleAndPlan(const std::filesystem::path &root) {
   for (;;) {
     auto batch = scanner.Next(29);
     scanned += batch.RowCount();
-    if (batch.End())
-      break;
+    if (batch.End()) break;
   }
   COBBLE_CHECK(scanned == 320);
 
@@ -334,7 +334,7 @@ void VerifySingleAndPlan(const std::filesystem::path &root) {
   db.Close();
 }
 
-} // namespace
+}  // namespace
 
 int main() {
   try {

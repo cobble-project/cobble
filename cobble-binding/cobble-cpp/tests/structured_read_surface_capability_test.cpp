@@ -31,7 +31,8 @@ void CheckCsrb(const std::vector<cobble::Byte> &buffer,
   COBBLE_CHECK(std::memcmp(buffer.data(), "CSRB", 4) == 0);
 }
 
-template <typename Database> void CheckReads(Database &db) {
+template <typename Database>
+void CheckReads(Database &db) {
   COBBLE_CHECK(db.CurrentSchema().Type("default", 1).kind ==
                cobble::structured::ColumnKind::kList);
   auto row = db.Get(0, Bytes("both"));
@@ -73,7 +74,7 @@ template <typename Database> void CheckReads(Database &db) {
   CheckCsrb(output, db.MultiGetInto(keys, output), keys.size());
 }
 
-} // namespace
+}  // namespace
 
 int main() {
   try {

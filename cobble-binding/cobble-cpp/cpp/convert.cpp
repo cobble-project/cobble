@@ -66,7 +66,8 @@ BufferStatus ToBufferStatus(std::uint8_t status) {
 }
 
 BufferResult ToBufferResult(const ffi::NativeBufferResult& native) {
-  return {ToBufferStatus(native.status), ToSize(native.bytes_written, "bytes_written"),
+  return {ToBufferStatus(native.status),
+          ToSize(native.bytes_written, "bytes_written"),
           ToSize(native.bytes_required, "bytes_required"),
           ToSize(native.row_count, "row_count")};
 }
@@ -121,9 +122,9 @@ ffi::NativeShardSnapshot ToNativeShardSnapshot(const ShardSnapshot& snapshot) {
   native.schema_id = snapshot.schema_id;
   native.schema_families.reserve(snapshot.schema_column_families.size());
   for (const auto& family : snapshot.schema_column_families) {
-    native.schema_families.push_back(
-        {RustString(family.name), family.id, family.num_columns,
-         family.value_has_ttl, RustString(family.metadata_json)});
+    native.schema_families.push_back({RustString(family.name), family.id,
+                                      family.num_columns, family.value_has_ttl,
+                                      RustString(family.metadata_json)});
   }
   return native;
 }
@@ -143,7 +144,7 @@ ffi::NativeScanSplit ToNativeScanSplit(const ScanSplit& split) {
   native.shard = ToNativeShardSnapshot(split.shard);
   native.has_start = split.start_inclusive.has_value();
   native.start = split.start_inclusive ? ToNativeBytes(*split.start_inclusive)
-                                      : rust::Vec<Byte>();
+                                       : rust::Vec<Byte>();
   native.has_end = split.end_exclusive.has_value();
   native.end = split.end_exclusive ? ToNativeBytes(*split.end_exclusive)
                                    : rust::Vec<Byte>();
@@ -170,9 +171,8 @@ ScanSplit ToScanSplit(const ffi::NativeScanSplit& native) {
     split.end_exclusive = ToBytes(native.end);
   }
   if (native.has_start_after) {
-    split.start_after_exclusive =
-        ScanSplitBoundary{native.start_after_bucket,
-                          ToBytes(native.start_after_key)};
+    split.start_after_exclusive = ScanSplitBoundary{
+        native.start_after_bucket, ToBytes(native.start_after_key)};
   }
   if (native.has_end_at) {
     split.end_at_inclusive =

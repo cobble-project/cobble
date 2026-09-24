@@ -50,10 +50,9 @@ class COBBLE_CPP_API Database final {
  public:
   [[nodiscard]] static Database Open(std::string_view config_json);
   [[nodiscard]] static Database OpenFile(std::string_view config_path);
-  [[nodiscard]] static Database Resume(std::string_view config_json,
-                                       SnapshotId snapshot,
-                                       RecoveryMode mode =
-                                           RecoveryMode::kSnapshotOnly);
+  [[nodiscard]] static Database Resume(
+      std::string_view config_json, SnapshotId snapshot,
+      RecoveryMode mode = RecoveryMode::kSnapshotOnly);
   [[nodiscard]] static Database ResumeFile(
       std::string_view config_path, SnapshotId snapshot,
       RecoveryMode mode = RecoveryMode::kSnapshotOnly);
@@ -65,8 +64,8 @@ class COBBLE_CPP_API Database final {
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;
 
-  void Put(BucketId bucket, BytesView key, ColumnIndex column,
-           BytesView value, const WriteOptions& options = {}) const;
+  void Put(BucketId bucket, BytesView key, ColumnIndex column, BytesView value,
+           const WriteOptions& options = {}) const;
   void Delete(BucketId bucket, BytesView key, ColumnIndex column,
               const WriteOptions& options = {}) const;
   void Merge(BucketId bucket, BytesView key, ColumnIndex column,
@@ -75,16 +74,16 @@ class COBBLE_CPP_API Database final {
 
   [[nodiscard]] OwnedRow Get(BucketId bucket, BytesView key,
                              const ReadOptions& options = {}) const;
-  [[nodiscard]] BufferResult GetColumnInto(
-      BucketId bucket, BytesView key, MutableBytesView output,
-      const ReadOptions& options) const;
-  [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
-                                              const ReadOptions& options = {}) const;
+  [[nodiscard]] BufferResult GetColumnInto(BucketId bucket, BytesView key,
+                                           MutableBytesView output,
+                                           const ReadOptions& options) const;
+  [[nodiscard]] OwnedMultiGetResult MultiGet(
+      std::span<const MultiGetKey> keys, const ReadOptions& options = {}) const;
 
-  [[nodiscard]] ScanCursor Scan(
-      BucketId bucket, std::optional<BytesView> start_inclusive,
-      std::optional<BytesView> end_exclusive,
-      const ScanOptions& options = {}) const;
+  [[nodiscard]] ScanCursor Scan(BucketId bucket,
+                                std::optional<BytesView> start_inclusive,
+                                std::optional<BytesView> end_exclusive,
+                                const ScanOptions& options = {}) const;
 
   [[nodiscard]] SnapshotId Snapshot() const;
   [[nodiscard]] GlobalSnapshot TakeSnapshot() const;

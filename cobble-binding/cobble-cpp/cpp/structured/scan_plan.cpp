@@ -12,8 +12,7 @@ namespace {
 rust::Vec<Byte> ToRustBytes(const std::vector<Byte> &value) {
   rust::Vec<Byte> result;
   result.reserve(value.size());
-  for (const auto byte : value)
-    result.push_back(byte);
+  for (const auto byte : value) result.push_back(byte);
   return result;
 }
 
@@ -22,8 +21,7 @@ std::vector<Byte> ToBytes(const rust::Vec<Byte> &value) {
 }
 
 std::vector<Byte> CopyBytes(BytesView value) {
-  if (value.empty())
-    return {};
+  if (value.empty()) return {};
   return {value.begin(), value.end()};
 }
 
@@ -53,9 +51,9 @@ structured_ffi::NativeShardSnapshot ToNative(const ShardSnapshot &value) {
   result.schema_id = value.schema_id;
   result.schema_families.reserve(value.schema_column_families.size());
   for (const auto &family : value.schema_column_families) {
-    result.schema_families.push_back(
-        {rust::String(family.name), family.id, family.num_columns,
-         family.value_has_ttl, rust::String(family.metadata_json)});
+    result.schema_families.push_back({rust::String(family.name), family.id,
+                                      family.num_columns, family.value_has_ttl,
+                                      rust::String(family.metadata_json)});
   }
   return result;
 }
@@ -87,10 +85,8 @@ structured_ffi::NativeStructuredScanSplit ToNative(const ScanSplit &value) {
 ScanSplit ToSplit(const structured_ffi::NativeStructuredScanSplit &value) {
   ScanSplit result;
   result.shard = detail::ToShardSnapshot(value.shard);
-  if (value.has_start)
-    result.start_inclusive = ToBytes(value.start);
-  if (value.has_end)
-    result.end_exclusive = ToBytes(value.end);
+  if (value.has_start) result.start_inclusive = ToBytes(value.start);
+  if (value.has_end) result.end_exclusive = ToBytes(value.end);
   if (value.has_start_after)
     result.start_after_exclusive = ScanSplitBoundary{
         value.start_after_bucket, ToBytes(value.start_after_key)};
@@ -100,7 +96,7 @@ ScanSplit ToSplit(const structured_ffi::NativeStructuredScanSplit &value) {
   return result;
 }
 
-} // namespace
+}  // namespace
 
 ScanPlan::ScanPlan(GlobalSnapshot snapshot) : snapshot_(std::move(snapshot)) {}
 ScanPlan ScanPlan::FromGlobalSnapshot(GlobalSnapshot snapshot) {
@@ -181,4 +177,4 @@ ScanCursor ScanSplit::OpenScannerFile(std::string_view config_path,
   return ScanCursor(std::make_unique<ScanCursor::Impl>(std::move(native)));
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

@@ -30,8 +30,7 @@ inline std::string String(cobble::BytesView value) {
 
 inline std::string FileUrl(const std::filesystem::path& path) {
   const auto generic = path.generic_string();
-  return "file://" + std::string(generic.starts_with('/') ? "" : "/") +
-         generic;
+  return "file://" + std::string(generic.starts_with('/') ? "" : "/") + generic;
 }
 
 class TempDirectory {

@@ -20,7 +20,8 @@ class COBBLE_CPP_API OwnedBatch final {
   [[nodiscard]] bool end() const noexcept;
   [[nodiscard]] bool stopped_at_block_boundary() const noexcept;
   [[nodiscard]] BucketId bucket(std::size_t row) const;
-  // Returned views remain valid while this OwnedBatch is alive and is not moved.
+  // Returned views remain valid while this OwnedBatch is alive and is not
+  // moved.
   [[nodiscard]] BytesView key(std::size_t row) const;
   [[nodiscard]] std::size_t column_count(std::size_t row) const;
   [[nodiscard]] bool has_column(std::size_t row, std::size_t column) const;

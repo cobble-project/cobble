@@ -26,7 +26,8 @@ std::string Config(const std::filesystem::path &root,
          R"(,"memtable_capacity":"4KB","base_file_size":"8KB","block_size":"512B","block_cache_size":0,"wal_enabled":true,"wal_flush_interval_ms":5})";
 }
 
-template <typename Callback> void ExpectInvalidState(Callback callback) {
+template <typename Callback>
+void ExpectInvalidState(Callback callback) {
   bool rejected = false;
   try {
     callback();
@@ -62,8 +63,7 @@ void VerifyBuilderExcludesQueueCreation(Database &db) {
       auto queue = db.GetPriorityQueue("builder-existing");
       COBBLE_CHECK(queue.ColumnFamily() == "builder-existing");
     }
-    ExpectInvalidState(
-        [&] { (void)db.NewPriorityQueue("after-builder-new"); });
+    ExpectInvalidState([&] { (void)db.NewPriorityQueue("after-builder-new"); });
     ExpectInvalidState(
         [&] { (void)db.GetOrNewPriorityQueue("after-builder-get-or-new"); });
     (void)builder.Commit();
@@ -97,8 +97,7 @@ void VerifyCommonQueueApi(Database &db, cobble::BucketId bucket) {
   ExpectInvalidState([&] { (void)db.GetPriorityQueue("missing"); });
 
   auto queue = db.GetOrNewPriorityQueue("jobs");
-  ExpectInvalidState(
-      [&] { (void)db.NewPriorityQueue("while-queue-active"); });
+  ExpectInvalidState([&] { (void)db.NewPriorityQueue("while-queue-active"); });
   ExpectInvalidState(
       [&] { (void)db.GetOrNewPriorityQueue("while-queue-active"); });
   queue.Offer(bucket, Bytes("k2"), Bytes("v2"));
@@ -152,8 +151,7 @@ void VerifyCommonQueueApi(Database &db, cobble::BucketId bucket) {
 
   std::array<std::uint8_t, 1> peek_small = {0x5a};
   const auto peek_required = queue.PeekInto(bucket, peek_small);
-  COBBLE_CHECK(peek_required.status ==
-               cobble::BufferStatus::kBufferTooSmall);
+  COBBLE_CHECK(peek_required.status == cobble::BufferStatus::kBufferTooSmall);
   COBBLE_CHECK(peek_small[0] == 0x5a);
   std::vector<std::uint8_t> peek_encoded(peek_required.bytes_required);
   const auto peek_success = queue.PeekInto(bucket, peek_encoded);
@@ -178,8 +176,7 @@ void VerifyCommonQueueApi(Database &db, cobble::BucketId bucket) {
   queue.Offer(bucket, Bytes("k5"), Bytes("v5"));
   std::array<std::uint8_t, 1> poll_small = {0x33};
   const auto poll_required = queue.PollInto(bucket, poll_small);
-  COBBLE_CHECK(poll_required.status ==
-               cobble::BufferStatus::kBufferTooSmall);
+  COBBLE_CHECK(poll_required.status == cobble::BufferStatus::kBufferTooSmall);
   std::vector<std::uint8_t> poll_encoded(poll_required.bytes_required);
   const auto poll_success = queue.PollInto(bucket, poll_encoded);
   COBBLE_CHECK(poll_success.status == cobble::BufferStatus::kOk);
@@ -203,8 +200,7 @@ void VerifyCommonQueueApi(Database &db, cobble::BucketId bucket) {
   std::string last_key;
   while (true) {
     const auto batch = queue.PollBatch(bucket, std::nullopt);
-    if (batch.Size() == 0)
-      break;
+    if (batch.Size() == 0) break;
     for (std::size_t index = 0; index < batch.Size(); ++index) {
       const auto key = String(batch.Entry(index).key);
       COBBLE_CHECK(last_key.empty() || last_key < key);
@@ -295,9 +291,7 @@ void VerifySharded(const std::filesystem::path &root) {
   auto close_db = cobble::structured::Db::Open(Config(root / "closed", 4));
   auto queue = close_db.NewPriorityQueue("closed-jobs");
   close_db.Close();
-  ExpectInvalidState([&] {
-    queue.Offer(0, Bytes("closed"), Bytes("value"));
-  });
+  ExpectInvalidState([&] { queue.Offer(0, Bytes("closed"), Bytes("value")); });
   db.Close();
 }
 
@@ -312,7 +306,7 @@ void VerifySingle(const std::filesystem::path &root) {
   ExpectInvalidState([&] { (void)queue.Peek(1); });
 }
 
-} // namespace
+}  // namespace
 
 int main() {
   try {

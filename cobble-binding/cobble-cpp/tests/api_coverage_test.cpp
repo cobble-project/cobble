@@ -117,8 +117,7 @@ void VerifyPointAndMutationApis(cobble::Database& db) {
   COBBLE_CHECK((small == std::array<std::uint8_t, 2>{0xA5, 0x5A}));
 
   std::vector<std::uint8_t> output(too_small.bytes_required);
-  const auto copied =
-      db.GetColumnInto(1, Bytes("direct"), output, one_column);
+  const auto copied = db.GetColumnInto(1, Bytes("direct"), output, one_column);
   COBBLE_CHECK(copied.status == cobble::BufferStatus::kOk);
   COBBLE_CHECK(copied.bytes_written == output.size());
   COBBLE_CHECK(String(output) == "old-merged");
@@ -178,8 +177,7 @@ void VerifyBlockBoundaryScan(const cobble::Database& db) {
     cobble::ScanOptions ordered_options;
     ordered_options.column_family = "default";
     ordered_options.columns = {0};
-    auto ordered =
-        db.Scan(0, Bytes("scan-"), Bytes("scan."), ordered_options);
+    auto ordered = db.Scan(0, Bytes("scan-"), Bytes("scan."), ordered_options);
     std::size_t expected = 0;
     while (true) {
       const auto batch = ordered.Next(73);
@@ -268,9 +266,9 @@ int main() {
     }
 
     {
-      auto wal_recovered = cobble::Database::ResumeFile(
-          config_path.string(), first_snapshot,
-          cobble::RecoveryMode::kLatestWithWal);
+      auto wal_recovered =
+          cobble::Database::ResumeFile(config_path.string(), first_snapshot,
+                                       cobble::RecoveryMode::kLatestWithWal);
       COBBLE_CHECK(wal_recovered.Get(2, Bytes("wal-tail")).found());
       COBBLE_CHECK(String(wal_recovered.Get(2, Bytes("wal-tail")).column(0)) ==
                    "after-snapshot");
@@ -285,7 +283,8 @@ int main() {
       COBBLE_CHECK(!snapshot_only.Get(2, Bytes("wal-tail")).found());
       COBBLE_CHECK(snapshot_only.Get(1, Bytes("direct")).found());
       snapshot_only.Put(3, Bytes("after-resume"), 0, Bytes("snapshot-2"));
-      second_snapshot = WaitForSnapshot(snapshot_only, snapshot_only.Snapshot());
+      second_snapshot =
+          WaitForSnapshot(snapshot_only, snapshot_only.Snapshot());
       COBBLE_CHECK(second_snapshot > first_snapshot);
 
       const auto snapshots = snapshot_only.ListSnapshots();
@@ -294,8 +293,7 @@ int main() {
       COBBLE_CHECK(std::find(snapshots.begin(), snapshots.end(),
                              second_snapshot) != snapshots.end());
       COBBLE_CHECK(snapshot_only.RetainSnapshot(second_snapshot));
-      const bool first_expired =
-          snapshot_only.ExpireSnapshot(first_snapshot);
+      const bool first_expired = snapshot_only.ExpireSnapshot(first_snapshot);
       const auto after_expire = snapshot_only.ListSnapshots();
       const bool first_is_absent =
           std::find(after_expire.begin(), after_expire.end(), first_snapshot) ==

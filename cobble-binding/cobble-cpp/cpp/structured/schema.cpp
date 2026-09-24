@@ -50,11 +50,10 @@ void CheckBuilder(const auto *impl) {
   }
 }
 
-} // namespace
+}  // namespace
 
-SchemaBuilder &
-SchemaBuilder::AddBytesColumn(std::optional<std::string_view> family,
-                              ColumnIndex column) {
+SchemaBuilder &SchemaBuilder::AddBytesColumn(
+    std::optional<std::string_view> family, ColumnIndex column) {
   CheckBuilder(impl_.get());
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_add_bytes(
@@ -64,9 +63,9 @@ SchemaBuilder::AddBytesColumn(std::optional<std::string_view> family,
   return *this;
 }
 
-SchemaBuilder &
-SchemaBuilder::AddListColumn(std::optional<std::string_view> family,
-                             ColumnIndex column, const ListConfig &config) {
+SchemaBuilder &SchemaBuilder::AddListColumn(
+    std::optional<std::string_view> family, ColumnIndex column,
+    const ListConfig &config) {
   CheckBuilder(impl_.get());
   const auto native = detail::ToNative(config);
   detail::Translate([&] {
@@ -77,9 +76,8 @@ SchemaBuilder::AddListColumn(std::optional<std::string_view> family,
   return *this;
 }
 
-SchemaBuilder &
-SchemaBuilder::DeleteColumn(std::optional<std::string_view> family,
-                            ColumnIndex column) {
+SchemaBuilder &SchemaBuilder::DeleteColumn(
+    std::optional<std::string_view> family, ColumnIndex column) {
   CheckBuilder(impl_.get());
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_delete(
@@ -89,9 +87,8 @@ SchemaBuilder::DeleteColumn(std::optional<std::string_view> family,
   return *this;
 }
 
-SchemaBuilder &
-SchemaBuilder::SetFamilyTtl(std::optional<std::string_view> family,
-                            bool value_has_ttl) {
+SchemaBuilder &SchemaBuilder::SetFamilyTtl(
+    std::optional<std::string_view> family, bool value_has_ttl) {
   CheckBuilder(impl_.get());
   detail::Translate([&] {
     structured_ffi::native_structured_schema_edit_set_family_ttl(
@@ -123,4 +120,4 @@ Schema SchemaBuilder::Commit() {
   return detail::ToSchema(native);
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

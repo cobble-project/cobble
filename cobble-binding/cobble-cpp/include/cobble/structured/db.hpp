@@ -23,47 +23,45 @@
 namespace cobble::structured {
 
 class COBBLE_CPP_API Db final {
-public:
+ public:
   [[nodiscard]] static Db Open(std::string_view config_json);
   [[nodiscard]] static Db Open(std::string_view config_json,
                                std::span<const BucketRange> ranges);
   [[nodiscard]] static Db OpenFile(std::string_view config_path);
   [[nodiscard]] static Db OpenFile(std::string_view config_path,
                                    std::span<const BucketRange> ranges);
-  [[nodiscard]] static Db
-  OpenFromSnapshot(std::string_view config_json, SnapshotId snapshot,
-                   std::string_view existing_db_id,
-                   RecoveryMode mode = RecoveryMode::kSnapshotOnly);
-  [[nodiscard]] static Db
-  OpenFromSnapshotFile(std::string_view config_path, SnapshotId snapshot,
-                       std::string_view existing_db_id,
-                       RecoveryMode mode = RecoveryMode::kSnapshotOnly);
+  [[nodiscard]] static Db OpenFromSnapshot(
+      std::string_view config_json, SnapshotId snapshot,
+      std::string_view existing_db_id,
+      RecoveryMode mode = RecoveryMode::kSnapshotOnly);
+  [[nodiscard]] static Db OpenFromSnapshotFile(
+      std::string_view config_path, SnapshotId snapshot,
+      std::string_view existing_db_id,
+      RecoveryMode mode = RecoveryMode::kSnapshotOnly);
   [[nodiscard]] static Db RestoreNew(std::string_view config_json,
                                      SnapshotId source_snapshot,
                                      std::string_view source_db_id);
   [[nodiscard]] static Db RestoreNewFile(std::string_view config_path,
                                          SnapshotId source_snapshot,
                                          std::string_view source_db_id);
-  [[nodiscard]] static Db
-  RestoreNewFromManifest(std::string_view config_json,
-                         std::string_view manifest_path);
-  [[nodiscard]] static Db
-  RestoreNewFromManifestFile(std::string_view config_path,
-                             std::string_view manifest_path);
-  [[nodiscard]] static Db
-  Resume(std::string_view config_json, std::string_view existing_db_id,
-         RecoveryMode mode = RecoveryMode::kLatestWithWal);
-  [[nodiscard]] static Db
-  ResumeFile(std::string_view config_path, std::string_view existing_db_id,
-             RecoveryMode mode = RecoveryMode::kLatestWithWal);
-  [[nodiscard]] static Db
-  ResumeFromSnapshot(std::string_view config_json, SnapshotId snapshot,
-                     std::string_view existing_db_id,
-                     RecoveryMode mode = RecoveryMode::kSnapshotOnly);
-  [[nodiscard]] static Db
-  ResumeFromSnapshotFile(std::string_view config_path, SnapshotId snapshot,
-                         std::string_view existing_db_id,
-                         RecoveryMode mode = RecoveryMode::kSnapshotOnly);
+  [[nodiscard]] static Db RestoreNewFromManifest(
+      std::string_view config_json, std::string_view manifest_path);
+  [[nodiscard]] static Db RestoreNewFromManifestFile(
+      std::string_view config_path, std::string_view manifest_path);
+  [[nodiscard]] static Db Resume(
+      std::string_view config_json, std::string_view existing_db_id,
+      RecoveryMode mode = RecoveryMode::kLatestWithWal);
+  [[nodiscard]] static Db ResumeFile(
+      std::string_view config_path, std::string_view existing_db_id,
+      RecoveryMode mode = RecoveryMode::kLatestWithWal);
+  [[nodiscard]] static Db ResumeFromSnapshot(
+      std::string_view config_json, SnapshotId snapshot,
+      std::string_view existing_db_id,
+      RecoveryMode mode = RecoveryMode::kSnapshotOnly);
+  [[nodiscard]] static Db ResumeFromSnapshotFile(
+      std::string_view config_path, SnapshotId snapshot,
+      std::string_view existing_db_id,
+      RecoveryMode mode = RecoveryMode::kSnapshotOnly);
 
   Db(Db &&) noexcept;
   Db &operator=(Db &&) noexcept;
@@ -98,17 +96,17 @@ public:
   void Write(WriteBatch &batch) const;
   [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
                                              const ReadOptions &options) const;
-  [[nodiscard]] OwnedMultiGetResult
-  MultiGet(std::span<const MultiGetKey> keys) const;
+  [[nodiscard]] OwnedMultiGetResult MultiGet(
+      std::span<const MultiGetKey> keys) const;
   [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
                                           MutableBytesView output,
                                           const ReadOptions &options) const;
   [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
                                           MutableBytesView output) const;
-  [[nodiscard]] ScanCursor
-  Scan(BucketId bucket, std::optional<BytesView> start_inclusive = std::nullopt,
-       std::optional<BytesView> end_exclusive = std::nullopt,
-       const ScanOptions &options = {}) const;
+  [[nodiscard]] ScanCursor Scan(
+      BucketId bucket, std::optional<BytesView> start_inclusive = std::nullopt,
+      std::optional<BytesView> end_exclusive = std::nullopt,
+      const ScanOptions &options = {}) const;
   [[nodiscard]] PriorityQueue NewPriorityQueue(std::string_view name);
   [[nodiscard]] PriorityQueue GetPriorityQueue(std::string_view name) const;
   [[nodiscard]] PriorityQueue GetOrNewPriorityQueue(std::string_view name);
@@ -134,11 +132,11 @@ public:
       std::optional<std::span<const BucketRange>> ranges = std::nullopt,
       ExpandStorageMode storage_mode = ExpandStorageMode::kAdoptAsync) const;
   void WaitForExpandAdoption(std::chrono::milliseconds timeout) const;
-  [[nodiscard]] SnapshotId
-  ShrinkBucket(std::span<const BucketRange> ranges) const;
+  [[nodiscard]] SnapshotId ShrinkBucket(
+      std::span<const BucketRange> ranges) const;
   void Close() const;
 
-private:
+ private:
   struct Impl;
   explicit Db(std::shared_ptr<Impl>) noexcept;
   std::shared_ptr<Impl> impl_;
@@ -148,4 +146,4 @@ private:
   friend class PriorityQueue;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

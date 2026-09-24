@@ -32,8 +32,7 @@ GlobalSnapshot DbCoordinator::MaterializeGlobalSnapshot(
     std::uint32_t total_buckets, SnapshotId snapshot,
     std::span<const ShardSnapshot> shards) const {
   if (!impl_) {
-    throw Error(ErrorCode::kInvalidState,
-                "DbCoordinator has been moved from");
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
   }
   return detail::ToGlobalSnapshot(detail::Translate([&] {
     return ffi::native_coordinator_materialize_global_snapshot(
@@ -44,19 +43,17 @@ GlobalSnapshot DbCoordinator::MaterializeGlobalSnapshot(
 
 GlobalSnapshot DbCoordinator::GetGlobalSnapshot(SnapshotId snapshot) const {
   if (!impl_) {
-    throw Error(ErrorCode::kInvalidState,
-                "DbCoordinator has been moved from");
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
   }
   return detail::ToGlobalSnapshot(detail::Translate([&] {
     return ffi::native_coordinator_get_global_snapshot(*impl_->native,
-                                                        snapshot);
+                                                       snapshot);
   }));
 }
 
 std::vector<GlobalSnapshot> DbCoordinator::ListGlobalSnapshots() const {
   if (!impl_) {
-    throw Error(ErrorCode::kInvalidState,
-                "DbCoordinator has been moved from");
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
   }
   auto native = detail::Translate([&] {
     return ffi::native_coordinator_list_global_snapshots(*impl_->native);
@@ -71,8 +68,7 @@ std::vector<GlobalSnapshot> DbCoordinator::ListGlobalSnapshots() const {
 
 std::optional<GlobalSnapshot> DbCoordinator::LoadCurrentGlobalSnapshot() const {
   if (!impl_) {
-    throw Error(ErrorCode::kInvalidState,
-                "DbCoordinator has been moved from");
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
   }
   auto native = detail::Translate([&] {
     return ffi::native_coordinator_load_current_global_snapshot(*impl_->native);
@@ -89,16 +85,14 @@ std::optional<GlobalSnapshot> DbCoordinator::LoadCurrentGlobalSnapshot() const {
 
 bool DbCoordinator::RetainSnapshot(SnapshotId snapshot) const {
   if (!impl_) {
-    throw Error(ErrorCode::kInvalidState,
-                "DbCoordinator has been moved from");
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
   }
   return ffi::native_coordinator_retain_snapshot(*impl_->native, snapshot);
 }
 
 bool DbCoordinator::ExpireSnapshot(SnapshotId snapshot) const {
   if (!impl_) {
-    throw Error(ErrorCode::kInvalidState,
-                "DbCoordinator has been moved from");
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
   }
   return detail::Translate([&] {
     return ffi::native_coordinator_expire_snapshot(*impl_->native, snapshot);

@@ -139,18 +139,18 @@ DescriptorStorage Describe(std::span<const WriteOperation> input) {
     }
     const auto &options = operation.options;
     std::uint16_t flags = options.await_durable ? kAwaitDurable : 0;
-    if (options.ttl_seconds)
-      flags |= kHasTtl;
+    if (options.ttl_seconds) flags |= kHasTtl;
     if (options.column_family) {
       if (options.column_family->empty())
         throw Error(ErrorCode::kInput, "column family must not be empty");
       flags |= kHasFamily;
     }
-    const auto family = options.column_family
-                            ? BytesView(reinterpret_cast<const Byte *>(
-                                            options.column_family->data()),
-                                        options.column_family->size())
-                            : BytesView{};
+    const auto family =
+        options.column_family
+            ? BytesView(
+                  reinterpret_cast<const Byte *>(options.column_family->data()),
+                  options.column_family->size())
+            : BytesView{};
     const auto *elements = operation.list_elements.empty()
                                ? nullptr
                                : result.elements.data() + element_start;
@@ -170,7 +170,7 @@ std::size_t DescriptorAddress(const DescriptorStorage &storage) noexcept {
              : reinterpret_cast<std::size_t>(storage.operations.data());
 }
 
-} // namespace
+}  // namespace
 
 struct WriteBatch::Impl {
   struct Element {
@@ -202,8 +202,7 @@ struct WriteBatch::Impl {
       throw Error(ErrorCode::kInput,
                   "WriteBatch byte storage overflows size_t");
     const auto offset = arena.size();
-    if (value.empty())
-      return {offset, 0};
+    if (value.empty()) return {offset, 0};
     arena.insert(arena.end(), value.begin(), value.end());
     return {offset, value.size()};
   }
@@ -372,8 +371,7 @@ void WriteBatch::Delete(BucketId bucket, BytesView key, ColumnIndex column,
                 column, {}, {}, options);
 }
 void WriteBatch::Clear() noexcept {
-  if (impl_)
-    impl_->Clear();
+  if (impl_) impl_->Clear();
 }
 std::size_t WriteBatch::size() const noexcept {
   return impl_ ? impl_->operations.size() : 0;
@@ -414,4 +412,4 @@ void SingleDb::Write(WriteBatch &batch) const {
   batch.impl_->Clear();
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

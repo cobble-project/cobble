@@ -45,18 +45,19 @@ BytesView OwnedBatch::key(std::size_t row) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }
-  return detail::Translate(
-      [&] { return detail::ToView(ffi::native_batch_key(*impl_->native, row)); });
+  return detail::Translate([&] {
+    return detail::ToView(ffi::native_batch_key(*impl_->native, row));
+  });
 }
 
 std::size_t OwnedBatch::column_count(std::size_t row) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }
-  return detail::ToSize(detail::Translate([&] {
-                          return ffi::native_batch_column_count(*impl_->native, row);
-                        }),
-                        "column_count");
+  return detail::ToSize(
+      detail::Translate(
+          [&] { return ffi::native_batch_column_count(*impl_->native, row); }),
+      "column_count");
 }
 
 bool OwnedBatch::has_column(std::size_t row, std::size_t column) const {
@@ -68,7 +69,8 @@ BytesView OwnedBatch::column(std::size_t row, std::size_t column) const {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }
   return detail::Translate([&] {
-    return detail::ToView(ffi::native_batch_column(*impl_->native, row, column));
+    return detail::ToView(
+        ffi::native_batch_column(*impl_->native, row, column));
   });
 }
 
@@ -82,8 +84,9 @@ OwnedBatch ScanCursor::Next(std::size_t max_rows) {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "ScanCursor has been moved from");
   }
-  auto native = detail::Translate(
-      [&] { return ffi::native_scan_cursor_next_owned(*impl_->native, max_rows); });
+  auto native = detail::Translate([&] {
+    return ffi::native_scan_cursor_next_owned(*impl_->native, max_rows);
+  });
   return OwnedBatch(std::make_unique<OwnedBatch::Impl>(std::move(native)));
 }
 
@@ -94,7 +97,7 @@ BufferResult ScanCursor::NextBatchInto(std::size_t max_rows,
   }
   return detail::ToBufferResult(detail::Translate([&] {
     return ffi::native_scan_cursor_next_batch_into(*impl_->native, max_rows,
-                                                     detail::RustBytes(output));
+                                                   detail::RustBytes(output));
   }));
 }
 

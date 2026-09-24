@@ -26,21 +26,21 @@ struct ColumnFamilySchema {
 };
 
 class COBBLE_CPP_API Schema final {
-public:
+ public:
   Schema() = default;
   explicit Schema(std::vector<ColumnFamilySchema> families);
 
-  [[nodiscard]] const std::vector<ColumnFamilySchema> &
-  Families() const noexcept;
+  [[nodiscard]] const std::vector<ColumnFamilySchema> &Families()
+      const noexcept;
   [[nodiscard]] ColumnType Type(std::string_view family,
                                 ColumnIndex column) const;
 
-private:
+ private:
   std::vector<ColumnFamilySchema> families_;
 };
 
 class COBBLE_CPP_API SchemaBuilder final {
-public:
+ public:
   SchemaBuilder(SchemaBuilder &&) noexcept;
   SchemaBuilder &operator=(SchemaBuilder &&) noexcept;
   ~SchemaBuilder();
@@ -58,7 +58,7 @@ public:
                               bool value_has_ttl);
   [[nodiscard]] Schema Commit();
 
-private:
+ private:
   struct Impl;
   explicit SchemaBuilder(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
@@ -67,4 +67,4 @@ private:
   friend class SingleDb;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

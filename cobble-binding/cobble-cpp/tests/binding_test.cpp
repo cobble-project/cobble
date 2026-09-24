@@ -16,11 +16,11 @@
 
 namespace {
 
-#define CHECK(condition)                                                     \
-  do {                                                                       \
-    if (!(condition)) {                                                      \
-      throw std::runtime_error("check failed: " #condition);                \
-    }                                                                        \
+#define CHECK(condition)                                     \
+  do {                                                       \
+    if (!(condition)) {                                      \
+      throw std::runtime_error("check failed: " #condition); \
+    }                                                        \
   } while (false)
 
 cobble::BytesView Bytes(std::string_view value) {
@@ -33,8 +33,7 @@ std::string String(cobble::BytesView value) {
 
 std::string FileUrl(const std::filesystem::path& path) {
   const auto generic = path.generic_string();
-  return "file://" + std::string(generic.starts_with('/') ? "" : "/") +
-         generic;
+  return "file://" + std::string(generic.starts_with('/') ? "" : "/") + generic;
 }
 
 std::uint16_t U16(const std::uint8_t* value) {
@@ -92,7 +91,8 @@ void VerifyEncodedBatch(const std::vector<std::uint8_t>& encoded,
 }  // namespace
 
 int RunBindingTest() {
-  const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
   const auto root = std::filesystem::temp_directory_path() /
                     ("cobble-cpp-binding-" + std::to_string(nonce));
   std::filesystem::remove_all(root);
@@ -127,8 +127,7 @@ int RunBindingTest() {
     CHECK((small == std::array<std::uint8_t, 2>{0xAA, 0xBB}));
 
     std::vector<std::uint8_t> value(too_small.bytes_required);
-    const auto copied =
-        db.GetColumnInto(0, Bytes("key-1"), value, one_column);
+    const auto copied = db.GetColumnInto(0, Bytes("key-1"), value, one_column);
     CHECK(copied.status == cobble::BufferStatus::kOk);
     CHECK(String(value) == "value-1-1");
 
@@ -166,16 +165,15 @@ int RunBindingTest() {
     bool materialized = false;
     for (int attempt = 0; attempt < 200 && !materialized; ++attempt) {
       const auto snapshots = db.ListSnapshots();
-      materialized =
-          std::find(snapshots.begin(), snapshots.end(), snapshot) !=
-          snapshots.end();
+      materialized = std::find(snapshots.begin(), snapshots.end(), snapshot) !=
+                     snapshots.end();
       if (!materialized) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     }
     CHECK(materialized);
     CHECK(db.SnapshotManifestJson(snapshot).find("\"id\":") !=
-           std::string::npos);
+          std::string::npos);
   }
 
   bool saw_config_error = false;

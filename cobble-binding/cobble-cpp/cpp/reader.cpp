@@ -77,8 +77,7 @@ BufferResult Reader::GetColumnInto(BucketId bucket, BytesView key,
 }
 
 ScanCursor Reader::Scan(BucketId bucket, BytesView start_inclusive,
-                        BytesView end_exclusive,
-                        const ScanOptions& options) {
+                        BytesView end_exclusive, const ScanOptions& options) {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Reader has been moved from");
   }

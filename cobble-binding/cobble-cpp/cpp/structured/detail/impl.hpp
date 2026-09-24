@@ -121,4 +121,4 @@ struct SchemaBuilder::Impl {
   bool committed = false;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

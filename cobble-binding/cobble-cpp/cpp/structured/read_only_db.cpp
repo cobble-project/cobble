@@ -68,4 +68,4 @@ Schema ReadOnlyDb::CurrentSchema() const {
           *impl_->native));
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

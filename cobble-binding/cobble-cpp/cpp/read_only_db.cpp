@@ -19,8 +19,7 @@ ReadOnlyDb ReadOnlyDb::Open(std::string_view config_json, SnapshotId snapshot,
                             std::string_view source_db_id) {
   auto native = detail::Translate([&] {
     return ffi::native_read_only_database_open(
-        detail::RustStr(config_json), snapshot,
-        detail::RustStr(source_db_id));
+        detail::RustStr(config_json), snapshot, detail::RustStr(source_db_id));
   });
   return ReadOnlyDb(std::make_unique<Impl>(std::move(native)));
 }
@@ -30,8 +29,7 @@ ReadOnlyDb ReadOnlyDb::OpenFile(std::string_view config_path,
                                 std::string_view source_db_id) {
   auto native = detail::Translate([&] {
     return ffi::native_read_only_database_open_file(
-        detail::RustStr(config_path), snapshot,
-        detail::RustStr(source_db_id));
+        detail::RustStr(config_path), snapshot, detail::RustStr(source_db_id));
   });
   return ReadOnlyDb(std::make_unique<Impl>(std::move(native)));
 }

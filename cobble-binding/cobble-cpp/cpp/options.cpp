@@ -42,7 +42,8 @@ ffi::NativeScanOptions ToNative(const ScanOptions& options) {
   for (const auto column : options.columns) {
     native.columns.push_back(static_cast<std::uint64_t>(column));
   }
-  native.read_ahead_bytes = static_cast<std::uint64_t>(options.read_ahead_bytes);
+  native.read_ahead_bytes =
+      static_cast<std::uint64_t>(options.read_ahead_bytes);
   native.has_max_rows = options.max_rows.has_value();
   native.max_rows = options.max_rows.value_or(0);
   native.preload_scan_cursor_block = options.preload_scan_cursor_block;

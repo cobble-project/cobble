@@ -8,7 +8,7 @@
 namespace cobble::structured {
 
 class COBBLE_CPP_API PendingShardSnapshot final {
-public:
+ public:
   PendingShardSnapshot(PendingShardSnapshot &&) noexcept;
   PendingShardSnapshot &operator=(PendingShardSnapshot &&) noexcept;
   ~PendingShardSnapshot();
@@ -18,7 +18,7 @@ public:
   [[nodiscard]] SnapshotId id() const noexcept;
   [[nodiscard]] ShardSnapshot Wait();
 
-private:
+ private:
   struct Impl;
   explicit PendingShardSnapshot(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
@@ -26,7 +26,7 @@ private:
 };
 
 class COBBLE_CPP_API PendingSnapshot final {
-public:
+ public:
   PendingSnapshot(PendingSnapshot &&) noexcept;
   PendingSnapshot &operator=(PendingSnapshot &&) noexcept;
   ~PendingSnapshot();
@@ -36,11 +36,11 @@ public:
   [[nodiscard]] SnapshotId id() const noexcept;
   [[nodiscard]] GlobalSnapshot Wait();
 
-private:
+ private:
   struct Impl;
   explicit PendingSnapshot(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
   friend class SingleDb;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

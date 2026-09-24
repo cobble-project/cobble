@@ -24,11 +24,11 @@ constexpr std::size_t kRowsPerScanBatch = 257;
 constexpr std::size_t kColumnZeroBytes = 256;
 constexpr std::size_t kColumnOneBytes = 384;
 
-#define CHECK(condition)                                                     \
-  do {                                                                       \
-    if (!(condition)) {                                                      \
-      throw std::runtime_error("check failed: " #condition);                \
-    }                                                                        \
+#define CHECK(condition)                                     \
+  do {                                                       \
+    if (!(condition)) {                                      \
+      throw std::runtime_error("check failed: " #condition); \
+    }                                                        \
   } while (false)
 
 cobble::BytesView Bytes(std::string_view value) {
@@ -41,8 +41,7 @@ std::string String(cobble::BytesView value) {
 
 std::string FileUrl(const std::filesystem::path& path) {
   const auto generic = path.generic_string();
-  return "file://" + std::string(generic.starts_with('/') ? "" : "/") +
-         generic;
+  return "file://" + std::string(generic.starts_with('/') ? "" : "/") + generic;
 }
 
 std::string Key(std::size_t row) {
@@ -52,8 +51,8 @@ std::string Key(std::size_t row) {
 }
 
 std::string Value(std::size_t row, std::size_t column, std::size_t size) {
-  const auto prefix = "row=" + std::to_string(row) +
-                      ";column=" + std::to_string(column) + ";";
+  const auto prefix =
+      "row=" + std::to_string(row) + ";column=" + std::to_string(column) + ";";
   std::string value = prefix;
   value.resize(size, static_cast<char>('a' + ((row + column) % 26)));
   return value;
@@ -199,7 +198,8 @@ void VerifyEncodedRows(cobble::BytesView encoded, std::size_t bucket,
       CHECK(value_size <= encoded.size() - offset);
       const auto expected_size =
           column == 0 ? kColumnZeroBytes : kColumnOneBytes;
-      CHECK(String(encoded.subspan(offset, static_cast<std::size_t>(value_size))) ==
+      CHECK(String(encoded.subspan(offset,
+                                   static_cast<std::size_t>(value_size))) ==
             Value(expected_row, column, expected_size));
       offset += static_cast<std::size_t>(value_size);
     }
@@ -283,8 +283,7 @@ int main() {
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
-    const auto payload_bytes =
-        kRowCount * (kColumnZeroBytes + kColumnOneBytes);
+    const auto payload_bytes = kRowCount * (kColumnZeroBytes + kColumnOneBytes);
     std::cout << "verified " << kRowCount << " rows and " << payload_bytes
               << " value bytes across " << kBucketCount << " buckets in "
               << elapsed.count() << " ms\n";

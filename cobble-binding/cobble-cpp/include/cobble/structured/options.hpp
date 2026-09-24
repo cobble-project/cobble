@@ -14,7 +14,7 @@ namespace cobble::structured {
 // Native-backed and reusable. Reusing an instance preserves the Rust schema
 // projection cache across Get calls.
 class COBBLE_CPP_API ReadOptions final {
-public:
+ public:
   ReadOptions();
   ReadOptions(const ReadOptions &other);
   ReadOptions &operator=(const ReadOptions &other);
@@ -25,7 +25,7 @@ public:
   ReadOptions &SetColumnFamily(std::optional<std::string_view> family);
   ReadOptions &SetColumns(std::span<const std::size_t> columns);
 
-private:
+ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
@@ -35,4 +35,4 @@ private:
   friend class ReadOnlyDb;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

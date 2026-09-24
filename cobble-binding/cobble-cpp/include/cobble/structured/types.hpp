@@ -27,4 +27,4 @@ struct ListConfig {
   bool preserve_element_ttl = false;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

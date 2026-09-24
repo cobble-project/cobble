@@ -26,9 +26,11 @@ std::string Config(const std::filesystem::path& root, std::size_t columns = 1) {
 }
 
 const cobble::ColumnFamily& DefaultFamily(const cobble::Schema& schema) {
-  const auto family = std::find_if(
-      schema.column_families.begin(), schema.column_families.end(),
-      [](const cobble::ColumnFamily& value) { return value.name == "default"; });
+  const auto family =
+      std::find_if(schema.column_families.begin(), schema.column_families.end(),
+                   [](const cobble::ColumnFamily& value) {
+                     return value.name == "default";
+                   });
   COBBLE_CHECK(family != schema.column_families.end());
   return *family;
 }
@@ -41,9 +43,8 @@ cobble::OwnedMultiGetResult FetchMixedKeys(const cobble::SingleDb& db) {
   const std::string empty;
   const std::string missing = "missing";
   const std::vector<cobble::MultiGetKey> keys = {
-      {0, Bytes(duplicate)},   {0, Bytes(duplicate)},
-      {0, Bytes(empty)},       {0, Bytes(cross_bucket)},
-      {1, Bytes(cross_bucket)}, {3, Bytes(missing)},
+      {0, Bytes(duplicate)},    {0, Bytes(duplicate)},    {0, Bytes(empty)},
+      {0, Bytes(cross_bucket)}, {1, Bytes(cross_bucket)}, {3, Bytes(missing)},
   };
   return db.MultiGet(keys);
 }
@@ -51,8 +52,7 @@ cobble::OwnedMultiGetResult FetchMixedKeys(const cobble::SingleDb& db) {
 void VerifyDetachedSchemaBuilder(const std::filesystem::path& root) {
   auto owner =
       std::make_unique<cobble::SingleDb>(cobble::SingleDb::Open(Config(root)));
-  auto builder =
-      std::make_unique<cobble::SchemaBuilder>(owner->UpdateSchema());
+  auto builder = std::make_unique<cobble::SchemaBuilder>(owner->UpdateSchema());
 
   // The builder retains the native database owner. Destroying the public
   // database first must neither deadlock nor invalidate the builder.
@@ -189,10 +189,11 @@ void VerifyLifecycleAndMetrics(cobble::SingleDb& db) {
                     [](const cobble::MetricLabel& label) {
                       return label.key == "db_id" && !label.value.empty();
                     });
-    saw_typed_value = saw_typed_value ||
-                      std::holds_alternative<cobble::CounterValue>(sample.value) ||
-                      std::holds_alternative<cobble::GaugeValue>(sample.value) ||
-                      std::holds_alternative<cobble::HistogramValue>(sample.value);
+    saw_typed_value =
+        saw_typed_value ||
+        std::holds_alternative<cobble::CounterValue>(sample.value) ||
+        std::holds_alternative<cobble::GaugeValue>(sample.value) ||
+        std::holds_alternative<cobble::HistogramValue>(sample.value);
   }
   COBBLE_CHECK(saw_database_label);
   COBBLE_CHECK(saw_typed_value);

@@ -41,7 +41,8 @@ void WriteBatch::Merge(BucketId bucket, BytesView key, ColumnIndex column,
   }
   const auto native_options = detail::ToNative(options);
   ffi::native_write_batch_merge(*impl_->native, bucket, detail::RustBytes(key),
-                                column, detail::RustBytes(value), native_options);
+                                column, detail::RustBytes(value),
+                                native_options);
 }
 
 std::size_t WriteBatch::size() const noexcept {

@@ -39,7 +39,8 @@ void VerifyDetachedBuilder(const std::filesystem::path &root) {
                cobble::structured::ColumnKind::kList);
 }
 
-template <typename Database> void VerifyPointApi(Database &db) {
+template <typename Database>
+void VerifyPointApi(Database &db) {
   auto builder = db.UpdateSchema();
   builder.AddListColumn(
       std::nullopt, 1,
@@ -215,7 +216,7 @@ void VerifyRescale(const std::filesystem::path &root) {
   source.Close();
 }
 
-} // namespace
+}  // namespace
 
 int main() {
   try {

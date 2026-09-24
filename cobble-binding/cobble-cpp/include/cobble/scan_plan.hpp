@@ -27,15 +27,13 @@ struct COBBLE_CPP_API ScanSplit {
   std::optional<ScanSplitBoundary> end_at_inclusive;
 
   [[nodiscard]] ScanSplitPartition SplitAfter(BucketId bucket,
-                                               BytesView key_inclusive) const;
+                                              BytesView key_inclusive) const;
   [[nodiscard]] std::string ToJson() const;
   [[nodiscard]] static ScanSplit FromJson(std::string_view json);
-  [[nodiscard]] ScanCursor OpenScanner(
-      std::string_view config_json,
-      const ScanOptions& options = {}) const;
+  [[nodiscard]] ScanCursor OpenScanner(std::string_view config_json,
+                                       const ScanOptions& options = {}) const;
   [[nodiscard]] ScanCursor OpenScannerFile(
-      std::string_view config_path,
-      const ScanOptions& options = {}) const;
+      std::string_view config_path, const ScanOptions& options = {}) const;
 };
 
 struct ScanSplitPartition {

@@ -8,17 +8,15 @@
 
 namespace cobble {
 
-SnapshotId Db::ExpandBucket(
-    std::string_view source_db_id,
-    std::optional<SnapshotId> source_snapshot,
-    std::optional<std::span<const BucketRange>> ranges,
-    ExpandStorageMode storage_mode) const {
+SnapshotId Db::ExpandBucket(std::string_view source_db_id,
+                            std::optional<SnapshotId> source_snapshot,
+                            std::optional<std::span<const BucketRange>> ranges,
+                            ExpandStorageMode storage_mode) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
   auto native_ranges =
-      ranges ? detail::ToNativeRanges(*ranges)
-             : rust::Vec<ffi::NativeRange>();
+      ranges ? detail::ToNativeRanges(*ranges) : rust::Vec<ffi::NativeRange>();
   return detail::Translate([&] {
     return ffi::native_sharded_database_expand_bucket(
         *impl_->native, detail::RustStr(source_db_id),

@@ -71,8 +71,8 @@ class COBBLE_CPP_API Db final {
 
   [[nodiscard]] std::string Id() const;
 
-  void Put(BucketId bucket, BytesView key, ColumnIndex column,
-           BytesView value, const WriteOptions& options = {}) const;
+  void Put(BucketId bucket, BytesView key, ColumnIndex column, BytesView value,
+           const WriteOptions& options = {}) const;
   void Delete(BucketId bucket, BytesView key, ColumnIndex column,
               const WriteOptions& options = {}) const;
   void Merge(BucketId bucket, BytesView key, ColumnIndex column,
@@ -81,16 +81,15 @@ class COBBLE_CPP_API Db final {
 
   [[nodiscard]] OwnedRow Get(BucketId bucket, BytesView key,
                              const ReadOptions& options = {}) const;
-  [[nodiscard]] BufferResult GetColumnInto(
-      BucketId bucket, BytesView key, MutableBytesView output,
-      const ReadOptions& options) const;
+  [[nodiscard]] BufferResult GetColumnInto(BucketId bucket, BytesView key,
+                                           MutableBytesView output,
+                                           const ReadOptions& options) const;
   [[nodiscard]] OwnedMultiGetResult MultiGet(
-      std::span<const MultiGetKey> keys,
-      const ReadOptions& options = {}) const;
-  [[nodiscard]] ScanCursor Scan(
-      BucketId bucket, std::optional<BytesView> start_inclusive,
-      std::optional<BytesView> end_exclusive,
-      const ScanOptions& options = {}) const;
+      std::span<const MultiGetKey> keys, const ReadOptions& options = {}) const;
+  [[nodiscard]] ScanCursor Scan(BucketId bucket,
+                                std::optional<BytesView> start_inclusive,
+                                std::optional<BytesView> end_exclusive,
+                                const ScanOptions& options = {}) const;
 
   [[nodiscard]] Schema CurrentSchema() const;
   [[nodiscard]] SchemaBuilder UpdateSchema() const;

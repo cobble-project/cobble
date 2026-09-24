@@ -13,8 +13,7 @@ std::uint32_t Database::NowSeconds() const {
   return ffi::native_database_now_seconds(*impl_->native);
 }
 
-void Database::SwitchMemtableType(MemtableType type,
-                                  bool flush_current) const {
+void Database::SwitchMemtableType(MemtableType type, bool flush_current) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
@@ -28,12 +27,12 @@ std::size_t Database::LoadReadonlyFilesToPrimary() const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  return detail::ToSize(detail::Translate([&] {
-                          return ffi::
-                              native_database_load_readonly_files_to_primary(
-                                  *impl_->native);
-                        }),
-                        "readonly file count");
+  return detail::ToSize(
+      detail::Translate([&] {
+        return ffi::native_database_load_readonly_files_to_primary(
+            *impl_->native);
+      }),
+      "readonly file count");
 }
 
 void Db::SetTime(std::uint32_t unix_seconds) const {
@@ -64,12 +63,12 @@ std::size_t Db::LoadReadonlyFilesToPrimary() const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
-  return detail::ToSize(detail::Translate([&] {
-                          return ffi::
-                              native_sharded_database_load_readonly_files_to_primary(
-                                  *impl_->native);
-                        }),
-                        "readonly file count");
+  return detail::ToSize(
+      detail::Translate([&] {
+        return ffi::native_sharded_database_load_readonly_files_to_primary(
+            *impl_->native);
+      }),
+      "readonly file count");
 }
 
 }  // namespace cobble

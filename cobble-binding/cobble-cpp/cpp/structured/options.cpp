@@ -32,8 +32,8 @@ ReadOptions::ReadOptions(ReadOptions &&) noexcept = default;
 ReadOptions &ReadOptions::operator=(ReadOptions &&) noexcept = default;
 ReadOptions::~ReadOptions() = default;
 
-ReadOptions &
-ReadOptions::SetColumnFamily(std::optional<std::string_view> family) {
+ReadOptions &ReadOptions::SetColumnFamily(
+    std::optional<std::string_view> family) {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "ReadOptions has been moved from");
   }
@@ -64,4 +64,4 @@ ReadOptions &ReadOptions::SetColumns(std::span<const std::size_t> columns) {
   return *this;
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

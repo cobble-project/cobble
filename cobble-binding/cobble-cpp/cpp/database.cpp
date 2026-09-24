@@ -56,8 +56,9 @@ Database Database::Open(std::string_view config_json) {
 }
 
 Database Database::OpenFile(std::string_view config_path) {
-  auto native = detail::Translate(
-      [&] { return ffi::native_database_open_file(detail::RustStr(config_path)); });
+  auto native = detail::Translate([&] {
+    return ffi::native_database_open_file(detail::RustStr(config_path));
+  });
   return Database(std::make_unique<Impl>(std::move(native)));
 }
 
@@ -73,7 +74,8 @@ Database Database::Resume(std::string_view config_json, SnapshotId snapshot,
 Database Database::ResumeFile(std::string_view config_path, SnapshotId snapshot,
                               RecoveryMode mode) {
   auto native = detail::Translate([&] {
-    return ffi::native_database_resume_file(detail::RustStr(config_path), snapshot,
+    return ffi::native_database_resume_file(detail::RustStr(config_path),
+                                            snapshot,
                                             static_cast<std::uint8_t>(mode));
   });
   return Database(std::make_unique<Impl>(std::move(native)));
@@ -86,8 +88,8 @@ void Database::Put(BucketId bucket, BytesView key, ColumnIndex column,
   }
   const auto native_options = detail::ToNative(options);
   detail::Translate([&] {
-    ffi::native_database_put(*impl_->native, bucket, detail::RustBytes(key), column,
-                             detail::RustBytes(value), native_options);
+    ffi::native_database_put(*impl_->native, bucket, detail::RustBytes(key),
+                             column, detail::RustBytes(value), native_options);
   });
 }
 
@@ -98,8 +100,8 @@ void Database::Delete(BucketId bucket, BytesView key, ColumnIndex column,
   }
   const auto native_options = detail::ToNative(options);
   detail::Translate([&] {
-    ffi::native_database_delete(*impl_->native, bucket, detail::RustBytes(key), column,
-                                native_options);
+    ffi::native_database_delete(*impl_->native, bucket, detail::RustBytes(key),
+                                column, native_options);
   });
 }
 
@@ -110,8 +112,9 @@ void Database::Merge(BucketId bucket, BytesView key, ColumnIndex column,
   }
   const auto native_options = detail::ToNative(options);
   detail::Translate([&] {
-    ffi::native_database_merge(*impl_->native, bucket, detail::RustBytes(key), column,
-                               detail::RustBytes(value), native_options);
+    ffi::native_database_merge(*impl_->native, bucket, detail::RustBytes(key),
+                               column, detail::RustBytes(value),
+                               native_options);
   });
 }
 
@@ -123,8 +126,8 @@ void Database::Write(WriteBatch batch, bool await_durable) const {
     throw Error(ErrorCode::kInvalidState, "WriteBatch has been moved from");
   }
   detail::Translate([&] {
-    ffi::native_database_write_batch(*impl_->native, std::move(batch.impl_->native),
-                                     await_durable);
+    ffi::native_database_write_batch(
+        *impl_->native, std::move(batch.impl_->native), await_durable);
   });
 }
 
@@ -135,8 +138,8 @@ OwnedRow Database::Get(BucketId bucket, BytesView key,
   }
   const auto native_options = detail::ToNative(options);
   auto native = detail::Translate([&] {
-    return ffi::native_database_get(*impl_->native, bucket, detail::RustBytes(key),
-                                    native_options);
+    return ffi::native_database_get(*impl_->native, bucket,
+                                    detail::RustBytes(key), native_options);
   });
   return OwnedRow(std::make_unique<OwnedRow::Impl>(std::move(native)));
 }
@@ -155,7 +158,8 @@ BufferResult Database::GetColumnInto(BucketId bucket, BytesView key,
   }));
 }
 
-ScanCursor Database::Scan(BucketId bucket, std::optional<BytesView> start_inclusive,
+ScanCursor Database::Scan(BucketId bucket,
+                          std::optional<BytesView> start_inclusive,
                           std::optional<BytesView> end_exclusive,
                           const ScanOptions& options) const {
   if (!impl_) {
@@ -213,7 +217,8 @@ std::string Database::SnapshotManifestJson(SnapshotId snapshot) const {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
   auto native = detail::Translate([&] {
-    return ffi::native_database_snapshot_manifest_json(*impl_->native, snapshot);
+    return ffi::native_database_snapshot_manifest_json(*impl_->native,
+                                                       snapshot);
   });
   return {native.data(), native.size()};
 }

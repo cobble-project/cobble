@@ -28,9 +28,10 @@ static_assert(std::is_standard_layout_v<KeyDescriptor>);
 constexpr std::size_t AlignUp(std::size_t value, std::size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
-constexpr std::size_t kDescriptorAlignment =
-    alignof(const Byte*) > alignof(std::size_t) ? alignof(const Byte*)
-                                                : alignof(std::size_t);
+constexpr std::size_t kDescriptorAlignment = alignof(const Byte*) >
+                                                     alignof(std::size_t)
+                                                 ? alignof(const Byte*)
+                                                 : alignof(std::size_t);
 constexpr std::size_t kDataOffset =
     AlignUp(2 * sizeof(std::uint16_t), alignof(const Byte*));
 constexpr std::size_t kLengthOffset =
@@ -46,7 +47,8 @@ static_assert(sizeof(KeyDescriptor) == kDescriptorSize);
 
 template <typename Call>
 rust::Box<ffi::NativeMultiGetResult> CallMultiGet(
-    std::span<const MultiGetKey> keys, const ReadOptions& options, Call&& call) {
+    std::span<const MultiGetKey> keys, const ReadOptions& options,
+    Call&& call) {
   if (keys.size() > std::numeric_limits<std::uint64_t>::max()) {
     throw Error(ErrorCode::kInput, "multi-get key count does not fit in u64");
   }
@@ -108,8 +110,7 @@ std::size_t OwnedMultiGetResult::column_count(std::size_t row) const {
 
 bool OwnedMultiGetResult::has_column(std::size_t row,
                                      std::size_t column) const {
-  return impl_ &&
-         ffi::native_multi_get_has_column(*impl_->native, row, column);
+  return impl_ && ffi::native_multi_get_has_column(*impl_->native, row, column);
 }
 
 BytesView OwnedMultiGetResult::column(std::size_t row,
@@ -124,16 +125,16 @@ BytesView OwnedMultiGetResult::column(std::size_t row,
   });
 }
 
-OwnedMultiGetResult Database::MultiGet(
-    std::span<const MultiGetKey> keys, const ReadOptions& options) const {
+OwnedMultiGetResult Database::MultiGet(std::span<const MultiGetKey> keys,
+                                       const ReadOptions& options) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
-                                                const auto& native_options) {
-    return ffi::native_database_multi_get(
-        *impl_->native, address, count, native_options);
-  });
+  auto native = CallMultiGet(
+      keys, options, [&](auto address, auto count, const auto& native_options) {
+        return ffi::native_database_multi_get(*impl_->native, address, count,
+                                              native_options);
+      });
   return OwnedMultiGetResult(
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }
@@ -143,25 +144,25 @@ OwnedMultiGetResult Db::MultiGet(std::span<const MultiGetKey> keys,
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
-  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
-                                                const auto& native_options) {
-    return ffi::native_sharded_database_multi_get(
-        *impl_->native, address, count, native_options);
-  });
+  auto native = CallMultiGet(
+      keys, options, [&](auto address, auto count, const auto& native_options) {
+        return ffi::native_sharded_database_multi_get(*impl_->native, address,
+                                                      count, native_options);
+      });
   return OwnedMultiGetResult(
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }
 
-OwnedMultiGetResult ReadOnlyDb::MultiGet(
-    std::span<const MultiGetKey> keys, const ReadOptions& options) const {
+OwnedMultiGetResult ReadOnlyDb::MultiGet(std::span<const MultiGetKey> keys,
+                                         const ReadOptions& options) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "ReadOnlyDb has been moved from");
   }
-  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
-                                                const auto& native_options) {
-    return ffi::native_read_only_database_multi_get(
-        *impl_->native, address, count, native_options);
-  });
+  auto native = CallMultiGet(
+      keys, options, [&](auto address, auto count, const auto& native_options) {
+        return ffi::native_read_only_database_multi_get(*impl_->native, address,
+                                                        count, native_options);
+      });
   return OwnedMultiGetResult(
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }
@@ -171,11 +172,11 @@ OwnedMultiGetResult Reader::MultiGet(std::span<const MultiGetKey> keys,
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Reader has been moved from");
   }
-  auto native = CallMultiGet(keys, options, [&](auto address, auto count,
-                                                const auto& native_options) {
-    return ffi::native_reader_multi_get(*impl_->native, address, count,
-                                        native_options);
-  });
+  auto native = CallMultiGet(
+      keys, options, [&](auto address, auto count, const auto& native_options) {
+        return ffi::native_reader_multi_get(*impl_->native, address, count,
+                                            native_options);
+      });
   return OwnedMultiGetResult(
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }

@@ -12,8 +12,8 @@ PendingShardSnapshot::PendingShardSnapshot(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 PendingShardSnapshot::PendingShardSnapshot(PendingShardSnapshot &&) noexcept =
     default;
-PendingShardSnapshot &
-PendingShardSnapshot::operator=(PendingShardSnapshot &&) noexcept = default;
+PendingShardSnapshot &PendingShardSnapshot::operator=(
+    PendingShardSnapshot &&) noexcept = default;
 PendingShardSnapshot::~PendingShardSnapshot() = default;
 
 SnapshotId PendingShardSnapshot::id() const noexcept {
@@ -36,8 +36,8 @@ ShardSnapshot PendingShardSnapshot::Wait() {
 PendingSnapshot::PendingSnapshot(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 PendingSnapshot::PendingSnapshot(PendingSnapshot &&) noexcept = default;
-PendingSnapshot &
-PendingSnapshot::operator=(PendingSnapshot &&) noexcept = default;
+PendingSnapshot &PendingSnapshot::operator=(PendingSnapshot &&) noexcept =
+    default;
 PendingSnapshot::~PendingSnapshot() = default;
 
 SnapshotId PendingSnapshot::id() const noexcept {
@@ -55,4 +55,4 @@ GlobalSnapshot PendingSnapshot::Wait() {
   }));
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

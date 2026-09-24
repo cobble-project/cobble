@@ -18,8 +18,8 @@ class COBBLE_CPP_API WriteBatch final {
   WriteBatch(const WriteBatch&) = delete;
   WriteBatch& operator=(const WriteBatch&) = delete;
 
-  void Put(BucketId bucket, BytesView key, ColumnIndex column,
-           BytesView value, const WriteOptions& options = {});
+  void Put(BucketId bucket, BytesView key, ColumnIndex column, BytesView value,
+           const WriteOptions& options = {});
   void Delete(BucketId bucket, BytesView key, ColumnIndex column,
               const WriteOptions& options = {});
   void Merge(BucketId bucket, BytesView key, ColumnIndex column,

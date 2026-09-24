@@ -27,8 +27,7 @@ struct HistogramValue {
   double max;
 };
 
-using MetricValue =
-    std::variant<CounterValue, GaugeValue, HistogramValue>;
+using MetricValue = std::variant<CounterValue, GaugeValue, HistogramValue>;
 
 struct MetricSample {
   std::string name;

@@ -27,20 +27,18 @@ struct COBBLE_CPP_API WriteOperation {
   std::span<const BytesView> list_elements;
   cobble::WriteOptions options;
 
-  [[nodiscard]] static WriteOperation
-  PutBytes(BucketId bucket, BytesView key, ColumnIndex column, BytesView value,
-           cobble::WriteOptions options = {});
-  [[nodiscard]] static WriteOperation
-  PutList(BucketId bucket, BytesView key, ColumnIndex column,
-          std::span<const BytesView> elements,
-          cobble::WriteOptions options = {});
-  [[nodiscard]] static WriteOperation
-  MergeBytes(BucketId bucket, BytesView key, ColumnIndex column,
-             BytesView value, cobble::WriteOptions options = {});
-  [[nodiscard]] static WriteOperation
-  MergeList(BucketId bucket, BytesView key, ColumnIndex column,
-            std::span<const BytesView> elements,
-            cobble::WriteOptions options = {});
+  [[nodiscard]] static WriteOperation PutBytes(
+      BucketId bucket, BytesView key, ColumnIndex column, BytesView value,
+      cobble::WriteOptions options = {});
+  [[nodiscard]] static WriteOperation PutList(
+      BucketId bucket, BytesView key, ColumnIndex column,
+      std::span<const BytesView> elements, cobble::WriteOptions options = {});
+  [[nodiscard]] static WriteOperation MergeBytes(
+      BucketId bucket, BytesView key, ColumnIndex column, BytesView value,
+      cobble::WriteOptions options = {});
+  [[nodiscard]] static WriteOperation MergeList(
+      BucketId bucket, BytesView key, ColumnIndex column,
+      std::span<const BytesView> elements, cobble::WriteOptions options = {});
   [[nodiscard]] static WriteOperation Delete(BucketId bucket, BytesView key,
                                              ColumnIndex column,
                                              cobble::WriteOptions options = {});
@@ -50,7 +48,7 @@ struct COBBLE_CPP_API WriteOperation {
 // C++-owned storage; source strings, spans, and containers may be destroyed
 // before Write. Clear and successful Write retain internal capacities.
 class COBBLE_CPP_API WriteBatch final {
-public:
+ public:
   WriteBatch();
   WriteBatch(WriteBatch &&) noexcept;
   WriteBatch &operator=(WriteBatch &&) noexcept;
@@ -74,11 +72,11 @@ public:
   [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] bool empty() const noexcept;
 
-private:
+ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
   friend class Db;
   friend class SingleDb;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

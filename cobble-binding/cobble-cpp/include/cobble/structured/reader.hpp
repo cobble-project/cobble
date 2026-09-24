@@ -17,7 +17,7 @@ namespace cobble::structured {
 using ReaderMode = cobble::ReaderMode;
 
 class COBBLE_CPP_API Reader final {
-public:
+ public:
   [[nodiscard]] static Reader OpenCurrent(std::string_view config_json);
   [[nodiscard]] static Reader OpenCurrentFile(std::string_view config_path);
   [[nodiscard]] static Reader Open(std::string_view config_json,
@@ -60,10 +60,10 @@ public:
   [[nodiscard]] GlobalSnapshot CurrentGlobalSnapshot() const;
   [[nodiscard]] std::vector<GlobalSnapshot> ListGlobalSnapshots() const;
 
-private:
+ private:
   struct Impl;
   explicit Reader(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

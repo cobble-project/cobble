@@ -41,9 +41,8 @@ std::vector<ScanSplit> ScanPlan::Splits() const {
   std::vector<ScanSplit> splits;
   splits.reserve(snapshot_.shards.size());
   for (const auto& shard : snapshot_.shards) {
-    splits.push_back(
-        ScanSplit{shard, start_inclusive_, end_exclusive_, std::nullopt,
-                  std::nullopt});
+    splits.push_back(ScanSplit{shard, start_inclusive_, end_exclusive_,
+                               std::nullopt, std::nullopt});
   }
   return splits;
 }
@@ -51,9 +50,9 @@ std::vector<ScanSplit> ScanPlan::Splits() const {
 ScanSplitPartition ScanSplit::SplitAfter(BucketId bucket,
                                          BytesView key_inclusive) const {
   auto native = detail::Translate([&] {
-    return ffi::native_scan_split_split_after(
-        detail::ToNativeScanSplit(*this), bucket,
-        detail::RustBytes(key_inclusive));
+    return ffi::native_scan_split_split_after(detail::ToNativeScanSplit(*this),
+                                              bucket,
+                                              detail::RustBytes(key_inclusive));
   });
   if (native.size() != 2) {
     throw Error(ErrorCode::kInvalidState,
@@ -78,9 +77,9 @@ ScanCursor ScanSplit::OpenScanner(std::string_view config_json,
                                   const ScanOptions& options) const {
   const auto native_options = detail::ToNative(options);
   auto native = detail::Translate([&] {
-    return ffi::native_scan_split_open_scanner(
-        detail::RustStr(config_json), detail::ToNativeScanSplit(*this),
-        native_options);
+    return ffi::native_scan_split_open_scanner(detail::RustStr(config_json),
+                                               detail::ToNativeScanSplit(*this),
+                                               native_options);
   });
   return ScanCursor(std::make_unique<ScanCursor::Impl>(std::move(native)));
 }

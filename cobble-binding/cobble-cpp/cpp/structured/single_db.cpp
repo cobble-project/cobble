@@ -240,4 +240,4 @@ void SingleDb::Close() const {
   });
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

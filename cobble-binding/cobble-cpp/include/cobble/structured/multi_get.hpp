@@ -13,7 +13,7 @@ struct MultiGetKey {
 };
 
 class COBBLE_CPP_API OwnedMultiGetResult final {
-public:
+ public:
   OwnedMultiGetResult(OwnedMultiGetResult &&) noexcept;
   OwnedMultiGetResult &operator=(OwnedMultiGetResult &&) noexcept;
   ~OwnedMultiGetResult();
@@ -30,7 +30,7 @@ public:
   [[nodiscard]] BytesView ListElement(std::size_t row, std::size_t column,
                                       std::size_t element) const;
 
-private:
+ private:
   struct Impl;
   explicit OwnedMultiGetResult(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
@@ -40,4 +40,4 @@ private:
   friend class ReadOnlyDb;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

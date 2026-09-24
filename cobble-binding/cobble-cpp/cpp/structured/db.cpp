@@ -401,4 +401,4 @@ void Db::Close() const {
       [&] { structured_ffi::native_structured_db_close(*impl_->native); });
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

@@ -20,10 +20,10 @@ BufferStatus ToStatus(std::uint8_t value) {
   return static_cast<BufferStatus>(value);
 }
 
-} // namespace
+}  // namespace
 
-structured_ffi::NativeWriteOptions
-ToNative(const cobble::WriteOptions &options) {
+structured_ffi::NativeWriteOptions ToNative(
+    const cobble::WriteOptions &options) {
   structured_ffi::NativeWriteOptions native;
   native.has_ttl_seconds = options.ttl_seconds.has_value();
   native.ttl_seconds = options.ttl_seconds.value_or(0);
@@ -34,8 +34,8 @@ ToNative(const cobble::WriteOptions &options) {
   return native;
 }
 
-rust::Vec<structured_ffi::NativeBucketRange>
-ToNativeRanges(std::span<const BucketRange> ranges) {
+rust::Vec<structured_ffi::NativeBucketRange> ToNativeRanges(
+    std::span<const BucketRange> ranges) {
   rust::Vec<structured_ffi::NativeBucketRange> native;
   native.reserve(ranges.size());
   for (const auto &range : ranges) {
@@ -47,8 +47,8 @@ ToNativeRanges(std::span<const BucketRange> ranges) {
   return native;
 }
 
-rust::Vec<structured_ffi::NativeBytesDescriptor>
-ToNativeElements(std::span<const BytesView> elements) {
+rust::Vec<structured_ffi::NativeBytesDescriptor> ToNativeElements(
+    std::span<const BytesView> elements) {
   rust::Vec<structured_ffi::NativeBytesDescriptor> native;
   native.reserve(elements.size());
   for (const auto element : elements) {
@@ -106,8 +106,8 @@ Schema ToSchema(const structured_ffi::NativeStructuredSchema &native) {
   return Schema(std::move(families));
 }
 
-ShardSnapshot
-ToShardSnapshot(const structured_ffi::NativeShardSnapshot &native) {
+ShardSnapshot ToShardSnapshot(
+    const structured_ffi::NativeShardSnapshot &native) {
   ShardSnapshot result;
   result.db_id.assign(native.db_id.data(), native.db_id.size());
   result.snapshot_id = native.snapshot_id;
@@ -150,8 +150,8 @@ GlobalSnapshot ToGlobalSnapshot(const structured_ffi::NativeSnapshot &native) {
   return result;
 }
 
-std::vector<MetricSample>
-ToMetrics(rust::Vec<structured_ffi::NativeMetric> native) {
+std::vector<MetricSample> ToMetrics(
+    rust::Vec<structured_ffi::NativeMetric> native) {
   std::vector<MetricSample> result;
   result.reserve(native.size());
   for (auto &metric : native) {
@@ -163,18 +163,18 @@ ToMetrics(rust::Vec<structured_ffi::NativeMetric> native) {
           {std::string(label.key), std::string(label.value)});
     }
     switch (metric.kind) {
-    case 0:
-      sample.value = CounterValue{metric.counter};
-      break;
-    case 1:
-      sample.value = GaugeValue{metric.gauge};
-      break;
-    case 2:
-      sample.value =
-          HistogramValue{metric.count, metric.sum, metric.min, metric.max};
-      break;
-    default:
-      throw Error(ErrorCode::kFileFormat, "unknown metric value kind");
+      case 0:
+        sample.value = CounterValue{metric.counter};
+        break;
+      case 1:
+        sample.value = GaugeValue{metric.gauge};
+        break;
+      case 2:
+        sample.value =
+            HistogramValue{metric.count, metric.sum, metric.min, metric.max};
+        break;
+      default:
+        throw Error(ErrorCode::kFileFormat, "unknown metric value kind");
     }
     result.push_back(std::move(sample));
   }
@@ -188,4 +188,4 @@ BufferResult ToBufferResult(const structured_ffi::NativeBufferResult &native) {
           ToSize(native.row_count, "row_count")};
 }
 
-} // namespace cobble::structured::detail
+}  // namespace cobble::structured::detail

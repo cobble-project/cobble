@@ -13,7 +13,7 @@
 namespace cobble::structured {
 
 class COBBLE_CPP_API ReadOnlyDb final {
-public:
+ public:
   [[nodiscard]] static ReadOnlyDb Open(std::string_view config_json,
                                        SnapshotId snapshot,
                                        std::string_view source_db_id);
@@ -38,8 +38,8 @@ public:
                                      MutableBytesView output) const;
   [[nodiscard]] OwnedMultiGetResult MultiGet(std::span<const MultiGetKey> keys,
                                              const ReadOptions &options) const;
-  [[nodiscard]] OwnedMultiGetResult
-  MultiGet(std::span<const MultiGetKey> keys) const;
+  [[nodiscard]] OwnedMultiGetResult MultiGet(
+      std::span<const MultiGetKey> keys) const;
   [[nodiscard]] BufferResult MultiGetInto(std::span<const MultiGetKey> keys,
                                           MutableBytesView output,
                                           const ReadOptions &options) const;
@@ -50,10 +50,10 @@ public:
                                 const ScanOptions &options = {}) const;
   [[nodiscard]] Schema CurrentSchema() const;
 
-private:
+ private:
   struct Impl;
   explicit ReadOnlyDb(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

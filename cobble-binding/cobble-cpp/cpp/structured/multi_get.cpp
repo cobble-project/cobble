@@ -74,14 +74,14 @@ void Require(const std::shared_ptr<T> &impl, const char *message) {
   }
 }
 
-} // namespace
+}  // namespace
 
 OwnedMultiGetResult::OwnedMultiGetResult(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 OwnedMultiGetResult::OwnedMultiGetResult(OwnedMultiGetResult &&) noexcept =
     default;
-OwnedMultiGetResult &
-OwnedMultiGetResult::operator=(OwnedMultiGetResult &&) noexcept = default;
+OwnedMultiGetResult &OwnedMultiGetResult::operator=(
+    OwnedMultiGetResult &&) noexcept = default;
 OwnedMultiGetResult::~OwnedMultiGetResult() = default;
 
 std::size_t OwnedMultiGetResult::RowCount() const noexcept {
@@ -108,8 +108,7 @@ std::size_t OwnedMultiGetResult::ColumnCount(std::size_t row) const {
 }
 
 bool OwnedMultiGetResult::HasColumn(std::size_t row, std::size_t column) const {
-  if (!impl_)
-    return false;
+  if (!impl_) return false;
   return structured_ffi::native_structured_multi_get_has_column(*impl_->native,
                                                                 row, column);
 }
@@ -252,8 +251,8 @@ OwnedMultiGetResult SingleDb::MultiGet(std::span<const MultiGetKey> keys,
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }
 
-OwnedMultiGetResult
-SingleDb::MultiGet(std::span<const MultiGetKey> keys) const {
+OwnedMultiGetResult SingleDb::MultiGet(
+    std::span<const MultiGetKey> keys) const {
   const ReadOptions options;
   return MultiGet(keys, options);
 }
@@ -354,8 +353,8 @@ OwnedMultiGetResult ReadOnlyDb::MultiGet(std::span<const MultiGetKey> keys,
       std::make_unique<OwnedMultiGetResult::Impl>(std::move(native)));
 }
 
-OwnedMultiGetResult
-ReadOnlyDb::MultiGet(std::span<const MultiGetKey> keys) const {
+OwnedMultiGetResult ReadOnlyDb::MultiGet(
+    std::span<const MultiGetKey> keys) const {
   return MultiGet(keys, impl_->default_read_options);
 }
 
@@ -376,4 +375,4 @@ BufferResult ReadOnlyDb::MultiGetInto(std::span<const MultiGetKey> keys,
   return MultiGetInto(keys, output, impl_->default_read_options);
 }
 
-} // namespace cobble::structured
+}  // namespace cobble::structured

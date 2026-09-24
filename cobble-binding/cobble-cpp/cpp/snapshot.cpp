@@ -37,11 +37,7 @@ ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native) {
 
 GlobalSnapshot ToGlobalSnapshot(const ffi::NativeSnapshot& native) {
   GlobalSnapshot result{
-      native.version,
-      native.id,
-      native.total_buckets,
-      {},
-      {},
+      native.version,           native.id, native.total_buckets, {}, {},
       native.watermark_seconds,
   };
   result.column_families.reserve(native.families.size());
@@ -110,9 +106,8 @@ ShardSnapshot PendingShardSnapshot::Wait() {
                 "PendingShardSnapshot has been moved from");
   }
   auto impl = std::move(impl_);
-  return detail::ToShardSnapshot(detail::Translate([&] {
-    return ffi::native_pending_shard_snapshot_wait(*impl->native);
-  }));
+  return detail::ToShardSnapshot(detail::Translate(
+      [&] { return ffi::native_pending_shard_snapshot_wait(*impl->native); }));
 }
 
 GlobalSnapshot Database::TakeSnapshot() const {
@@ -146,8 +141,9 @@ std::vector<GlobalSnapshot> Database::ListGlobalSnapshots() const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Database has been moved from");
   }
-  auto native = detail::Translate(
-      [&] { return ffi::native_database_list_snapshots_typed(*impl_->native); });
+  auto native = detail::Translate([&] {
+    return ffi::native_database_list_snapshots_typed(*impl_->native);
+  });
   std::vector<GlobalSnapshot> result;
   result.reserve(native.size());
   for (const auto& snapshot : native) {
@@ -190,7 +186,7 @@ bool Db::CancelSnapshot(SnapshotId snapshot) const {
   }
   return detail::Translate([&] {
     return ffi::native_sharded_database_cancel_snapshot(*impl_->native,
-                                                         snapshot);
+                                                        snapshot);
   });
 }
 
@@ -200,7 +196,7 @@ ShardSnapshot Db::GetShardSnapshot(SnapshotId snapshot) const {
   }
   return detail::ToShardSnapshot(detail::Translate([&] {
     return ffi::native_sharded_database_get_shard_snapshot(*impl_->native,
-                                                            snapshot);
+                                                           snapshot);
   }));
 }
 
@@ -208,8 +204,7 @@ bool Db::RetainSnapshot(SnapshotId snapshot) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
-  return ffi::native_sharded_database_retain_snapshot(*impl_->native,
-                                                       snapshot);
+  return ffi::native_sharded_database_retain_snapshot(*impl_->native, snapshot);
 }
 
 bool Db::ExpireSnapshot(SnapshotId snapshot) const {
@@ -218,7 +213,7 @@ bool Db::ExpireSnapshot(SnapshotId snapshot) const {
   }
   return detail::Translate([&] {
     return ffi::native_sharded_database_expire_snapshot(*impl_->native,
-                                                         snapshot);
+                                                        snapshot);
   });
 }
 

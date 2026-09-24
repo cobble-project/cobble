@@ -1,0 +1,3 @@
+# Use clang-format 20.1.8, matching cpp-ci.yml.
+BasedOnStyle: Google
+SortIncludes: Never

@@ -26,11 +26,11 @@ std::string Config(const std::filesystem::path& root, std::uint32_t buckets,
   if (wal_enabled) {
     json += R"(,{"base_dir":")" + url + R"(","kinds":["wal"]})";
   }
-  json += R"(],"num_columns":1,"total_buckets":)" +
-          std::to_string(buckets) +
-          R"(,"memtable_capacity":"8KB","base_file_size":"16KB","block_cache_size":0,"snapshot_retention":20,"ttl_enabled":true,"time_provider":"manual","wal_enabled":)" +
-          std::string(wal_enabled ? "true" : "false") +
-          R"(,"wal_flush_interval_ms":5})";
+  json +=
+      R"(],"num_columns":1,"total_buckets":)" + std::to_string(buckets) +
+      R"(,"memtable_capacity":"8KB","base_file_size":"16KB","block_cache_size":0,"snapshot_retention":20,"ttl_enabled":true,"time_provider":"manual","wal_enabled":)" +
+      std::string(wal_enabled ? "true" : "false") +
+      R"(,"wal_flush_interval_ms":5})";
   return json;
 }
 
@@ -96,8 +96,7 @@ void VerifyCrudAndSchema(cobble::Db& db) {
 
   db.Put(0, Bytes("merge"), 0, Bytes("base"));
   db.Merge(0, Bytes("merge"), 0, Bytes("-merged"));
-  COBBLE_CHECK(String(db.Get(0, Bytes("merge")).column(0)) ==
-               "base-merged");
+  COBBLE_CHECK(String(db.Get(0, Bytes("merge")).column(0)) == "base-merged");
   db.Put(1, Bytes("delete"), 0, Bytes("value"));
   db.Delete(1, Bytes("delete"), 0);
   COBBLE_CHECK(!db.Get(1, Bytes("delete")).found());
@@ -159,15 +158,14 @@ void VerifyCrudAndSchema(cobble::Db& db) {
   db.SwitchMemtableType(cobble::MemtableType::kSkiplist, true);
   COBBLE_CHECK(db.LoadReadonlyFilesToPrimary() == 0);
   const auto metrics = db.Metrics();
-  COBBLE_CHECK(std::any_of(metrics.begin(), metrics.end(),
-                           [](const cobble::MetricSample& sample) {
-                             return std::any_of(
-                                 sample.labels.begin(), sample.labels.end(),
-                                 [](const cobble::MetricLabel& label) {
-                                   return label.key == "db_id" &&
-                                          !label.value.empty();
-                                 });
-                           }));
+  COBBLE_CHECK(std::any_of(
+      metrics.begin(), metrics.end(), [](const cobble::MetricSample& sample) {
+        return std::any_of(sample.labels.begin(), sample.labels.end(),
+                           [](const cobble::MetricLabel& label) {
+                             return label.key == "db_id" &&
+                                    !label.value.empty();
+                           });
+      }));
 }
 
 struct MainSnapshotState {
@@ -265,9 +263,9 @@ MainSnapshotState VerifySnapshotsAndRecovery(
   }
 
   {
-    auto opened = cobble::Db::OpenFromSnapshot(
-        config, recovery.snapshot_id, db_id,
-        cobble::RecoveryMode::kSnapshotOnly);
+    auto opened =
+        cobble::Db::OpenFromSnapshot(config, recovery.snapshot_id, db_id,
+                                     cobble::RecoveryMode::kSnapshotOnly);
     COBBLE_CHECK(!opened.Get(5, Bytes("wal-tail")).found());
     opened.Close();
   }
@@ -278,8 +276,8 @@ MainSnapshotState VerifySnapshotsAndRecovery(
 void VerifyRestoreNew(std::string_view config,
                       const MainSnapshotState& source) {
   {
-    auto restored = cobble::Db::RestoreNew(
-        config, source.recovery.snapshot_id, source.db_id);
+    auto restored = cobble::Db::RestoreNew(config, source.recovery.snapshot_id,
+                                           source.db_id);
     COBBLE_CHECK(restored.Id() != source.db_id);
     COBBLE_CHECK(restored.Get(4, Bytes("batch-four")).found());
     restored.Close();
@@ -309,9 +307,9 @@ void VerifyRescale(const std::filesystem::path& directory) {
   COBBLE_CHECK(source.RetainSnapshot(source_snapshot.snapshot_id));
 
   const std::array persistent_ranges = {cobble::BucketRange{2, 3}};
-  (void)target.ExpandBucket(
-      source.Id(), source_snapshot.snapshot_id, persistent_ranges,
-      cobble::ExpandStorageMode::kReferencePersistent);
+  (void)target.ExpandBucket(source.Id(), source_snapshot.snapshot_id,
+                            persistent_ranges,
+                            cobble::ExpandStorageMode::kReferencePersistent);
   COBBLE_CHECK(String(target.Get(2, Bytes("source-two")).column(0)) == "two");
   target.WaitForExpandAdoption(std::chrono::seconds(1));
 
@@ -321,8 +319,7 @@ void VerifyRescale(const std::filesystem::path& directory) {
                             cobble::ExpandStorageMode::kAdoptAsync);
   target.WaitForExpandAdoption(std::chrono::seconds(10));
   source.Close();
-  COBBLE_CHECK(String(target.Get(4, Bytes("source-four")).column(0)) ==
-               "four");
+  COBBLE_CHECK(String(target.Get(4, Bytes("source-four")).column(0)) == "four");
 
   const std::array shrink_ranges = {cobble::BucketRange{2, 5}};
   (void)target.ShrinkBucket(shrink_ranges);
@@ -339,8 +336,8 @@ void VerifyRescale(const std::filesystem::path& directory) {
   const auto target_id = target.Id();
   target.Close();
 
-  auto resumed = cobble::Db::ResumeFromSnapshot(
-      config, post_shrink.snapshot_id, target_id);
+  auto resumed = cobble::Db::ResumeFromSnapshot(config, post_shrink.snapshot_id,
+                                                target_id);
   COBBLE_CHECK(resumed.Get(0, Bytes("post-shrink")).found());
   resumed.Close();
 }
@@ -357,15 +354,13 @@ int main() {
     const auto state = VerifySnapshotsAndRecovery(config, config_path);
     VerifyRestoreNew(config, state);
 
-    cobble_test::TempDirectory rescale_directory(
-        "cobble-cpp-sharded-rescale");
+    cobble_test::TempDirectory rescale_directory("cobble-cpp-sharded-rescale");
     VerifyRescale(rescale_directory.path());
 
     std::cout << "verified sharded C++ Db capability surface\n";
     return 0;
   } catch (const std::exception& error) {
-    std::cerr << "sharded Db capability test failed: " << error.what()
-              << '\n';
+    std::cerr << "sharded Db capability test failed: " << error.what() << '\n';
     return 1;
   }
 }
