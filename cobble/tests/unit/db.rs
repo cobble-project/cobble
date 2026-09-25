@@ -50,6 +50,143 @@ fn runtime_manifest_store(db: &Db) -> crate::runtime_manifest::RuntimeManifestSt
 
 #[test]
 #[serial(file)]
+fn dedicated_compactor_reads_tiered_runtime_manifest_replica() {
+    let root = tempfile::tempdir().unwrap();
+    let high_root = root.path().join("high");
+    let low_root = root.path().join("low");
+    let config = Config {
+        volumes: vec![
+            VolumeDescriptor::new(
+                format!("file://{}", high_root.display()),
+                vec![
+                    VolumeUsageKind::PrimaryDataPriorityHigh,
+                    VolumeUsageKind::Meta,
+                ],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}", low_root.display()),
+                vec![VolumeUsageKind::PrimaryDataPriorityLow],
+            ),
+        ],
+        memtable_capacity: Size::from_mib(1),
+        base_file_size: Size::from_mib(1),
+        l0_file_limit: 2,
+        compaction_mode: CompactionMode::Dedicated,
+        compaction_policy: crate::CompactionPolicyKind::RoundRobin,
+        ..Config::default()
+    };
+    let db_id = "tiered-runtime-manifest";
+    let db = DbBuilder::new(config.clone())
+        .db_id(db_id)
+        .bucket_ranges(std::iter::once(full_bucket_range(config.total_buckets)).collect())
+        .open()
+        .unwrap();
+    // This tests the durable replica route, not watermark scheduling. Stop the
+    // periodic worker so backfill cannot race the explicitly controlled move.
+    if let Some(worker) = &db.primary_tiering_worker {
+        worker.stop();
+        worker.join();
+    }
+    let value = vec![b'v'; 1024];
+    for batch in 0..3 {
+        for i in 0..4 {
+            db.put(0, format!("key-{batch}-{i}").as_bytes(), 0, &value)
+                .unwrap();
+        }
+        db.memtable_manager.flush_active().unwrap();
+        let results = db.memtable_manager.wait_for_flushes();
+        assert_eq!(results.len(), 1);
+        results.into_iter().next().unwrap().unwrap();
+    }
+    db.runtime_manifest_publisher
+        .as_ref()
+        .unwrap()
+        .publish_current()
+        .unwrap();
+    let store = runtime_manifest_store(&db);
+    let before = store.load_current().unwrap().unwrap();
+    let files: Vec<_> = before
+        .manifest
+        .tree_levels
+        .iter()
+        .flatten()
+        .flat_map(|level| &level.files)
+        .collect();
+    assert_eq!(files.len(), 3);
+    let low_volume = db
+        .file_manager
+        .data_volumes
+        .iter()
+        .find(|volume| !volume.supports_meta)
+        .unwrap();
+    for file in &files {
+        assert!(
+            file.path
+                .starts_with(&format!("file://{}/", high_root.display()))
+        );
+        // Same move implementation as the background worker: copy, publish the
+        // new durable route, then retire the old replica, all before returning.
+        assert!(
+            db.file_manager
+                .move_file_to_primary_volume(file.file_id, low_volume)
+                .unwrap()
+        );
+        assert!(
+            db.file_manager
+                .get_logical_file(file.file_id)
+                .unwrap()
+                .replica_at_absolute_path(&file.path)
+                .is_none()
+        );
+        // Physical deletion is asynchronous. Remove any residual source now so
+        // planner validation cannot accidentally succeed through the old path.
+        match std::fs::remove_file(file.path.strip_prefix("file://").unwrap()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("remove retired source: {err}"),
+        }
+    }
+    // Do not publish here: the move itself must persist the new route before
+    // deleting the source. Check resolved manifests, including delta chains.
+    let after = store.load_current().unwrap().unwrap();
+    assert!(after.generation > before.generation);
+    let moved: Vec<_> = after
+        .manifest
+        .tree_levels
+        .iter()
+        .flatten()
+        .flat_map(|level| &level.files)
+        .collect();
+    assert_eq!(moved.len(), files.len());
+    for file in moved {
+        assert!(files.iter().any(|source| source.file_id == file.file_id));
+        assert!(
+            file.path
+                .starts_with(&format!("file://{}/", low_root.display()))
+        );
+        assert!(std::path::Path::new(file.path.strip_prefix("file://").unwrap()).is_file());
+    }
+    let planner = crate::DedicatedCompactionPlanner::open(config, db_id).unwrap();
+    assert!(matches!(
+        planner.plan().unwrap(),
+        crate::DedicatedCompactionPlanning::Plan(_)
+    ));
+    for batch in 0..3 {
+        for i in 0..4 {
+            assert_eq!(
+                db.get(0, format!("key-{batch}-{i}").as_bytes())
+                    .unwrap()
+                    .unwrap()[0]
+                    .as_deref(),
+                Some(value.as_slice())
+            );
+        }
+    }
+    db.close().unwrap();
+}
+
+#[test]
+#[serial(file)]
 fn snapshot_schema_is_fixed_when_snapshot_starts() {
     let root = "/tmp/db_snapshot_schema_cut";
     cleanup_test_root(root);

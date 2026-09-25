@@ -17,7 +17,7 @@ use cobble::{
     CompactionMode, CompactionPolicyKind, Config, Db, DbBuilder, DedicatedCompactionExecution,
     DedicatedCompactionExecutor, DedicatedCompactionPlan, DedicatedCompactionPlanStatus,
     DedicatedCompactionPlanner, DedicatedCompactionPlanning, DedicatedCompactionService,
-    DedicatedCompactor, RuntimeManifestMode, VolumeDescriptor, VolumeUsageKind,
+    DedicatedCompactor, RuntimeManifestMode,
 };
 use serial_test::serial;
 use size::Size;
@@ -249,103 +249,6 @@ fn wait_for_pending_plan(planner: &DedicatedCompactionPlanner) -> DedicatedCompa
         }
     }
     panic!("pending dedicated compaction plan was not produced before timeout");
-}
-
-fn current_runtime_manifest_references_path(root: &str, path: &str) -> bool {
-    fn metadata_payload(path: &std::path::Path) -> Option<Vec<u8>> {
-        let bytes = std::fs::read(path).ok()?;
-        (bytes.len() >= 8).then(|| bytes[..bytes.len() - 8].to_vec())
-    }
-
-    fn resolve_tree_paths(
-        runtime_dir: &std::path::Path,
-        generation: u64,
-    ) -> Option<std::collections::BTreeMap<u64, String>> {
-        let manifest_path = runtime_dir.join(format!("MANIFEST-{generation}"));
-        let payload = metadata_payload(&manifest_path)?;
-        let envelope = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
-        let manifest = envelope.get("manifest")?;
-        let payload = manifest.get("payload")?;
-        let kind = manifest.get("kind")?.as_str()?;
-        let mut paths = if kind == "full" {
-            std::collections::BTreeMap::new()
-        } else {
-            resolve_tree_paths(runtime_dir, payload.get("base_generation")?.as_u64()?)?
-        };
-        if kind == "full" {
-            for levels in payload.get("tree_levels")?.as_array()? {
-                for level in levels.as_array()? {
-                    for file in level.get("files")?.as_array()? {
-                        paths.insert(
-                            file.get("file_id")?.as_u64()?,
-                            file.get("path")?.as_str()?.into(),
-                        );
-                    }
-                }
-            }
-        } else {
-            for tree_edit in payload.get("tree_level_edits")?.as_array()? {
-                for level_edit in tree_edit.get("level_edits")?.as_array()? {
-                    for file_id in level_edit.get("removed_file_ids")?.as_array()? {
-                        paths.remove(&file_id.as_u64()?);
-                    }
-                    for file in level_edit.get("added_files")?.as_array()? {
-                        paths.insert(
-                            file.get("file_id")?.as_u64()?,
-                            file.get("path")?.as_str()?.into(),
-                        );
-                    }
-                }
-            }
-        }
-        Some(paths)
-    }
-
-    let current = find_file(root, |candidate| {
-        candidate.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
-            && candidate
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                == Some("runtime")
-    });
-    let Some(payload) = metadata_payload(&current) else {
-        return false;
-    };
-    let Some(generation) = std::str::from_utf8(&payload)
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-    else {
-        return false;
-    };
-    resolve_tree_paths(current.parent().unwrap(), generation)
-        .is_some_and(|paths| paths.values().any(|candidate| candidate == path))
-}
-
-fn current_runtime_manifest_referenced_data_file(
-    root: &str,
-    data_root: &str,
-) -> Option<std::path::PathBuf> {
-    fn walk(root: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        let entries = std::fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(file) = walk(root, &path) {
-                    return Some(file);
-                }
-                continue;
-            }
-            if path.extension().and_then(|extension| extension.to_str()) == Some("sst") {
-                let url = format!("file://{}", path.display());
-                if current_runtime_manifest_references_path(root, &url) {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    }
-    walk(root, std::path::Path::new(data_root))
 }
 
 fn find_file(root: &str, predicate: impl Fn(&std::path::Path) -> bool) -> std::path::PathBuf {
@@ -607,78 +510,6 @@ fn queued_plan_becomes_stale_after_writer_observation_advances() {
         DedicatedCompactionExecution::Stale
     );
     assert_eq!(count_compaction_results(root), 0);
-
-    db.close().unwrap();
-    cleanup_test_root(root);
-}
-
-#[test]
-#[serial(file)]
-fn dedicated_compactor_reads_tiered_runtime_manifest_replica() {
-    let root = "/tmp/dedicated_compaction_tiered_runtime_manifest";
-    let high_root = format!("{root}/high");
-    let low_root = format!("{root}/low");
-    cleanup_test_root(root);
-    let db_id = "dedicated-compaction-tiered-runtime-manifest".to_string();
-    let mut config = dedicated_config(root);
-    let mut high = VolumeDescriptor::new(
-        format!("file://{high_root}"),
-        vec![
-            VolumeUsageKind::PrimaryDataPriorityHigh,
-            VolumeUsageKind::Meta,
-        ],
-    );
-    // Keep the first flushed SST below the offload watermark so the initial
-    // runtime manifest has a stable high-priority route to observe.
-    high.size_limit = Some(Size::from_kib(32));
-    config.volumes = vec![
-        high,
-        VolumeDescriptor::new(
-            format!("file://{low_root}"),
-            vec![VolumeUsageKind::PrimaryDataPriorityLow],
-        ),
-    ];
-    config.primary_volume_offload_trigger_watermark = 0.4;
-
-    let db = open_db_with_id(config.clone(), &db_id);
-    let value = vec![b'v'; 1024];
-    for i in 0..10u32 {
-        db.put(0, format!("tiered-source-{i:08}").as_bytes(), 0, &value)
-            .unwrap();
-    }
-    assert!(wait_for(
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || runtime_current_exists(root)
-            && current_runtime_manifest_referenced_data_file(root, &high_root).is_some()
-    ));
-    let source = current_runtime_manifest_referenced_data_file(root, &high_root).unwrap();
-    let source_url = format!("file://{}", source.display());
-    assert!(current_runtime_manifest_references_path(root, &source_url));
-
-    // The second batch crosses the 40% watermark and must move the durable
-    // replica to the low-priority volume.
-    for i in 10..48u32 {
-        db.put(0, format!("tiered-target-{i:08}").as_bytes(), 0, &value)
-            .unwrap();
-    }
-    assert!(wait_for(
-        Duration::from_secs(20),
-        Duration::from_millis(50),
-        || {
-            !source.exists()
-                && count_data_files(&low_root) > 0
-                && !current_runtime_manifest_references_path(root, &source_url)
-                && current_runtime_manifest_referenced_data_file(root, &low_root).is_some()
-        }
-    ));
-
-    // Planning rebuilds and validates the runtime observation without executing
-    // a compaction that could publish a result.
-    DedicatedCompactionPlanner::open(config, db_id)
-        .unwrap()
-        .plan()
-        .unwrap();
 
     db.close().unwrap();
     cleanup_test_root(root);
