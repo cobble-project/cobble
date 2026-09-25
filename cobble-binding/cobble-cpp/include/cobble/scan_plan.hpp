@@ -50,6 +50,8 @@ class COBBLE_CPP_API ScanPlan final {
   ScanPlan& WithoutStart() noexcept;
   ScanPlan& WithoutEnd() noexcept;
   [[nodiscard]] std::vector<ScanSplit> Splits() const;
+  [[nodiscard]] std::string ToJson() const;
+  [[nodiscard]] static ScanPlan FromJson(std::string_view json);
 
  private:
   explicit ScanPlan(GlobalSnapshot snapshot);

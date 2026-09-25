@@ -47,6 +47,29 @@ std::vector<ScanSplit> ScanPlan::Splits() const {
   return splits;
 }
 
+std::string ScanPlan::ToJson() const {
+  const auto json = detail::Translate([&] {
+    return ffi::native_scan_plan_to_json(
+        detail::ToNativeScanPlan(snapshot_, start_inclusive_, end_exclusive_));
+  });
+  return {json.data(), json.size()};
+}
+
+ScanPlan ScanPlan::FromJson(std::string_view json) {
+  auto native = detail::Translate(
+      [&] { return ffi::native_scan_plan_from_json(detail::RustStr(json)); });
+  auto plan = FromGlobalSnapshot(detail::ToGlobalSnapshot(native.snapshot));
+  if (native.has_start) {
+    plan.start_inclusive_ =
+        std::vector<Byte>(native.start.begin(), native.start.end());
+  }
+  if (native.has_end) {
+    plan.end_exclusive_ =
+        std::vector<Byte>(native.end.begin(), native.end.end());
+  }
+  return plan;
+}
+
 ScanSplitPartition ScanSplit::SplitAfter(BucketId bucket,
                                          BytesView key_inclusive) const {
   auto native = detail::Translate([&] {

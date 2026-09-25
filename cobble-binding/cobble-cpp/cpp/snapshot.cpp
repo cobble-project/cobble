@@ -53,6 +53,34 @@ GlobalSnapshot ToGlobalSnapshot(const ffi::NativeSnapshot& native) {
 
 }  // namespace detail
 
+std::string ShardSnapshot::ToJson() const {
+  const auto json = detail::Translate([&] {
+    return ffi::native_shard_snapshot_to_json(
+        detail::ToNativeShardSnapshot(*this));
+  });
+  return {json.data(), json.size()};
+}
+
+ShardSnapshot ShardSnapshot::FromJson(std::string_view json) {
+  return detail::ToShardSnapshot(detail::Translate([&] {
+    return ffi::native_shard_snapshot_from_json(detail::RustStr(json));
+  }));
+}
+
+std::string GlobalSnapshot::ToJson() const {
+  const auto json = detail::Translate([&] {
+    return ffi::native_global_snapshot_to_json(
+        detail::ToNativeGlobalSnapshot(*this));
+  });
+  return {json.data(), json.size()};
+}
+
+GlobalSnapshot GlobalSnapshot::FromJson(std::string_view json) {
+  return detail::ToGlobalSnapshot(detail::Translate([&] {
+    return ffi::native_global_snapshot_from_json(detail::RustStr(json));
+  }));
+}
+
 ShardSnapshot LoadShardSnapshotMetadata(std::string_view config_json,
                                         std::string_view db_id,
                                         std::string_view manifest_path) {

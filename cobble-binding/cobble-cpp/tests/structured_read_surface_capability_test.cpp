@@ -121,12 +121,34 @@ int main() {
           config, left.Id(), left_first.manifest_path);
       COBBLE_CHECK(loaded_shard.has_schema_metadata);
       COBBLE_CHECK(loaded_shard.schema_id == left_first.schema_id);
+      COBBLE_CHECK(cobble::ShardSnapshot::FromJson(loaded_shard.ToJson())
+                       .schema_column_families.size() ==
+                   loaded_shard.schema_column_families.size());
       loaded = cobble::LoadGlobalSnapshotMetadataFile(path.string(),
                                                       FileUrl(global_path));
       COBBLE_CHECK(loaded.id == first.id);
       COBBLE_CHECK(!loaded.shards.front().has_schema_metadata);
+      loaded = cobble::GlobalSnapshot::FromJson(loaded.ToJson());
       unavailable.Restore();
     }
+
+    const std::array<cobble::Byte, 2> binary_start = {0x00, 0xff};
+    const std::array<cobble::Byte, 2> binary_end = {0xff, 0x00};
+    auto scan_plan = cobble::structured::ScanPlan::FromGlobalSnapshot(loaded);
+    scan_plan.WithStart(binary_start).WithEnd(binary_end);
+    const auto transferred_splits =
+        cobble::structured::ScanPlan::FromJson(scan_plan.ToJson()).Splits();
+    COBBLE_CHECK(transferred_splits.size() == 2);
+    COBBLE_CHECK(
+        transferred_splits[0].start_inclusive ==
+        std::vector<cobble::Byte>(binary_start.begin(), binary_start.end()));
+    COBBLE_CHECK(
+        transferred_splits[0].end_exclusive ==
+        std::vector<cobble::Byte>(binary_end.begin(), binary_end.end()));
+    COBBLE_CHECK(transferred_splits[0]
+                     .OpenScannerFile(path.string())
+                     .Next(10)
+                     .RowCount() == 2);
 
     auto fixed = cobble::structured::ReadOnlyDb::OpenFile(
         path.string(), left_first.snapshot_id, left.Id());

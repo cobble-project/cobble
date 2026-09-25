@@ -29,7 +29,7 @@ struct SnapshotColumnFamily {
   std::string metadata_json;
 };
 
-struct ShardSnapshot {
+struct COBBLE_CPP_API ShardSnapshot {
   std::vector<BucketRange> ranges;
   std::vector<ColumnFamilyId> column_families;
   std::string db_id;
@@ -42,15 +42,21 @@ struct ShardSnapshot {
   bool has_schema_metadata = false;
   std::uint64_t schema_id = 0;
   std::vector<SnapshotColumnFamily> schema_column_families;
+
+  [[nodiscard]] std::string ToJson() const;
+  [[nodiscard]] static ShardSnapshot FromJson(std::string_view json);
 };
 
-struct GlobalSnapshot {
+struct COBBLE_CPP_API GlobalSnapshot {
   std::uint32_t version;
   SnapshotId id;
   std::uint32_t total_buckets;
   std::vector<ColumnFamilyId> column_families;
   std::vector<ShardSnapshot> shards;
   std::uint32_t watermark_seconds;
+
+  [[nodiscard]] std::string ToJson() const;
+  [[nodiscard]] static GlobalSnapshot FromJson(std::string_view json);
 };
 
 // Metadata-only reads: no DB, SST files, or coordinator are opened. Paths must

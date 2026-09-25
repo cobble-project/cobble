@@ -24,6 +24,10 @@ rust::Vec<ffi::NativeShardSnapshot> ToNativeShardSnapshots(
     std::span<const ShardSnapshot> snapshots);
 ffi::NativeScanSplit ToNativeScanSplit(const ScanSplit& split);
 ScanSplit ToScanSplit(const ffi::NativeScanSplit& split);
+ffi::NativeScanPlan ToNativeScanPlan(
+    const GlobalSnapshot& snapshot,
+    const std::optional<std::vector<Byte>>& start_inclusive,
+    const std::optional<std::vector<Byte>>& end_exclusive);
 Schema ToSchema(const ffi::NativeSchema& native);
 std::vector<MetricSample> ToMetrics(rust::Vec<ffi::NativeMetric> native);
 

@@ -135,6 +135,15 @@ obtain `Splits()`, and call `OpenScanner(config)` on each split. Splits support
 `ToJson()` / `FromJson()` for transfer to workers. See
 [Reader & Distributed Scan](../getting-started/reader-and-scan).
 
+`ShardSnapshot`, `GlobalSnapshot`, and both raw and structured `ScanPlan` also
+support `ToJson()` / `FromJson()`. A writer can send serialized shard reports to
+a coordinator; the coordinator can send the resulting global snapshot and a
+bounded scan plan to a reader process. The application chooses the transport
+(file, RPC, or queue). These strings contain metadata and binary key bounds,
+not SST data or live handles; keep the referenced snapshot files available and
+retained for recipients. A shard report retains its captured schema metadata,
+while shards embedded in a global snapshot are lightweight references.
+
 ## Structured columns
 
 `cobble::structured` provides `Db`, `SingleDb`, `Reader`, and `ReadOnlyDb` with

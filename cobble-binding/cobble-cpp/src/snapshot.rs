@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, ops::RangeInclusive, sync::mpsc};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     BridgeResult,
     database::NativeDatabase,
@@ -104,6 +106,169 @@ pub(crate) fn snapshot(value: cobble_binding::GlobalSnapshotManifest) -> ffi::Na
             .collect(),
         watermark_seconds: value.watermark_seconds,
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", content = "snapshot", rename_all = "snake_case")]
+enum ShardSnapshotJson {
+    Metadata(ShardMetadataJson),
+    Reference(cobble_binding::ShardSnapshotRef),
+}
+
+#[derive(Deserialize, Serialize)]
+struct FamilyJson {
+    name: String,
+    id: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SnapshotColumnFamilyJson {
+    name: String,
+    id: u8,
+    num_columns: usize,
+    value_has_ttl: bool,
+    // Keep the JSON text, rather than Option<Value>, so absence ("") and
+    // an explicit JSON null ("null") survive the round trip distinctly.
+    metadata_json: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ShardMetadataJson {
+    ranges: Vec<RangeInclusive<u16>>,
+    column_families: Vec<FamilyJson>,
+    db_id: String,
+    snapshot_id: u64,
+    manifest_path: String,
+    timestamp_seconds: u32,
+    data_size_bytes: u64,
+    incremental_data_size_bytes: u64,
+    schema_id: u64,
+    schema_column_families: Vec<SnapshotColumnFamilyJson>,
+}
+
+fn shard_metadata_json(value: ffi::NativeShardSnapshot) -> BridgeResult<ShardMetadataJson> {
+    let ranges = native_ranges(value.ranges)?;
+    let schema_column_families = value
+        .schema_families
+        .into_iter()
+        .map(|family| {
+            if !family.metadata_json.is_empty() {
+                serde_json::from_str::<serde_json::Value>(&family.metadata_json).map_err(
+                    |error| input_error(&format!("invalid column family metadata JSON: {error}")),
+                )?;
+            }
+            Ok(SnapshotColumnFamilyJson {
+                name: family.name,
+                id: family.id,
+                num_columns: family.num_columns,
+                value_has_ttl: family.value_has_ttl,
+                metadata_json: family.metadata_json,
+            })
+        })
+        .collect::<BridgeResult<_>>()?;
+    Ok(ShardMetadataJson {
+        ranges,
+        column_families: value
+            .families
+            .into_iter()
+            .map(|family| FamilyJson {
+                name: family.name,
+                id: family.id,
+            })
+            .collect(),
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+        schema_id: value.schema_id,
+        schema_column_families,
+    })
+}
+
+fn native_shard_metadata_json(value: ShardMetadataJson) -> BridgeResult<ffi::NativeShardSnapshot> {
+    let ranges = value
+        .ranges
+        .into_iter()
+        .map(|range| ffi::NativeRange {
+            first: *range.start(),
+            last: *range.end(),
+        })
+        .collect();
+    let families = value
+        .column_families
+        .into_iter()
+        .map(|family| ffi::NativeFamily {
+            name: family.name,
+            id: family.id,
+        })
+        .collect();
+    let schema_families = value
+        .schema_column_families
+        .into_iter()
+        .map(|family| {
+            if !family.metadata_json.is_empty() {
+                serde_json::from_str::<serde_json::Value>(&family.metadata_json).map_err(
+                    |error| input_error(&format!("invalid column family metadata JSON: {error}")),
+                )?;
+            }
+            Ok(ffi::NativeSnapshotColumnFamily {
+                name: family.name,
+                id: family.id,
+                num_columns: family.num_columns,
+                value_has_ttl: family.value_has_ttl,
+                metadata_json: family.metadata_json,
+            })
+        })
+        .collect::<BridgeResult<_>>()?;
+    Ok(ffi::NativeShardSnapshot {
+        ranges,
+        families,
+        db_id: value.db_id,
+        snapshot_id: value.snapshot_id,
+        manifest_path: value.manifest_path,
+        timestamp_seconds: value.timestamp_seconds,
+        data_size_bytes: value.data_size_bytes,
+        incremental_data_size_bytes: value.incremental_data_size_bytes,
+        has_schema_metadata: true,
+        schema_id: value.schema_id,
+        schema_families,
+    })
+}
+
+pub(crate) fn native_shard_snapshot_to_json(
+    value: ffi::NativeShardSnapshot,
+) -> BridgeResult<String> {
+    let value = if value.has_schema_metadata {
+        ShardSnapshotJson::Metadata(shard_metadata_json(value)?)
+    } else {
+        ShardSnapshotJson::Reference(shard_snapshot_reference(value)?)
+    };
+    serde_json::to_string(&value)
+        .map_err(|error| input_error(&format!("cannot encode shard snapshot JSON: {error}")))
+}
+
+pub(crate) fn native_shard_snapshot_from_json(
+    json: &str,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    let value: ShardSnapshotJson = serde_json::from_str(json)
+        .map_err(|error| input_error(&format!("invalid shard snapshot JSON: {error}")))?;
+    match value {
+        ShardSnapshotJson::Metadata(value) => native_shard_metadata_json(value),
+        ShardSnapshotJson::Reference(value) => Ok(shard_snapshot_ref(value)),
+    }
+}
+
+pub(crate) fn native_global_snapshot_to_json(value: ffi::NativeSnapshot) -> BridgeResult<String> {
+    serde_json::to_string(&global_snapshot_manifest(value)?)
+        .map_err(|error| input_error(&format!("cannot encode global snapshot JSON: {error}")))
+}
+
+pub(crate) fn native_global_snapshot_from_json(json: &str) -> BridgeResult<ffi::NativeSnapshot> {
+    let value: cobble_binding::GlobalSnapshotManifest = serde_json::from_str(json)
+        .map_err(|error| input_error(&format!("invalid global snapshot JSON: {error}")))?;
+    Ok(snapshot(value))
 }
 
 fn native_families(values: Vec<ffi::NativeFamily>) -> BridgeResult<BTreeMap<String, u8>> {

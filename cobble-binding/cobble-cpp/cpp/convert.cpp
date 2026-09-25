@@ -153,6 +153,21 @@ ffi::NativeSnapshot ToNativeGlobalSnapshot(const GlobalSnapshot& snapshot) {
   return native;
 }
 
+ffi::NativeScanPlan ToNativeScanPlan(
+    const GlobalSnapshot& snapshot,
+    const std::optional<std::vector<Byte>>& start_inclusive,
+    const std::optional<std::vector<Byte>>& end_exclusive) {
+  ffi::NativeScanPlan native;
+  native.snapshot = ToNativeGlobalSnapshot(snapshot);
+  native.has_start = start_inclusive.has_value();
+  native.start =
+      start_inclusive ? ToNativeBytes(*start_inclusive) : rust::Vec<Byte>();
+  native.has_end = end_exclusive.has_value();
+  native.end =
+      end_exclusive ? ToNativeBytes(*end_exclusive) : rust::Vec<Byte>();
+  return native;
+}
+
 ffi::NativeScanSplit ToNativeScanSplit(const ScanSplit& split) {
   ffi::NativeScanSplit native;
   native.shard = ToNativeShardSnapshot(split.shard);

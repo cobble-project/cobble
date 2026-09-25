@@ -671,6 +671,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "opendal",
+ "serde",
  "serde_json",
  "size",
 ]

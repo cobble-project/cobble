@@ -69,10 +69,12 @@ use sharded_db::*;
 use snapshot::{
     NativePendingShardSnapshot, NativePendingSnapshot, native_database_get_snapshot_typed,
     native_database_list_snapshots_typed, native_database_start_snapshot,
-    native_database_take_snapshot, native_load_global_snapshot_metadata,
+    native_database_take_snapshot, native_global_snapshot_from_json,
+    native_global_snapshot_to_json, native_load_global_snapshot_metadata,
     native_load_global_snapshot_metadata_file, native_load_shard_snapshot_metadata,
     native_load_shard_snapshot_metadata_file, native_pending_shard_snapshot_id,
     native_pending_shard_snapshot_wait, native_pending_snapshot_id, native_pending_snapshot_wait,
+    native_shard_snapshot_from_json, native_shard_snapshot_to_json,
     native_sharded_database_cancel_snapshot, native_sharded_database_expire_snapshot,
     native_sharded_database_get_shard_snapshot, native_sharded_database_retain_snapshot,
     native_sharded_database_snapshot, native_sharded_database_start_snapshot,
@@ -159,6 +161,13 @@ mod ffi {
         has_end_at: bool,
         end_at_bucket: u16,
         end_at_key: Vec<u8>,
+    }
+    struct NativeScanPlan {
+        snapshot: NativeSnapshot,
+        has_start: bool,
+        start: Vec<u8>,
+        has_end: bool,
+        end: Vec<u8>,
     }
     struct NativeMetric {
         name: String,
@@ -702,6 +711,10 @@ mod ffi {
             config_path: &str,
             manifest_path: &str,
         ) -> Result<NativeSnapshot>;
+        fn native_shard_snapshot_to_json(snapshot: NativeShardSnapshot) -> Result<String>;
+        fn native_shard_snapshot_from_json(json: &str) -> Result<NativeShardSnapshot>;
+        fn native_global_snapshot_to_json(snapshot: NativeSnapshot) -> Result<String>;
+        fn native_global_snapshot_from_json(json: &str) -> Result<NativeSnapshot>;
 
         fn native_coordinator_open(config_json: &str) -> Result<Box<NativeCoordinator>>;
         fn native_coordinator_open_file(config_path: &str) -> Result<Box<NativeCoordinator>>;
@@ -737,6 +750,8 @@ mod ffi {
         ) -> Result<Vec<NativeScanSplit>>;
         fn native_scan_split_to_json(split: NativeScanSplit) -> Result<String>;
         fn native_scan_split_from_json(json: &str) -> Result<NativeScanSplit>;
+        fn native_scan_plan_to_json(plan: NativeScanPlan) -> Result<String>;
+        fn native_scan_plan_from_json(json: &str) -> Result<NativeScanPlan>;
         fn native_scan_split_open_scanner(
             config_json: &str,
             split: NativeScanSplit,

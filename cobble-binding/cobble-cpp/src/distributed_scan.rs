@@ -1,4 +1,5 @@
 use cobble_binding::{Config, ScanSplit};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     BridgeResult,
@@ -6,8 +7,37 @@ use crate::{
     ffi,
     options::to_scan_options,
     scan::{NativeScanCursor, native_scan_cursor_from_split_scanner},
-    snapshot::{shard_snapshot_ref, shard_snapshot_reference},
+    snapshot::{global_snapshot_manifest, shard_snapshot_ref, shard_snapshot_reference, snapshot},
 };
+
+#[derive(Deserialize, Serialize)]
+struct ScanPlanJson {
+    snapshot: cobble_binding::GlobalSnapshotManifest,
+    start_inclusive: Option<Vec<u8>>,
+    end_exclusive: Option<Vec<u8>>,
+}
+
+pub(crate) fn native_scan_plan_to_json(value: ffi::NativeScanPlan) -> BridgeResult<String> {
+    let value = ScanPlanJson {
+        snapshot: global_snapshot_manifest(value.snapshot)?,
+        start_inclusive: value.has_start.then_some(value.start),
+        end_exclusive: value.has_end.then_some(value.end),
+    };
+    serde_json::to_string(&value)
+        .map_err(|error| input_error(&format!("cannot encode scan plan JSON: {error}")))
+}
+
+pub(crate) fn native_scan_plan_from_json(json: &str) -> BridgeResult<ffi::NativeScanPlan> {
+    let value: ScanPlanJson = serde_json::from_str(json)
+        .map_err(|error| input_error(&format!("invalid scan plan JSON: {error}")))?;
+    Ok(ffi::NativeScanPlan {
+        snapshot: snapshot(value.snapshot),
+        has_start: value.start_inclusive.is_some(),
+        start: value.start_inclusive.unwrap_or_default(),
+        has_end: value.end_exclusive.is_some(),
+        end: value.end_exclusive.unwrap_or_default(),
+    })
+}
 
 fn native_split(value: ScanSplit) -> BridgeResult<ffi::NativeScanSplit> {
     let (has_start_after, start_after_bucket, start_after_key) =

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -81,6 +82,25 @@ cobble::GlobalSnapshot VerifyLightweightMetadata(
   COBBLE_CHECK(loaded_shard.schema_column_families.size() ==
                shard.schema_column_families.size());
   COBBLE_CHECK(loaded_shard_file.snapshot_id == shard.snapshot_id);
+  const auto rebound_shard =
+      cobble::ShardSnapshot::FromJson(loaded_shard.ToJson());
+  ExpectError(cobble::ErrorCode::kInput,
+              [] { (void)cobble::ShardSnapshot::FromJson("{"); });
+  COBBLE_CHECK(rebound_shard.has_schema_metadata);
+  COBBLE_CHECK(rebound_shard.schema_id == loaded_shard.schema_id);
+  COBBLE_CHECK(rebound_shard.schema_column_families.size() ==
+               loaded_shard.schema_column_families.size());
+  auto metadata_cases = loaded_shard;
+  COBBLE_CHECK(!metadata_cases.schema_column_families.empty());
+  metadata_cases.data_size_bytes = std::numeric_limits<std::uint64_t>::max();
+  for (const auto metadata : {std::string{}, std::string("null"),
+                              std::string(R"({"nested":[null,{"key":7}]})")}) {
+    metadata_cases.schema_column_families[0].metadata_json = metadata;
+    const auto rebound =
+        cobble::ShardSnapshot::FromJson(metadata_cases.ToJson());
+    COBBLE_CHECK(rebound.data_size_bytes == metadata_cases.data_size_bytes);
+    COBBLE_CHECK(rebound.schema_column_families[0].metadata_json == metadata);
+  }
   const auto loaded =
       cobble::LoadGlobalSnapshotMetadata(config, FileUrl(global_path));
   const auto loaded_file = cobble::LoadGlobalSnapshotMetadataFile(
@@ -88,8 +108,18 @@ cobble::GlobalSnapshot VerifyLightweightMetadata(
   COBBLE_CHECK(loaded.id == global.id && loaded_file.id == global.id);
   COBBLE_CHECK(loaded.shards.size() == 2);
   COBBLE_CHECK(!loaded.shards.front().has_schema_metadata);
+  const auto rebound_reference =
+      cobble::ShardSnapshot::FromJson(loaded.shards.front().ToJson());
+  COBBLE_CHECK(!rebound_reference.has_schema_metadata);
+  COBBLE_CHECK(rebound_reference.schema_column_families.empty());
+  auto exact_ids = loaded;
+  exact_ids.id = std::numeric_limits<std::uint64_t>::max();
+  ExpectError(cobble::ErrorCode::kInput,
+              [] { (void)cobble::GlobalSnapshot::FromJson("{"); });
+  COBBLE_CHECK(cobble::GlobalSnapshot::FromJson(exact_ids.ToJson()).id ==
+               exact_ids.id);
   unavailable.Restore();
-  return loaded;
+  return cobble::GlobalSnapshot::FromJson(loaded.ToJson());
 }
 
 void VerifyCoverageValidation(const cobble::DbCoordinator& coordinator,
@@ -183,13 +213,25 @@ void VerifyPlanAndSplit(const std::string& config,
   const std::array<cobble::Byte, 2> binary_end = {0xFF, 0x7F};
   auto binary_plan = cobble::ScanPlan::FromGlobalSnapshot(global);
   binary_plan.WithStart(binary_start).WithEnd(binary_end);
-  const auto binary_splits = binary_plan.Splits();
+  ExpectError(cobble::ErrorCode::kInput,
+              [] { (void)cobble::ScanPlan::FromJson("{"); });
+  const auto binary_splits =
+      cobble::ScanPlan::FromJson(binary_plan.ToJson()).Splits();
   COBBLE_CHECK(binary_splits.size() == 2);
   COBBLE_CHECK(
       *binary_splits[0].start_inclusive ==
       std::vector<cobble::Byte>(binary_start.begin(), binary_start.end()));
   COBBLE_CHECK(*binary_splits[0].end_exclusive ==
                std::vector<cobble::Byte>(binary_end.begin(), binary_end.end()));
+  const auto unbounded = cobble::ScanPlan::FromJson(
+      cobble::ScanPlan::FromGlobalSnapshot(global).ToJson());
+  COBBLE_CHECK(!unbounded.Splits()[0].start_inclusive);
+  COBBLE_CHECK(!unbounded.Splits()[0].end_exclusive);
+  auto empty_start = cobble::ScanPlan::FromGlobalSnapshot(global);
+  empty_start.WithStart(Bytes(""));
+  COBBLE_CHECK(cobble::ScanPlan::FromJson(empty_start.ToJson())
+                   .Splits()[0]
+                   .start_inclusive == std::vector<cobble::Byte>{});
 
   auto plan = cobble::ScanPlan::FromGlobalSnapshot(global);
   plan.WithStart(Bytes("a")).WithEnd(Bytes("z"));

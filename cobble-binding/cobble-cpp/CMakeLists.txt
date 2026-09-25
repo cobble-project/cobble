@@ -186,6 +186,18 @@ if(COBBLE_CPP_BUILD_TESTS)
            COMMAND cobble_cpp_read_surface_capability_test)
   set_tests_properties(cobble_cpp_read_surface_capability PROPERTIES TIMEOUT 240)
 
+  add_executable(cobble_cpp_snapshot_transfer_process_test
+                 tests/snapshot_transfer_process_test.cpp)
+  target_link_libraries(cobble_cpp_snapshot_transfer_process_test
+                        PRIVATE cobble::cobble)
+  add_test(
+    NAME cobble_cpp_snapshot_transfer_process
+    COMMAND "${CMAKE_COMMAND}"
+            "-DWORKER=$<TARGET_FILE:cobble_cpp_snapshot_transfer_process_test>"
+            "-DTEST_ROOT_PARENT=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/snapshot_transfer_process_test.cmake")
+  set_tests_properties(cobble_cpp_snapshot_transfer_process PROPERTIES TIMEOUT 240)
+
   add_executable(cobble_cpp_structured_basic_capability_test
                  tests/structured_basic_capability_test.cpp)
   target_link_libraries(cobble_cpp_structured_basic_capability_test

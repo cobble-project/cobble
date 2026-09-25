@@ -37,6 +37,7 @@ bytes = { workspace = true }
 cobble-binding = { workspace = true }
 cxx = "1.0.186"
 opendal = { version = "0.58.1", default-features = false }
+serde = { workspace = true }
 serde_json = { workspace = true }
 size = { workspace = true }
 
