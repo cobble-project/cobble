@@ -35,6 +35,7 @@ storage-sftp = ["cobble/storage-sftp"]
 axum = "0.8.4"
 base64 = "0.22.1"
 cobble = { workspace = true }
+cobble-table = { workspace = true }
 include_dir = "0.7.4"
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

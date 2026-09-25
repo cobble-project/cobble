@@ -17,6 +17,8 @@ A Vue 3 + Vite + Tailwind single-page app is located at `cobble-web-monitor/web-
 - Main pages:
   - Snapshots: list snapshots and switch tracking mode (`current` or specific snapshot).
   - Inspect:
+    - Choose Raw for bucket/key bytes or Table for schema-aware lookup and paged scans of tables in the selected snapshot.
+    - Table view shows named, typed fields; large integers and decimals remain exact text, and binary values are labeled base64.
     - Left sidebar navigation with nested `lookup` and `scan`.
     - Scan supports empty prefix to list all keys.
     - Scan row menu (`...`) supports copy key (utf8/base64) and add key to lookup cache.

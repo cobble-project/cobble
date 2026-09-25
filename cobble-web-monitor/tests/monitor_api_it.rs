@@ -1,10 +1,14 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use cobble::{Config, SingleDb, VolumeDescriptor};
+use cobble::{Config, CoordinatorConfig, DbBuilder, DbCoordinator, SingleDb, VolumeDescriptor};
+use cobble_table::catalog::{Catalog, FileCatalog, FileCatalogConfig, TableIdentifier};
+use cobble_table::snapshot::TableSnapshotCommitter;
+use cobble_table::{LogicalType, SchemaChange, TableSchema, Value};
 use cobble_web_monitor::{MonitorConfig, MonitorConfigSource, MonitorServer};
 use serde_json::{Value as JsonValue, json};
 use serial_test::serial;
 use size::Size;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -175,6 +179,305 @@ fn test_monitor_snapshots_mode_switch_and_inspect() {
     assert_eq!(items.len(), 1);
 
     server.shutdown().expect("shutdown monitor server");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[serial(file)]
+fn test_table_inspection_uses_selected_snapshot_and_typed_projection() {
+    let root = test_root("monitor_table_inspect");
+    let config = Config {
+        total_buckets: 1,
+        volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+        ..Config::default()
+    };
+    let catalog = FileCatalog::open(&config, FileCatalogConfig::new("monitor-test")).unwrap();
+    catalog.create_namespace(vec!["app".into()]).unwrap();
+    let table_id = TableIdentifier::new(["app"], "customers");
+    catalog
+        .create_table(
+            table_id.clone(),
+            TableSchema::builder()
+                .field("id", LogicalType::int64())
+                .field("name", LogicalType::string())
+                .field("balance", LogicalType::decimal(18, 2))
+                .field("tags", LogicalType::list(LogicalType::string()))
+                .field("note", LogicalType::string().nullable())
+                .primary_key(["id"])
+                .bucket_key(["id"])
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    let db = Arc::new(
+        DbBuilder::new(config.clone())
+            .bucket_ranges(std::iter::once(0..=0).collect())
+            .db_id("table-shard")
+            .open()
+            .unwrap(),
+    );
+    let table = catalog
+        .materialize_table(Arc::clone(&db), &table_id)
+        .unwrap();
+    for (offset, name) in ["Alice", "Bob", "Carol"].iter().enumerate() {
+        table
+            .put(&[
+                Value::Int64(9_007_199_254_740_993 + offset as i64),
+                Value::String((*name).into()),
+                Value::Decimal {
+                    precision: 18,
+                    scale: 2,
+                    unscaled: 125050 + offset as i128,
+                },
+                Value::List(vec![Value::String("member".into())]),
+                Value::Null,
+            ])
+            .unwrap();
+    }
+    let committer = TableSnapshotCommitter::new(
+        Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(&config)).unwrap()),
+        1,
+        4,
+    )
+    .unwrap();
+    let first = committer
+        .commit_batch(1, vec![table.snapshot_and_wait().unwrap()])
+        .unwrap()
+        .unwrap();
+    drop(table);
+    catalog
+        .evolve_schema(
+            &table_id,
+            vec![SchemaChange::AddField {
+                name: "region".into(),
+                logical_type: LogicalType::string().nullable(),
+            }],
+        )
+        .unwrap();
+    let table = catalog
+        .materialize_table(Arc::clone(&db), &table_id)
+        .unwrap();
+    table
+        .put(&[
+            Value::Int64(9_007_199_254_740_996),
+            Value::String("Dora".into()),
+            Value::Decimal {
+                precision: 18,
+                scale: 2,
+                unscaled: 250000,
+            },
+            Value::List(vec![]),
+            Value::String("new".into()),
+            Value::String("Europe".into()),
+        ])
+        .unwrap();
+    let second = committer
+        .commit_batch(2, vec![table.snapshot_and_wait().unwrap()])
+        .unwrap()
+        .unwrap();
+    drop(table);
+    db.close().unwrap();
+
+    let mut server = MonitorServer::new(MonitorConfig {
+        source: MonitorConfigSource::Config(Box::new(config)),
+        global_snapshot_id: Some(first.id),
+        inspect_default_limit: 2,
+        inspect_max_limit: 10,
+        ..MonitorConfig::default()
+    })
+    .unwrap();
+    let base = server.serve().unwrap().base_url();
+    wait_until_ready(&base);
+    let client = reqwest::blocking::Client::new();
+
+    let tables: JsonValue = client
+        .get(format!("{base}/api/v1/tables"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(tables["snapshot_id"], first.id);
+    let table_name = tables["tables"][0]["name"].as_str().unwrap().to_string();
+    assert_eq!(tables["tables"][0]["schema"]["fields"][0]["name"], "id");
+    assert_eq!(
+        tables["tables"][0]["schema"]["fields"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+
+    let fields = r#"["name","balance","tags","note"]"#;
+    let first_page: JsonValue = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "scan"),
+            ("bucket", "0"),
+            ("limit", "2"),
+            ("fields", fields),
+        ])
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        first_page["fields"],
+        json!(["name", "balance", "tags", "note"])
+    );
+    assert_eq!(first_page["scan"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        first_page["scan"]["items"][0]["values"],
+        json!(["Alice", "1250.50", ["member"], null])
+    );
+    assert_eq!(first_page["scan"]["has_more"], true);
+    let cursor = serde_json::to_string(&first_page["scan"]["next_start_after"]).unwrap();
+    assert_eq!(
+        first_page["scan"]["next_start_after"]["key"],
+        json!(["9007199254740994"])
+    );
+    let second_page: JsonValue = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "scan"),
+            ("bucket", "0"),
+            ("limit", "2"),
+            ("fields", fields),
+            ("start_after", cursor.as_str()),
+        ])
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(second_page["scan"]["items"][0]["values"][0], "Carol");
+    assert_eq!(second_page["scan"]["has_more"], false);
+    let changed_projection = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "scan"),
+            ("bucket", "0"),
+            ("fields", r#"["id"]"#),
+            ("start_after", cursor.as_str()),
+        ])
+        .send()
+        .unwrap();
+    assert_eq!(
+        changed_projection.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let lookup: JsonValue = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "lookup"),
+            ("key", r#"["9007199254740993"]"#),
+            ("fields", r#"["id","balance"]"#),
+        ])
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        lookup["lookup"]["values"],
+        json!(["9007199254740993", "1250.50"])
+    );
+    let invalid = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "lookup"),
+            ("key", r#"["not-an-int"]"#),
+        ])
+        .send()
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    client
+        .post(format!("{base}/api/v1/mode"))
+        .json(&json!({"mode":"snapshot", "snapshot_id":second.id}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let changed: JsonValue = client
+        .get(format!("{base}/api/v1/tables"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(changed["snapshot_id"], second.id);
+    assert_eq!(
+        changed["tables"][0]["schema"]["fields"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        changed["tables"][0]["schema"]["fields"][5]["name"],
+        "region"
+    );
+    let stale = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "scan"),
+            ("bucket", "0"),
+            ("limit", "2"),
+            ("fields", fields),
+            ("start_after", cursor.as_str()),
+        ])
+        .send()
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+    let new_row: JsonValue = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "lookup"),
+            ("key", r#"["9007199254740996"]"#),
+        ])
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(new_row["lookup"]["values"][1], "Dora");
+    assert_eq!(new_row["lookup"]["values"][5], "Europe");
+    let old_row: JsonValue = client
+        .get(format!("{base}/api/v1/table/inspect"))
+        .query(&[
+            ("table", table_name.as_str()),
+            ("mode", "lookup"),
+            ("key", r#"["9007199254740993"]"#),
+            ("fields", r#"["id","region"]"#),
+        ])
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        old_row["lookup"]["values"],
+        json!(["9007199254740993", null])
+    );
+
+    server.shutdown().unwrap();
     let _ = std::fs::remove_dir_all(root);
 }
 

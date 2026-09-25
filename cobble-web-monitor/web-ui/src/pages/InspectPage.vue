@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { fetchMeta, inspectLookup, inspectScan } from '../api'
 import AutoRefreshControl from '../components/AutoRefreshControl.vue'
+import TableInspectPage from './TableInspectPage.vue'
 import { copyText, formatTimestamp, safeLocalStorageGet, safeLocalStorageSet, shortB64 } from '../utils'
 
 const props = defineProps({
@@ -12,6 +13,8 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['open-lookup'])
+const inspectionKind = ref(safeLocalStorageGet('cobble-web-monitor-inspection-kind', 'raw') === 'table' ? 'table' : 'raw')
+watch(inspectionKind, (value) => safeLocalStorageSet('cobble-web-monitor-inspection-kind', value))
 
 const cacheKey = 'cobble-web-monitor-inspect-cache-v6'
 const persisted = safeLocalStorageGet(cacheKey, {
@@ -464,13 +467,13 @@ function scheduleRefresh() {
   }
   const intervalMs = Number(refreshIntervalSeconds.value || 10) * 1000
   refreshTimer = setInterval(() => {
-    runInspect({ resetCursor: false })
+    if (inspectionKind.value === 'raw') runInspect({ resetCursor: false })
   }, intervalMs)
   persistState()
 }
 
 onMounted(() => {
-  runInspect({ resetCursor: false })
+  if (inspectionKind.value === 'raw') runInspect({ resetCursor: false })
   scheduleRefresh()
   window.addEventListener('click', closeMenus)
   window.addEventListener('scroll', closeMenus, true)
@@ -500,9 +503,12 @@ watch(
   () => props.mode,
   () => {
     closeMenus()
-    runInspect({ resetCursor: false })
+    if (inspectionKind.value === 'raw') runInspect({ resetCursor: false })
   },
 )
+watch(inspectionKind, (value) => {
+  if (value === 'raw') runInspect({ resetCursor: false })
+})
 watch(
   () => scanResult.value,
   () => {
@@ -514,7 +520,12 @@ watch(
 
 <template>
   <section class="space-y-4">
-    <div class="card space-y-3">
+    <div class="inline-flex gap-2" role="group" aria-label="Inspection view">
+      <button class="btn-secondary" :aria-pressed="inspectionKind === 'raw'" @click="inspectionKind = 'raw'">Raw</button>
+      <button class="btn-secondary" :aria-pressed="inspectionKind === 'table'" @click="inspectionKind = 'table'">Table</button>
+    </div>
+    <TableInspectPage v-if="inspectionKind === 'table'" :mode="mode" />
+    <div v-if="inspectionKind === 'raw'" class="card space-y-3">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 class="text-lg font-semibold text-stone-800">Inspect · {{ modeLabel }}</h3>
@@ -584,7 +595,7 @@ watch(
       <p v-if="copyHint" class="text-sm text-green-700">{{ copyHint }}</p>
     </div>
 
-    <div v-if="mode === 'lookup'" class="card overflow-x-auto">
+    <div v-if="inspectionKind === 'raw' && mode === 'lookup'" class="card overflow-x-auto">
       <table class="min-w-full divide-y divide-stone-200 text-sm">
         <thead>
           <tr class="text-left text-stone-500">
@@ -620,7 +631,7 @@ watch(
       </table>
     </div>
 
-    <div v-else class="card space-y-3">
+    <div v-else-if="inspectionKind === 'raw'" class="card space-y-3">
       <div class="flex items-center justify-between text-sm">
         <span class="text-stone-600">has_more: {{ scanResult?.has_more ? 'true' : 'false' }}</span>
         <button class="btn-secondary" :disabled="!scanResult?.has_more || loading" @click="nextPage">Next page</button>

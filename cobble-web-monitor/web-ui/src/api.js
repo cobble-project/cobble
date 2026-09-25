@@ -20,6 +20,20 @@ export async function fetchSnapshots() {
   return request('/api/v1/snapshots')
 }
 
+export async function fetchTables() {
+  return request('/api/v1/tables')
+}
+
+export async function inspectTable({ table, mode, key, bucket, startAfter, fields, limit, snapshotId }) {
+  const query = new URLSearchParams({ table, mode, fields: JSON.stringify(fields) })
+  if (key !== undefined) query.set('key', JSON.stringify(key))
+  if (bucket !== undefined) query.set('bucket', String(bucket))
+  if (startAfter) query.set('start_after', JSON.stringify(startAfter))
+  if (limit !== undefined) query.set('limit', String(limit))
+  if (snapshotId !== undefined && snapshotId !== null) query.set('snapshot_id', String(snapshotId))
+  return request(`/api/v1/table/inspect?${query.toString()}`)
+}
+
 export async function switchToCurrentMode() {
   return request('/api/v1/mode', {
     method: 'POST',

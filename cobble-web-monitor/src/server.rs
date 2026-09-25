@@ -18,6 +18,8 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+mod typed;
+
 const DEFAULT_INSPECT_LIMIT: usize = 100;
 const DEFAULT_INSPECT_MAX_LIMIT: usize = 1000;
 static UI_DIST: Dir<'_> = include_dir!("$COBBLE_WEB_MONITOR_UI_DIST");
@@ -128,6 +130,8 @@ struct SnapshotListResponse {
 
 struct AppState {
     proxy: Mutex<Reader>,
+    table_cache: Mutex<Option<typed::TableCache>>,
+    table_config: Config,
     read_proxy_config: ReaderConfig,
     inspect_default_limit: usize,
     inspect_max_limit: usize,
@@ -198,6 +202,8 @@ impl MonitorServer {
             runtime,
             state: Arc::new(AppState {
                 proxy: Mutex::new(proxy),
+                table_cache: Mutex::new(None),
+                table_config: cobble_config,
                 read_proxy_config,
                 inspect_default_limit: config.inspect_default_limit,
                 inspect_max_limit: config.inspect_max_limit,
@@ -241,6 +247,8 @@ impl MonitorServer {
             .route("/healthz", get(healthz_handler))
             .route("/api/v1/meta", get(meta_handler))
             .route("/api/v1/inspect", get(inspect_handler))
+            .route("/api/v1/tables", get(typed::tables_handler))
+            .route("/api/v1/table/inspect", get(typed::inspect_handler))
             .route("/api/v1/snapshots", get(list_snapshots_handler))
             .route("/api/v1/mode", post(switch_mode_handler))
             .route("/assets/{*path}", get(ui_assets_handler))
