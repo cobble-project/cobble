@@ -1,7 +1,10 @@
 use crate::error::input_error;
 use crate::error::{invalid_state, map_error};
 use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
-use cobble_binding::{Db, GlobalSnapshotManifest, ShardSnapshotInput, ShardSnapshotRef, SingleDb};
+use cobble_binding::{
+    ColumnFamilyOptions, Db, GlobalSnapshotManifest, ShardSnapshotMetadata, ShardSnapshotRef,
+    SingleDb, SnapshotColumnFamily,
+};
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -61,6 +64,55 @@ impl PyColumnFamilyId {
 }
 
 #[pyclass(
+    name = "SnapshotColumnFamily",
+    module = "pycobble._native",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub(crate) struct PySnapshotColumnFamily {
+    #[pyo3(get)]
+    pub(crate) name: String,
+    #[pyo3(get)]
+    pub(crate) id: u8,
+    #[pyo3(get)]
+    pub(crate) num_columns: usize,
+    #[pyo3(get)]
+    pub(crate) value_has_ttl: bool,
+    #[pyo3(get)]
+    pub(crate) metadata_json: Option<String>,
+}
+
+#[pymethods]
+impl PySnapshotColumnFamily {
+    #[new]
+    #[pyo3(signature = (name, id, num_columns, value_has_ttl, metadata_json=None))]
+    fn new(
+        name: String,
+        id: u8,
+        num_columns: usize,
+        value_has_ttl: bool,
+        metadata_json: Option<String>,
+    ) -> PyResult<Self> {
+        if name.is_empty() {
+            return Err(input_error("column family name must not be empty"));
+        }
+        if let Some(ref value) = metadata_json {
+            serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+                input_error(format!("invalid column family metadata json: {error}"))
+            })?;
+        }
+        Ok(Self {
+            name,
+            id,
+            num_columns,
+            value_has_ttl,
+            metadata_json,
+        })
+    }
+}
+
+#[pyclass(
     name = "ShardSnapshot",
     module = "pycobble._native",
     frozen,
@@ -70,6 +122,9 @@ impl PyColumnFamilyId {
 pub(crate) struct PyShardSnapshot {
     ranges: Vec<PyBucketRange>,
     column_families: Vec<PyColumnFamilyId>,
+    schema_column_families: Option<Vec<PySnapshotColumnFamily>>,
+    #[pyo3(get)]
+    schema_id: Option<u64>,
     #[pyo3(get)]
     pub(crate) db_id: String,
     #[pyo3(get)]
@@ -88,7 +143,7 @@ pub(crate) struct PyShardSnapshot {
 impl PyShardSnapshot {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (ranges, column_families, db_id, snapshot_id, manifest_path, timestamp_seconds, data_size_bytes, incremental_data_size_bytes))]
+    #[pyo3(signature = (ranges, column_families, db_id, snapshot_id, manifest_path, timestamp_seconds, data_size_bytes, incremental_data_size_bytes, schema_id=None, schema_column_families=None))]
     fn new(
         ranges: Vec<PyBucketRange>,
         column_families: Vec<PyColumnFamilyId>,
@@ -98,10 +153,14 @@ impl PyShardSnapshot {
         timestamp_seconds: u32,
         data_size_bytes: u64,
         incremental_data_size_bytes: u64,
+        schema_id: Option<u64>,
+        schema_column_families: Option<Vec<PySnapshotColumnFamily>>,
     ) -> PyResult<Self> {
         let value = Self {
             ranges,
             column_families,
+            schema_id,
+            schema_column_families,
             db_id,
             snapshot_id,
             manifest_path,
@@ -109,7 +168,10 @@ impl PyShardSnapshot {
             data_size_bytes,
             incremental_data_size_bytes,
         };
-        shard_snapshot_input(value.clone())?;
+        shard_snapshot_reference(value.clone())?;
+        if value.schema_id.is_some() || value.schema_column_families.is_some() {
+            shard_snapshot_metadata(value.clone())?;
+        }
         Ok(value)
     }
 
@@ -121,6 +183,11 @@ impl PyShardSnapshot {
     #[getter]
     fn column_families(&self) -> Vec<PyColumnFamilyId> {
         self.column_families.clone()
+    }
+
+    #[getter]
+    fn schema_column_families(&self) -> Option<Vec<PySnapshotColumnFamily>> {
+        self.schema_column_families.clone()
     }
 }
 
@@ -161,6 +228,16 @@ fn family((name, id): (String, u8)) -> PyColumnFamilyId {
     PyColumnFamilyId { name, id }
 }
 
+fn schema_family((name, family): (String, SnapshotColumnFamily)) -> PySnapshotColumnFamily {
+    PySnapshotColumnFamily {
+        name,
+        id: family.id,
+        num_columns: family.num_columns,
+        value_has_ttl: family.options.value_has_ttl,
+        metadata_json: family.options.metadata.map(|value| value.to_string()),
+    }
+}
+
 pub(crate) fn shard(value: ShardSnapshotRef) -> PyShardSnapshot {
     PyShardSnapshot {
         ranges: value
@@ -172,6 +249,8 @@ pub(crate) fn shard(value: ShardSnapshotRef) -> PyShardSnapshot {
             })
             .collect(),
         column_families: value.column_family_ids.into_iter().map(family).collect(),
+        schema_id: None,
+        schema_column_families: None,
         db_id: value.db_id,
         snapshot_id: value.snapshot_id,
         manifest_path: value.manifest_path,
@@ -181,7 +260,13 @@ pub(crate) fn shard(value: ShardSnapshotRef) -> PyShardSnapshot {
     }
 }
 
-pub(crate) fn shard_input(value: ShardSnapshotInput) -> PyShardSnapshot {
+pub(crate) fn shard_metadata(value: ShardSnapshotMetadata) -> PyShardSnapshot {
+    let column_families = value.column_family_ids().into_iter().map(family).collect();
+    let schema_column_families = value
+        .column_families
+        .into_iter()
+        .map(schema_family)
+        .collect();
     PyShardSnapshot {
         ranges: value
             .ranges
@@ -191,7 +276,9 @@ pub(crate) fn shard_input(value: ShardSnapshotInput) -> PyShardSnapshot {
                 end_inclusive: *range.end(),
             })
             .collect(),
-        column_families: value.column_family_ids.into_iter().map(family).collect(),
+        column_families,
+        schema_id: Some(value.schema_id),
+        schema_column_families: Some(schema_column_families),
         db_id: value.db_id,
         snapshot_id: value.snapshot_id,
         manifest_path: value.manifest_path,
@@ -244,29 +331,73 @@ fn native_families(values: Vec<PyColumnFamilyId>) -> PyResult<BTreeMap<String, u
     Ok(by_name)
 }
 
-pub(crate) fn shard_snapshot_input(value: PyShardSnapshot) -> PyResult<ShardSnapshotInput> {
+pub(crate) fn shard_snapshot_metadata(value: PyShardSnapshot) -> PyResult<ShardSnapshotMetadata> {
+    let reference = shard_snapshot_reference(value.clone())?;
+    let (schema_id, schema_families) = match (value.schema_id, value.schema_column_families) {
+        (Some(schema_id), Some(families)) => (schema_id, families),
+        _ => return Err(input_error("shard snapshot schema metadata is required")),
+    };
+    let mut column_families = BTreeMap::new();
+    for family in schema_families {
+        if family.name.is_empty() {
+            return Err(input_error("column family name must not be empty"));
+        }
+        let metadata = family
+            .metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| {
+                input_error(format!("invalid column family metadata json: {error}"))
+            })?;
+        if column_families
+            .insert(
+                family.name,
+                SnapshotColumnFamily {
+                    id: family.id,
+                    num_columns: family.num_columns,
+                    options: ColumnFamilyOptions {
+                        value_has_ttl: family.value_has_ttl,
+                        metadata,
+                    },
+                },
+            )
+            .is_some()
+        {
+            return Err(input_error("duplicate schema column family name"));
+        }
+    }
+    let schema_ids: BTreeMap<_, _> = column_families
+        .iter()
+        .map(|(name, family)| (name.clone(), family.id))
+        .collect();
+    if schema_ids != reference.column_family_ids {
+        return Err(input_error(
+            "shard snapshot schema column families do not match column family ids",
+        ));
+    }
+    Ok(ShardSnapshotMetadata {
+        ranges: reference.ranges,
+        db_id: reference.db_id,
+        snapshot_id: reference.snapshot_id,
+        manifest_path: reference.manifest_path,
+        timestamp_seconds: reference.timestamp_seconds,
+        data_size_bytes: reference.data_size_bytes,
+        incremental_data_size_bytes: reference.incremental_data_size_bytes,
+        schema_id,
+        column_families,
+    })
+}
+
+pub(crate) fn shard_snapshot_reference(value: PyShardSnapshot) -> PyResult<ShardSnapshotRef> {
     if value.db_id.is_empty() || value.manifest_path.is_empty() {
         return Err(input_error(
             "shard snapshot db_id and manifest_path must not be empty",
         ));
     }
-    Ok(ShardSnapshotInput {
+    Ok(ShardSnapshotRef {
         ranges: native_ranges(value.ranges)?,
         column_family_ids: native_families(value.column_families)?,
-        db_id: value.db_id,
-        snapshot_id: value.snapshot_id,
-        manifest_path: value.manifest_path,
-        timestamp_seconds: value.timestamp_seconds,
-        data_size_bytes: value.data_size_bytes,
-        incremental_data_size_bytes: value.incremental_data_size_bytes,
-    })
-}
-
-pub(crate) fn shard_snapshot_reference(value: PyShardSnapshot) -> PyResult<ShardSnapshotRef> {
-    let value = shard_snapshot_input(value)?;
-    Ok(ShardSnapshotRef {
-        ranges: value.ranges,
-        column_family_ids: value.column_family_ids,
         db_id: value.db_id,
         snapshot_id: value.snapshot_id,
         manifest_path: value.manifest_path,
@@ -305,7 +436,7 @@ pub(crate) struct PyPendingSnapshot {
     receiver: Mutex<Option<mpsc::Receiver<SnapshotResult>>>,
 }
 
-type ShardSnapshotResult = cobble_binding::Result<ShardSnapshotInput>;
+type ShardSnapshotResult = cobble_binding::Result<ShardSnapshotMetadata>;
 
 #[pyclass(name = "PendingShardSnapshot", module = "pycobble._native")]
 pub(crate) struct PyPendingShardSnapshot {
@@ -351,7 +482,7 @@ impl PyPendingShardSnapshot {
             receiver
                 .recv()
                 .map_err(|_| invalid_state("shard snapshot completion channel closed"))?
-                .map(shard_input)
+                .map(shard_metadata)
                 .map_err(map_error)
         })
     }
@@ -428,6 +559,7 @@ impl PyPendingSnapshot {
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyBucketRange>()?;
     module.add_class::<PyColumnFamilyId>()?;
+    module.add_class::<PySnapshotColumnFamily>()?;
     module.add_class::<PyShardSnapshot>()?;
     module.add_class::<PyGlobalSnapshot>()?;
     module.add_class::<PyPendingSnapshot>()?;

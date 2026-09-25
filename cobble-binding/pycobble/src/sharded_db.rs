@@ -6,7 +6,7 @@ use crate::options::{PyReadOptions, PyWriteOptions};
 use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
 use crate::schema::{PySchema, PySchemaBuilder, schema};
-use crate::snapshot::{PyBucketRange, PyPendingShardSnapshot, PyShardSnapshot, shard_input};
+use crate::snapshot::{PyBucketRange, PyPendingShardSnapshot, PyShardSnapshot, shard_metadata};
 use crate::types::{PyBufferResult, PyExpandStorageMode, PyMemtableType, PyRecoveryMode};
 use crate::write_batch::PyWriteBatch;
 use cobble_binding::{Config, Db, ReadOptions, WriteOptions};
@@ -520,8 +520,8 @@ impl PyDb {
         self.ensure_open()?;
         let db = Arc::clone(&self.db);
         py.detach(move || {
-            db.shard_snapshot_input(snapshot_id)
-                .map(shard_input)
+            db.shard_snapshot_metadata(snapshot_id)
+                .map(shard_metadata)
                 .map_err(map_error)
         })
     }

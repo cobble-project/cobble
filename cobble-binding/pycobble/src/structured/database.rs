@@ -10,7 +10,7 @@ use crate::metrics::{PyMetricSample, metrics};
 use crate::multi_get::extract_keys;
 use crate::snapshot::{
     PyBucketRange, PyGlobalSnapshot, PyPendingShardSnapshot, PyPendingSnapshot, PyShardSnapshot,
-    shard_input, snapshot,
+    shard_metadata, snapshot,
 };
 use crate::types::{
     PyBufferResult, PyBufferStatus, PyExpandStorageMode, PyMemtableType, PyRecoveryMode,
@@ -1342,8 +1342,8 @@ impl PyStructuredDb {
     fn get_shard_snapshot(&self, py: Python<'_>, snapshot_id: u64) -> PyResult<PyShardSnapshot> {
         let db = Arc::clone(&self.db);
         py.detach(move || {
-            db.shard_snapshot_input(snapshot_id)
-                .map(shard_input)
+            db.shard_snapshot_metadata(snapshot_id)
+                .map(shard_metadata)
                 .map_err(map_error)
         })
     }

@@ -1,6 +1,6 @@
 use crate::error::{input_error, map_error};
-use crate::snapshot::{PyGlobalSnapshot, PyShardSnapshot, shard_snapshot_input, snapshot};
-use cobble_binding::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotInput};
+use crate::snapshot::{PyGlobalSnapshot, PyShardSnapshot, shard_snapshot_metadata, snapshot};
+use cobble_binding::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata};
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ impl PyDbCoordinator {
             .map_err(map_error)
     }
 
-    fn validate_coverage(total_buckets: u32, shards: &[ShardSnapshotInput]) -> PyResult<()> {
+    fn validate_coverage(total_buckets: u32, shards: &[ShardSnapshotMetadata]) -> PyResult<()> {
         if total_buckets == 0 || total_buckets > u32::from(u16::MAX) + 1 {
             return Err(input_error("total_buckets must be in range 1..=65536"));
         }
@@ -71,7 +71,7 @@ impl PyDbCoordinator {
     ) -> PyResult<PyGlobalSnapshot> {
         let shards = shards
             .into_iter()
-            .map(shard_snapshot_input)
+            .map(shard_snapshot_metadata)
             .collect::<PyResult<Vec<_>>>()?;
         Self::validate_coverage(total_buckets, &shards)?;
         py.detach(|| {

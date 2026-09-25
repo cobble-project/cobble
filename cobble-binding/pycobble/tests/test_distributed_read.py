@@ -43,6 +43,32 @@ def collect(cursor: pycobble.ScanCursor) -> list[tuple[int, bytes, bytes]]:
     return rows
 
 
+def reconstruct_snapshot(value: pycobble.ShardSnapshot) -> pycobble.ShardSnapshot:
+    assert value.schema_id is not None
+    assert value.schema_column_families is not None
+    return pycobble.ShardSnapshot(
+        value.ranges,
+        value.column_families,
+        value.db_id,
+        value.snapshot_id,
+        value.manifest_path,
+        value.timestamp_seconds,
+        value.data_size_bytes,
+        value.incremental_data_size_bytes,
+        value.schema_id,
+        [
+            pycobble.SnapshotColumnFamily(
+                family.name,
+                family.id,
+                family.num_columns,
+                family.value_has_ttl,
+                family.metadata_json,
+            )
+            for family in value.schema_column_families
+        ],
+    )
+
+
 def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> None:
     cfg = config(tmp_path / "distributed")
     left = pycobble.Db.open(cfg, [pycobble.BucketRange(0, 1)])
@@ -59,8 +85,11 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
     with pytest.raises(pycobble.InputError):
         coordinator.materialize_global_snapshot(4, 99, [left_snapshot])
     first = coordinator.materialize_global_snapshot(
-        4, 100, [left_snapshot, right_snapshot]
+        4, 100, [reconstruct_snapshot(left_snapshot), reconstruct_snapshot(right_snapshot)]
     )
+    assert all(shard.schema_id is None for shard in first.shards)
+    with pytest.raises(pycobble.InputError, match="schema metadata is required"):
+        coordinator.materialize_global_snapshot(4, 99, first.shards)
     assert coordinator.get_global_snapshot(100).id == 100
     assert coordinator.load_current_global_snapshot().id == 100
 
