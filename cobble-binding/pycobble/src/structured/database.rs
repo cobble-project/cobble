@@ -18,8 +18,8 @@ use crate::types::{
 use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{
-    StructuredColumnValue, StructuredDb, StructuredDbIterator, StructuredScanSplitScanner,
-    StructuredSingleDb, StructuredWriteOptions,
+    StructuredColumnValue, StructuredDb, StructuredDbIterator, StructuredReadOnlyDb,
+    StructuredScanSplitScanner, StructuredSingleDb, StructuredWriteOptions,
 };
 use pyo3::prelude::*;
 use std::ops::RangeInclusive;
@@ -43,7 +43,7 @@ fn extract_elements(values: &Bound<'_, PyAny>) -> PyResult<Vec<InputBytes>> {
         .collect()
 }
 
-fn encode_get_into(
+pub(super) fn encode_get_into(
     bucket: u16,
     key: &[u8],
     columns: Option<&[Option<StructuredColumnValue>]>,
@@ -79,7 +79,7 @@ fn encode_get_into(
     ))
 }
 
-fn encode_multi_get_into(
+pub(super) fn encode_multi_get_into(
     keys: &[(u16, InputBytes)],
     values: &[Option<Vec<Option<StructuredColumnValue>>>],
     output: &mut [u8],
@@ -121,6 +121,7 @@ fn encode_multi_get_into(
 enum IteratorOwner {
     Db { _db: Arc<StructuredDb> },
     Single { _db: Arc<StructuredSingleDb> },
+    ReadOnly { _db: Arc<StructuredReadOnlyDb> },
 }
 
 // Keep the common database iterator inline so ordinary scans do not gain a
@@ -221,6 +222,30 @@ impl PyStructuredScanCursor {
             pending: None,
             pending_batch: None,
             owner: Some(IteratorOwner::Single { _db: db }),
+        }
+    }
+
+    pub(super) fn new_reader(bucket: u16, iterator: StructuredDbIterator) -> Self {
+        Self {
+            iterator: Some(StructuredIterator::Db(iterator)),
+            bucket,
+            pending: None,
+            pending_batch: None,
+            owner: None,
+        }
+    }
+
+    pub(super) fn new_read_only(
+        bucket: u16,
+        iterator: StructuredDbIterator,
+        db: Arc<StructuredReadOnlyDb>,
+    ) -> Self {
+        Self {
+            iterator: Some(StructuredIterator::Db(iterator)),
+            bucket,
+            pending: None,
+            pending_batch: None,
+            owner: Some(IteratorOwner::ReadOnly { _db: db }),
         }
     }
 

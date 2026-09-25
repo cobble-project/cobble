@@ -66,6 +66,13 @@ assert bytes(row.list_element(1, 0)) == b"a"
 db.close()
 ```
 
+For snapshot reads, `StructuredReader.open_current(config)` follows the latest
+global snapshot on access and also supports explicit `refresh()`, while
+`StructuredReader.open(config, id)` stays fixed.
+`StructuredReadOnlyDb.open(config, shard_snapshot_id, db_id)`
+reads one shard snapshot. Both return the same typed rows and scans as the
+writable structured databases, including caller-owned CSRB buffer methods.
+
 ## API surface
 
 The binding includes:
@@ -74,7 +81,7 @@ The binding includes:
   snapshots, recovery, metrics, lifecycle operations, and rescaling;
 - `Reader`, `ReadOnlyDb`, `DbCoordinator`, and typed distributed scan plans;
 - structured BYTES/LIST rows, batches, scans, schema evolution, snapshots,
-  recovery, rescaling, typed distributed scans, and priority queues;
+  recovery, rescaling, snapshot readers, typed distributed scans, and priority queues;
 - typed errors and complete `.pyi` declarations.
 
 All database calls are synchronous. Blocking storage work releases the Python

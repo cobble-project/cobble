@@ -354,6 +354,107 @@ def test_structured_distributed_scan_plan(tmp_path: Path) -> None:
         )
 
 
+def test_structured_snapshot_readers(tmp_path: Path) -> None:
+    config_json = config(tmp_path / "structured-readers")
+    config_path = tmp_path / "structured-readers.json"
+    config_path.write_text(config_json)
+    db = pycobble.StructuredSingleDb.open(config_json)
+    builder = db.update_schema()
+    builder.add_list_column(1, pycobble.ListConfig())
+    builder.add_bytes_column(2)
+    builder.commit()
+    db.put_bytes(0, b"a", 0, b"old")
+    db.put_list(0, b"a", 1, [b"x", b"y"])
+    db.put_bytes(0, b"a", 2, b"tail")
+    first = db.take_snapshot()
+    shard = first.shards[0]
+
+    current = pycobble.StructuredReader.open_current_file(config_path)
+    pinned = pycobble.StructuredReader.open(config_json, first.id)
+    direct = pycobble.StructuredReader.open_from_global_snapshot_file(
+        config_path, snapshot=first
+    )
+    read_only = pycobble.StructuredReadOnlyDb.open_file(
+        config_path, shard.snapshot_id, shard.db_id
+    )
+    assert current.mode == pycobble.ReaderMode.Current
+    assert current.configured_snapshot_id is None
+    assert pinned.mode == direct.mode == pycobble.ReaderMode.Snapshot
+    assert direct.configured_snapshot_id == first.id
+    assert read_only.id == shard.db_id
+    assert current.current_global_snapshot.id == first.id
+    assert [item.id for item in current.list_global_snapshots()] == [first.id]
+
+    projection = pycobble.StructuredReadOptions(columns=[2, 0, 1])
+    for reader in (current, pinned, direct, read_only):
+        row = reader.get(0, b"a", projection)
+        assert bytes(row.bytes(0)) == b"tail"
+        assert bytes(row.bytes(1)) == b"old"
+        assert [bytes(row.list_element(2, i)) for i in range(row.list_size(2))] == [
+            b"x", b"y"
+        ]
+        assert not reader.get(0, b"missing")
+        rows = reader.multi_get([(0, b"missing"), (0, b"a")], projection)
+        assert not rows.row(0)
+        assert bytes(rows.row(1).bytes(0)) == b"tail"
+        probe = bytearray(b"\xa5" * 4)
+        result = reader.get_into(0, b"a", probe, projection)
+        assert result.status == pycobble.BufferStatus.BufferTooSmall
+        assert probe == b"\xa5" * 4
+        output = bytearray(result.bytes_required)
+        result = reader.get_into(0, b"a", output, projection)
+        assert decode_csrb(output, result.bytes_written) == [
+            (0, b"a", True, [b"tail", b"old", [b"x", b"y"]])
+        ]
+        result = reader.multi_get_into([(0, b"missing"), (0, b"a")], bytearray(), projection)
+        assert result.status == pycobble.BufferStatus.BufferTooSmall
+        output = bytearray(result.bytes_required)
+        result = reader.multi_get_into([(0, b"missing"), (0, b"a")], output, projection)
+        assert decode_csrb(output, result.bytes_written) == [
+            (0, b"missing", False, []),
+            (0, b"a", True, [b"tail", b"old", [b"x", b"y"]]),
+        ]
+    del reader
+
+    old_scan = current.scan(0, b"a", b"z")
+    fixed_scan = pinned.scan(0, b"a", b"z", pycobble.StructuredScanOptions(columns=[2, 0]))
+    read_only_scan = read_only.scan(0, b"a", b"z")
+    with pytest.raises(pycobble.InputError):
+        read_only.scan(0, b"z", b"a")
+    del read_only
+    del pinned
+    gc.collect()
+
+    db.put_bytes(0, b"a", 0, b"new")
+    builder = db.update_schema()
+    builder.add_list_column(3, pycobble.ListConfig())
+    builder.commit()
+    db.put_list(0, b"a", 3, [b"new-column"])
+    second = db.take_snapshot()
+    current.refresh()
+    assert current.current_global_snapshot.id == second.id
+    assert bytes(current.get(0, b"a").bytes(0)) == b"new"
+    assert bytes(current.get(0, b"a").list_element(3, 0)) == b"new-column"
+    assert any(column.index == 3 for family in current.current_schema().families for column in family.columns)
+    assert bytes(direct.get(0, b"a").bytes(0)) == b"old"
+    with pytest.raises(pycobble.InternalStateError):
+        direct.refresh()
+    del current
+    gc.collect()
+    probe = bytearray(b"\x5a" * 4)
+    result = old_scan.next_into(1, probe)
+    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert probe == b"\x5a" * 4
+    output = bytearray(result.bytes_required)
+    result = old_scan.next_into(1, output)
+    assert decode_csrb(output, result.bytes_written)[0][3][0] == b"old"
+    assert bytes(fixed_scan.next(1).row(0).value.bytes(0)) == b"tail"
+    assert bytes(read_only_scan.next(1).row(0).value.bytes(0)) == b"old"
+    for cursor in (old_scan, fixed_scan, read_only_scan):
+        cursor.close()
+    db.close()
+
+
 def test_structured_caller_owned_buffers_and_retry(tmp_path: Path) -> None:
     db = pycobble.StructuredSingleDb.open(config(tmp_path / "structured-csrb"))
     builder = db.update_schema()
