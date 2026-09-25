@@ -702,6 +702,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobble-python"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "cobble-binding",
+ "opendal",
+ "pyo3",
+ "serde_json",
+ "size",
+]
+
+[[package]]
 name = "cobble-table"
 version = "0.5.0"
 dependencies = [
@@ -3275,18 +3287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "pycobble"
-version = "0.5.0"
-dependencies = [
- "bytes",
- "cobble-binding",
- "opendal",
- "pyo3",
- "serde_json",
- "size",
 ]
 
 [[package]]

@@ -50,7 +50,7 @@ jobs:
           manylinux: ${{ matrix.platform.manylinux }}
           args: >-
             --release --locked --compatibility pypi --out dist
-            --manifest-path cobble-binding/pycobble/Cargo.toml
+            --manifest-path cobble-binding/cobble-python/Cargo.toml
       - name: Smoke-test wheel
         run: |
           python -m pip install --no-index --find-links dist pycobble
@@ -73,7 +73,7 @@ jobs:
           maturin-version: v1.14.1
           args: >-
             --out dist
-            --manifest-path cobble-binding/pycobble/Cargo.toml
+            --manifest-path cobble-binding/cobble-python/Cargo.toml
       - uses: actions/upload-artifact@v5
         with:
           name: pycobble-source

@@ -102,6 +102,6 @@ synchronized rather than used concurrently from multiple Python threads.
 python3.11 -m venv .venv
 . .venv/bin/activate
 pip install maturin pytest
-maturin develop --manifest-path cobble-binding/pycobble/Cargo.toml
-pytest cobble-binding/pycobble/tests
+maturin develop --manifest-path cobble-binding/cobble-python/Cargo.toml
+pytest cobble-binding/cobble-python/tests
 ```

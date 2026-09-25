@@ -1,5 +1,5 @@
 [package]
-name = "pycobble"
+name = "cobble-python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

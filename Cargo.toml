@@ -5,7 +5,7 @@ members = [
     "cobble-binding",
     "cobble-binding/cobble-cpp",
     "cobble-binding/cobble-java",
-    "cobble-binding/pycobble",
+    "cobble-binding/cobble-python",
     "cobble-cli",
     "cobble-cluster",
     "cobble",
