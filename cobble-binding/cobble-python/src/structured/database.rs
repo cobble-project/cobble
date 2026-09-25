@@ -1,8 +1,9 @@
 use super::batch::PyStructuredWriteBatch;
 use super::encoding::{CsrbColumns, CsrbRow, buffer_result, prepare};
 use super::types::{
-    PyStructuredMultiGetResult, PyStructuredReadOptions, PyStructuredRow, PyStructuredScanOptions,
-    PyStructuredSchema, PyStructuredSchemaBuilder, StructuredOwner, schema,
+    PickledColumns, PyStructuredMultiGetResult, PyStructuredReadOptions, PyStructuredRow,
+    PyStructuredScanOptions, PyStructuredSchema, PyStructuredSchemaBuilder, StructuredOwner,
+    pickle_columns, restore_columns, schema,
 };
 use crate::buffer::{InputBytes, WritableBuffer};
 use crate::error::{input_error, invalid_state, map_error};
@@ -13,7 +14,8 @@ use crate::snapshot::{
     shard_metadata, snapshot,
 };
 use crate::types::{
-    PyBufferResult, PyBufferStatus, PyExpandStorageMode, PyMemtableType, PyRecoveryMode,
+    PickleReduction, PyBufferResult, PyBufferStatus, PyExpandStorageMode, PyMemtableType,
+    PyRecoveryMode,
 };
 use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
@@ -138,6 +140,26 @@ struct StructuredBatchRow {
     columns: Vec<Option<StructuredColumnValue>>,
 }
 
+type PickledStructuredRow = (u16, Vec<u8>, PickledColumns);
+
+impl StructuredBatchRow {
+    fn from_pickled((bucket, key, columns): PickledStructuredRow) -> PyResult<Self> {
+        Ok(Self {
+            bucket,
+            key: bytes::Bytes::from(key),
+            columns: restore_columns(columns)?,
+        })
+    }
+
+    fn to_pickled(&self) -> PickledStructuredRow {
+        (
+            self.bucket,
+            self.key.to_vec(),
+            pickle_columns(&self.columns),
+        )
+    }
+}
+
 #[pyclass(name = "StructuredScanRow", module = "pycobble._native", frozen)]
 pub(crate) struct PyStructuredScanRow {
     row: StructuredBatchRow,
@@ -145,6 +167,20 @@ pub(crate) struct PyStructuredScanRow {
 
 #[pymethods]
 impl PyStructuredScanRow {
+    #[staticmethod]
+    fn _restore(row: PickledStructuredRow) -> PyResult<Self> {
+        Ok(Self {
+            row: StructuredBatchRow::from_pickled(row)?,
+        })
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(PickledStructuredRow,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.row.to_pickled(),),
+        ))
+    }
+
     #[getter]
     fn bucket(&self) -> u16 {
         self.row.bucket
@@ -172,6 +208,39 @@ pub(crate) struct PyStructuredBatch {
 
 #[pymethods]
 impl PyStructuredBatch {
+    #[staticmethod]
+    fn _restore(
+        rows: Vec<PickledStructuredRow>,
+        end: bool,
+        stopped_at_block_boundary: bool,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            rows: rows
+                .into_iter()
+                .map(StructuredBatchRow::from_pickled)
+                .collect::<PyResult<_>>()?,
+            end,
+            stopped_at_block_boundary,
+        })
+    }
+
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(Vec<PickledStructuredRow>, bool, bool)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                self.rows
+                    .iter()
+                    .map(StructuredBatchRow::to_pickled)
+                    .collect(),
+                self.end,
+                self.stopped_at_block_boundary,
+            ),
+        ))
+    }
+
     fn __len__(&self) -> usize {
         self.rows.len()
     }

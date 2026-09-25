@@ -47,6 +47,7 @@ where
     T: PyTypeInfo,
 {
     let exception = module.py().get_type::<T>();
+    exception.setattr("__module__", "pycobble._native")?;
     exception.setattr("code", code)?;
     module.add(name, exception)
 }

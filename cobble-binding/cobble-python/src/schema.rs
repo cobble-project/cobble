@@ -1,16 +1,19 @@
 use crate::buffer::InputBytes;
 use crate::error::{input_error, invalid_state, map_error};
+use crate::types::PickleReduction;
 use bytes::Bytes;
 use cobble_binding::{Db, MergeOperator, Schema, SchemaBuilder, SingleDb, merge_operator_by_id};
 use pyo3::prelude::*;
 use serde_json::Value;
 use std::sync::Arc;
 
+type PickledColumnFamily = (String, u8, usize, bool, Vec<PyMergeOperatorSpec>);
+
 #[pyclass(
     name = "MergeOperatorSpec",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyMergeOperatorSpec {
@@ -20,11 +23,25 @@ pub(crate) struct PyMergeOperatorSpec {
     metadata_json: Option<String>,
 }
 
+#[pymethods]
+impl PyMergeOperatorSpec {
+    #[staticmethod]
+    fn _restore(id: String, metadata_json: Option<String>) -> Self {
+        Self { id, metadata_json }
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(String, Option<String>)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.id.clone(), self.metadata_json.clone()),
+        ))
+    }
+}
+
 #[pyclass(
     name = "ColumnFamily",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyColumnFamily {
@@ -41,6 +58,35 @@ pub(crate) struct PyColumnFamily {
 
 #[pymethods]
 impl PyColumnFamily {
+    #[staticmethod]
+    fn _restore(
+        name: String,
+        id: u8,
+        column_count: usize,
+        value_has_ttl: bool,
+        merge_operators: Vec<PyMergeOperatorSpec>,
+    ) -> Self {
+        Self {
+            name,
+            id,
+            column_count,
+            value_has_ttl,
+            merge_operators,
+        }
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<PickledColumnFamily>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                self.name.clone(),
+                self.id,
+                self.column_count,
+                self.value_has_ttl,
+                self.merge_operators.clone(),
+            ),
+        ))
+    }
+
     #[getter]
     fn merge_operators(&self) -> Vec<PyMergeOperatorSpec> {
         self.merge_operators.clone()
@@ -56,6 +102,20 @@ pub(crate) struct PySchema {
 
 #[pymethods]
 impl PySchema {
+    #[staticmethod]
+    fn _restore(version: u64, column_families: Vec<PyColumnFamily>) -> Self {
+        Self {
+            version,
+            column_families,
+        }
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(u64, Vec<PyColumnFamily>)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.version, self.column_families.clone()),
+        ))
+    }
+
     #[getter]
     fn column_families(&self) -> Vec<PyColumnFamily> {
         self.column_families.clone()

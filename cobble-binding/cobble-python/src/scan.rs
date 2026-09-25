@@ -1,7 +1,7 @@
 use crate::buffer::{OwnedBytes, WritableBuffer};
 use crate::encoding::prepare_batch;
 use crate::error::{input_error, invalid_state, map_error};
-use crate::types::{PyBufferResult, PyBufferStatus};
+use crate::types::{PickleReduction, PyBufferResult, PyBufferStatus};
 use bytes::Bytes;
 use cobble_binding::{Db, DbIterator, ReadOnlyDb, ScanSplitScanner, SingleDb};
 use pyo3::prelude::*;
@@ -13,6 +13,32 @@ pub(crate) struct BatchRow {
     pub(crate) columns: Vec<Option<Bytes>>,
 }
 
+type PickledRow = (u16, Vec<u8>, Vec<Option<Vec<u8>>>);
+
+impl BatchRow {
+    fn from_pickled((bucket, key, columns): PickledRow) -> Self {
+        Self {
+            bucket,
+            key: Bytes::from(key),
+            columns: columns
+                .into_iter()
+                .map(|value| value.map(Bytes::from))
+                .collect(),
+        }
+    }
+
+    fn to_pickled(&self) -> PickledRow {
+        (
+            self.bucket,
+            self.key.to_vec(),
+            self.columns
+                .iter()
+                .map(|value| value.as_ref().map(|value| value.to_vec()))
+                .collect(),
+        )
+    }
+}
+
 #[pyclass(name = "ScanRow", module = "pycobble._native", frozen)]
 pub(crate) struct PyScanRow {
     row: BatchRow,
@@ -20,6 +46,20 @@ pub(crate) struct PyScanRow {
 
 #[pymethods]
 impl PyScanRow {
+    #[staticmethod]
+    fn _restore(row: PickledRow) -> Self {
+        Self {
+            row: BatchRow::from_pickled(row),
+        }
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(PickledRow,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.row.to_pickled(),),
+        ))
+    }
+
     #[getter]
     fn bucket(&self) -> u16 {
         self.row.bucket
@@ -57,6 +97,29 @@ pub(crate) struct PyOwnedBatch {
 
 #[pymethods]
 impl PyOwnedBatch {
+    #[staticmethod]
+    fn _restore(rows: Vec<PickledRow>, end: bool, stopped_at_block_boundary: bool) -> Self {
+        Self {
+            rows: rows.into_iter().map(BatchRow::from_pickled).collect(),
+            end,
+            stopped_at_block_boundary,
+        }
+    }
+
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(Vec<PickledRow>, bool, bool)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                self.rows.iter().map(BatchRow::to_pickled).collect(),
+                self.end,
+                self.stopped_at_block_boundary,
+            ),
+        ))
+    }
+
     fn __len__(&self) -> usize {
         self.rows.len()
     }

@@ -192,7 +192,7 @@ pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
 pub use r#type::ValueType;
 pub use url::Url;
-pub use write_batch::WriteBatch;
+pub use write_batch::{WriteBatch, WriteBatchOperationRef};
 
 #[doc(hidden)]
 pub mod test_utils {

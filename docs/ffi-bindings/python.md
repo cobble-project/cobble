@@ -147,3 +147,8 @@ See [Distributed Deployment](../getting-started/distributed) and
 - Close database handles and cursors when finished. Do not use the same handle
   concurrently from multiple Python threads without synchronization.
 - Catch `pycobble.CobbleError` to handle storage errors.
+- Snapshot metadata, scan plans/splits, options, write batches, and detached
+  results can be pickled for `spawn` workers. Pickles do not carry data files or
+  snapshot retention; workers need shared storage access, and snapshots must
+  remain retained while work runs. Live handles and cursors are not transferable.
+  Unpickle only trusted data.

@@ -1,6 +1,9 @@
 use crate::buffer::OwnedBytes;
+use crate::types::PickleReduction;
 use bytes::Bytes;
 use pyo3::prelude::*;
+
+pub(crate) type PickledColumns = Option<Vec<Option<Vec<u8>>>>;
 
 #[pyclass(name = "OwnedRow", module = "pycobble._native", frozen)]
 pub(crate) struct PyOwnedRow {
@@ -15,6 +18,29 @@ impl PyOwnedRow {
 
 #[pymethods]
 impl PyOwnedRow {
+    #[staticmethod]
+    fn _restore(columns: Option<Vec<Option<Vec<u8>>>>) -> Self {
+        Self::new(columns.map(|columns| {
+            columns
+                .into_iter()
+                .map(|value| value.map(Bytes::from))
+                .collect()
+        }))
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(PickledColumns,)>> {
+        let columns = self.columns.as_ref().map(|columns| {
+            columns
+                .iter()
+                .map(|value| value.as_ref().map(|value| value.to_vec()))
+                .collect()
+        });
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (columns,),
+        ))
+    }
+
     #[getter]
     fn found(&self) -> bool {
         self.columns.is_some()

@@ -82,6 +82,20 @@ reloading its global manifest.
 `SingleDb` and `StructuredSingleDb` return snapshot objects from
 `list_snapshots()` and IDs from `list_snapshot_ids()`.
 
+## Multiprocessing
+
+Snapshot metadata, scan plans and splits, options, write batches, and detached
+result values support standard `pickle`, including `spawn` workers. For example,
+a worker can return a `ShardSnapshot` to the parent coordinator; the parent can
+send a `ScanPlan` or `ScanSplit` back to workers and receive detached batches.
+Use `spawn` rather than inheriting native storage runtimes with `fork`.
+
+Pickles carry values and metadata, not data files or a snapshot-retention lease.
+Workers still need access to the same configured storage, and the caller must
+retain snapshots while work is in flight. Database, reader, coordinator, cursor,
+priority-queue, pending-snapshot, and schema-builder handles are not transferable.
+Unpickle only trusted data.
+
 ## API surface
 
 The binding includes:

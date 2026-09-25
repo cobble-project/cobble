@@ -1,6 +1,7 @@
 use super::database::{PyStructuredDb, PyStructuredSingleDb};
 use crate::buffer::OwnedBytes;
 use crate::error::{input_error, invalid_state, map_error};
+use crate::types::{PickleReduction, enum_reduce};
 use cobble_binding::ColumnFamilyOptions;
 use cobble_binding::structured::{
     ListConfig, ListRetainMode, StructuredColumnType, StructuredColumnValue, StructuredDb,
@@ -9,6 +10,9 @@ use cobble_binding::structured::{
 use pyo3::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+type PickledReadOptions = (Option<String>, Option<Vec<usize>>);
+type PickledScanOptions = (Option<String>, Option<Vec<usize>>, bool, bool);
 
 #[pyclass(
     name = "StructuredColumnKind",
@@ -25,6 +29,19 @@ pub(crate) enum PyStructuredColumnKind {
     List = 1,
 }
 
+#[pymethods]
+impl PyStructuredColumnKind {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Py<PyAny>, &'static str)>> {
+        enum_reduce::<Self>(
+            py,
+            match self {
+                Self::Bytes => "BYTES",
+                Self::List => "LIST",
+            },
+        )
+    }
+}
+
 #[pyclass(
     name = "ListRetainMode",
     module = "pycobble._native",
@@ -38,6 +55,19 @@ pub(crate) enum PyListRetainMode {
     First = 0,
     #[pyo3(name = "LAST")]
     Last = 1,
+}
+
+#[pymethods]
+impl PyListRetainMode {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Py<PyAny>, &'static str)>> {
+        enum_reduce::<Self>(
+            py,
+            match self {
+                Self::First => "FIRST",
+                Self::Last => "LAST",
+            },
+        )
+    }
 }
 
 #[pyclass(
@@ -58,6 +88,29 @@ pub(crate) struct PyListConfig {
 
 #[pymethods]
 impl PyListConfig {
+    #[staticmethod]
+    fn _restore(
+        max_elements: Option<usize>,
+        retain_mode: PyListRetainMode,
+        preserve_element_ttl: bool,
+    ) -> Self {
+        Self::new(max_elements, retain_mode, preserve_element_ttl)
+    }
+
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(Option<usize>, PyListRetainMode, bool)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                self.max_elements,
+                self.retain_mode,
+                self.preserve_element_ttl,
+            ),
+        ))
+    }
+
     #[new]
     #[pyo3(signature = (*, max_elements=None, retain_mode=PyListRetainMode::Last, preserve_element_ttl=false))]
     fn new(
@@ -99,6 +152,19 @@ pub(crate) struct PyStructuredReadOptions {
 
 #[pymethods]
 impl PyStructuredReadOptions {
+    #[staticmethod]
+    fn _restore(column_family: Option<String>, columns: Option<Vec<usize>>) -> Self {
+        Self::new(column_family, columns)
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<PickledReadOptions>> {
+        let raw = self.inner.as_cobble();
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (raw.column_family.clone(), raw.column_indices.clone()),
+        ))
+    }
+
     #[new]
     #[pyo3(signature = (*, column_family=None, columns=None))]
     fn new(column_family: Option<String>, columns: Option<Vec<usize>>) -> Self {
@@ -124,6 +190,34 @@ pub(crate) struct PyStructuredScanOptions {
 
 #[pymethods]
 impl PyStructuredScanOptions {
+    #[staticmethod]
+    fn _restore(
+        column_family: Option<String>,
+        columns: Option<Vec<usize>>,
+        preload_scan_cursor_block: bool,
+        stop_at_block_boundary: bool,
+    ) -> Self {
+        Self::new(
+            column_family,
+            columns,
+            preload_scan_cursor_block,
+            stop_at_block_boundary,
+        )
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<PickledScanOptions>> {
+        let raw = self.inner.as_cobble();
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                raw.column_family.clone(),
+                raw.column_indices.clone(),
+                raw.preload_scan_cursor_block(),
+                raw.should_stop_at_block_boundary(),
+            ),
+        ))
+    }
+
     #[new]
     #[pyo3(signature = (*, column_family=None, columns=None, preload_scan_cursor_block=false, stop_at_block_boundary=false))]
     fn new(
@@ -149,6 +243,44 @@ pub(crate) struct PyStructuredRow {
     pub(crate) columns: Option<Vec<Option<StructuredColumnValue>>>,
 }
 
+pub(crate) type PickledColumn = (u8, Vec<Vec<u8>>);
+pub(crate) type PickledColumns = Vec<Option<PickledColumn>>;
+
+pub(crate) fn pickle_columns(columns: &[Option<StructuredColumnValue>]) -> PickledColumns {
+    columns
+        .iter()
+        .map(|column| {
+            column.as_ref().map(|value| match value {
+                StructuredColumnValue::Bytes(value) => (0, vec![value.to_vec()]),
+                StructuredColumnValue::List(values) => {
+                    (1, values.iter().map(|value| value.to_vec()).collect())
+                }
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn restore_columns(
+    columns: PickledColumns,
+) -> PyResult<Vec<Option<StructuredColumnValue>>> {
+    columns
+        .into_iter()
+        .map(|column| {
+            column
+                .map(|(kind, values)| match kind {
+                    0 if values.len() == 1 => Ok(StructuredColumnValue::Bytes(bytes::Bytes::from(
+                        values.into_iter().next().unwrap(),
+                    ))),
+                    1 => Ok(StructuredColumnValue::List(
+                        values.into_iter().map(bytes::Bytes::from).collect(),
+                    )),
+                    _ => Err(input_error("invalid pickled structured column")),
+                })
+                .transpose()
+        })
+        .collect()
+}
+
 #[pyclass(name = "StructuredMultiGetResult", module = "pycobble._native", frozen)]
 pub(crate) struct PyStructuredMultiGetResult {
     pub(crate) rows: Vec<Option<Vec<Option<StructuredColumnValue>>>>,
@@ -156,6 +288,28 @@ pub(crate) struct PyStructuredMultiGetResult {
 
 #[pymethods]
 impl PyStructuredMultiGetResult {
+    #[staticmethod]
+    fn _restore(rows: Vec<Option<PickledColumns>>) -> PyResult<Self> {
+        Ok(Self {
+            rows: rows
+                .into_iter()
+                .map(|row| row.map(restore_columns).transpose())
+                .collect::<PyResult<_>>()?,
+        })
+    }
+
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(Vec<Option<PickledColumns>>,)>> {
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| row.as_ref().map(|columns| pickle_columns(columns)))
+            .collect();
+        Ok((py.get_type::<Self>().getattr("_restore")?.unbind(), (rows,)))
+    }
+
     fn __len__(&self) -> usize {
         self.rows.len()
     }
@@ -186,6 +340,20 @@ impl PyStructuredRow {
 
 #[pymethods]
 impl PyStructuredRow {
+    #[staticmethod]
+    fn _restore(columns: Option<PickledColumns>) -> PyResult<Self> {
+        Ok(Self {
+            columns: columns.map(restore_columns).transpose()?,
+        })
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Option<PickledColumns>,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.columns.as_ref().map(|columns| pickle_columns(columns)),),
+        ))
+    }
+
     #[getter]
     fn found(&self) -> bool {
         self.columns.is_some()
@@ -244,7 +412,7 @@ impl PyStructuredRow {
     name = "StructuredColumn",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyStructuredColumn {
@@ -256,11 +424,36 @@ pub(crate) struct PyStructuredColumn {
     list_config: Option<PyListConfig>,
 }
 
+#[pymethods]
+impl PyStructuredColumn {
+    #[staticmethod]
+    fn _restore(
+        index: u16,
+        kind: PyRef<'_, PyStructuredColumnKind>,
+        list_config: Option<PyListConfig>,
+    ) -> Self {
+        Self {
+            index,
+            kind: *kind,
+            list_config,
+        }
+    }
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(u16, PyStructuredColumnKind, Option<PyListConfig>)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.index, self.kind, self.list_config.clone()),
+        ))
+    }
+}
+
 #[pyclass(
     name = "StructuredFamily",
     module = "pycobble._native",
     frozen,
-    skip_from_py_object
+    from_py_object
 )]
 #[derive(Clone)]
 pub(crate) struct PyStructuredFamily {
@@ -273,6 +466,20 @@ pub(crate) struct PyStructuredFamily {
 
 #[pymethods]
 impl PyStructuredFamily {
+    #[staticmethod]
+    fn _restore(name: String, id: u8, columns: Vec<PyStructuredColumn>) -> Self {
+        Self { name, id, columns }
+    }
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(String, u8, Vec<PyStructuredColumn>)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.name.clone(), self.id, self.columns.clone()),
+        ))
+    }
+
     #[getter]
     fn columns(&self) -> Vec<PyStructuredColumn> {
         self.columns.clone()
@@ -286,6 +493,17 @@ pub(crate) struct PyStructuredSchema {
 
 #[pymethods]
 impl PyStructuredSchema {
+    #[staticmethod]
+    fn _restore(families: Vec<PyStructuredFamily>) -> Self {
+        Self { families }
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Vec<PyStructuredFamily>,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.families.clone(),),
+        ))
+    }
+
     #[getter]
     fn families(&self) -> Vec<PyStructuredFamily> {
         self.families.clone()

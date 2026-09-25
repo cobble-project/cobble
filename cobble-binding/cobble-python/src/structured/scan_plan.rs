@@ -2,12 +2,15 @@ use super::database::PyStructuredScanCursor;
 use super::types::PyStructuredScanOptions;
 use crate::buffer::InputBytes;
 use crate::error::{input_error, map_error};
-use crate::snapshot::{PyGlobalSnapshot, PyShardSnapshot, global_snapshot, shard};
+use crate::snapshot::{PyGlobalSnapshot, PyShardSnapshot, global_snapshot, shard, snapshot};
+use crate::types::PickleReduction;
 use cobble_binding::Config;
 use cobble_binding::structured::{StructuredScanPlan, StructuredScanSplit};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::PathBuf;
+
+type PickledPlan = (PyGlobalSnapshot, Option<Vec<u8>>, Option<Vec<u8>>);
 
 #[pyclass(
     name = "StructuredScanSplitBoundary",
@@ -22,6 +25,18 @@ pub(crate) struct PyStructuredScanSplitBoundary {
 
 #[pymethods]
 impl PyStructuredScanSplitBoundary {
+    #[staticmethod]
+    fn _restore(bucket: u16, key: Vec<u8>) -> Self {
+        Self { bucket, key }
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(u16, Vec<u8>)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.bucket, self.key.clone()),
+        ))
+    }
+
     #[getter]
     fn key(&self, py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, &self.key).unbind()
@@ -59,6 +74,13 @@ impl PyStructuredScanSplit {
 
 #[pymethods]
 impl PyStructuredScanSplit {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(String,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("from_json")?.unbind(),
+            (self.to_json()?,),
+        ))
+    }
+
     #[getter]
     fn shard(&self) -> PyShardSnapshot {
         shard(self.split.shard.clone())
@@ -173,6 +195,27 @@ pub(crate) struct PyStructuredScanSplitPartition {
 
 #[pymethods]
 impl PyStructuredScanSplitPartition {
+    #[staticmethod]
+    fn _restore(
+        before: PyRef<'_, PyStructuredScanSplit>,
+        after: PyRef<'_, PyStructuredScanSplit>,
+    ) -> Self {
+        Self {
+            before: PyStructuredScanSplit::new(before.split.clone()),
+            after: PyStructuredScanSplit::new(after.split.clone()),
+        }
+    }
+
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PickleReduction<(PyStructuredScanSplit, PyStructuredScanSplit)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.before(), self.after()),
+        ))
+    }
+
     #[getter]
     fn before(&self) -> PyStructuredScanSplit {
         PyStructuredScanSplit::new(self.before.split.clone())
@@ -193,6 +236,30 @@ pub(crate) struct PyStructuredScanPlan {
 
 #[pymethods]
 impl PyStructuredScanPlan {
+    #[staticmethod]
+    fn _restore(
+        snapshot: PyGlobalSnapshot,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            snapshot: global_snapshot(snapshot)?,
+            start,
+            end,
+        })
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<PickledPlan>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                snapshot(self.snapshot.clone()),
+                self.start.clone(),
+                self.end.clone(),
+            ),
+        ))
+    }
+
     #[staticmethod]
     fn from_global_snapshot(snapshot: PyGlobalSnapshot) -> PyResult<Self> {
         Ok(Self {

@@ -8,7 +8,7 @@ use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::slice;
 
-use crate::types::{PyBufferResult, PyBufferStatus};
+use crate::types::{PickleReduction, PyBufferResult, PyBufferStatus};
 
 pub(crate) enum InputBytes {
     ReadOnly(PyBuffer<u8>),
@@ -124,6 +124,18 @@ impl OwnedBytes {
 
 #[pymethods]
 impl OwnedBytes {
+    #[staticmethod]
+    fn _restore(value: Vec<u8>) -> Self {
+        Self::new(Bytes::from(value))
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Vec<u8>,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.bytes.to_vec(),),
+        ))
+    }
+
     /// Export the Rust-owned allocation through Python's read-only buffer protocol.
     ///
     /// # Safety

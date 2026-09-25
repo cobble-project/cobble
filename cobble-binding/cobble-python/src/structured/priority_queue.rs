@@ -2,13 +2,15 @@ use super::database::{PyStructuredDb, PyStructuredSingleDb};
 use super::encoding::{CsrbColumns, CsrbRow, buffer_result, prepare};
 use crate::buffer::{InputBytes, OwnedBytes, WritableBuffer};
 use crate::error::{input_error, invalid_state, map_error};
-use crate::types::{PyBufferResult, PyBufferStatus};
+use crate::types::{PickleReduction, PyBufferResult, PyBufferStatus};
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+type PickledEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 enum PriorityQueueOwner {
     Db(Arc<StructuredDb>),
@@ -42,6 +44,20 @@ pub(crate) struct PyPriorityQueueEntry {
 
 #[pymethods]
 impl PyPriorityQueueEntry {
+    #[staticmethod]
+    fn _restore(key: Vec<u8>, value: Vec<u8>) -> Self {
+        Self {
+            key: bytes::Bytes::from(key),
+            value: bytes::Bytes::from(value),
+        }
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Vec<u8>, Vec<u8>)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self.key.to_vec(), self.value.to_vec()),
+        ))
+    }
+
     #[getter]
     fn key(&self) -> OwnedBytes {
         OwnedBytes::new(self.key.clone())
@@ -60,6 +76,26 @@ pub(crate) struct PyPriorityQueueBatch {
 
 #[pymethods]
 impl PyPriorityQueueBatch {
+    #[staticmethod]
+    fn _restore(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self {
+            rows: rows
+                .into_iter()
+                .map(|(key, value)| (bytes::Bytes::from(key), bytes::Bytes::from(value)))
+                .collect(),
+        }
+    }
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(PickledEntries,)>> {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (self
+                .rows
+                .iter()
+                .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                .collect(),),
+        ))
+    }
+
     fn __len__(&self) -> usize {
         self.rows.len()
     }

@@ -1,5 +1,6 @@
 use crate::error::input_error;
 use crate::error::{invalid_state, map_error};
+use crate::types::PickleReduction;
 use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
 use cobble_binding::{
     ColumnFamilyOptions, Config, Db, GlobalSnapshotManifest, ShardSnapshotMetadata,
@@ -10,6 +11,8 @@ use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+
+type PickledSnapshotColumnFamily = (String, u8, usize, bool, Option<String>);
 
 #[pyclass(
     name = "BucketRange",
@@ -37,6 +40,13 @@ impl PyBucketRange {
             end_inclusive,
         })
     }
+
+    fn __reduce__(&self, py: Python<'_>) -> (Py<PyAny>, (u16, u16)) {
+        (
+            py.get_type::<Self>().into_any().unbind(),
+            (self.start_inclusive, self.end_inclusive),
+        )
+    }
 }
 
 #[pyclass(
@@ -61,6 +71,13 @@ impl PyColumnFamilyId {
             return Err(input_error("column family name must not be empty"));
         }
         Ok(Self { name, id })
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> (Py<PyAny>, (String, u8)) {
+        (
+            py.get_type::<Self>().into_any().unbind(),
+            (self.name.clone(), self.id),
+        )
     }
 }
 
@@ -110,6 +127,19 @@ impl PySnapshotColumnFamily {
             value_has_ttl,
             metadata_json,
         })
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PickleReduction<PickledSnapshotColumnFamily> {
+        (
+            py.get_type::<Self>().into_any().unbind(),
+            (
+                self.name.clone(),
+                self.id,
+                self.num_columns,
+                self.value_has_ttl,
+                self.metadata_json.clone(),
+            ),
+        )
     }
 }
 
@@ -176,6 +206,42 @@ impl PyShardSnapshot {
         Ok(value)
     }
 
+    #[allow(clippy::type_complexity)]
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> (
+        Py<PyAny>,
+        (
+            Vec<PyBucketRange>,
+            Vec<PyColumnFamilyId>,
+            String,
+            u64,
+            String,
+            u32,
+            u64,
+            u64,
+            Option<u64>,
+            Option<Vec<PySnapshotColumnFamily>>,
+        ),
+    ) {
+        (
+            py.get_type::<Self>().into_any().unbind(),
+            (
+                self.ranges.clone(),
+                self.column_families.clone(),
+                self.db_id.clone(),
+                self.snapshot_id,
+                self.manifest_path.clone(),
+                self.timestamp_seconds,
+                self.data_size_bytes,
+                self.incremental_data_size_bytes,
+                self.schema_id,
+                self.schema_column_families.clone(),
+            ),
+        )
+    }
+
     #[getter]
     fn ranges(&self) -> Vec<PyBucketRange> {
         self.ranges.clone()
@@ -214,6 +280,54 @@ pub(crate) struct PyGlobalSnapshot {
 
 #[pymethods]
 impl PyGlobalSnapshot {
+    #[staticmethod]
+    fn _restore(
+        version: u32,
+        id: u64,
+        total_buckets: u32,
+        column_families: Vec<PyColumnFamilyId>,
+        shards: Vec<PyShardSnapshot>,
+        watermark_seconds: u32,
+    ) -> PyResult<Self> {
+        let value = Self {
+            version,
+            id,
+            total_buckets,
+            column_families,
+            shards,
+            watermark_seconds,
+        };
+        global_snapshot(value.clone())?;
+        Ok(value)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<
+        PickleReduction<(
+            u32,
+            u64,
+            u32,
+            Vec<PyColumnFamilyId>,
+            Vec<PyShardSnapshot>,
+            u32,
+        )>,
+    > {
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (
+                self.version,
+                self.id,
+                self.total_buckets,
+                self.column_families.clone(),
+                self.shards.clone(),
+                self.watermark_seconds,
+            ),
+        ))
+    }
+
     #[getter]
     fn column_families(&self) -> Vec<PyColumnFamilyId> {
         self.column_families.clone()

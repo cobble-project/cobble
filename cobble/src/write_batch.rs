@@ -10,6 +10,33 @@ pub(crate) enum WriteOp {
     Merge(Bytes, Bytes, Option<u32>),
 }
 
+/// A borrowed operation from a write batch. Operations for the same key and
+/// column retain their insertion order; order across different keys is unspecified.
+pub enum WriteBatchOperationRef<'a> {
+    Put {
+        bucket: u16,
+        key: &'a [u8],
+        column_family: Option<&'a str>,
+        column: u16,
+        value: &'a [u8],
+        ttl_seconds: Option<u32>,
+    },
+    Delete {
+        bucket: u16,
+        key: &'a [u8],
+        column_family: Option<&'a str>,
+        column: u16,
+    },
+    Merge {
+        bucket: u16,
+        key: &'a [u8],
+        column_family: Option<&'a str>,
+        column: u16,
+        value: &'a [u8],
+        ttl_seconds: Option<u32>,
+    },
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub(crate) struct KeyAndSeq {
     pub bucket: u16,
@@ -27,6 +54,37 @@ pub struct WriteBatch {
 }
 
 impl WriteBatch {
+    /// Iterates over the batch without copying operation data.
+    ///
+    /// Operations for the same key and column retain insertion order; order
+    /// across different keys is unspecified.
+    pub fn operations(&self) -> impl Iterator<Item = WriteBatchOperationRef<'_>> {
+        self.ops.iter().map(|(key, op)| match op {
+            WriteOp::Put(_, value, ttl_seconds) => WriteBatchOperationRef::Put {
+                bucket: key.bucket,
+                key: &key.key,
+                column_family: key.column_family.as_deref(),
+                column: key.column,
+                value,
+                ttl_seconds: *ttl_seconds,
+            },
+            WriteOp::Delete(_) => WriteBatchOperationRef::Delete {
+                bucket: key.bucket,
+                key: &key.key,
+                column_family: key.column_family.as_deref(),
+                column: key.column,
+            },
+            WriteOp::Merge(_, value, ttl_seconds) => WriteBatchOperationRef::Merge {
+                bucket: key.bucket,
+                key: &key.key,
+                column_family: key.column_family.as_deref(),
+                column: key.column,
+                value,
+                ttl_seconds: *ttl_seconds,
+            },
+        })
+    }
+
     /// Creates a new empty `WriteBatch`.
     pub fn new() -> Self {
         Self {

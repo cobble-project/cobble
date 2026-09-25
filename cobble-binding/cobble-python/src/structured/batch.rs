@@ -1,12 +1,24 @@
 use crate::buffer::InputBytes;
-use crate::error::{invalid_state, map_error};
+use crate::error::{input_error, invalid_state, map_error};
 use crate::options::PyWriteOptions;
+use crate::types::PickleReduction;
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{
     StructuredDb, StructuredSingleDb, StructuredWriteBatch, StructuredWriteOptions,
 };
 use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
+
+type PickledOperation = (
+    u8,
+    u16,
+    Vec<u8>,
+    u16,
+    Option<Vec<Vec<u8>>>,
+    Option<u32>,
+    Option<String>,
+    bool,
+);
 
 pub(super) enum Operation {
     PutBytes(u16, bytes::Bytes, u16, bytes::Bytes, StructuredWriteOptions),
@@ -171,6 +183,129 @@ impl PyStructuredWriteBatch {
                 in_flight: false,
             }),
         }
+    }
+    #[staticmethod]
+    fn _restore(operations: Vec<PickledOperation>) -> PyResult<Self> {
+        let batch = Self::new();
+        for (kind, bucket, key, column, values, ttl_seconds, column_family, await_durable) in
+            operations
+        {
+            if !matches!((kind, values.as_ref()), (0 | 1, Some(values)) if values.len() == 1)
+                && !matches!((kind, values.as_ref()), (2 | 3, Some(_)) | (4, None))
+            {
+                return Err(input_error(
+                    "invalid pickled structured write batch operation",
+                ));
+            }
+            let mut raw_options =
+                cobble_binding::WriteOptions::default().with_await_durable(await_durable);
+            raw_options.ttl_seconds = ttl_seconds;
+            raw_options.column_family = column_family;
+            let options = StructuredWriteOptions::from(raw_options);
+            let key = bytes::Bytes::from(key);
+            batch.with_operations(|operations| {
+                operations.push(match (kind, values) {
+                    (0, Some(values)) => Operation::PutBytes(
+                        bucket,
+                        key,
+                        column,
+                        bytes::Bytes::from(values.into_iter().next().unwrap()),
+                        options,
+                    ),
+                    (1, Some(values)) => Operation::MergeBytes(
+                        bucket,
+                        key,
+                        column,
+                        bytes::Bytes::from(values.into_iter().next().unwrap()),
+                        options,
+                    ),
+                    (2, Some(values)) => Operation::PutList(
+                        bucket,
+                        key,
+                        column,
+                        values.into_iter().map(bytes::Bytes::from).collect(),
+                        options,
+                    ),
+                    (3, Some(values)) => Operation::MergeList(
+                        bucket,
+                        key,
+                        column,
+                        values.into_iter().map(bytes::Bytes::from).collect(),
+                        options,
+                    ),
+                    (4, None) => Operation::Delete(bucket, key, column, options),
+                    _ => unreachable!("validated above"),
+                });
+            })?;
+        }
+        Ok(batch)
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Vec<PickledOperation>,)>> {
+        let state = self.state.lock().unwrap();
+        if state.in_flight {
+            return Err(invalid_state(
+                "StructuredWriteBatch is currently being written",
+            ));
+        }
+        let operations = state
+            .operations
+            .iter()
+            .map(|operation| {
+                let (kind, bucket, key, column, values, options) = match operation {
+                    Operation::PutBytes(bucket, key, column, value, options) => (
+                        0,
+                        *bucket,
+                        key,
+                        *column,
+                        Some(vec![value.to_vec()]),
+                        options,
+                    ),
+                    Operation::MergeBytes(bucket, key, column, value, options) => (
+                        1,
+                        *bucket,
+                        key,
+                        *column,
+                        Some(vec![value.to_vec()]),
+                        options,
+                    ),
+                    Operation::PutList(bucket, key, column, values, options) => (
+                        2,
+                        *bucket,
+                        key,
+                        *column,
+                        Some(values.iter().map(|value| value.to_vec()).collect()),
+                        options,
+                    ),
+                    Operation::MergeList(bucket, key, column, values, options) => (
+                        3,
+                        *bucket,
+                        key,
+                        *column,
+                        Some(values.iter().map(|value| value.to_vec()).collect()),
+                        options,
+                    ),
+                    Operation::Delete(bucket, key, column, options) => {
+                        (4, *bucket, key, *column, None, options)
+                    }
+                };
+                let raw_options = options.as_cobble();
+                (
+                    kind,
+                    bucket,
+                    key.to_vec(),
+                    column,
+                    values,
+                    raw_options.ttl_seconds,
+                    raw_options.column_family.clone(),
+                    raw_options.await_durable,
+                )
+            })
+            .collect();
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (operations,),
+        ))
     }
     #[pyo3(signature=(bucket,key,column,value,options=None))]
     fn put_bytes(

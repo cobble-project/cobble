@@ -1,9 +1,20 @@
 use crate::buffer::InputBytes;
-use crate::error::invalid_state;
+use crate::error::{input_error, invalid_state};
 use crate::options::PyWriteOptions;
-use cobble_binding::{WriteBatch, WriteOptions};
+use crate::types::PickleReduction;
+use cobble_binding::{WriteBatch, WriteBatchOperationRef, WriteOptions};
 use pyo3::prelude::*;
 use std::sync::Mutex;
+
+type PickledOperation = (
+    u8,
+    u16,
+    Vec<u8>,
+    u16,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<u32>,
+);
 
 struct BatchState {
     batch: WriteBatch,
@@ -66,6 +77,98 @@ impl PyWriteBatch {
                 in_flight: false,
             }),
         }
+    }
+
+    #[staticmethod]
+    fn _restore(operations: Vec<PickledOperation>) -> PyResult<Self> {
+        let batch = Self::new();
+        for (kind, bucket, key, column, value, column_family, ttl_seconds) in operations {
+            if !matches!(
+                (kind, value.as_ref(), ttl_seconds),
+                (0 | 2, Some(_), _) | (1, None, None)
+            ) {
+                return Err(input_error("invalid pickled write batch operation"));
+            }
+            let mut options = WriteOptions::default();
+            options.column_family = column_family;
+            options.ttl_seconds = ttl_seconds;
+            batch.with_state(|state| match (kind, value) {
+                (0, Some(value)) => state
+                    .batch
+                    .put_with_options(bucket, &key, column, &value, &options),
+                (1, None) if ttl_seconds.is_none() => state
+                    .batch
+                    .delete_with_options(bucket, &key, column, &options),
+                (2, Some(value)) => state
+                    .batch
+                    .merge_with_options(bucket, &key, column, &value, &options),
+                _ => unreachable!("validated above"),
+            })?;
+        }
+        Ok(batch)
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Vec<PickledOperation>,)>> {
+        let state = self.state.lock().unwrap();
+        if state.in_flight {
+            return Err(invalid_state("WriteBatch is currently being written"));
+        }
+        let operations = state
+            .batch
+            .operations()
+            .map(|operation| match operation {
+                WriteBatchOperationRef::Put {
+                    bucket,
+                    key,
+                    column_family,
+                    column,
+                    value,
+                    ttl_seconds,
+                } => (
+                    0,
+                    bucket,
+                    key.to_vec(),
+                    column,
+                    Some(value.to_vec()),
+                    column_family.map(str::to_string),
+                    ttl_seconds,
+                ),
+                WriteBatchOperationRef::Delete {
+                    bucket,
+                    key,
+                    column_family,
+                    column,
+                } => (
+                    1,
+                    bucket,
+                    key.to_vec(),
+                    column,
+                    None,
+                    column_family.map(str::to_string),
+                    None,
+                ),
+                WriteBatchOperationRef::Merge {
+                    bucket,
+                    key,
+                    column_family,
+                    column,
+                    value,
+                    ttl_seconds,
+                } => (
+                    2,
+                    bucket,
+                    key.to_vec(),
+                    column,
+                    Some(value.to_vec()),
+                    column_family.map(str::to_string),
+                    ttl_seconds,
+                ),
+            })
+            .collect();
+        Ok((
+            py.get_type::<Self>().getattr("_restore")?.unbind(),
+            (operations,),
+        ))
     }
 
     #[pyo3(signature = (bucket, key, column, value, options=None))]
