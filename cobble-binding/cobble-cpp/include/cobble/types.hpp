@@ -46,7 +46,7 @@ class COBBLE_CPP_API Error final : public std::runtime_error {
  public:
   Error(ErrorCode code, std::string message);
 
-  [[nodiscard]] ErrorCode code() const noexcept;
+  [[nodiscard]] ErrorCode Code() const noexcept;
 
  private:
   ErrorCode code_;

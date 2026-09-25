@@ -15,7 +15,7 @@ class COBBLE_CPP_API PendingShardSnapshot final {
   PendingShardSnapshot(const PendingShardSnapshot &) = delete;
   PendingShardSnapshot &operator=(const PendingShardSnapshot &) = delete;
 
-  [[nodiscard]] SnapshotId id() const noexcept;
+  [[nodiscard]] SnapshotId Id() const noexcept;
   [[nodiscard]] ShardSnapshot Wait();
 
  private:
@@ -33,7 +33,7 @@ class COBBLE_CPP_API PendingSnapshot final {
   PendingSnapshot(const PendingSnapshot &) = delete;
   PendingSnapshot &operator=(const PendingSnapshot &) = delete;
 
-  [[nodiscard]] SnapshotId id() const noexcept;
+  [[nodiscard]] SnapshotId Id() const noexcept;
   [[nodiscard]] GlobalSnapshot Wait();
 
  private:

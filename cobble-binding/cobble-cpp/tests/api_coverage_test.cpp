@@ -90,21 +90,21 @@ void VerifyPointAndMutationApis(cobble::Database& db) {
   db.Merge(1, Bytes("direct"), 1, Bytes("-merged"), default_family);
 
   auto direct = db.Get(1, Bytes("direct"));
-  COBBLE_CHECK(direct.found());
-  COBBLE_CHECK(direct.column_count() == 3);
-  COBBLE_CHECK(direct.has_column(0));
-  COBBLE_CHECK(String(direct.column(0)) == "column-0");
-  COBBLE_CHECK(String(direct.column(1)) == "old-merged");
-  COBBLE_CHECK(String(direct.column(2)) == "column-2");
+  COBBLE_CHECK(direct.Found());
+  COBBLE_CHECK(direct.ColumnCount() == 3);
+  COBBLE_CHECK(direct.HasColumn(0));
+  COBBLE_CHECK(String(direct.Column(0)) == "column-0");
+  COBBLE_CHECK(String(direct.Column(1)) == "old-merged");
+  COBBLE_CHECK(String(direct.Column(2)) == "column-2");
 
   cobble::ReadOptions projected;
   projected.column_family = "default";
   projected.columns = {2, 0};
   auto projection = db.Get(1, Bytes("direct"), projected);
-  COBBLE_CHECK(projection.found());
-  COBBLE_CHECK(projection.column_count() == 2);
-  COBBLE_CHECK(String(projection.column(0)) == "column-2");
-  COBBLE_CHECK(String(projection.column(1)) == "column-0");
+  COBBLE_CHECK(projection.Found());
+  COBBLE_CHECK(projection.ColumnCount() == 2);
+  COBBLE_CHECK(String(projection.Column(0)) == "column-2");
+  COBBLE_CHECK(String(projection.Column(1)) == "column-0");
 
   cobble::ReadOptions one_column;
   one_column.column_family = "default";
@@ -128,7 +128,7 @@ void VerifyPointAndMutationApis(cobble::Database& db) {
 
   db.Put(1, Bytes("delete-direct"), 0, Bytes("value"), default_family);
   db.Delete(1, Bytes("delete-direct"), 0, default_family);
-  COBBLE_CHECK(!db.Get(1, Bytes("delete-direct")).found());
+  COBBLE_CHECK(!db.Get(1, Bytes("delete-direct")).Found());
 
   db.Put(1, Bytes("delete-batch"), 0, Bytes("value"), default_family);
   cobble::WriteBatch batch;
@@ -140,11 +140,11 @@ void VerifyPointAndMutationApis(cobble::Database& db) {
   db.Write(std::move(batch), false);
 
   auto batch_row = db.Get(1, Bytes("batch"));
-  COBBLE_CHECK(batch_row.found());
-  COBBLE_CHECK(String(batch_row.column(0)) == "base-merged");
-  COBBLE_CHECK(!batch_row.has_column(1));
-  COBBLE_CHECK(String(batch_row.column(2)) == "third");
-  COBBLE_CHECK(!db.Get(1, Bytes("delete-batch")).found());
+  COBBLE_CHECK(batch_row.Found());
+  COBBLE_CHECK(String(batch_row.Column(0)) == "base-merged");
+  COBBLE_CHECK(!batch_row.HasColumn(1));
+  COBBLE_CHECK(String(batch_row.Column(2)) == "third");
+  COBBLE_CHECK(!db.Get(1, Bytes("delete-batch")).Found());
 
   cobble::ScanOptions scan_options;
   scan_options.column_family = "default";
@@ -154,12 +154,12 @@ void VerifyPointAndMutationApis(cobble::Database& db) {
   scan_options.preload_scan_cursor_block = true;
   auto scan = db.Scan(1, Bytes("batch"), Bytes("batci"), scan_options);
   const auto scan_batch = scan.Next(16);
-  COBBLE_CHECK(scan_batch.row_count() == 1);
-  COBBLE_CHECK(scan_batch.bucket(0) == 1);
-  COBBLE_CHECK(String(scan_batch.key(0)) == "batch");
-  COBBLE_CHECK(scan_batch.column_count(0) == 2);
-  COBBLE_CHECK(String(scan_batch.column(0, 0)) == "third");
-  COBBLE_CHECK(String(scan_batch.column(0, 1)) == "base-merged");
+  COBBLE_CHECK(scan_batch.RowCount() == 1);
+  COBBLE_CHECK(scan_batch.Bucket(0) == 1);
+  COBBLE_CHECK(String(scan_batch.Key(0)) == "batch");
+  COBBLE_CHECK(scan_batch.ColumnCount(0) == 2);
+  COBBLE_CHECK(String(scan_batch.Column(0, 0)) == "third");
+  COBBLE_CHECK(String(scan_batch.Column(0, 1)) == "base-merged");
 
   db.SetTime(1'000);
   cobble::WriteOptions ttl;
@@ -167,9 +167,9 @@ void VerifyPointAndMutationApis(cobble::Database& db) {
   ttl.ttl_seconds = 1;
   ttl.await_durable = true;
   db.Put(1, Bytes("ttl"), 0, Bytes("expires"), ttl);
-  COBBLE_CHECK(db.Get(1, Bytes("ttl")).found());
+  COBBLE_CHECK(db.Get(1, Bytes("ttl")).Found());
   db.SetTime(1'002);
-  COBBLE_CHECK(!db.Get(1, Bytes("ttl")).found());
+  COBBLE_CHECK(!db.Get(1, Bytes("ttl")).Found());
 }
 
 void VerifyBlockBoundaryScan(const cobble::Database& db) {
@@ -181,11 +181,11 @@ void VerifyBlockBoundaryScan(const cobble::Database& db) {
     std::size_t expected = 0;
     while (true) {
       const auto batch = ordered.Next(73);
-      for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        COBBLE_CHECK(String(batch.key(row)) == ScanKey(expected));
+      for (std::size_t row = 0; row < batch.RowCount(); ++row) {
+        COBBLE_CHECK(String(batch.Key(row)) == ScanKey(expected));
         ++expected;
       }
-      if (batch.end()) {
+      if (batch.End()) {
         break;
       }
     }
@@ -205,24 +205,24 @@ void VerifyBlockBoundaryScan(const cobble::Database& db) {
   bool end = false;
   while (!end) {
     const auto batch = scan.Next(73);
-    for (std::size_t row = 0; row < batch.row_count(); ++row) {
+    for (std::size_t row = 0; row < batch.RowCount(); ++row) {
       COBBLE_CHECK(expected_row < kBoundaryRows);
-      COBBLE_CHECK(batch.bucket(row) == 0);
-      const auto actual_key = String(batch.key(row));
+      COBBLE_CHECK(batch.Bucket(row) == 0);
+      const auto actual_key = String(batch.Key(row));
       const auto expected_key = ScanKey(expected_row);
       if (actual_key != expected_key) {
         throw std::runtime_error("boundary scan expected " + expected_key +
                                  " but read " + actual_key);
       }
-      COBBLE_CHECK(batch.column_count(row) == 1);
-      COBBLE_CHECK(String(batch.column(row, 0)) == ScanValue(expected_row));
+      COBBLE_CHECK(batch.ColumnCount(row) == 1);
+      COBBLE_CHECK(String(batch.Column(row, 0)) == ScanValue(expected_row));
       ++expected_row;
     }
-    if (batch.stopped_at_block_boundary()) {
+    if (batch.StoppedAtBlockBoundary()) {
       ++boundaries;
       scan.ResumeAfterBlockBoundary();
     }
-    end = batch.end();
+    end = batch.End();
   }
   COBBLE_CHECK(expected_row == kBoundaryRows);
   COBBLE_CHECK(boundaries > 0);
@@ -233,7 +233,7 @@ void VerifyClosedHandle(cobble::Database& db) {
   try {
     (void)db.Get(0, Bytes("closed"));
   } catch (const cobble::Error& error) {
-    rejected = error.code() == cobble::ErrorCode::kInvalidState;
+    rejected = error.Code() == cobble::ErrorCode::kInvalidState;
   }
   COBBLE_CHECK(rejected);
 }
@@ -269,8 +269,8 @@ int main() {
       auto wal_recovered =
           cobble::Database::ResumeFile(config_path.string(), first_snapshot,
                                        cobble::RecoveryMode::kLatestWithWal);
-      COBBLE_CHECK(wal_recovered.Get(2, Bytes("wal-tail")).found());
-      COBBLE_CHECK(String(wal_recovered.Get(2, Bytes("wal-tail")).column(0)) ==
+      COBBLE_CHECK(wal_recovered.Get(2, Bytes("wal-tail")).Found());
+      COBBLE_CHECK(String(wal_recovered.Get(2, Bytes("wal-tail")).Column(0)) ==
                    "after-snapshot");
       VerifyBlockBoundaryScan(wal_recovered);
       wal_recovered.Close();
@@ -280,8 +280,8 @@ int main() {
     {
       auto snapshot_only = cobble::Database::Resume(
           config, first_snapshot, cobble::RecoveryMode::kSnapshotOnly);
-      COBBLE_CHECK(!snapshot_only.Get(2, Bytes("wal-tail")).found());
-      COBBLE_CHECK(snapshot_only.Get(1, Bytes("direct")).found());
+      COBBLE_CHECK(!snapshot_only.Get(2, Bytes("wal-tail")).Found());
+      COBBLE_CHECK(snapshot_only.Get(1, Bytes("direct")).Found());
       snapshot_only.Put(3, Bytes("after-resume"), 0, Bytes("snapshot-2"));
       second_snapshot =
           WaitForSnapshot(snapshot_only, snapshot_only.Snapshot());
@@ -306,9 +306,9 @@ int main() {
       auto resumed =
           cobble::Database::ResumeFile(config_path.string(), second_snapshot);
       const auto row = resumed.Get(3, Bytes("after-resume"));
-      COBBLE_CHECK(row.found());
-      COBBLE_CHECK(String(row.column(0)) == "snapshot-2");
-      COBBLE_CHECK(!resumed.Get(2, Bytes("wal-tail")).found());
+      COBBLE_CHECK(row.Found());
+      COBBLE_CHECK(String(row.Column(0)) == "snapshot-2");
+      COBBLE_CHECK(!resumed.Get(2, Bytes("wal-tail")).Found());
       resumed.Close();
     }
 

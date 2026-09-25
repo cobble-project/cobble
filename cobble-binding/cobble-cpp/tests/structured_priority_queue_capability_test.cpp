@@ -32,7 +32,7 @@ void ExpectInvalidState(Callback callback) {
   try {
     callback();
   } catch (const cobble::Error &error) {
-    rejected = error.code() == cobble::ErrorCode::kInvalidState;
+    rejected = error.Code() == cobble::ErrorCode::kInvalidState;
   }
   COBBLE_CHECK(rejected);
 }

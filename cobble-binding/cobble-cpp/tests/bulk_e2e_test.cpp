@@ -127,14 +127,14 @@ void VerifyPointReads(const cobble::Database& db) {
     const auto bucket = static_cast<cobble::BucketId>(row % kBucketCount);
     const auto key = Key(row);
     const auto result = db.Get(bucket, Bytes(key));
-    CHECK(result.found());
-    CHECK(result.column_count() == 2);
-    CHECK(String(result.column(0)) == Value(row, 0, kColumnZeroBytes));
-    CHECK(String(result.column(1)) == Value(row, 1, kColumnOneBytes));
+    CHECK(result.Found());
+    CHECK(result.ColumnCount() == 2);
+    CHECK(String(result.Column(0)) == Value(row, 0, kColumnZeroBytes));
+    CHECK(String(result.Column(1)) == Value(row, 1, kColumnOneBytes));
   }
 
   const auto missing_key = Key(kRowCount + 1);
-  CHECK(!db.Get(0, Bytes(missing_key)).found());
+  CHECK(!db.Get(0, Bytes(missing_key)).Found());
 }
 
 void VerifyOwnedScans(const cobble::Database& db) {
@@ -146,22 +146,22 @@ void VerifyOwnedScans(const cobble::Database& db) {
     bool end = false;
     while (!end) {
       const auto batch = scan.Next(kRowsPerScanBatch);
-      CHECK(batch.row_count() != 0 || batch.end());
-      for (std::size_t index = 0; index < batch.row_count(); ++index) {
+      CHECK(batch.RowCount() != 0 || batch.End());
+      for (std::size_t index = 0; index < batch.RowCount(); ++index) {
         CHECK(expected_row < kRowCount);
-        CHECK(batch.bucket(index) == bucket);
-        CHECK(String(batch.key(index)) == Key(expected_row));
-        CHECK(batch.column_count(index) == 2);
-        CHECK(batch.has_column(index, 0));
-        CHECK(batch.has_column(index, 1));
-        CHECK(String(batch.column(index, 0)) ==
+        CHECK(batch.Bucket(index) == bucket);
+        CHECK(String(batch.Key(index)) == Key(expected_row));
+        CHECK(batch.ColumnCount(index) == 2);
+        CHECK(batch.HasColumn(index, 0));
+        CHECK(batch.HasColumn(index, 1));
+        CHECK(String(batch.Column(index, 0)) ==
               Value(expected_row, 0, kColumnZeroBytes));
-        CHECK(String(batch.column(index, 1)) ==
+        CHECK(String(batch.Column(index, 1)) ==
               Value(expected_row, 1, kColumnOneBytes));
         expected_row += kBucketCount;
         ++total_rows;
       }
-      end = batch.end();
+      end = batch.End();
     }
     CHECK(expected_row >= kRowCount);
   }

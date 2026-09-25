@@ -109,13 +109,13 @@ int RunBindingTest() {
     db.Put(0, Bytes("key-1"), 1, Bytes("value-1-1"));
 
     auto row = db.Get(0, Bytes("key-1"));
-    CHECK(row.found());
-    CHECK(row.column_count() == 2);
-    CHECK(String(row.column(0)) == "value-1-0");
-    CHECK(String(row.column(1)) == "value-1-1");
+    CHECK(row.Found());
+    CHECK(row.ColumnCount() == 2);
+    CHECK(String(row.Column(0)) == "value-1-0");
+    CHECK(String(row.Column(1)) == "value-1-1");
 
     auto missing = db.Get(0, Bytes("missing"));
-    CHECK(!missing.found());
+    CHECK(!missing.Found());
 
     cobble::ReadOptions one_column;
     one_column.columns = {1};
@@ -140,13 +140,13 @@ int RunBindingTest() {
 
     auto scan = db.Scan(0, Bytes("key-1"), Bytes("key-4"));
     auto owned = scan.Next(16);
-    CHECK(owned.row_count() == 3);
-    CHECK(String(owned.key(0)) == "key-1");
-    CHECK(!owned.has_column(0, 0));
-    CHECK(String(owned.column(0, 1)) == "value-1-1");
-    CHECK(String(owned.key(1)) == "key-2");
-    CHECK(String(owned.column(1, 0)) == "value-2-0");
-    CHECK(owned.end());
+    CHECK(owned.RowCount() == 3);
+    CHECK(String(owned.Key(0)) == "key-1");
+    CHECK(!owned.HasColumn(0, 0));
+    CHECK(String(owned.Column(0, 1)) == "value-1-1");
+    CHECK(String(owned.Key(1)) == "key-2");
+    CHECK(String(owned.Column(1, 0)) == "value-2-0");
+    CHECK(owned.End());
 
     auto encoded_scan = db.Scan(0, std::nullopt, std::nullopt);
     std::array<std::uint8_t, 1> tiny{};
@@ -180,7 +180,7 @@ int RunBindingTest() {
   try {
     (void)cobble::Database::Open(R"({"total_buckets":0})");
   } catch (const cobble::Error& error) {
-    saw_config_error = error.code() == cobble::ErrorCode::kConfiguration;
+    saw_config_error = error.Code() == cobble::ErrorCode::kConfiguration;
   }
   CHECK(saw_config_error);
 

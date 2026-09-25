@@ -9,7 +9,7 @@ namespace cobble {
 Error::Error(ErrorCode code, std::string message)
     : std::runtime_error(std::move(message)), code_(code) {}
 
-ErrorCode Error::code() const noexcept { return code_; }
+ErrorCode Error::Code() const noexcept { return code_; }
 
 namespace detail {
 

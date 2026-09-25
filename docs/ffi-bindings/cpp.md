@@ -85,8 +85,8 @@ int main() {
     db.Put(0, Bytes("user:1"), 0, Bytes("Alice"));
     {
       auto row = db.Get(0, Bytes("user:1"));
-      if (row.found() && row.has_column(0)) {
-        const auto value = row.column(0);
+      if (row.Found() && row.HasColumn(0)) {
+        const auto value = row.Column(0);
         std::cout << std::string(value.begin(), value.end()) << '\n';
       }
     }

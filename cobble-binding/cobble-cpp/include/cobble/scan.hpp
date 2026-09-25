@@ -16,16 +16,16 @@ class COBBLE_CPP_API OwnedBatch final {
   OwnedBatch(const OwnedBatch&) = delete;
   OwnedBatch& operator=(const OwnedBatch&) = delete;
 
-  [[nodiscard]] std::size_t row_count() const noexcept;
-  [[nodiscard]] bool end() const noexcept;
-  [[nodiscard]] bool stopped_at_block_boundary() const noexcept;
-  [[nodiscard]] BucketId bucket(std::size_t row) const;
+  [[nodiscard]] std::size_t RowCount() const noexcept;
+  [[nodiscard]] bool End() const noexcept;
+  [[nodiscard]] bool StoppedAtBlockBoundary() const noexcept;
+  [[nodiscard]] BucketId Bucket(std::size_t row) const;
   // Returned views remain valid while this OwnedBatch is alive and is not
   // moved.
-  [[nodiscard]] BytesView key(std::size_t row) const;
-  [[nodiscard]] std::size_t column_count(std::size_t row) const;
-  [[nodiscard]] bool has_column(std::size_t row, std::size_t column) const;
-  [[nodiscard]] BytesView column(std::size_t row, std::size_t column) const;
+  [[nodiscard]] BytesView Key(std::size_t row) const;
+  [[nodiscard]] std::size_t ColumnCount(std::size_t row) const;
+  [[nodiscard]] bool HasColumn(std::size_t row, std::size_t column) const;
+  [[nodiscard]] BytesView Column(std::size_t row, std::size_t column) const;
 
  private:
   struct Impl;

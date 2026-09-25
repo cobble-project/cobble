@@ -16,11 +16,11 @@ OwnedRow::OwnedRow(OwnedRow&&) noexcept = default;
 OwnedRow& OwnedRow::operator=(OwnedRow&&) noexcept = default;
 OwnedRow::~OwnedRow() = default;
 
-bool OwnedRow::found() const noexcept {
+bool OwnedRow::Found() const noexcept {
   return impl_ && ffi::native_row_found(*impl_->native);
 }
 
-std::size_t OwnedRow::column_count() const noexcept {
+std::size_t OwnedRow::ColumnCount() const noexcept {
   if (!impl_) {
     return 0;
   }
@@ -30,11 +30,11 @@ std::size_t OwnedRow::column_count() const noexcept {
              : static_cast<std::size_t>(count);
 }
 
-bool OwnedRow::has_column(std::size_t column) const {
+bool OwnedRow::HasColumn(std::size_t column) const {
   return impl_ && ffi::native_row_has_column(*impl_->native, column);
 }
 
-BytesView OwnedRow::column(std::size_t column) const {
+BytesView OwnedRow::Column(std::size_t column) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedRow has been moved from");
   }

@@ -33,6 +33,10 @@ sharded rescaling, one-crossing batch and multi-get operations, owned and
 caller-buffer scans, current/pinned or fixed-snapshot reads, typed distributed
 scan plans, and detached priority queues.
 
+Public operations use PascalCase (for example, `Get`, `ColumnCount`, and
+`PendingSnapshot::Id`); container-style `size`/`empty` and standard iterator
+`begin`/`end` retain their usual C++ spelling.
+
 ## Requirements
 
 - Rust toolchain compatible with the Cobble workspace

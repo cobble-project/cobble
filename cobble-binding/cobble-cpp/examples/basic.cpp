@@ -31,14 +31,14 @@ int main(int argc, char** argv) {
     db.Put(0, Bytes("hello"), 0, Bytes("world"));
 
     auto row = db.Get(0, Bytes("hello"));
-    if (row.found() && row.has_column(0)) {
-      std::cout << String(row.column(0)) << '\n';
+    if (row.Found() && row.HasColumn(0)) {
+      std::cout << String(row.Column(0)) << '\n';
     }
 
     const auto snapshot = db.Snapshot();
     std::cout << "queued snapshot " << snapshot << '\n';
   } catch (const cobble::Error& error) {
-    std::cerr << "Cobble error (" << static_cast<int>(error.code())
+    std::cerr << "Cobble error (" << static_cast<int>(error.Code())
               << "): " << error.what() << '\n';
     return 1;
   }

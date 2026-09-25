@@ -82,7 +82,7 @@ OwnedMultiGetResult& OwnedMultiGetResult::operator=(
     OwnedMultiGetResult&&) noexcept = default;
 OwnedMultiGetResult::~OwnedMultiGetResult() = default;
 
-std::size_t OwnedMultiGetResult::row_count() const noexcept {
+std::size_t OwnedMultiGetResult::RowCount() const noexcept {
   if (!impl_) {
     return 0;
   }
@@ -92,11 +92,11 @@ std::size_t OwnedMultiGetResult::row_count() const noexcept {
              : static_cast<std::size_t>(count);
 }
 
-bool OwnedMultiGetResult::found(std::size_t row) const {
+bool OwnedMultiGetResult::Found(std::size_t row) const {
   return impl_ && ffi::native_multi_get_found(*impl_->native, row);
 }
 
-std::size_t OwnedMultiGetResult::column_count(std::size_t row) const {
+std::size_t OwnedMultiGetResult::ColumnCount(std::size_t row) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState,
                 "OwnedMultiGetResult has been moved from");
@@ -108,12 +108,11 @@ std::size_t OwnedMultiGetResult::column_count(std::size_t row) const {
                         "multi-get column count");
 }
 
-bool OwnedMultiGetResult::has_column(std::size_t row,
-                                     std::size_t column) const {
+bool OwnedMultiGetResult::HasColumn(std::size_t row, std::size_t column) const {
   return impl_ && ffi::native_multi_get_has_column(*impl_->native, row, column);
 }
 
-BytesView OwnedMultiGetResult::column(std::size_t row,
+BytesView OwnedMultiGetResult::Column(std::size_t row,
                                       std::size_t column) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState,

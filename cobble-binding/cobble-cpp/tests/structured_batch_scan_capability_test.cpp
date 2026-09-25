@@ -150,7 +150,7 @@ void VerifyBatchAndMultiGet(Database &db) {
   try {
     db.Write(invalid);
   } catch (const cobble::Error &error) {
-    rejected = error.code() == cobble::ErrorCode::kInput;
+    rejected = error.Code() == cobble::ErrorCode::kInput;
   }
   COBBLE_CHECK(rejected);
   COBBLE_CHECK(!db.Get(0, Bytes("atomic-good")).Found());
@@ -230,7 +230,7 @@ void VerifySharded(const std::filesystem::path &root) {
     try {
       (void)retry_builder.Commit();
     } catch (const cobble::Error &error) {
-      rejected = error.code() == cobble::ErrorCode::kInvalidState;
+      rejected = error.Code() == cobble::ErrorCode::kInvalidState;
     }
     COBBLE_CHECK(rejected);
   }
@@ -241,7 +241,7 @@ void VerifySharded(const std::filesystem::path &root) {
   try {
     (void)retry_builder.Commit();
   } catch (const cobble::Error &error) {
-    double_commit_rejected = error.code() == cobble::ErrorCode::kInvalidState;
+    double_commit_rejected = error.Code() == cobble::ErrorCode::kInvalidState;
   }
   COBBLE_CHECK(double_commit_rejected);
   const auto snapshot = db.TakeSnapshot();
@@ -251,7 +251,7 @@ void VerifySharded(const std::filesystem::path &root) {
     try {
       db.SwitchToSnapshot(snapshot.snapshot_id);
     } catch (const cobble::Error &error) {
-      rejected = error.code() == cobble::ErrorCode::kInvalidState;
+      rejected = error.Code() == cobble::ErrorCode::kInvalidState;
     }
     COBBLE_CHECK(rejected);
     (void)cursor.Next(1);
@@ -307,7 +307,7 @@ void VerifySingleAndPlan(const std::filesystem::path &root) {
   try {
     (void)cobble::structured::ScanSplit::FromJson(malformed);
   } catch (const cobble::Error &error) {
-    malformed_rejected = error.code() == cobble::ErrorCode::kInput;
+    malformed_rejected = error.Code() == cobble::ErrorCode::kInput;
   }
   COBBLE_CHECK(malformed_rejected);
   const std::array<cobble::Byte, 3> binary = {0, 0xff, 1};
@@ -328,7 +328,7 @@ void VerifySingleAndPlan(const std::filesystem::path &root) {
   try {
     (void)split.OpenScanner(config, unsupported);
   } catch (const cobble::Error &error) {
-    rejected = error.code() == cobble::ErrorCode::kInput;
+    rejected = error.Code() == cobble::ErrorCode::kInput;
   }
   COBBLE_CHECK(rejected);
   db.Close();

@@ -34,7 +34,7 @@ void ExpectError(cobble::ErrorCode code, const auto& action) {
   try {
     action();
   } catch (const cobble::Error& error) {
-    rejected = error.code() == code;
+    rejected = error.Code() == code;
   }
   COBBLE_CHECK(rejected);
 }
@@ -44,10 +44,10 @@ std::vector<std::pair<cobble::BucketId, std::string>> Collect(
   std::vector<std::pair<cobble::BucketId, std::string>> rows;
   while (true) {
     auto batch = cursor.Next(2);
-    for (std::size_t row = 0; row < batch.row_count(); ++row) {
-      rows.emplace_back(batch.bucket(row), String(batch.key(row)));
+    for (std::size_t row = 0; row < batch.RowCount(); ++row) {
+      rows.emplace_back(batch.Bucket(row), String(batch.Key(row)));
     }
-    if (batch.end()) {
+    if (batch.End()) {
       return rows;
     }
   }
@@ -128,7 +128,7 @@ void VerifyReadOnly(const std::string& config,
   auto db = cobble::ReadOnlyDb::OpenFile(config_path.string(),
                                          snapshot.snapshot_id, source.Id());
   COBBLE_CHECK(db.Id() == source.Id());
-  COBBLE_CHECK(String(db.Get(0, Bytes("version")).column(0)) == "old-left");
+  COBBLE_CHECK(String(db.Get(0, Bytes("version")).Column(0)) == "old-left");
 
   cobble::ReadOptions one;
   one.columns = {0};
@@ -147,11 +147,11 @@ void VerifyReadOnly(const std::string& config,
       cobble::MultiGetKey{1, Bytes("missing")},
   };
   const auto rows = db.MultiGet(keys);
-  COBBLE_CHECK(rows.row_count() == keys.size());
-  COBBLE_CHECK(String(rows.column(0, 0)) == "old-left");
-  COBBLE_CHECK(String(rows.column(1, 0)) == "left-1-b");
-  COBBLE_CHECK(String(rows.column(2, 0)) == "old-left");
-  COBBLE_CHECK(!rows.found(3));
+  COBBLE_CHECK(rows.RowCount() == keys.size());
+  COBBLE_CHECK(String(rows.Column(0, 0)) == "old-left");
+  COBBLE_CHECK(String(rows.Column(1, 0)) == "left-1-b");
+  COBBLE_CHECK(String(rows.Column(2, 0)) == "old-left");
+  COBBLE_CHECK(!rows.Found(3));
 
   auto scan = db.Scan(1, std::nullopt, std::nullopt);
   std::array<cobble::Byte, 1> tiny{};
@@ -270,9 +270,9 @@ void VerifyReaders(const std::string& config,
       cobble::Reader::OpenFile(config_path.string(), loaded);
   COBBLE_CHECK(from_object.CurrentGlobalSnapshot().id == first.id);
   COBBLE_CHECK(from_object.ConfiguredSnapshotId() == first.id);
-  COBBLE_CHECK(String(from_object.Get(2, Bytes("version")).column(0)) ==
+  COBBLE_CHECK(String(from_object.Get(2, Bytes("version")).Column(0)) ==
                "old-right");
-  COBBLE_CHECK(String(from_object_file.Get(0, Bytes("version")).column(0)) ==
+  COBBLE_CHECK(String(from_object_file.Get(0, Bytes("version")).Column(0)) ==
                "old-left");
   unavailable.Restore();
   COBBLE_CHECK(pinned.Mode() == cobble::ReaderMode::kSnapshot);
@@ -289,10 +289,10 @@ void VerifyReaders(const std::string& config,
       cobble::MultiGetKey{3, Bytes("missing")},
   };
   const auto rows = current.MultiGet(keys);
-  COBBLE_CHECK(String(rows.column(0, 0)) == "old-left");
-  COBBLE_CHECK(String(rows.column(1, 0)) == "old-right");
-  COBBLE_CHECK(String(rows.column(2, 0)) == "old-left");
-  COBBLE_CHECK(!rows.found(3));
+  COBBLE_CHECK(String(rows.Column(0, 0)) == "old-left");
+  COBBLE_CHECK(String(rows.Column(1, 0)) == "old-right");
+  COBBLE_CHECK(String(rows.Column(2, 0)) == "old-left");
+  COBBLE_CHECK(!rows.Found(3));
 
   cobble::ReadOptions one;
   one.columns = {0};
@@ -318,14 +318,14 @@ void VerifyReaders(const std::string& config,
       coordinator.MaterializeGlobalSnapshot(4, first.id + 1, shards);
 
   ExpectError(cobble::ErrorCode::kInvalidState, [&] { pinned.Refresh(); });
-  COBBLE_CHECK(String(pinned.Get(0, Bytes("version")).column(0)) == "old-left");
-  COBBLE_CHECK(String(from_object.Get(0, Bytes("version")).column(0)) ==
+  COBBLE_CHECK(String(pinned.Get(0, Bytes("version")).Column(0)) == "old-left");
+  COBBLE_CHECK(String(from_object.Get(0, Bytes("version")).Column(0)) ==
                "old-left");
   current.Refresh();
   COBBLE_CHECK(current.CurrentGlobalSnapshot().id == second.id);
-  COBBLE_CHECK(String(current.Get(0, Bytes("version")).column(0)) ==
+  COBBLE_CHECK(String(current.Get(0, Bytes("version")).Column(0)) ==
                "new-left");
-  COBBLE_CHECK(String(current.Get(2, Bytes("version")).column(0)) ==
+  COBBLE_CHECK(String(current.Get(2, Bytes("version")).Column(0)) ==
                "new-right");
 }
 

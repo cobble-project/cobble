@@ -209,7 +209,7 @@ int main() {
     try {
       pinned.Refresh();
     } catch (const cobble::Error &error) {
-      rejected = error.code() == cobble::ErrorCode::kInvalidState;
+      rejected = error.Code() == cobble::ErrorCode::kInvalidState;
     }
     COBBLE_CHECK(rejected);
     COBBLE_CHECK(String(pinned.Get(0, Bytes("both")).Bytes(0)) == "old");

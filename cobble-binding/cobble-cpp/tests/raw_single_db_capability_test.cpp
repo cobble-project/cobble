@@ -93,19 +93,19 @@ void VerifySchemaEvolution(cobble::SingleDb& db) {
   try {
     (void)builder.Commit();
   } catch (const cobble::Error& error) {
-    consumed = error.code() == cobble::ErrorCode::kInvalidState;
+    consumed = error.Code() == cobble::ErrorCode::kInvalidState;
   }
   COBBLE_CHECK(consumed);
 
   const auto row = db.Get(0, Bytes("before-schema"));
-  COBBLE_CHECK(row.found());
-  COBBLE_CHECK(row.column_count() == 2);
-  COBBLE_CHECK(String(row.column(0)) == "old-value");
-  COBBLE_CHECK(String(row.column(1)) == "new-default");
+  COBBLE_CHECK(row.Found());
+  COBBLE_CHECK(row.ColumnCount() == 2);
+  COBBLE_CHECK(String(row.Column(0)) == "old-value");
+  COBBLE_CHECK(String(row.Column(1)) == "new-default");
 
   db.Put(0, Bytes("merge-after-schema"), 0, Bytes("base"));
   db.Merge(0, Bytes("merge-after-schema"), 0, Bytes("-merged"));
-  COBBLE_CHECK(String(db.Get(0, Bytes("merge-after-schema")).column(0)) ==
+  COBBLE_CHECK(String(db.Get(0, Bytes("merge-after-schema")).Column(0)) ==
                "base-merged");
 }
 
@@ -116,31 +116,31 @@ void VerifyMultiGet(cobble::SingleDb& db) {
   db.Put(1, Bytes("cross-bucket"), 0, Bytes("bucket-one"));
 
   auto result = FetchMixedKeys(db);
-  COBBLE_CHECK(result.row_count() == 6);
-  COBBLE_CHECK(result.found(0));
-  COBBLE_CHECK(result.found(1));
-  COBBLE_CHECK(String(result.column(0, 0)) == "duplicate-value");
-  COBBLE_CHECK(String(result.column(1, 0)) == "duplicate-value");
-  COBBLE_CHECK(String(result.column(2, 0)) == "empty-key-value");
-  COBBLE_CHECK(String(result.column(3, 0)) == "bucket-zero");
-  COBBLE_CHECK(String(result.column(4, 0)) == "bucket-one");
-  COBBLE_CHECK(!result.found(5));
-  COBBLE_CHECK(result.column_count(5) == 0);
-  COBBLE_CHECK(!result.has_column(5, 0));
+  COBBLE_CHECK(result.RowCount() == 6);
+  COBBLE_CHECK(result.Found(0));
+  COBBLE_CHECK(result.Found(1));
+  COBBLE_CHECK(String(result.Column(0, 0)) == "duplicate-value");
+  COBBLE_CHECK(String(result.Column(1, 0)) == "duplicate-value");
+  COBBLE_CHECK(String(result.Column(2, 0)) == "empty-key-value");
+  COBBLE_CHECK(String(result.Column(3, 0)) == "bucket-zero");
+  COBBLE_CHECK(String(result.Column(4, 0)) == "bucket-one");
+  COBBLE_CHECK(!result.Found(5));
+  COBBLE_CHECK(result.ColumnCount(5) == 0);
+  COBBLE_CHECK(!result.HasColumn(5, 0));
 
   // A view obtained after all caller key buffers have been destroyed still
   // points into the result's Rust-owned Bytes allocation.
-  const auto retained_view = result.column(4, 0);
+  const auto retained_view = result.Column(4, 0);
   COBBLE_CHECK(String(retained_view) == "bucket-one");
 
   const std::vector<cobble::MultiGetKey> no_keys;
-  COBBLE_CHECK(db.MultiGet(no_keys).row_count() == 0);
+  COBBLE_CHECK(db.MultiGet(no_keys).RowCount() == 0);
 }
 
 cobble::GlobalSnapshot VerifyTypedSnapshots(cobble::SingleDb& db) {
   db.Put(2, Bytes("async"), 0, Bytes("snapshot"));
   auto pending = db.StartSnapshot();
-  const auto pending_id = pending.id();
+  const auto pending_id = pending.Id();
   const auto async_snapshot = pending.Wait();
   COBBLE_CHECK(async_snapshot.id == pending_id);
   COBBLE_CHECK(async_snapshot.total_buckets == 4);
@@ -153,7 +153,7 @@ cobble::GlobalSnapshot VerifyTypedSnapshots(cobble::SingleDb& db) {
   try {
     (void)pending.Wait();
   } catch (const cobble::Error& error) {
-    second_wait_rejected = error.code() == cobble::ErrorCode::kInvalidState;
+    second_wait_rejected = error.Code() == cobble::ErrorCode::kInvalidState;
   }
   COBBLE_CHECK(second_wait_rejected);
 
@@ -223,14 +223,14 @@ int main() {
     {
       auto latest = cobble::SingleDb::Resume(
           config, recovery_snapshot, cobble::RecoveryMode::kLatestWithWal);
-      COBBLE_CHECK(latest.Get(3, Bytes("wal-tail")).found());
+      COBBLE_CHECK(latest.Get(3, Bytes("wal-tail")).Found());
       latest.Close();
     }
     {
       auto exact = cobble::SingleDb::Resume(
           config, recovery_snapshot, cobble::RecoveryMode::kSnapshotOnly);
-      COBBLE_CHECK(!exact.Get(3, Bytes("wal-tail")).found());
-      COBBLE_CHECK(exact.Get(2, Bytes("sync")).found());
+      COBBLE_CHECK(!exact.Get(3, Bytes("wal-tail")).Found());
+      COBBLE_CHECK(exact.Get(2, Bytes("sync")).Found());
       exact.Close();
     }
 

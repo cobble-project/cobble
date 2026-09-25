@@ -53,7 +53,7 @@ void VerifyPointApi(Database &db) {
   try {
     (void)builder.Commit();
   } catch (const cobble::Error &error) {
-    consumed = error.code() == cobble::ErrorCode::kInvalidState;
+    consumed = error.Code() == cobble::ErrorCode::kInvalidState;
   }
   COBBLE_CHECK(consumed);
   COBBLE_CHECK(schema.Type("default", 0).kind ==
@@ -123,7 +123,7 @@ void VerifySharded(const std::filesystem::path &root) {
   COBBLE_CHECK(!db.Metrics().empty());
 
   auto pending = db.StartSnapshot();
-  const auto pending_id = pending.id();
+  const auto pending_id = pending.Id();
   const auto async_snapshot = pending.Wait();
   COBBLE_CHECK(async_snapshot.snapshot_id == pending_id);
   COBBLE_CHECK(async_snapshot.has_schema_metadata);
@@ -141,7 +141,7 @@ void VerifySharded(const std::filesystem::path &root) {
     try {
       db.SwitchToSnapshot(exact.snapshot_id);
     } catch (const cobble::Error &error) {
-      rejected = error.code() == cobble::ErrorCode::kInvalidState;
+      rejected = error.Code() == cobble::ErrorCode::kInvalidState;
     }
     COBBLE_CHECK(rejected);
     (void)active_builder.Commit();
@@ -152,7 +152,7 @@ void VerifySharded(const std::filesystem::path &root) {
   COBBLE_CHECK(db.Get(0, Bytes("key")).ListSize(1) == 3);
 
   auto cancelled = db.StartSnapshot();
-  (void)db.CancelSnapshot(cancelled.id());
+  (void)db.CancelSnapshot(cancelled.Id());
   (void)db.ExpireSnapshot(pending_id);
   db.PutBytes(1, Bytes("wal-tail"), 0, Bytes("latest"));
   const auto db_id = db.Id();
@@ -177,7 +177,7 @@ void VerifySingle(const std::filesystem::path &root) {
   db.SwitchMemtableType(cobble::MemtableType::kVec, true);
   (void)db.LoadReadonlyFilesToPrimary();
   auto pending = db.StartSnapshot();
-  const auto pending_id = pending.id();
+  const auto pending_id = pending.Id();
   const auto snapshot = pending.Wait();
   COBBLE_CHECK(snapshot.id == pending_id);
   COBBLE_CHECK(!db.ListSnapshots().empty());

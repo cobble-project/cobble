@@ -15,7 +15,7 @@ OwnedBatch::OwnedBatch(OwnedBatch&&) noexcept = default;
 OwnedBatch& OwnedBatch::operator=(OwnedBatch&&) noexcept = default;
 OwnedBatch::~OwnedBatch() = default;
 
-std::size_t OwnedBatch::row_count() const noexcept {
+std::size_t OwnedBatch::RowCount() const noexcept {
   if (!impl_) {
     return 0;
   }
@@ -25,15 +25,15 @@ std::size_t OwnedBatch::row_count() const noexcept {
              : static_cast<std::size_t>(count);
 }
 
-bool OwnedBatch::end() const noexcept {
+bool OwnedBatch::End() const noexcept {
   return impl_ && ffi::native_batch_end(*impl_->native);
 }
 
-bool OwnedBatch::stopped_at_block_boundary() const noexcept {
+bool OwnedBatch::StoppedAtBlockBoundary() const noexcept {
   return impl_ && ffi::native_batch_stopped_at_block_boundary(*impl_->native);
 }
 
-BucketId OwnedBatch::bucket(std::size_t row) const {
+BucketId OwnedBatch::Bucket(std::size_t row) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }
@@ -41,7 +41,7 @@ BucketId OwnedBatch::bucket(std::size_t row) const {
       [&] { return ffi::native_batch_bucket(*impl_->native, row); });
 }
 
-BytesView OwnedBatch::key(std::size_t row) const {
+BytesView OwnedBatch::Key(std::size_t row) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }
@@ -50,7 +50,7 @@ BytesView OwnedBatch::key(std::size_t row) const {
   });
 }
 
-std::size_t OwnedBatch::column_count(std::size_t row) const {
+std::size_t OwnedBatch::ColumnCount(std::size_t row) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }
@@ -60,11 +60,11 @@ std::size_t OwnedBatch::column_count(std::size_t row) const {
       "column_count");
 }
 
-bool OwnedBatch::has_column(std::size_t row, std::size_t column) const {
+bool OwnedBatch::HasColumn(std::size_t row, std::size_t column) const {
   return impl_ && ffi::native_batch_has_column(*impl_->native, row, column);
 }
 
-BytesView OwnedBatch::column(std::size_t row, std::size_t column) const {
+BytesView OwnedBatch::Column(std::size_t row, std::size_t column) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "OwnedBatch has been moved from");
   }

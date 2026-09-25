@@ -16,7 +16,7 @@ PendingShardSnapshot &PendingShardSnapshot::operator=(
     PendingShardSnapshot &&) noexcept = default;
 PendingShardSnapshot::~PendingShardSnapshot() = default;
 
-SnapshotId PendingShardSnapshot::id() const noexcept {
+SnapshotId PendingShardSnapshot::Id() const noexcept {
   return impl_
              ? structured_ffi::native_pending_shard_snapshot_id(*impl_->native)
              : 0;
@@ -40,7 +40,7 @@ PendingSnapshot &PendingSnapshot::operator=(PendingSnapshot &&) noexcept =
     default;
 PendingSnapshot::~PendingSnapshot() = default;
 
-SnapshotId PendingSnapshot::id() const noexcept {
+SnapshotId PendingSnapshot::Id() const noexcept {
   return impl_ ? structured_ffi::native_pending_snapshot_id(*impl_->native) : 0;
 }
 

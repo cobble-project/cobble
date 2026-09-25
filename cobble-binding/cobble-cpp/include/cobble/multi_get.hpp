@@ -21,12 +21,12 @@ class COBBLE_CPP_API OwnedMultiGetResult final {
   ~OwnedMultiGetResult();
   OwnedMultiGetResult(const OwnedMultiGetResult&) = delete;
   OwnedMultiGetResult& operator=(const OwnedMultiGetResult&) = delete;
-  [[nodiscard]] std::size_t row_count() const noexcept;
-  [[nodiscard]] bool found(std::size_t row) const;
-  [[nodiscard]] std::size_t column_count(std::size_t row) const;
-  [[nodiscard]] bool has_column(std::size_t row, std::size_t column) const;
+  [[nodiscard]] std::size_t RowCount() const noexcept;
+  [[nodiscard]] bool Found(std::size_t row) const;
+  [[nodiscard]] std::size_t ColumnCount(std::size_t row) const;
+  [[nodiscard]] bool HasColumn(std::size_t row, std::size_t column) const;
   // The view remains valid while this result is alive and is not moved.
-  [[nodiscard]] BytesView column(std::size_t row, std::size_t column) const;
+  [[nodiscard]] BytesView Column(std::size_t row, std::size_t column) const;
 
  private:
   struct Impl;

@@ -59,8 +59,8 @@ void ExpectInputError(const auto& action) {
   try {
     action();
   } catch (const cobble::Error& error) {
-    rejected = error.code() == cobble::ErrorCode::kInput ||
-               error.code() == cobble::ErrorCode::kConfiguration;
+    rejected = error.Code() == cobble::ErrorCode::kInput ||
+               error.Code() == cobble::ErrorCode::kConfiguration;
   }
   COBBLE_CHECK(rejected);
 }
@@ -91,15 +91,15 @@ void VerifyCrudAndSchema(cobble::Db& db) {
   const auto evolved = builder.Commit();
   COBBLE_CHECK(evolved.column_families[0].column_count == 2);
   const auto old = db.Get(0, Bytes("old-row"));
-  COBBLE_CHECK(String(old.column(0)) == "old-value");
-  COBBLE_CHECK(String(old.column(1)) == "default-column");
+  COBBLE_CHECK(String(old.Column(0)) == "old-value");
+  COBBLE_CHECK(String(old.Column(1)) == "default-column");
 
   db.Put(0, Bytes("merge"), 0, Bytes("base"));
   db.Merge(0, Bytes("merge"), 0, Bytes("-merged"));
-  COBBLE_CHECK(String(db.Get(0, Bytes("merge")).column(0)) == "base-merged");
+  COBBLE_CHECK(String(db.Get(0, Bytes("merge")).Column(0)) == "base-merged");
   db.Put(1, Bytes("delete"), 0, Bytes("value"));
   db.Delete(1, Bytes("delete"), 0);
-  COBBLE_CHECK(!db.Get(1, Bytes("delete")).found());
+  COBBLE_CHECK(!db.Get(1, Bytes("delete")).Found());
 
   cobble::WriteBatch batch;
   batch.Put(2, Bytes("batch-two"), 0, Bytes("two"));
@@ -114,12 +114,12 @@ void VerifyCrudAndSchema(cobble::Db& db) {
       cobble::MultiGetKey{5, Bytes("missing")},
   };
   const auto rows = db.MultiGet(keys);
-  COBBLE_CHECK(rows.row_count() == keys.size());
-  COBBLE_CHECK(String(rows.column(0, 0)) == "old-value");
-  COBBLE_CHECK(String(rows.column(1, 0)) == "two");
-  COBBLE_CHECK(String(rows.column(2, 0)) == "four");
-  COBBLE_CHECK(String(rows.column(3, 0)) == "two");
-  COBBLE_CHECK(!rows.found(4));
+  COBBLE_CHECK(rows.RowCount() == keys.size());
+  COBBLE_CHECK(String(rows.Column(0, 0)) == "old-value");
+  COBBLE_CHECK(String(rows.Column(1, 0)) == "two");
+  COBBLE_CHECK(String(rows.Column(2, 0)) == "four");
+  COBBLE_CHECK(String(rows.Column(3, 0)) == "two");
+  COBBLE_CHECK(!rows.Found(4));
 
   cobble::ReadOptions one_column;
   one_column.columns = {0};
@@ -138,9 +138,9 @@ void VerifyCrudAndSchema(cobble::Db& db) {
   }
   auto scan = db.Scan(3, Bytes("scan-"), Bytes("scan."));
   const auto batch_rows = scan.Next(10);
-  COBBLE_CHECK(batch_rows.row_count() == 3);
-  COBBLE_CHECK(String(batch_rows.key(0)) == "scan-a");
-  COBBLE_CHECK(String(batch_rows.key(2)) == "scan-c");
+  COBBLE_CHECK(batch_rows.RowCount() == 3);
+  COBBLE_CHECK(String(batch_rows.Key(0)) == "scan-a");
+  COBBLE_CHECK(String(batch_rows.Key(2)) == "scan-c");
 
   auto encoded_scan = db.Scan(3, Bytes("scan-"), Bytes("scan."));
   std::array<std::uint8_t, 1> tiny{};
@@ -190,7 +190,7 @@ MainSnapshotState VerifySnapshotsAndRecovery(
 
     db.Put(5, Bytes("cancel"), 0, Bytes("candidate"));
     auto pending = db.StartSnapshot();
-    const auto pending_id = pending.id();
+    const auto pending_id = pending.Id();
     const bool cancelled = db.CancelSnapshot(pending_id);
     bool wait_cancelled = false;
     try {
@@ -198,7 +198,7 @@ MainSnapshotState VerifySnapshotsAndRecovery(
       COBBLE_CHECK(!cancelled);
       COBBLE_CHECK(completed.snapshot_id == pending_id);
     } catch (const cobble::Error& error) {
-      wait_cancelled = error.code() == cobble::ErrorCode::kCancelled;
+      wait_cancelled = error.Code() == cobble::ErrorCode::kCancelled;
     }
     COBBLE_CHECK(wait_cancelled == cancelled);
 
@@ -215,14 +215,14 @@ MainSnapshotState VerifySnapshotsAndRecovery(
 
   {
     auto latest = cobble::Db::Resume(config, db_id);
-    COBBLE_CHECK(latest.Get(5, Bytes("wal-tail")).found());
+    COBBLE_CHECK(latest.Get(5, Bytes("wal-tail")).Found());
     latest.Close();
   }
 
   {
     auto exact =
         cobble::Db::ResumeFromSnapshot(config, recovery.snapshot_id, db_id);
-    COBBLE_CHECK(!exact.Get(5, Bytes("wal-tail")).found());
+    COBBLE_CHECK(!exact.Get(5, Bytes("wal-tail")).Found());
 
     {
       auto cursor = exact.Scan(0, std::nullopt, std::nullopt);
@@ -230,7 +230,7 @@ MainSnapshotState VerifySnapshotsAndRecovery(
       try {
         exact.SwitchToSnapshot(recovery.snapshot_id);
       } catch (const cobble::Error& error) {
-        rejected = error.code() == cobble::ErrorCode::kInvalidState;
+        rejected = error.Code() == cobble::ErrorCode::kInvalidState;
       }
       COBBLE_CHECK(rejected);
       (void)cursor;
@@ -241,7 +241,7 @@ MainSnapshotState VerifySnapshotsAndRecovery(
       try {
         exact.SwitchToSnapshot(recovery.snapshot_id);
       } catch (const cobble::Error& error) {
-        rejected = error.code() == cobble::ErrorCode::kInvalidState;
+        rejected = error.Code() == cobble::ErrorCode::kInvalidState;
       }
       COBBLE_CHECK(rejected);
       (void)builder;
@@ -251,14 +251,14 @@ MainSnapshotState VerifySnapshotsAndRecovery(
     const auto newer = exact.TakeSnapshot();
     COBBLE_CHECK(newer.snapshot_id > recovery.snapshot_id);
     exact.SwitchToSnapshot(recovery.snapshot_id);
-    COBBLE_CHECK(!exact.Get(5, Bytes("newer")).found());
+    COBBLE_CHECK(!exact.Get(5, Bytes("newer")).Found());
     exact.Close();
   }
 
   {
     auto exact = cobble::Db::ResumeFromSnapshotFile(
         config_path.string(), recovery.snapshot_id, db_id);
-    COBBLE_CHECK(!exact.Get(5, Bytes("wal-tail")).found());
+    COBBLE_CHECK(!exact.Get(5, Bytes("wal-tail")).Found());
     exact.Close();
   }
 
@@ -266,7 +266,7 @@ MainSnapshotState VerifySnapshotsAndRecovery(
     auto opened =
         cobble::Db::OpenFromSnapshot(config, recovery.snapshot_id, db_id,
                                      cobble::RecoveryMode::kSnapshotOnly);
-    COBBLE_CHECK(!opened.Get(5, Bytes("wal-tail")).found());
+    COBBLE_CHECK(!opened.Get(5, Bytes("wal-tail")).Found());
     opened.Close();
   }
 
@@ -279,14 +279,14 @@ void VerifyRestoreNew(std::string_view config,
     auto restored = cobble::Db::RestoreNew(config, source.recovery.snapshot_id,
                                            source.db_id);
     COBBLE_CHECK(restored.Id() != source.db_id);
-    COBBLE_CHECK(restored.Get(4, Bytes("batch-four")).found());
+    COBBLE_CHECK(restored.Get(4, Bytes("batch-four")).Found());
     restored.Close();
   }
   {
     auto restored = cobble::Db::RestoreNewFromManifest(
         config, source.recovery.manifest_path);
     COBBLE_CHECK(restored.Id() != source.db_id);
-    COBBLE_CHECK(restored.Get(2, Bytes("batch-two")).found());
+    COBBLE_CHECK(restored.Get(2, Bytes("batch-two")).Found());
     restored.Close();
   }
 }
@@ -310,7 +310,7 @@ void VerifyRescale(const std::filesystem::path& directory) {
   (void)target.ExpandBucket(source.Id(), source_snapshot.snapshot_id,
                             persistent_ranges,
                             cobble::ExpandStorageMode::kReferencePersistent);
-  COBBLE_CHECK(String(target.Get(2, Bytes("source-two")).column(0)) == "two");
+  COBBLE_CHECK(String(target.Get(2, Bytes("source-two")).Column(0)) == "two");
   target.WaitForExpandAdoption(std::chrono::seconds(1));
 
   const std::array adopted_ranges = {cobble::BucketRange{4, 5}};
@@ -319,13 +319,13 @@ void VerifyRescale(const std::filesystem::path& directory) {
                             cobble::ExpandStorageMode::kAdoptAsync);
   target.WaitForExpandAdoption(std::chrono::seconds(10));
   source.Close();
-  COBBLE_CHECK(String(target.Get(4, Bytes("source-four")).column(0)) == "four");
+  COBBLE_CHECK(String(target.Get(4, Bytes("source-four")).Column(0)) == "four");
 
   const std::array shrink_ranges = {cobble::BucketRange{2, 5}};
   (void)target.ShrinkBucket(shrink_ranges);
   bool removed = false;
   try {
-    removed = !target.Get(2, Bytes("source-two")).found();
+    removed = !target.Get(2, Bytes("source-two")).Found();
   } catch (const cobble::Error&) {
     removed = true;
   }
@@ -338,7 +338,7 @@ void VerifyRescale(const std::filesystem::path& directory) {
 
   auto resumed = cobble::Db::ResumeFromSnapshot(config, post_shrink.snapshot_id,
                                                 target_id);
-  COBBLE_CHECK(resumed.Get(0, Bytes("post-shrink")).found());
+  COBBLE_CHECK(resumed.Get(0, Bytes("post-shrink")).Found());
   resumed.Close();
 }
 

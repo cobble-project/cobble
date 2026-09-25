@@ -29,11 +29,11 @@ class COBBLE_CPP_API OwnedRow final {
   OwnedRow(const OwnedRow&) = delete;
   OwnedRow& operator=(const OwnedRow&) = delete;
 
-  [[nodiscard]] bool found() const noexcept;
-  [[nodiscard]] std::size_t column_count() const noexcept;
-  [[nodiscard]] bool has_column(std::size_t column) const;
+  [[nodiscard]] bool Found() const noexcept;
+  [[nodiscard]] std::size_t ColumnCount() const noexcept;
+  [[nodiscard]] bool HasColumn(std::size_t column) const;
   // The view remains valid while this OwnedRow is alive and is not moved.
-  [[nodiscard]] BytesView column(std::size_t column) const;
+  [[nodiscard]] BytesView Column(std::size_t column) const;
 
  private:
   struct Impl;

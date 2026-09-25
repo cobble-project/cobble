@@ -169,9 +169,9 @@ void VerifyRawS3(std::string_view endpoint, std::string_view bucket,
   for (std::size_t row = 0; row < kRowCount; row += 31) {
     const auto key = Key(row);
     const auto result = resumed.Get(0, Bytes(key));
-    COBBLE_CHECK(result.found());
-    COBBLE_CHECK(result.column_count() == 1);
-    COBBLE_CHECK(String(result.column(0)) == Value(row));
+    COBBLE_CHECK(result.Found());
+    COBBLE_CHECK(result.ColumnCount() == 1);
+    COBBLE_CHECK(String(result.Column(0)) == Value(row));
   }
 
   {
@@ -179,12 +179,12 @@ void VerifyRawS3(std::string_view endpoint, std::string_view bucket,
     std::size_t expected = 0;
     while (true) {
       const auto rows = scan.Next(73);
-      for (std::size_t index = 0; index < rows.row_count(); ++index) {
-        COBBLE_CHECK(String(rows.key(index)) == Key(expected));
-        COBBLE_CHECK(String(rows.column(index, 0)) == Value(expected));
+      for (std::size_t index = 0; index < rows.RowCount(); ++index) {
+        COBBLE_CHECK(String(rows.Key(index)) == Key(expected));
+        COBBLE_CHECK(String(rows.Column(index, 0)) == Value(expected));
         ++expected;
       }
-      if (rows.end()) {
+      if (rows.End()) {
         break;
       }
     }
