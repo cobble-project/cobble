@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1100" role="img" aria-labelledby="table-title table-desc">
+<title id="table-title">Distributed tables: typed writes and reads</title>
+<desc id="table-desc">An optional catalog manages table definitions and storage locations. Each writer process has typed write support; each scan worker has typed read support using the selected snapshot's schema. Workers are on the left and coordinators on the right. Writers persist shard snapshots and report them for a global commit. The scan coordinator selects a global snapshot and distributes work to readers of the shared shard data.</desc>
+<defs>
+<marker id="arrow" markerWidth="7" markerHeight="6" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 Z" fill="#655f55"/></marker>
+<marker id="blue" markerWidth="7" markerHeight="6" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 Z" fill="#3f6579"/></marker>
+<marker id="brown" markerWidth="7" markerHeight="6" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 Z" fill="#89643b"/></marker>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#302d28}.label{font-size:16px;fill:#655f55}.body{font-size:20px}.name{font-size:22px;font-weight:600}.heading{font-family:Georgia,serif;font-size:36px}</style>
+</defs>
+<rect width="1280" height="1100" fill="#faf8f3"/>
+<text x="48" y="44" class="label">COBBLE / 06</text>
+<text x="48" y="92" class="heading">Distributed tables: typed writes and reads</text>
+<text x="48" y="128" class="body">Write named, typed fields across shards; scan a consistent snapshot in parallel.</text>
+<rect x="48" y="164" width="1184" height="80" rx="8" fill="#eaf0f2" stroke="#b5c7cf" stroke-width="1.4"/>
+<text x="72" y="198" class="name">Catalog · optional</text>
+<text x="360" y="198" class="body">Table definitions · field names and types · storage locations</text>
+<text x="360" y="227" class="label">Writers use the table definition; readers use the schema saved with their snapshot.</text>
+<g transform="translate(0,-120)">
+<path d="M224 450 V404 H1056 V450" fill="none" stroke="#655f55" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M584 450 V404" fill="none" stroke="#655f55" stroke-width="2" stroke-linejoin="round"/>
+<text x="680" y="393" class="label">Report shard snapshots</text>
+<rect x="72" y="450" width="304" height="130" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="92" y="483" class="body">Writer 01 · process</text>
+<rect x="92" y="499" width="264" height="38" rx="6" fill="#eaf0f2" stroke="#b5c7cf"/>
+<text x="108" y="525" class="name">Typed write</text>
+<text x="92" y="558" class="label">Write rows and take shard snapshots</text>
+<rect x="432" y="450" width="304" height="130" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="452" y="483" class="body">Writer 02 · process</text>
+<rect x="452" y="499" width="264" height="38" rx="6" fill="#eaf0f2" stroke="#b5c7cf"/>
+<text x="468" y="525" class="name">Typed write</text>
+<text x="452" y="558" class="label">Write rows and take shard snapshots</text>
+<rect x="896" y="450" width="312" height="130" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="916" y="483" class="body">Commit coordinator · process</text>
+<text x="916" y="525" class="name">Commit global snapshot</text>
+<text x="916" y="558" class="label">Check schemas and collect shards</text>
+<rect x="64" y="668" width="1152" height="132" rx="8" fill="#f0e9dd" stroke="#c8c0b3" stroke-width="1.4"/>
+<rect x="88" y="692" width="272" height="84" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4"/>
+<text x="108" y="725" class="name">Shard 01 snapshot</text>
+<text x="108" y="755" class="label">Immutable data + stored schema</text>
+<rect x="448" y="692" width="272" height="84" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4"/>
+<text x="468" y="725" class="name">Shard 02 snapshot</text>
+<text x="468" y="755" class="label">Immutable data + stored schema</text>
+<rect x="912" y="692" width="288" height="84" rx="8" fill="#f7f4ed" stroke="#89643b" stroke-width="1.4"/>
+<text x="932" y="725" class="name">Global snapshot</text>
+<text x="932" y="755" class="label">One consistent view of all shards</text>
+<path d="M224 580 V692" fill="none" stroke="#89643b" stroke-width="2" stroke-linejoin="round" marker-end="url(#brown)"/>
+<path d="M584 580 V692" fill="none" stroke="#89643b" stroke-width="2" stroke-linejoin="round" marker-end="url(#brown)"/>
+<path d="M1056 580 V692" fill="none" stroke="#3f6579" stroke-width="2" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="240" y="620" class="label">Persist files</text>
+<text x="600" y="620" class="label">Persist files</text>
+<text x="1072" y="620" class="label">Publish</text>
+<text x="756" y="720" class="body">Shared</text>
+<text x="756" y="748" class="body">storage</text>
+<rect x="72" y="910" width="304" height="130" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="92" y="943" class="body">Scan worker 01 · process</text>
+<rect x="92" y="959" width="264" height="38" rx="6" fill="#eaf0f2" stroke="#b5c7cf"/>
+<text x="108" y="985" class="name">Typed read</text>
+<text x="92" y="1018" class="label">Read rows using snapshot schema</text>
+<rect x="432" y="910" width="304" height="130" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="452" y="943" class="body">Scan worker 02 · process</text>
+<rect x="452" y="959" width="264" height="38" rx="6" fill="#eaf0f2" stroke="#b5c7cf"/>
+<text x="468" y="985" class="name">Typed read</text>
+<text x="452" y="1018" class="label">Read rows using snapshot schema</text>
+<rect x="896" y="910" width="312" height="130" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="916" y="943" class="body">Scan coordinator · process</text>
+<text x="916" y="985" class="name">Plan parallel reads</text>
+<text x="916" y="1018" class="label">Select fields and divide the work</text>
+<path d="M224 776 V910" fill="none" stroke="#3f6579" stroke-width="2" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M584 776 V910" fill="none" stroke="#3f6579" stroke-width="2" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M1056 776 V910" fill="none" stroke="#3f6579" stroke-width="2" stroke-linejoin="round" marker-end="url(#blue)"/>
+<text x="240" y="848" class="label">Read data</text>
+<text x="600" y="848" class="label">Read data</text>
+<text x="1072" y="833" class="label">Open / pin</text>
+<text x="1072" y="857" class="label">snapshot</text>
+<path d="M1056 1040 V1090 H224 V1040" fill="none" stroke="#655f55" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M584 1090 V1040" fill="none" stroke="#655f55" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="664" y="1120" class="label">Assign scan tasks</text>
+<text x="48" y="1184" class="label">Blue panels: typed access · Dashed boxes: independent processes · Shared storage connects writers and readers</text>
+</g>
+</svg>
