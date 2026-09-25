@@ -12,3 +12,4 @@ Cobble's core engine is written in Rust, but its functionality is accessible fro
 |---------|----------|-------|
 | [Java](java) | JVM (Java, Kotlin, Scala, …) | `cobble-java` |
 | [C++](cpp) | C++20 | `cobble-cpp` |
+| [Python](python) | Python 3.11+ | `cobble-python` (PyPI: `pycobble`) |
