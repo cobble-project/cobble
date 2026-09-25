@@ -34,7 +34,7 @@ def config(root: Path) -> str:
 def collect(cursor: pycobble.ScanCursor) -> list[tuple[int, bytes, bytes]]:
     rows: list[tuple[int, bytes, bytes]] = []
     while True:
-        batch = cursor.next(2)
+        batch = cursor.next_batch(2)
         for index in range(len(batch)):
             row = batch.row(index)
             rows.append((row.bucket, bytes(row.key), bytes(row.column(0))))
@@ -128,7 +128,7 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
         pinned_from_file = pycobble.Reader.open_from_global_snapshot_file(
             config_path, snapshot=loaded_global_file
         )
-        assert pinned_from_metadata.mode == pycobble.ReaderMode.Snapshot
+        assert pinned_from_metadata.mode == pycobble.ReaderMode.SNAPSHOT
         assert pinned_from_metadata.configured_snapshot_id == first.id
         assert bytes(pinned_from_metadata.get(2, b"alpha").column(0)) == b"old-2-a"
         assert bytes(pinned_from_file.get(0, b"alpha").column(0)) == b"old-0-a"
@@ -153,9 +153,9 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
 
     pinned = pycobble.Reader.open(cfg, first.id)
     current = pycobble.Reader.open_current(cfg)
-    assert pinned.mode == pycobble.ReaderMode.Snapshot
+    assert pinned.mode == pycobble.ReaderMode.SNAPSHOT
     assert pinned.configured_snapshot_id == first.id
-    assert current.mode == pycobble.ReaderMode.Current
+    assert current.mode == pycobble.ReaderMode.CURRENT
     assert current.configured_snapshot_id is None
     assert bytes(pinned.get(2, b"alpha").column(0)) == b"old-2-a"
     routed = pinned.multi_get([(0, b"alpha"), (3, b"beta"), (1, b"missing")])
@@ -166,8 +166,14 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
         pinned.refresh()
 
     plan = pycobble.ScanPlan.from_global_snapshot(first)
-    plan.with_start(b"alpha")
-    plan.with_end(b"z")
+    assert plan.with_start(b"beta").with_end(b"z") is plan
+    assert all(split.start_inclusive == b"beta" for split in plan.splits())
+    assert plan.without_start().without_end() is plan
+    assert all(
+        split.start_inclusive is None and split.end_exclusive is None
+        for split in plan.splits()
+    )
+    assert plan.with_start(b"alpha").with_end(b"z") is plan
     splits = plan.splits()
     assert len(splits) == 2
     assert pycobble.ScanSplit.from_json(splits[0].to_json()).shard.db_id == splits[0].shard.db_id

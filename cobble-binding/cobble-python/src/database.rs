@@ -297,7 +297,7 @@ impl PySingleDb {
         })
     }
 
-    fn list_global_snapshots(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalSnapshot>> {
+    fn list_snapshots(&self, py: Python<'_>) -> PyResult<Vec<PyGlobalSnapshot>> {
         self.ensure_open()?;
         let db = Arc::clone(&self.db);
         py.detach(move || {
@@ -319,7 +319,7 @@ impl PySingleDb {
         py.detach(move || db.expire_snapshot(snapshot_id).map_err(map_error))
     }
 
-    fn list_snapshots(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
+    fn list_snapshot_ids(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
         self.ensure_open()?;
         let db = Arc::clone(&self.db);
         py.detach(move || {

@@ -72,7 +72,7 @@ def test_scan_cursor_owns_database_access_and_preserves_order(tmp_path: Path) ->
     with pytest.raises(pycobble.InternalStateError):
         db.close()
 
-    first_batch = cursor.next(1)
+    first_batch = cursor.next_batch(1)
     retained_row = first_batch.row(0)
     del first_batch
     gc.collect()
@@ -80,7 +80,7 @@ def test_scan_cursor_owns_database_access_and_preserves_order(tmp_path: Path) ->
 
     keys: list[bytes] = [bytes(retained_row.key)]
     while True:
-        batch = cursor.next(4)
+        batch = cursor.next_batch(4)
         keys.extend(bytes(batch.row(index).key) for index in range(len(batch)))
         if batch.end:
             break
@@ -133,22 +133,22 @@ def test_caller_buffers_retry_without_mutation_or_advancement(tmp_path: Path) ->
         options = pycobble.ReadOptions(columns=[0])
         too_small = bytearray(b"unchanged")
         result = db.get_column_into(0, b"key", too_small, options)
-        assert result.status == pycobble.BufferStatus.BufferTooSmall
+        assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
         assert result.bytes_required == len(b"caller-owned")
         assert too_small == b"unchanged"
         output = bytearray(result.bytes_required)
         result = db.get_column_into(0, b"key", output, options)
-        assert result.status == pycobble.BufferStatus.Ok
+        assert result.status == pycobble.BufferStatus.OK
         assert output == b"caller-owned"
 
         cursor = db.scan(0)
         tiny = bytearray(b"sentinel")
         result = cursor.next_batch_into(8, tiny)
-        assert result.status == pycobble.BufferStatus.BufferTooSmall
+        assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
         assert tiny == b"sentinel"
         encoded = bytearray(result.bytes_required)
         result = cursor.next_batch_into(8, encoded)
-        assert result.status == pycobble.BufferStatus.Ok
+        assert result.status == pycobble.BufferStatus.OK
         assert result.row_count == 1
         assert encoded[:4] == b"CBRB"
         cursor.close()

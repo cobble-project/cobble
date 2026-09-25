@@ -202,22 +202,30 @@ impl PyStructuredScanPlan {
         })
     }
 
-    fn with_start(&mut self, start_inclusive: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.start = Some(InputBytes::extract(start_inclusive)?.as_ref().to_vec());
-        Ok(())
+    fn with_start<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        start_inclusive: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.start = Some(InputBytes::extract(start_inclusive)?.as_ref().to_vec());
+        Ok(slf)
     }
 
-    fn with_end(&mut self, end_exclusive: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.end = Some(InputBytes::extract(end_exclusive)?.as_ref().to_vec());
-        Ok(())
+    fn with_end<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        end_exclusive: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.end = Some(InputBytes::extract(end_exclusive)?.as_ref().to_vec());
+        Ok(slf)
     }
 
-    fn without_start(&mut self) {
-        self.start = None;
+    fn without_start(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.start = None;
+        slf
     }
 
-    fn without_end(&mut self) {
-        self.end = None;
+    fn without_end(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.end = None;
+        slf
     }
 
     fn splits(&self) -> Vec<PyStructuredScanSplit> {

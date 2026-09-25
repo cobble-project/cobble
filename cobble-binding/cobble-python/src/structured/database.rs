@@ -323,14 +323,14 @@ impl PyStructuredScanCursor {
 
 #[pymethods]
 impl PyStructuredScanCursor {
-    fn next(&mut self, max_rows: usize) -> PyResult<PyStructuredBatch> {
+    fn next_batch(&mut self, max_rows: usize) -> PyResult<PyStructuredBatch> {
         if let Some(batch) = self.pending_batch.take() {
             return Ok(batch);
         }
         self.read_batch(max_rows)
     }
 
-    fn next_into(
+    fn next_batch_into(
         &mut self,
         max_rows: usize,
         output: &Bound<'_, PyAny>,
@@ -693,7 +693,7 @@ impl PyStructuredSingleDb {
         let count = Arc::clone(&slf.active_builders);
         PyStructuredSchemaBuilder::new(StructuredOwner::Single(slf.into()), count)
     }
-    fn new_priority_queue(
+    fn create_priority_queue(
         &mut self,
         name: String,
     ) -> PyResult<super::priority_queue::PyPriorityQueue> {
@@ -702,7 +702,7 @@ impl PyStructuredSingleDb {
     fn get_priority_queue(&self, name: String) -> PyResult<super::priority_queue::PyPriorityQueue> {
         super::priority_queue::get_single(self, name)
     }
-    fn get_or_new_priority_queue(
+    fn get_or_create_priority_queue(
         &mut self,
         name: String,
     ) -> PyResult<super::priority_queue::PyPriorityQueue> {
@@ -732,6 +732,14 @@ impl PyStructuredSingleDb {
         py.detach(move || {
             db.list_snapshots()
                 .map(|values| values.into_iter().map(snapshot).collect())
+                .map_err(map_error)
+        })
+    }
+    fn list_snapshot_ids(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.list_snapshots()
+                .map(|values| values.into_iter().map(|value| value.id).collect())
                 .map_err(map_error)
         })
     }
@@ -1335,7 +1343,7 @@ impl PyStructuredDb {
         let count = Arc::clone(&slf.active_builders);
         PyStructuredSchemaBuilder::new(StructuredOwner::Db(slf.into()), count)
     }
-    fn new_priority_queue(
+    fn create_priority_queue(
         &mut self,
         name: String,
     ) -> PyResult<super::priority_queue::PyPriorityQueue> {
@@ -1344,7 +1352,7 @@ impl PyStructuredDb {
     fn get_priority_queue(&self, name: String) -> PyResult<super::priority_queue::PyPriorityQueue> {
         super::priority_queue::get_db(self, name)
     }
-    fn get_or_new_priority_queue(
+    fn get_or_create_priority_queue(
         &mut self,
         name: String,
     ) -> PyResult<super::priority_queue::PyPriorityQueue> {

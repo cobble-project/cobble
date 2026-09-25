@@ -43,8 +43,8 @@ assert view.readonly
 ```
 
 For reusable caller-owned memory, `get_column_into`, `next_batch_into`, and the
-structured `get_into`, `multi_get_into`, `next_into`, and priority-queue `*into`
-methods return a `BufferResult`. A `BufferTooSmall` result reports the required
+structured `get_into`, `multi_get_into`, `next_batch_into`, and priority-queue `*into`
+methods return a `BufferResult`. `BufferStatus.BUFFER_TOO_SMALL` reports the required
 size and leaves the output unchanged, so the same operation can be retried.
 
 ## Structured API
@@ -79,6 +79,8 @@ metadata files. Each has a `_file` variant for a configuration path. A loaded
 `GlobalSnapshot` can be passed to `Reader.open_from_global_snapshot` or
 `StructuredReader.open_from_global_snapshot` to open a fixed view without
 reloading its global manifest.
+`SingleDb` and `StructuredSingleDb` return snapshot objects from
+`list_snapshots()` and IDs from `list_snapshot_ids()`.
 
 ## API surface
 

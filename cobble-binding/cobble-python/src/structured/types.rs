@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyStructuredColumnKind {
+    #[pyo3(name = "BYTES")]
     Bytes = 0,
+    #[pyo3(name = "LIST")]
     List = 1,
 }
 
@@ -32,7 +34,9 @@ pub(crate) enum PyStructuredColumnKind {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyListRetainMode {
+    #[pyo3(name = "FIRST")]
     First = 0,
+    #[pyo3(name = "LAST")]
     Last = 1,
 }
 

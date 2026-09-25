@@ -58,7 +58,7 @@ def test_sharded_ranges_crud_batch_multi_scan_and_owner(tmp_path: Path) -> None:
         db.close()
     keys: list[bytes] = []
     while True:
-        result = cursor.next(2)
+        result = cursor.next_batch(2)
         keys.extend(bytes(result.row(index).key) for index in range(len(result)))
         if result.end:
             break
@@ -121,7 +121,7 @@ def test_sharded_reference_expand_and_shrink(tmp_path: Path) -> None:
         source.id,
         source_snapshot=source_snapshot.snapshot_id,
         ranges=[pycobble.BucketRange(2, 3)],
-        storage_mode=pycobble.ExpandStorageMode.ReferencePersistent,
+        storage_mode=pycobble.ExpandStorageMode.REFERENCE_PERSISTENT,
     )
     target.wait_for_expand_adoption(1.0)
     assert bytes(target.get(2, b"moved").column(0)) == b"value"

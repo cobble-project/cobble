@@ -77,14 +77,14 @@ def test_s3_raw_and_structured_exact_snapshot_resume() -> None:
     raw.close()
 
     raw = pycobble.SingleDb.resume(
-        raw_config, raw_snapshot.id, pycobble.RecoveryMode.SnapshotOnly
+        raw_config, raw_snapshot.id, pycobble.RecoveryMode.SNAPSHOT_ONLY
     )
     for key in list(expected_raw)[::29]:
         assert bytes(raw.get(0, key).column(0)) == expected_raw[key]
     raw_keys: list[bytes] = []
     cursor = raw.scan(0)
     while True:
-        rows = cursor.next(47)
+        rows = cursor.next_batch(47)
         raw_keys.extend(bytes(rows.row(index).key) for index in range(len(rows)))
         if rows.end:
             break
@@ -123,7 +123,7 @@ def test_s3_raw_and_structured_exact_snapshot_resume() -> None:
         structured_config,
         structured_snapshot.snapshot_id,
         db_id,
-        pycobble.RecoveryMode.SnapshotOnly,
+        pycobble.RecoveryMode.SNAPSHOT_ONLY,
     )
     for key in list(expected_structured)[::23]:
         row = structured.get(0, key)
@@ -133,7 +133,7 @@ def test_s3_raw_and_structured_exact_snapshot_resume() -> None:
     structured_keys: list[bytes] = []
     cursor = structured.scan(0)
     while True:
-        rows = cursor.next(41)
+        rows = cursor.next_batch(41)
         structured_keys.extend(bytes(rows.row(index).key) for index in range(len(rows)))
         if rows.end:
             break

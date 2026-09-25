@@ -62,7 +62,7 @@ reader = pycobble.Reader.open(config, snapshot.id)
 cursor = reader.scan(0, b"user:", b"user;")
 try:
     while True:
-        batch = cursor.next(128)
+        batch = cursor.next_batch(128)
         for index in range(len(batch)):
             row = batch.row(index)
             print(bytes(row.key), bytes(row.column(0)))
@@ -77,6 +77,8 @@ finally:
 `take_snapshot()` waits for the snapshot to finish. Use
 `SingleDb.resume(config, snapshot_id)` to reopen a saved global snapshot.
 Keep snapshots retained while readers or scans need them.
+`SingleDb.list_snapshots()` returns snapshot objects; use
+`list_snapshot_ids()` for IDs. `StructuredSingleDb` follows the same convention.
 
 - `Reader.open_current(config)` follows committed global snapshots on access;
   `refresh()` explicitly checks for a newer snapshot.

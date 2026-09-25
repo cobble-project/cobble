@@ -49,10 +49,11 @@ def test_typed_sync_and_async_snapshots(tmp_path: Path) -> None:
         second = db.take_snapshot()
         assert second.id > first.id
         assert db.get_snapshot(second.id).id == second.id
-        assert [snapshot.id for snapshot in db.list_global_snapshots()] == [
+        assert [snapshot.id for snapshot in db.list_snapshots()] == [
             first.id,
             second.id,
         ]
+        assert db.list_snapshot_ids() == [first.id, second.id]
         assert db.retain_snapshot(second.id)
         assert db.expire_snapshot(first.id)
 
@@ -91,8 +92,8 @@ def test_lifecycle_memtable_and_typed_metrics(tmp_path: Path) -> None:
         db.set_time(2_000)
         assert db.now_seconds() == 2_000
         db.put(0, b"metric", 0, b"value")
-        db.switch_memtable_type(pycobble.MemtableType.Skiplist, flush_current=True)
-        db.switch_memtable_type(pycobble.MemtableType.Adaptive)
+        db.switch_memtable_type(pycobble.MemtableType.SKIPLIST, flush_current=True)
+        db.switch_memtable_type(pycobble.MemtableType.ADAPTIVE)
         assert db.load_readonly_files_to_primary() == 0
 
         samples = db.metrics()

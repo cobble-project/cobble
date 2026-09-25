@@ -10,7 +10,9 @@ use pyo3::prelude::*;
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyRecoveryMode {
+    #[pyo3(name = "SNAPSHOT_ONLY")]
     SnapshotOnly = 0,
+    #[pyo3(name = "LATEST_WITH_WAL")]
     LatestWithWal = 1,
 }
 
@@ -23,9 +25,13 @@ pub(crate) enum PyRecoveryMode {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyMemtableType {
+    #[pyo3(name = "HASH")]
     Hash = 0,
+    #[pyo3(name = "SKIPLIST")]
     Skiplist = 1,
+    #[pyo3(name = "VEC")]
     Vec = 2,
+    #[pyo3(name = "ADAPTIVE")]
     Adaptive = 3,
 }
 
@@ -38,8 +44,11 @@ pub(crate) enum PyMemtableType {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyExpandStorageMode {
+    #[pyo3(name = "ADOPT_ASYNC")]
     AdoptAsync = 0,
+    #[pyo3(name = "REFERENCE_PERSISTENT")]
     ReferencePersistent = 1,
+    #[pyo3(name = "REFERENCE_PERSISTENT_WITH_CACHE")]
     ReferencePersistentWithCache = 2,
 }
 
@@ -52,7 +61,9 @@ pub(crate) enum PyExpandStorageMode {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyReaderMode {
+    #[pyo3(name = "CURRENT")]
     Current = 0,
+    #[pyo3(name = "SNAPSHOT")]
     Snapshot = 1,
 }
 
@@ -65,10 +76,15 @@ pub(crate) enum PyReaderMode {
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PyBufferStatus {
+    #[pyo3(name = "OK")]
     Ok = 0,
+    #[pyo3(name = "NOT_FOUND")]
     NotFound = 1,
+    #[pyo3(name = "END")]
     End = 2,
+    #[pyo3(name = "BUFFER_TOO_SMALL")]
     BufferTooSmall = 3,
+    #[pyo3(name = "BLOCK_BOUNDARY")]
     BlockBoundary = 4,
 }
 

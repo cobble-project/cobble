@@ -250,7 +250,7 @@ impl PyScanCursor {
 
 #[pymethods]
 impl PyScanCursor {
-    fn next(&mut self, max_rows: usize) -> PyResult<PyOwnedBatch> {
+    fn next_batch(&mut self, max_rows: usize) -> PyResult<PyOwnedBatch> {
         if max_rows == 0 {
             return Err(input_error("max_rows must be greater than zero"));
         }

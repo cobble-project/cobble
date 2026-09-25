@@ -76,6 +76,47 @@ def decode_csrb(value: bytearray, length: int) -> list[tuple[int, bytes, bool, l
     return rows
 
 
+def test_python_api_names_are_consistent() -> None:
+    names = (
+        (pycobble.RecoveryMode, "SnapshotOnly", "SNAPSHOT_ONLY"),
+        (pycobble.RecoveryMode, "LatestWithWal", "LATEST_WITH_WAL"),
+        (pycobble.MemtableType, "Hash", "HASH"),
+        (pycobble.MemtableType, "Skiplist", "SKIPLIST"),
+        (pycobble.MemtableType, "Vec", "VEC"),
+        (pycobble.MemtableType, "Adaptive", "ADAPTIVE"),
+        (pycobble.ExpandStorageMode, "AdoptAsync", "ADOPT_ASYNC"),
+        (pycobble.ExpandStorageMode, "ReferencePersistent", "REFERENCE_PERSISTENT"),
+        (pycobble.ExpandStorageMode, "ReferencePersistentWithCache", "REFERENCE_PERSISTENT_WITH_CACHE"),
+        (pycobble.ReaderMode, "Current", "CURRENT"),
+        (pycobble.ReaderMode, "Snapshot", "SNAPSHOT"),
+        (pycobble.BufferStatus, "Ok", "OK"),
+        (pycobble.BufferStatus, "NotFound", "NOT_FOUND"),
+        (pycobble.BufferStatus, "End", "END"),
+        (pycobble.BufferStatus, "BufferTooSmall", "BUFFER_TOO_SMALL"),
+        (pycobble.BufferStatus, "BlockBoundary", "BLOCK_BOUNDARY"),
+        (pycobble.StructuredColumnKind, "Bytes", "BYTES"),
+        (pycobble.StructuredColumnKind, "List", "LIST"),
+        (pycobble.ListRetainMode, "First", "FIRST"),
+        (pycobble.ListRetainMode, "Last", "LAST"),
+    )
+    for enum, old, new in names:
+        assert hasattr(enum, new)
+        assert not hasattr(enum, old)
+    assert pycobble.ListConfig().retain_mode == pycobble.ListRetainMode.LAST
+    assert not hasattr(pycobble.ScanCursor, "next")
+    assert not hasattr(pycobble.StructuredScanCursor, "next")
+    assert not hasattr(pycobble.StructuredScanCursor, "next_into")
+    assert not hasattr(pycobble.SingleDb, "list_global_snapshots")
+    assert hasattr(pycobble.SingleDb, "list_snapshots")
+    assert hasattr(pycobble.SingleDb, "list_snapshot_ids")
+    assert hasattr(pycobble.StructuredSingleDb, "list_snapshot_ids")
+    for db_type in (pycobble.StructuredSingleDb, pycobble.StructuredDb):
+        assert not hasattr(db_type, "new_priority_queue")
+        assert not hasattr(db_type, "get_or_new_priority_queue")
+        assert hasattr(db_type, "create_priority_queue")
+        assert hasattr(db_type, "get_or_create_priority_queue")
+
+
 def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -> None:
     db = pycobble.StructuredSingleDb.open(config(tmp_path / "single"))
     builder = db.update_schema()
@@ -85,13 +126,13 @@ def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -
         1,
         pycobble.ListConfig(
             max_elements=3,
-            retain_mode=pycobble.ListRetainMode.Last,
+            retain_mode=pycobble.ListRetainMode.LAST,
         ),
     )
     evolved = builder.commit()
     family = next(family for family in evolved.families if family.name == "default")
     assert family.columns[0].index == 1
-    assert family.columns[0].kind == pycobble.StructuredColumnKind.List
+    assert family.columns[0].kind == pycobble.StructuredColumnKind.LIST
     with pytest.raises(pycobble.InternalStateError):
         builder.commit()
 
@@ -99,7 +140,7 @@ def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -
     db.put_list(0, b"row", 1, [b"a", bytearray(b"b")])
     db.merge_list(0, b"row", 1, [memoryview(b"c"), b"d"])
     row = db.get(0, b"row")
-    assert row.kind(0) == pycobble.StructuredColumnKind.Bytes
+    assert row.kind(0) == pycobble.StructuredColumnKind.BYTES
     assert bytes(row.bytes(0)) == b"bytes"
     assert [bytes(row.list_element(1, index)) for index in range(row.list_size(1))] == [
         b"b",
@@ -110,7 +151,7 @@ def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -
     cursor = db.scan(0)
     with pytest.raises(pycobble.InternalStateError):
         db.close()
-    batch = cursor.next(10)
+    batch = cursor.next_batch(10)
     assert len(batch) == 1
     retained_row = batch.row(0)
     del batch
@@ -119,8 +160,9 @@ def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -
     assert bytes(retained_row.value.bytes(0)) == b"bytes"
     cursor.close()
 
-    queue = db.new_priority_queue("timers")
+    queue = db.create_priority_queue("timers")
     assert queue.column_family
+    queue_family = queue.column_family
     queue.offer(0, b"002", b"two")
     queue.offer(0, b"001", b"one")
     queue.offer(0, b"003", b"three")
@@ -137,6 +179,10 @@ def test_structured_bytes_lists_schema_scan_and_priority_queue(tmp_path: Path) -
     with pytest.raises(pycobble.InternalStateError):
         db.close()
     del queue
+    gc.collect()
+    same_queue = db.get_or_create_priority_queue("timers")
+    assert same_queue.column_family == queue_family
+    del same_queue
     gc.collect()
 
     snapshot = db.take_snapshot()
@@ -238,7 +284,7 @@ def test_structured_snapshot_recovery_and_lifecycle(tmp_path: Path) -> None:
     next_time = db.now_seconds() + 1234
     db.set_time(next_time)
     assert db.now_seconds() == next_time
-    db.switch_memtable_type(pycobble.MemtableType.Skiplist)
+    db.switch_memtable_type(pycobble.MemtableType.SKIPLIST)
     assert isinstance(db.load_readonly_files_to_primary(), int)
     assert isinstance(db.metrics(), list)
     db.close()
@@ -247,13 +293,13 @@ def test_structured_snapshot_recovery_and_lifecycle(tmp_path: Path) -> None:
         config_path,
         first_snapshot.snapshot_id,
         db_id,
-        pycobble.RecoveryMode.SnapshotOnly,
+        pycobble.RecoveryMode.SNAPSHOT_ONLY,
     )
     assert bytes(exact.get(0, b"versioned").bytes(0)) == b"v1"
     exact.close()
 
     latest = pycobble.StructuredDb.resume(
-        config_json, db_id, pycobble.RecoveryMode.SnapshotOnly
+        config_json, db_id, pycobble.RecoveryMode.SNAPSHOT_ONLY
     )
     assert bytes(latest.get(0, b"versioned").bytes(0)) == b"v2"
     cursor = latest.scan(0)
@@ -279,12 +325,13 @@ def test_structured_single_snapshot_management(tmp_path: Path) -> None:
         manifest = pending.wait()
         assert db.get_snapshot(manifest.id).id == manifest.id
         assert [item.id for item in db.list_snapshots()] == [manifest.id]
+        assert db.list_snapshot_ids() == [manifest.id]
         assert db.retain_snapshot(manifest.id)
         assert db.retain_snapshot(manifest.id)
         next_time = db.now_seconds() + 4321
         db.set_time(next_time)
         assert db.now_seconds() == next_time
-        db.switch_memtable_type(pycobble.MemtableType.Hash)
+        db.switch_memtable_type(pycobble.MemtableType.HASH)
         assert isinstance(db.load_readonly_files_to_primary(), int)
     db.close()
 
@@ -317,6 +364,16 @@ def test_structured_distributed_scan_plan(tmp_path: Path) -> None:
         4, 77, [left_snapshot, right_snapshot]
     )
     plan = pycobble.StructuredScanPlan.from_global_snapshot(global_snapshot)
+    assert plan.with_start(b"a").with_end(b"z") is plan
+    assert all(
+        split.start_inclusive == b"a" and split.end_exclusive == b"z"
+        for split in plan.splits()
+    )
+    assert plan.without_start().without_end() is plan
+    assert all(
+        split.start_inclusive is None and split.end_exclusive is None
+        for split in plan.splits()
+    )
     splits = plan.splits()
     assert len(splits) == 2
 
@@ -325,7 +382,7 @@ def test_structured_distributed_scan_plan(tmp_path: Path) -> None:
         restored = pycobble.StructuredScanSplit.from_json(split.to_json())
         scanner = restored.open_scanner_file(config_path)
         while True:
-            batch = scanner.next(2)
+            batch = scanner.next_batch(2)
             for index in range(len(batch)):
                 row = batch.row(index)
                 value = row.value
@@ -377,9 +434,9 @@ def test_structured_snapshot_readers(tmp_path: Path) -> None:
     read_only = pycobble.StructuredReadOnlyDb.open_file(
         config_path, shard.snapshot_id, shard.db_id
     )
-    assert current.mode == pycobble.ReaderMode.Current
+    assert current.mode == pycobble.ReaderMode.CURRENT
     assert current.configured_snapshot_id is None
-    assert pinned.mode == direct.mode == pycobble.ReaderMode.Snapshot
+    assert pinned.mode == direct.mode == pycobble.ReaderMode.SNAPSHOT
     assert direct.configured_snapshot_id == first.id
     assert read_only.id == shard.db_id
     assert current.current_global_snapshot.id == first.id
@@ -399,7 +456,7 @@ def test_structured_snapshot_readers(tmp_path: Path) -> None:
         assert bytes(rows.row(1).bytes(0)) == b"tail"
         probe = bytearray(b"\xa5" * 4)
         result = reader.get_into(0, b"a", probe, projection)
-        assert result.status == pycobble.BufferStatus.BufferTooSmall
+        assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
         assert probe == b"\xa5" * 4
         output = bytearray(result.bytes_required)
         result = reader.get_into(0, b"a", output, projection)
@@ -407,7 +464,7 @@ def test_structured_snapshot_readers(tmp_path: Path) -> None:
             (0, b"a", True, [b"tail", b"old", [b"x", b"y"]])
         ]
         result = reader.multi_get_into([(0, b"missing"), (0, b"a")], bytearray(), projection)
-        assert result.status == pycobble.BufferStatus.BufferTooSmall
+        assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
         output = bytearray(result.bytes_required)
         result = reader.multi_get_into([(0, b"missing"), (0, b"a")], output, projection)
         assert decode_csrb(output, result.bytes_written) == [
@@ -442,14 +499,14 @@ def test_structured_snapshot_readers(tmp_path: Path) -> None:
     del current
     gc.collect()
     probe = bytearray(b"\x5a" * 4)
-    result = old_scan.next_into(1, probe)
-    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    result = old_scan.next_batch_into(1, probe)
+    assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
     assert probe == b"\x5a" * 4
     output = bytearray(result.bytes_required)
-    result = old_scan.next_into(1, output)
+    result = old_scan.next_batch_into(1, output)
     assert decode_csrb(output, result.bytes_written)[0][3][0] == b"old"
-    assert bytes(fixed_scan.next(1).row(0).value.bytes(0)) == b"tail"
-    assert bytes(read_only_scan.next(1).row(0).value.bytes(0)) == b"old"
+    assert bytes(fixed_scan.next_batch(1).row(0).value.bytes(0)) == b"tail"
+    assert bytes(read_only_scan.next_batch(1).row(0).value.bytes(0)) == b"old"
     for cursor in (old_scan, fixed_scan, read_only_scan):
         cursor.close()
     db.close()
@@ -467,12 +524,12 @@ def test_structured_caller_owned_buffers_and_retry(tmp_path: Path) -> None:
     too_small = bytearray(b"\xa5" * 8)
     before = too_small[:]
     result = db.get_into(0, b"a", too_small)
-    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
     assert result.bytes_written == 0
     assert too_small == before
     output = bytearray(result.bytes_required)
     result = db.get_into(0, b"a", output)
-    assert result.status == pycobble.BufferStatus.Ok
+    assert result.status == pycobble.BufferStatus.OK
     assert decode_csrb(output, result.bytes_written) == [
         (0, b"a", True, [b"value-a", [b"x", b"y"]])
     ]
@@ -480,7 +537,7 @@ def test_structured_caller_owned_buffers_and_retry(tmp_path: Path) -> None:
     keys = [(0, b"a"), (0, b"missing"), (0, b"b"), (0, b"a")]
     probe = bytearray()
     result = db.multi_get_into(keys, probe)
-    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
     output = bytearray(result.bytes_required)
     result = db.multi_get_into(keys, output)
     rows = decode_csrb(output, result.bytes_written)
@@ -490,24 +547,24 @@ def test_structured_caller_owned_buffers_and_retry(tmp_path: Path) -> None:
     cursor = db.scan(0)
     probe = bytearray(b"\x5a" * 12)
     before = probe[:]
-    result = cursor.next_into(1, probe)
-    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    result = cursor.next_batch_into(1, probe)
+    assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
     assert probe == before
     output = bytearray(result.bytes_required)
-    result = cursor.next_into(1, output)
+    result = cursor.next_batch_into(1, output)
     assert decode_csrb(output, result.bytes_written)[0][1] == b"a"
     output = bytearray(256)
-    result = cursor.next_into(1, output)
+    result = cursor.next_batch_into(1, output)
     assert decode_csrb(output, result.bytes_written)[0][1] == b"b"
     cursor.close()
 
-    queue = db.new_priority_queue("caller-buffer")
+    queue = db.create_priority_queue("caller-buffer")
     queue.offer(0, b"001", b"one")
     queue.offer(0, b"002", b"two")
     probe = bytearray(b"\x33" * 4)
     before = probe[:]
     result = queue.poll_into(0, probe)
-    assert result.status == pycobble.BufferStatus.BufferTooSmall
+    assert result.status == pycobble.BufferStatus.BUFFER_TOO_SMALL
     assert probe == before
     with pytest.raises(pycobble.InternalStateError):
         queue.peek(0)
@@ -525,7 +582,7 @@ def test_structured_caller_owned_buffers_and_retry(tmp_path: Path) -> None:
         (0, b"002", True, [b"two"])
     ]
     result = queue.peek_batch_into(0, output)
-    assert result.status == pycobble.BufferStatus.End
+    assert result.status == pycobble.BufferStatus.END
     assert result.row_count == 0
     assert decode_csrb(output, result.bytes_written) == []
     del queue
