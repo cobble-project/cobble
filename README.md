@@ -88,6 +88,16 @@ Use the structured layer for `Bytes` and `List` columns or a column-family-scope
 
 [Learn about structured data](https://cobble-project.github.io/cobble/latest/getting-started/structured-db.html).
 
+### Typed tables across shards
+
+Build applications with named fields, logical types, and schema evolution. Use the optional Catalog to manage table definitions and storage paths, coordinate shard snapshots into a consistent global view, and read or scan typed rows across shards.
+
+<p align="center">
+  <img src="docs/static/use-cases/table.svg" width="100%" alt="Catalog supplies table definitions to distributed typed writers. Writers persist shard data and report snapshots for global commit. A scan coordinator pins the global snapshot and dispatches splits to independent workers, which read shared shard data and decode typed rows using the snapshot schema." />
+</p>
+
+[Learn about tables](https://cobble-project.github.io/cobble/latest/getting-started/table.html).
+
 ## Getting Started
 
 Follow the [Quick Start](https://cobble-project.github.io/cobble/latest/getting-started/quick-start.html) for runnable examples covering the main usage patterns, or browse the [complete documentation](https://cobble-project.github.io/cobble/latest/).
