@@ -66,7 +66,7 @@ impl PyDb {
         }
         let end = u16::try_from(config.total_buckets - 1)
             .map_err(|_| input_error("total_buckets does not fit the bucket id range"))?;
-        Ok(vec![0..=end])
+        Ok(std::iter::once(0..=end).collect())
     }
 
     fn ranges(
