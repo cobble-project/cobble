@@ -73,6 +73,13 @@ global snapshot on access and also supports explicit `refresh()`, while
 reads one shard snapshot. Both return the same typed rows and scans as the
 writable structured databases, including caller-owned CSRB buffer methods.
 
+`load_shard_snapshot_metadata(config, db_id, manifest_path)` and
+`load_global_snapshot_metadata(config, manifest_path)` read only the snapshot
+metadata files. Each has a `_file` variant for a configuration path. A loaded
+`GlobalSnapshot` can be passed to `Reader.open_from_global_snapshot` or
+`StructuredReader.open_from_global_snapshot` to open a fixed view without
+reloading its global manifest.
+
 ## API surface
 
 The binding includes:

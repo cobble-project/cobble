@@ -4,9 +4,9 @@ use crate::multi_get::{PyMultiGetResult, extract_keys};
 use crate::options::{PyReadOptions, PyScanOptions};
 use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
-use crate::snapshot::{PyGlobalSnapshot, snapshot};
+use crate::snapshot::{PyGlobalSnapshot, global_snapshot, snapshot};
 use crate::types::{PyBufferResult, PyReaderMode};
-use cobble_binding::{Config, ReadOptions, Reader, ReaderConfig};
+use cobble_binding::{Config, ReadOptions, Reader, ReaderBuilder, ReaderConfig};
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
@@ -29,6 +29,14 @@ impl PyReader {
 
     fn read_options(options: Option<PyRef<'_, PyReadOptions>>) -> ReadOptions {
         options.map_or_else(ReadOptions::default, |options| options.inner.clone())
+    }
+
+    fn open_snapshot(config: Config, snapshot: PyGlobalSnapshot) -> PyResult<Self> {
+        opendal::install_default();
+        ReaderBuilder::new(ReaderConfig::from_config(&config))
+            .open_from_global_snapshot(global_snapshot(snapshot)?)
+            .map(|reader| Self { reader })
+            .map_err(map_error)
     }
 }
 
@@ -68,6 +76,31 @@ impl PyReader {
                 Config::from_path(config_path).map_err(map_error)?,
                 Some(snapshot_id),
             )
+        })
+    }
+
+    #[staticmethod]
+    fn open_from_global_snapshot(
+        py: Python<'_>,
+        config_json: String,
+        snapshot: PyGlobalSnapshot,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            Self::open_snapshot(
+                Config::from_json_str(&config_json).map_err(map_error)?,
+                snapshot,
+            )
+        })
+    }
+
+    #[staticmethod]
+    fn open_from_global_snapshot_file(
+        py: Python<'_>,
+        config_path: PathBuf,
+        snapshot: PyGlobalSnapshot,
+    ) -> PyResult<Self> {
+        py.detach(move || {
+            Self::open_snapshot(Config::from_path(config_path).map_err(map_error)?, snapshot)
         })
     }
 

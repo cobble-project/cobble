@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import shutil
 from pathlib import Path
 
 import pycobble
@@ -70,7 +71,10 @@ def reconstruct_snapshot(value: pycobble.ShardSnapshot) -> pycobble.ShardSnapsho
 
 
 def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> None:
-    cfg = config(tmp_path / "distributed")
+    root = tmp_path / "distributed"
+    cfg = config(root)
+    config_path = tmp_path / "distributed.json"
+    config_path.write_text(cfg)
     left = pycobble.Db.open(cfg, [pycobble.BucketRange(0, 1)])
     right = pycobble.Db.open(cfg, [pycobble.BucketRange(2, 3)])
     for bucket, owner in ((0, left), (1, left), (2, right), (3, right)):
@@ -78,6 +82,15 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
         owner.put(bucket, b"beta", 0, f"old-{bucket}-b".encode())
     left_snapshot = left.take_snapshot()
     right_snapshot = right.take_snapshot()
+    loaded_left = pycobble.load_shard_snapshot_metadata(
+        cfg, left_snapshot.db_id, left_snapshot.manifest_path
+    )
+    loaded_right = pycobble.load_shard_snapshot_metadata_file(
+        config_path, right_snapshot.db_id, right_snapshot.manifest_path
+    )
+    assert loaded_left.schema_id == left_snapshot.schema_id
+    assert loaded_left.schema_column_families is not None
+    assert loaded_right.column_families[0].name == "default"
     assert left.retain_snapshot(left_snapshot.snapshot_id)
     assert right.retain_snapshot(right_snapshot.snapshot_id)
 
@@ -85,13 +98,44 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
     with pytest.raises(pycobble.InputError):
         coordinator.materialize_global_snapshot(4, 99, [left_snapshot])
     first = coordinator.materialize_global_snapshot(
-        4, 100, [reconstruct_snapshot(left_snapshot), reconstruct_snapshot(right_snapshot)]
+        4, 100, [reconstruct_snapshot(loaded_left), loaded_right]
     )
     assert all(shard.schema_id is None for shard in first.shards)
     with pytest.raises(pycobble.InputError, match="schema metadata is required"):
         coordinator.materialize_global_snapshot(4, 99, first.shards)
     assert coordinator.get_global_snapshot(100).id == 100
     assert coordinator.load_current_global_snapshot().id == 100
+    global_manifest_path = root / "snapshot" / "SNAPSHOT-100"
+    loaded_global = pycobble.load_global_snapshot_metadata(
+        cfg, global_manifest_path.as_uri()
+    )
+    loaded_global_file = pycobble.load_global_snapshot_metadata_file(
+        config_path, str(global_manifest_path)
+    )
+    assert loaded_global.id == loaded_global_file.id == first.id
+    assert all(shard.schema_id is None for shard in loaded_global.shards)
+    with pytest.raises(pycobble.ConfigurationError):
+        pycobble.load_global_snapshot_metadata(cfg, str(tmp_path / "outside"))
+    with pytest.raises(pycobble.CobbleError):
+        pycobble.load_global_snapshot_metadata(cfg, str(root / "snapshot" / "missing"))
+
+    hidden_manifest_path = global_manifest_path.with_name("SNAPSHOT-100.hidden")
+    global_manifest_path.rename(hidden_manifest_path)
+    try:
+        pinned_from_metadata = pycobble.Reader.open_from_global_snapshot(
+            cfg, snapshot=loaded_global
+        )
+        pinned_from_file = pycobble.Reader.open_from_global_snapshot_file(
+            config_path, snapshot=loaded_global_file
+        )
+        assert pinned_from_metadata.mode == pycobble.ReaderMode.Snapshot
+        assert pinned_from_metadata.configured_snapshot_id == first.id
+        assert bytes(pinned_from_metadata.get(2, b"alpha").column(0)) == b"old-2-a"
+        assert bytes(pinned_from_file.get(0, b"alpha").column(0)) == b"old-0-a"
+        with pytest.raises(pycobble.CobbleError):
+            pycobble.Reader.open(cfg, first.id)
+    finally:
+        hidden_manifest_path.rename(global_manifest_path)
 
     read_only = pycobble.ReadOnlyDb.open(
         cfg, left_snapshot.snapshot_id, left_snapshot.db_id
@@ -165,3 +209,75 @@ def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> No
     gc.collect()
     left.close()
     right.close()
+
+
+def test_shard_snapshot_metadata_needs_no_data_files(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    db = pycobble.Db.open(config(source_root), [pycobble.BucketRange(0, 3)])
+    db.put(0, b"key", 0, b"value")
+    captured = db.take_snapshot()
+    db.close()
+    assert captured.schema_id is not None
+
+    metadata_root = tmp_path / "metadata-only"
+    manifest_path = (
+        metadata_root / captured.db_id / "snapshot" / f"SNAPSHOT-{captured.snapshot_id}"
+    )
+    schema_path = metadata_root / captured.db_id / "schema" / f"schema-{captured.schema_id}"
+    manifest_path.parent.mkdir(parents=True)
+    schema_path.parent.mkdir(parents=True)
+    shutil.copy2(
+        source_root / captured.db_id / "snapshot" / f"SNAPSHOT-{captured.snapshot_id}",
+        manifest_path,
+    )
+    shutil.copy2(
+        source_root / captured.db_id / "schema" / f"schema-{captured.schema_id}",
+        schema_path,
+    )
+    missing_data_root = tmp_path / "no-data-files"
+    metadata_config = json.dumps(
+        {
+            "volumes": [
+                {"base_dir": metadata_root.as_uri(), "kinds": ["meta"]},
+                {
+                    "base_dir": missing_data_root.as_uri(),
+                    "kinds": ["primary_data_priority_high"],
+                },
+            ],
+            "num_columns": 1,
+            "total_buckets": 4,
+        }
+    )
+    metadata_config_path = tmp_path / "metadata-only.json"
+    metadata_config_path.write_text(metadata_config)
+    hidden_source_root = tmp_path / "source-hidden"
+    source_root.rename(hidden_source_root)
+    try:
+        loaded = pycobble.load_shard_snapshot_metadata(
+            metadata_config, captured.db_id, manifest_path.as_uri()
+        )
+        loaded_file = pycobble.load_shard_snapshot_metadata_file(
+            metadata_config_path, captured.db_id, str(manifest_path)
+        )
+    finally:
+        hidden_source_root.rename(source_root)
+    assert loaded.snapshot_id == loaded_file.snapshot_id == captured.snapshot_id
+    assert loaded.schema_id == captured.schema_id
+    assert loaded.schema_column_families is not None
+    assert captured.schema_column_families is not None
+    assert [
+        (family.name, family.id, family.num_columns, family.value_has_ttl, family.metadata_json)
+        for family in loaded.schema_column_families
+    ] == [
+        (family.name, family.id, family.num_columns, family.value_has_ttl, family.metadata_json)
+        for family in captured.schema_column_families
+    ]
+    assert not missing_data_root.exists()
+    with pytest.raises(pycobble.ConfigurationError):
+        pycobble.load_shard_snapshot_metadata(
+            metadata_config, captured.db_id, captured.manifest_path
+        )
+    with pytest.raises(pycobble.CobbleError):
+        pycobble.load_shard_snapshot_metadata(
+            metadata_config, captured.db_id, str(manifest_path.with_name("missing"))
+        )

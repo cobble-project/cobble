@@ -2,12 +2,13 @@ use crate::error::input_error;
 use crate::error::{invalid_state, map_error};
 use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
 use cobble_binding::{
-    ColumnFamilyOptions, Db, GlobalSnapshotManifest, ShardSnapshotMetadata, ShardSnapshotRef,
-    SingleDb, SnapshotColumnFamily,
+    ColumnFamilyOptions, Config, Db, GlobalSnapshotManifest, ShardSnapshotMetadata,
+    ShardSnapshotRef, SingleDb, SnapshotColumnFamily,
 };
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
 #[pyclass(
@@ -428,6 +429,87 @@ pub(crate) fn global_snapshot(value: PyGlobalSnapshot) -> PyResult<GlobalSnapsho
     })
 }
 
+fn load_shard_metadata_config(
+    config: Config,
+    db_id: String,
+    manifest_path: String,
+) -> PyResult<PyShardSnapshot> {
+    opendal::install_default();
+    cobble_binding::load_shard_snapshot_metadata(&config, &db_id, &manifest_path)
+        .map(shard_metadata)
+        .map_err(map_error)
+}
+
+fn load_global_metadata_config(
+    config: Config,
+    manifest_path: String,
+) -> PyResult<PyGlobalSnapshot> {
+    opendal::install_default();
+    cobble_binding::load_global_snapshot_metadata(&config, &manifest_path)
+        .map(snapshot)
+        .map_err(map_error)
+}
+
+#[pyfunction]
+fn load_shard_snapshot_metadata(
+    py: Python<'_>,
+    config_json: String,
+    db_id: String,
+    manifest_path: String,
+) -> PyResult<PyShardSnapshot> {
+    py.detach(move || {
+        load_shard_metadata_config(
+            Config::from_json_str(&config_json).map_err(map_error)?,
+            db_id,
+            manifest_path,
+        )
+    })
+}
+
+#[pyfunction]
+fn load_shard_snapshot_metadata_file(
+    py: Python<'_>,
+    config_path: PathBuf,
+    db_id: String,
+    manifest_path: String,
+) -> PyResult<PyShardSnapshot> {
+    py.detach(move || {
+        load_shard_metadata_config(
+            Config::from_path(config_path).map_err(map_error)?,
+            db_id,
+            manifest_path,
+        )
+    })
+}
+
+#[pyfunction]
+fn load_global_snapshot_metadata(
+    py: Python<'_>,
+    config_json: String,
+    manifest_path: String,
+) -> PyResult<PyGlobalSnapshot> {
+    py.detach(move || {
+        load_global_metadata_config(
+            Config::from_json_str(&config_json).map_err(map_error)?,
+            manifest_path,
+        )
+    })
+}
+
+#[pyfunction]
+fn load_global_snapshot_metadata_file(
+    py: Python<'_>,
+    config_path: PathBuf,
+    manifest_path: String,
+) -> PyResult<PyGlobalSnapshot> {
+    py.detach(move || {
+        load_global_metadata_config(
+            Config::from_path(config_path).map_err(map_error)?,
+            manifest_path,
+        )
+    })
+}
+
 type SnapshotResult = cobble_binding::Result<GlobalSnapshotManifest>;
 
 #[pyclass(name = "PendingSnapshot", module = "pycobble._native")]
@@ -563,5 +645,12 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyShardSnapshot>()?;
     module.add_class::<PyGlobalSnapshot>()?;
     module.add_class::<PyPendingSnapshot>()?;
-    module.add_class::<PyPendingShardSnapshot>()
+    module.add_class::<PyPendingShardSnapshot>()?;
+    module.add_function(wrap_pyfunction!(load_shard_snapshot_metadata, module)?)?;
+    module.add_function(wrap_pyfunction!(load_shard_snapshot_metadata_file, module)?)?;
+    module.add_function(wrap_pyfunction!(load_global_snapshot_metadata, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        load_global_snapshot_metadata_file,
+        module
+    )?)
 }
