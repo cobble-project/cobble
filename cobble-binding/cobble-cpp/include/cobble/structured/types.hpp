@@ -10,6 +10,8 @@ namespace cobble::structured {
 
 class Db;
 class SingleDb;
+class Reader;
+class ReadOnlyDb;
 
 enum class ColumnKind : std::uint8_t {
   kBytes = 0,
