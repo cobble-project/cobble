@@ -107,3 +107,29 @@ pip install maturin pytest
 maturin develop --manifest-path cobble-binding/cobble-python/Cargo.toml
 pytest cobble-binding/cobble-python/tests
 ```
+
+## Publishing to PyPI
+
+Publishing a GitHub Release runs `python-package.yml`: it builds and smoke-tests
+the platform wheels, builds the source distribution, then uploads them to PyPI
+as `pycobble` and attaches them to the GitHub Release. The release tag must match
+the workspace version (for example, `v0.5.0`). Manual workflow runs only build
+artifacts and do not publish. Pre-release GitHub Releases also trigger publishing;
+use a pre-release package version and matching tag for those.
+
+One-time setup (no repository secrets or custom variables are required):
+
+1. Create a GitHub Actions environment named `pypi`. Optionally require approval
+   and restrict it to release tags.
+2. In PyPI, configure a **Trusted Publisher** for `pycobble`:
+   - Owner: `cobble-project`
+   - Repository: `cobble`
+   - Workflow: `python-package.yml`
+   - Environment: `pypi`
+3. If the PyPI project does not exist yet, use PyPI's pending publisher setup
+   with project name `pycobble` before the first release.
+
+GitHub supplies the short-lived publishing credentials automatically. Re-running
+the PyPI job skips files already uploaded; changed packages need a new version.
+See [PyPI Trusted Publishers](https://docs.pypi.org/trusted-publishers/adding-a-publisher/)
+for setup instructions.

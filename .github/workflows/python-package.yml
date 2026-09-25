@@ -1,4 +1,4 @@
-name: Package Python binding
+name: Package and publish Python binding
 
 on:
   workflow_dispatch:
@@ -9,7 +9,36 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate package and release version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Check package identity and release tag
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          workspace = tomllib.loads(Path("Cargo.toml").read_text())
+          project = tomllib.loads(Path("cobble-binding/cobble-python/pyproject.toml").read_text())
+          version = workspace["workspace"]["package"]["version"]
+          if project["project"]["name"] != "pycobble":
+              raise SystemExit("The PyPI package name must remain pycobble")
+          tag = os.environ["RELEASE_TAG"]
+          if tag and tag.removeprefix("v") != version:
+              raise SystemExit(f"Release tag {tag} does not match workspace version {version}")
+          print(f"Building pycobble {version}")
+          PY
+
   wheel:
+    needs: validate
     name: ${{ matrix.platform.name }}
     strategy:
       fail-fast: false
@@ -62,6 +91,7 @@ jobs:
           if-no-files-found: error
 
   source:
+    needs: validate
     name: source distribution
     runs-on: ubuntu-24.04
     steps:
@@ -90,6 +120,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
+          pattern: pycobble-*
           path: release-assets
           merge-multiple: true
       - name: Generate checksums
@@ -99,6 +130,29 @@ jobs:
       - name: Upload assets to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_REPO: ${{ github.repository }}
         run: >-
-          gh release upload "${{ github.event.release.tag_name }}"
+          gh release upload "$RELEASE_TAG"
           release-assets/*
+
+  publish-pypi:
+    name: Publish pycobble to PyPI
+    if: github.event_name == 'release'
+    needs: [wheel, source]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pycobble
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: pycobble-*
+          path: dist
+          merge-multiple: true
+      - name: Publish wheels and source distribution
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
