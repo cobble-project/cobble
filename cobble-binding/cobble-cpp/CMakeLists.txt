@@ -117,6 +117,10 @@ target_include_directories(
           "${COBBLE_CARGO_TARGET_DIR}/cxxbridge")
 target_link_libraries(cobble_cpp PRIVATE cobble_cpp_rust Threads::Threads
                                          ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+  find_package(JNI REQUIRED)
+  target_link_libraries(cobble_cpp PRIVATE JNI::JVM)
+endif()
 set_target_properties(
   cobble_cpp
   PROPERTIES OUTPUT_NAME cobble_cpp
