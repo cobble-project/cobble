@@ -29,6 +29,9 @@ let you select columns or customize individual operations.
 
 ## Build and link
 
+Prebuilt C++ packages are available from the [0.5.0 release](https://github.com/cobble-project/cobble/releases/tag/v0.5.0).
+Choose the archive for your platform and build profile.
+
 Build from a Cobble source checkout with a compatible Rust toolchain,
 CMake 3.22 or newer, and a C++20 compiler:
 
@@ -45,7 +48,7 @@ To enable optional storage backends, add, for example,
 In your application's `CMakeLists.txt`:
 
 ```cmake
-find_package(cobble-cpp CONFIG REQUIRED)
+find_package(cobble-cpp 0.5.0 EXACT CONFIG REQUIRED)
 add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE cobble::cobble)
 target_compile_features(my_app PRIVATE cxx_std_20)
