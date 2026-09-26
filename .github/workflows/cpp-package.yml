@@ -52,13 +52,13 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
       - name: Configure
         run: >-
           cmake -S cobble-binding/cobble-cpp -B build/cobble-cpp
           -DCMAKE_BUILD_TYPE=${{ matrix.profile.cmake }}
           -DCOBBLE_CPP_BUILD_TESTS=ON
-          -DCOBBLE_CPP_CARGO_FEATURES=${{ matrix.platform.features }}
+          "-DCOBBLE_CPP_CARGO_FEATURES=${{ matrix.platform.features }}"
       - name: Build
         run: cmake --build build/cobble-cpp --config ${{ matrix.profile.cmake }} --parallel
       - name: Test
