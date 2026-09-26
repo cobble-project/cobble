@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 880" role="img" aria-labelledby="wal-checkpoint-title wal-checkpoint-desc">
+  <title id="wal-checkpoint-title">Checkpoint published, old WAL being truncated</title>
+  <desc id="wal-checkpoint-desc">At the instant checkpoint S has been published, its durable manifest records WAL boundary C and references its data files; the Cobble shard deletes WAL segments at or below C while its memtable and WAL writer continue accepting newer writes, whose WAL segments above C are retained for recovery.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#655f55"/></marker>
+    <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#89643b"/></marker>
+    <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#3f6579"/></marker>
+    <pattern id="wal-checkpoint-deleting" width="12" height="12" patternUnits="userSpaceOnUse">
+      <rect width="12" height="12" fill="#ffffff"/>
+      <path d="M-4 4 L4 -4 M0 12 L12 0 M8 16 L16 8" fill="none" stroke="#ded6cb" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #302d28; }
+    .title { font-family: Georgia, serif; font-size: 32px; }
+    .heading { font-size: 24px; font-weight: 600; }
+    .label { font-size: 20px; font-weight: 600; }
+    .body { font-size: 20px; fill: #655f55; }
+    .box { fill: #ffffff; stroke: #c8c0b3; stroke-width: 1.5; }
+    .arrow { fill: none; stroke: #655f55; stroke-width: 2; marker-end: url(#arrow); }
+    .delete { fill: none; stroke: #89643b; stroke-width: 2; marker-end: url(#arrow-accent); }
+    .write { fill: none; stroke: #3f6579; stroke-width: 2; marker-end: url(#arrow-link); }
+  </style>
+  <rect width="1120" height="880" fill="#faf8f3"/>
+  <text x="40" y="60" class="title">Checkpoint published, old WAL being truncated</text>
+  <text x="40" y="100" class="body">One shard at this instant: checkpoint S is durable; writes beyond C continue.</text>
+
+  <!-- Runtime above; all persistent files share the bottom storage tier.
+       The two storage areas are logical roles, not necessarily separate devices. -->
+  <rect x="40" y="144" width="1040" height="208" rx="8" fill="#f2efe8" stroke="#b9b1a3" stroke-width="1.5"/>
+  <text x="64" y="184" class="heading">Cobble shard process</text>
+  <text x="1056" y="184" class="body" text-anchor="end">New writes remain active</text>
+  <rect x="40" y="480" width="1040" height="344" rx="8" fill="#f2efe8" stroke="#c8c0b3" stroke-width="1.5"/>
+  <text x="64" y="520" class="heading">Storage</text>
+  <rect x="432" y="560" width="272" height="212" rx="4" fill="url(#wal-checkpoint-deleting)" stroke="#b2a28d" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <rect x="752" y="560" width="304" height="212" rx="4" fill="#eaf0f2" stroke="#b5c7cf" stroke-width="1.2"/>
+
+  <!-- Active runtime relationships, not a sequence of steps. -->
+  <path d="M208 320 V560" class="arrow"/>
+  <path d="M312 320 V416 Q312 424 320 424 H568 Q576 424 576 432 V620" class="delete"/>
+  <path d="M972 320 V620" class="write"/>
+  <path d="M232 640 V692" class="arrow"/>
+  <rect x="96" y="380" width="100" height="32" fill="#faf8f3"/>
+  <text x="104" y="404" class="body">Durable</text>
+  <rect x="376" y="380" width="176" height="32" fill="#faf8f3"/>
+  <text x="464" y="404" class="label" text-anchor="middle" style="fill:#89643b">Truncate ≤ C</text>
+  <rect x="752" y="380" width="200" height="32" fill="#faf8f3"/>
+  <text x="760" y="404" class="label" style="fill:#3f6579">Publish new WAL</text>
+
+  <g id="wal-checkpoint-runtime">
+    <rect x="64" y="216" width="280" height="104" rx="8" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/>
+    <text x="88" y="256" class="heading">Checkpoint S</text>
+    <text x="88" y="292" class="body">Published · C recorded</text>
+    <rect x="416" y="216" width="280" height="104" rx="8" class="box"/>
+    <text x="440" y="256" class="heading">Memtable</text>
+    <text x="440" y="292" class="body">Writes after boundary C</text>
+    <rect x="768" y="216" width="288" height="104" rx="8" fill="#eaf0f2" stroke="#b5c7cf" stroke-width="1.5"/>
+    <text x="792" y="256" class="heading">WAL writer</text>
+    <text x="792" y="292" class="body">New groups beyond C</text>
+  </g>
+
+  <g id="wal-checkpoint-published-files">
+    <rect x="64" y="560" width="336" height="80" rx="4" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/>
+    <text x="88" y="592" class="heading">Snapshot manifest S</text>
+    <text x="88" y="624" class="body">WAL checkpoint = C</text>
+    <rect x="248" y="648" width="136" height="28" fill="#f2efe8"/>
+    <text x="256" y="668" class="body">References</text>
+    <rect x="64" y="692" width="336" height="80" rx="4" class="box"/>
+    <text x="88" y="728" class="heading">Checkpoint data files</text>
+    <text x="88" y="756" class="body">SSTs and snapshot data</text>
+    <text x="232" y="804" class="body" text-anchor="middle">Cover writes through C</text>
+  </g>
+
+  <g id="wal-checkpoint-wal-files">
+    <rect x="448" y="620" width="72" height="80" rx="4" fill="#ffffff" stroke="#b2a28d" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <rect x="540" y="620" width="72" height="80" rx="4" fill="#ffffff" stroke="#b2a28d" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <rect x="632" y="620" width="56" height="80" rx="4" fill="#ffffff" stroke="#b2a28d" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <text x="484" y="668" class="label" text-anchor="middle">C−2</text>
+    <text x="576" y="668" class="label" text-anchor="middle">C−1</text>
+    <text x="660" y="668" class="label" text-anchor="middle">C</text>
+    <rect x="768" y="620" width="112" height="80" rx="4" fill="#dbe6ea" stroke="#a8bcc5" stroke-width="1.2"/>
+    <rect x="904" y="620" width="136" height="80" rx="4" fill="#dbe6ea" stroke="#a8bcc5" stroke-width="1.2"/>
+    <text x="824" y="668" class="label" text-anchor="middle">C+1</text>
+    <text x="972" y="668" class="label" text-anchor="middle">C+2 …</text>
+    <text x="568" y="740" class="heading" text-anchor="middle">WAL ≤ C</text>
+    <text x="904" y="740" class="heading" text-anchor="middle">WAL &gt; C</text>
+    <text x="568" y="804" class="body" text-anchor="middle">Being deleted</text>
+    <text x="904" y="804" class="body" text-anchor="middle">Retained for recovery</text>
+    <path d="M728 552 V772" fill="none" stroke="#89643b" stroke-width="1.5" stroke-dasharray="5 5"/>
+  </g>
+  <text x="40" y="860" class="body">C is the durable WAL boundary captured by S, not the current end of WAL.</text>
+</svg>

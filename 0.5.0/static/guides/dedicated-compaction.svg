@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 788" role="img" aria-labelledby="dedicated-compaction-title dedicated-compaction-desc">
+<title id="dedicated-compaction-title">Compaction in a separate process</title>
+<desc id="dedicated-compaction-desc">The writer publishes its persisted layout and applies valid result files; a dedicated compactor observes shared metadata, reads input data and publishes output data and results.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#655f55"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#89643b"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0 0 L8 3 L0 6 Z" fill="#3f6579"/></marker>
+</defs>
+<rect x="0" y="0" width="960" height="788" fill="#faf8f3"/>
+<text x="40" y="60" font-family="Georgia, serif" font-size="32" fill="#302d28" font-weight="400" text-anchor="start">Compaction in a separate process</text>
+<text x="40" y="100" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Writer and compactor coordinate through shared files, not direct RPC.</text>
+<rect x="40" y="144" width="352" height="232" rx="8" fill="#f7f4ed" stroke="#c8c0b3" stroke-width="1.5" stroke-dasharray="8 6"/>
+<rect x="568" y="144" width="352" height="232" rx="8" fill="#f7f4ed" stroke="#c8c0b3" stroke-width="1.5" stroke-dasharray="8 6"/>
+<rect x="40" y="480" width="880" height="232" rx="8" fill="#eaf0f2" stroke="#b5c7cf" stroke-width="1.5"/>
+<text x="64" y="188" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Writer application</text>
+<text x="592" y="188" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Dedicated compactor</text>
+<path d="M120 328 V560" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<path d="M264 560 V432 Q264 424 272 424 H400 a8 8 0 0 1 16 0 H616 Q624 424 624 416 V328" fill="none" stroke="#3f6579" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow-link)"/>
+<path d="M712 328 V440 Q712 448 704 448 H488 Q480 448 480 456 V560" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<path d="M408 560 V408 Q408 400 400 400 H336 Q328 400 328 392 V328" fill="none" stroke="#3f6579" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow-link)"/>
+<path d="M800 560 V328" fill="none" stroke="#3f6579" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow-link)"/>
+<path d="M864 328 V560" fill="none" stroke="#89643b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-accent)"/>
+<rect x="132" y="416" width="88" height="32" rx="8" fill="#faf8f3" stroke="none" stroke-width="1.5"/><text x="140" y="440" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#89643b" font-weight="400" text-anchor="start">Publish</text>
+<rect x="448" y="384" width="136" height="32" rx="8" fill="#faf8f3" stroke="none" stroke-width="1.5"/><text x="456" y="408" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#3f6579" font-weight="400" text-anchor="start">Read layout</text>
+<rect x="488" y="444" width="88" height="32" rx="8" fill="#faf8f3" stroke="none" stroke-width="1.5"/><text x="496" y="468" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#89643b" font-weight="400" text-anchor="start">Results</text>
+<rect x="64" y="224" width="304" height="104" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="88" y="264" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Write / snapshot</text><text x="88" y="300" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Apply valid results</text>
+<rect x="592" y="224" width="304" height="104" rx="8" fill="#f0e9dd" stroke="#89643b" stroke-width="1.5"/><text x="616" y="264" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Compact files</text><text x="616" y="300" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Separate process</text>
+<text x="536" y="520" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#3f6579" font-weight="600" text-anchor="start">Shared storage</text>
+<rect x="64" y="560" width="240" height="120" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="88" y="600" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Persisted layout</text><text x="88" y="636" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Runtime / snapshot</text>
+<rect x="352" y="560" width="240" height="120" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="376" y="600" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Result metadata</text><text x="376" y="636" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Writer validates it</text>
+<rect x="640" y="560" width="256" height="120" rx="8" fill="#fff" stroke="#c8c0b3" stroke-width="1.5"/><text x="664" y="600" font-family="Arial, Helvetica, sans-serif" font-size="24" fill="#302d28" font-weight="600" text-anchor="start">Data files</text><text x="664" y="636" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Inputs + outputs</text>
+<text x="40" y="756" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#655f55" font-weight="400" text-anchor="start">Both processes need access to the configured storage volumes.</text>
+</svg>
