@@ -117,6 +117,10 @@ target_include_directories(
           "${COBBLE_CARGO_TARGET_DIR}/cxxbridge")
 target_link_libraries(cobble_cpp PRIVATE cobble_cpp_rust Threads::Threads
                                          ${CMAKE_DL_LIBS})
+if(COBBLE_CPP_CARGO_FEATURES MATCHES "(^|,)storage-(all|hdfs)(,|$)")
+  find_package(JNI REQUIRED)
+  target_link_libraries(cobble_cpp PRIVATE ${JNI_LIBRARIES})
+endif()
 set_target_properties(
   cobble_cpp
   PROPERTIES OUTPUT_NAME cobble_cpp
@@ -136,7 +140,7 @@ if(APPLE)
                        "${COBBLE_SYSTEM_CONFIGURATION_FRAMEWORK}")
 elseif(WIN32)
   target_link_libraries(cobble_cpp PRIVATE advapi32 bcrypt ntdll ole32 shell32
-                                           userenv ws2_32)
+                                           secur32 userenv ws2_32)
 else()
   target_link_libraries(cobble_cpp PRIVATE m)
 endif()

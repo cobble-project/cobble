@@ -4,6 +4,16 @@ on:
   workflow_dispatch:
   release:
     types: [published]
+  pull_request:
+    paths:
+      - "cobble-binding/Cargo.toml"
+      - "cobble-binding/src/**"
+      - "cobble-binding/cobble-cpp/**"
+      - "cobble/**"
+      - "cobble-data-structure/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/cpp-package.yml"
 
 permissions:
   contents: read
@@ -39,6 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
       - name: Configure
         run: >-
           cmake -S cobble-binding/cobble-cpp -B build/cobble-cpp
