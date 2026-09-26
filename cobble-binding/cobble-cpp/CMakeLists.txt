@@ -15,6 +15,11 @@ endif()
 
 project(cobble-cpp VERSION "${CMAKE_MATCH_1}" LANGUAGES CXX)
 
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+  add_compile_definitions($<$<CONFIG:Debug>:_ITERATOR_DEBUG_LEVEL=0>)
+endif()
+
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
