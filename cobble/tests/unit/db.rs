@@ -2840,6 +2840,99 @@ fn test_transform_specs_available_during_restore_and_snapshot_switch() {
 
 #[test]
 #[serial(file)]
+fn restore_v1_noop_schema_and_persist_v2_without_changing_source() {
+    use crate::file::metadata_io::{
+        encode_metadata_payload_for_test, read_metadata_payload_from_path_for_test,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        snapshot_on_flush: false,
+        ..Config::default()
+    };
+    let source_id = "v1-noop-source";
+    let source = DbBuilder::new(config.clone())
+        .db_id(source_id)
+        .bucket_ranges(std::iter::once(0..=0).collect())
+        .open()
+        .unwrap();
+    source.put(0, b"old", 0, b"old-value").unwrap();
+    let snapshot = source.create_snapshot_and_wait("v1 fixture").unwrap();
+    source.close().unwrap();
+    drop(source);
+
+    // Keep real snapshot/SST data, but encode its schema exactly as 0.4 did.
+    // No version-1 evolution is being translated or silently discarded.
+    let schema_path = root.path().join(source_id).join("schema/schema-0");
+    let mut v1: serde_json::Value =
+        serde_json::from_slice(&read_metadata_payload_from_path_for_test(&schema_path).unwrap())
+            .unwrap();
+    v1["format_version"] = serde_json::json!(1);
+    for family in v1["column_families"].as_array_mut().unwrap() {
+        let family = family.as_object_mut().unwrap();
+        assert!(family.remove("transition").unwrap().is_null());
+        family.insert("evolution_id".into(), serde_json::json!("noop"));
+        family.insert("evolution_indexes".into(), serde_json::Value::Null);
+        family.insert("evolution_default_values".into(), serde_json::Value::Null);
+    }
+    let original = encode_metadata_payload_for_test(&serde_json::to_vec(&v1).unwrap());
+    std::fs::write(&schema_path, &original).unwrap();
+    let manifest_path = format!(
+        "file://{}/{}/{}",
+        root.path().display(),
+        source_id,
+        crate::paths::snapshot_manifest_relative_path(snapshot)
+    );
+    let metadata = crate::load_shard_snapshot_metadata(&config, source_id, &manifest_path).unwrap();
+    assert_eq!(metadata.snapshot_id, snapshot);
+
+    let source = DbBuilder::new(config.clone())
+        .db_id(source_id)
+        .open_from_snapshot(snapshot)
+        .unwrap();
+    assert_eq!(
+        source.get(0, b"old").unwrap().unwrap()[0].as_deref(),
+        Some(b"old-value".as_slice())
+    );
+    source.close().unwrap();
+    drop(source);
+    assert_eq!(std::fs::read(&schema_path).unwrap(), original);
+
+    // Restoring into a new DB persists the loaded schema as v2 at a new path.
+    let restored = DbBuilder::new(config.clone())
+        .open_new_with_snapshot(snapshot, source_id)
+        .unwrap();
+    let restored_id = restored.id().to_string();
+    let restored_schema = root.path().join(&restored_id).join("schema/schema-0");
+    let v2: serde_json::Value = serde_json::from_slice(
+        &read_metadata_payload_from_path_for_test(&restored_schema).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v2["format_version"], 2);
+    assert!(v2["column_families"][0].get("evolution_id").is_none());
+    restored.put(0, b"new", 0, b"new-value").unwrap();
+    let next = restored
+        .create_snapshot_and_wait("v2 restored snapshot")
+        .unwrap();
+    restored.close().unwrap();
+    drop(restored);
+    let reopened = DbBuilder::new(config)
+        .db_id(restored_id)
+        .open_from_snapshot(next)
+        .unwrap();
+    for (key, value) in [(b"old", b"old-value"), (b"new", b"new-value")] {
+        assert_eq!(
+            reopened.get(0, key).unwrap().unwrap()[0].as_deref(),
+            Some(value.as_slice())
+        );
+    }
+    reopened.close().unwrap();
+    assert_eq!(std::fs::read(schema_path).unwrap(), original);
+}
+
+#[test]
+#[serial(file)]
 fn test_db_memtable_read_evolves_older_schema_values() {
     let root = "/tmp/db_schema_evolution_memtable_read";
     cleanup_test_root(root);

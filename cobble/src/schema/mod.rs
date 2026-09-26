@@ -1095,11 +1095,98 @@ fn collect_schema_ids_from_manifest(manifest: &ManifestSnapshot, schema_ids: &mu
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct SchemaFile {
     pub(crate) format_version: u32,
     pub(crate) id: u64,
     pub(crate) column_families: Vec<ColumnFamilyFile>,
+}
+
+// v0.4.0 persisted these fields instead of v2's `transition`. This
+// compatibility path accepts only identity evolutions.
+#[derive(Deserialize)]
+struct LegacyV1ColumnFamilyFile {
+    id: u8,
+    name: String,
+    merge_operator_ids: Vec<String>,
+    column_metadata: Vec<Option<JsonValue>>,
+    options: ColumnFamilyOptions,
+    evolution_id: Option<String>,
+    evolution_indexes: Option<Vec<usize>>,
+    evolution_default_values: Option<Vec<Option<Vec<u8>>>>,
+}
+
+impl<'de> Deserialize<'de> for SchemaFile {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireSchemaFile {
+            format_version: u32,
+            id: u64,
+            column_families: Vec<JsonValue>,
+        }
+
+        let wire = WireSchemaFile::deserialize(deserializer)?;
+        if !matches!(wire.format_version, 1 | SCHEMA_FILE_FORMAT_VERSION) {
+            return Err(serde::de::Error::custom(format!(
+                "Unsupported schema file format version {} (expected 1 or {})",
+                wire.format_version, SCHEMA_FILE_FORMAT_VERSION
+            )));
+        }
+        let mut column_families = Vec::with_capacity(wire.column_families.len());
+        for (position, family) in wire.column_families.into_iter().enumerate() {
+            let decoded = match wire.format_version {
+                SCHEMA_FILE_FORMAT_VERSION => serde_json::from_value(family),
+                1 => {
+                    let legacy: LegacyV1ColumnFamilyFile =
+                        serde_json::from_value(family).map_err(|err| {
+                            serde::de::Error::custom(format!(
+                                "invalid v1 column family at position {}: {}",
+                                position, err
+                            ))
+                        })?;
+                    if !matches!(legacy.evolution_id.as_deref(), None | Some("noop"))
+                        || legacy
+                            .evolution_indexes
+                            .as_ref()
+                            .is_some_and(|indexes| !indexes.is_empty())
+                        || legacy
+                            .evolution_default_values
+                            .as_ref()
+                            .is_some_and(|defaults| !defaults.is_empty())
+                    {
+                        return Err(serde::de::Error::custom(format!(
+                            "unsupported v1 schema evolution in column family '{}'",
+                            legacy.name
+                        )));
+                    }
+                    Ok(ColumnFamilyFile {
+                        id: legacy.id,
+                        name: legacy.name,
+                        merge_operator_ids: legacy.merge_operator_ids,
+                        column_metadata: legacy.column_metadata,
+                        options: legacy.options,
+                        transition: None,
+                    })
+                }
+                _ => unreachable!("schema file version checked above"),
+            }
+            .map_err(|err| {
+                serde::de::Error::custom(format!(
+                    "invalid column family at position {}: {}",
+                    position, err
+                ))
+            })?;
+            column_families.push(decoded);
+        }
+        Ok(Self {
+            format_version: SCHEMA_FILE_FORMAT_VERSION,
+            id: wire.id,
+            column_families,
+        })
+    }
 }
 
 pub(crate) fn persist_schema(file_manager: &FileManager, schema: &Schema) -> Result<()> {

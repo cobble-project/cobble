@@ -6,6 +6,134 @@ use crate::vlog::VlogPointer;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// Matches the v0.4.0 SchemaFile/ColumnFamilyFile JSON shape.
+fn v1_schema_payload() -> serde_json::Value {
+    let merge_operator_id = default_merge_operator().id();
+    serde_json::json!({
+        "format_version": 1,
+        "id": 7,
+        "column_families": [
+            {
+                "id": 0,
+                "name": "default",
+                "merge_operator_ids": [merge_operator_id],
+                "column_metadata": [{"column": "primary"}],
+                "options": {"value_has_ttl": false, "metadata": {"owner": "default"}},
+                "evolution_id": "noop",
+                "evolution_indexes": null,
+                "evolution_default_values": null
+            },
+            {
+                "id": 1,
+                "name": "archive",
+                "merge_operator_ids": [],
+                "column_metadata": [],
+                "options": {"value_has_ttl": true, "metadata": {"owner": "archive"}},
+                "evolution_id": "noop",
+                "evolution_indexes": [],
+                "evolution_default_values": []
+            }
+        ]
+    })
+}
+
+#[test]
+fn test_v1_noop_schema_is_read_as_v2_without_losing_metadata() {
+    let original = v1_schema_payload();
+    let payload = serde_json::to_vec(&original).unwrap();
+    let decoded: SchemaFile = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(decoded.format_version, 2);
+    assert_eq!(decoded.id, 7);
+    assert!(
+        decoded
+            .column_families
+            .iter()
+            .all(|family| family.transition.is_none())
+    );
+
+    let schema = schema_from_file(&decoded, None).unwrap();
+    assert_eq!(schema.version(), 7);
+    assert_eq!(
+        schema.column_families(),
+        vec![("default".to_string(), 1), ("archive".to_string(), 0)]
+    );
+    assert_eq!(
+        schema.column_metadata_at(None, 0).unwrap(),
+        Some(&serde_json::json!({"column": "primary"}))
+    );
+    assert_eq!(
+        schema.column_family_options_in_family(0).metadata,
+        Some(serde_json::json!({"owner": "default"}))
+    );
+    assert!(!schema.value_has_ttl_in_family(0));
+    assert_eq!(
+        schema.column_family_options_in_family(1).metadata,
+        Some(serde_json::json!({"owner": "archive"}))
+    );
+
+    let snapshot_families = snapshot_column_families_from_payload(&payload, 7).unwrap();
+    assert_eq!(snapshot_families["default"].num_columns, 1);
+    assert_eq!(
+        snapshot_families["default"].options.metadata,
+        Some(serde_json::json!({"owner": "default"}))
+    );
+    assert_eq!(snapshot_families["archive"].id, 1);
+
+    let serialized = serde_json::to_value(schema_to_file(&schema)).unwrap();
+    assert_eq!(serialized["format_version"], 2);
+    for family in serialized["column_families"].as_array().unwrap() {
+        assert!(family.get("transition").is_some());
+        assert!(family.get("evolution_id").is_none());
+        assert!(family.get("evolution_indexes").is_none());
+        assert!(family.get("evolution_default_values").is_none());
+    }
+
+    // v1 accepted absent and explicit null identity fields as well as "noop".
+    let mut absent = original.clone();
+    let first = absent["column_families"][0].as_object_mut().unwrap();
+    first.remove("evolution_id");
+    first.remove("evolution_indexes");
+    first.remove("evolution_default_values");
+    assert!(serde_json::from_value::<SchemaFile>(absent).is_ok());
+    let mut null_id = original;
+    null_id["column_families"][0]["evolution_id"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<SchemaFile>(null_id).is_ok());
+}
+
+#[test]
+fn test_v1_schema_rejects_non_noop_evolution_and_nonempty_parameters() {
+    let mut cases = Vec::new();
+    for evolution_id in ["column_add", "column_delete", "unknown"] {
+        let mut value = v1_schema_payload();
+        value["column_families"][1]["evolution_id"] = evolution_id.into();
+        cases.push(value);
+    }
+    let mut indexes = v1_schema_payload();
+    indexes["column_families"][1]["evolution_indexes"] = serde_json::json!([0]);
+    cases.push(indexes);
+    let mut defaults = v1_schema_payload();
+    defaults["column_families"][1]["evolution_default_values"] = serde_json::json!([[1, 2]]);
+    cases.push(defaults);
+
+    for value in cases {
+        let payload = serde_json::to_vec(&value).unwrap();
+        let error = schema_file_from_payload(&payload).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported v1 schema evolution"),
+            "{error}"
+        );
+        let error = snapshot_column_families_from_payload(&payload, 7).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported v1 schema evolution"),
+            "{error}"
+        );
+    }
+}
+
 struct BracketMergeOperator;
 
 impl MergeOperator for BracketMergeOperator {
