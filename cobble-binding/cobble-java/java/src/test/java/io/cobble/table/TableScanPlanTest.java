@@ -180,6 +180,44 @@ class TableScanPlanTest {
                         Collections.<Value>emptyList(),
                         Collections.<Value>emptyList()),
                 readProjected(config, plan.project(Collections.<String>emptyList())));
+        TableScanPlan projected = plan.project(Arrays.asList("second", "id"));
+        byte[] boundary =
+                KeyCodec.encode(
+                        Collections.singletonList(LogicalTypes.int64()),
+                        Collections.singletonList(Value.int64(8)));
+        TableScanPlan.Partition partition =
+                projected.partitionAfter(projected.splits().get(0), 0, boundary);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> partition.after.forSplit(projected.splits().get(0)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> partition.after.open(config, projected.splits().get(0)));
+        byte[] earlier =
+                KeyCodec.encode(
+                        Collections.singletonList(LogicalTypes.int64()),
+                        Collections.singletonList(Value.int64(7)));
+        byte[] later =
+                KeyCodec.encode(
+                        Collections.singletonList(LogicalTypes.int64()),
+                        Collections.singletonList(Value.int64(9)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> partition.after.partitionAfter(partition.after.splits().get(0), 0, earlier));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> partition.before.partitionAfter(partition.before.splits().get(0), 0, later));
+        TableScanPlan.Partition atStart =
+                partition.after.partitionAfter(partition.after.splits().get(0), 0, boundary);
+        assertEquals(Collections.emptyList(), readProjected(config, atStart.before));
+        assertEquals(
+                Arrays.asList(
+                        Arrays.asList(Value.string("second"), Value.int64(7)),
+                        Arrays.asList(Value.string("large"), Value.int64(8))),
+                readProjected(config, roundTrip(partition.before)));
+        assertEquals(
+                Collections.singletonList(Arrays.asList(Value.string("end"), Value.int64(9))),
+                readProjected(config, roundTrip(partition.after)));
         assertThrows(
                 IllegalArgumentException.class, () -> reordered.project(Arrays.asList("id", "id")));
 

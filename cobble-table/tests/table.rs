@@ -1,11 +1,12 @@
 use cobble::{
     Config, CoordinatorConfig, DbBuilder, DbCoordinator, FileSystemRegistry, Reader, ReaderConfig,
-    VolumeDescriptor, VolumeUsageKind,
+    ScanSplit, VolumeDescriptor, VolumeUsageKind,
 };
 use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
-    DataField, LogicalType, ReadOnlyTable, ReadOnlyTableBuilder, Table, TableKey, TableKeyBuilder,
-    TableReader, TableReaderBuilder, TableScanPlan, TableSchema, TableWriterBuilder, Value,
+    DataField, KeyCodec, LogicalType, ReadOnlyTable, ReadOnlyTableBuilder, Table, TableKey,
+    TableKeyBuilder, TableReader, TableReaderBuilder, TableScanPlan, TableSchema,
+    TableWriterBuilder, Value,
 };
 use std::sync::{Arc, mpsc};
 
@@ -726,6 +727,67 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
     let worker_plan = serde_json::from_str::<TableScanPlan>(&scan_plan_json).unwrap();
     let mut worker_runtime = reader_config.clone();
     worker_runtime.total_buckets = 1;
+
+    let boundary_bucket = keys[0].bucket();
+    let boundary_key = KeyCodec::encode_row(&[LogicalType::int64()], &[Value::Int64(0)]).unwrap();
+    let assigned =
+        worker_plan
+            .splits()
+            .unwrap()
+            .into_iter()
+            .find(|split| {
+                let json = serde_json::to_value(split).unwrap();
+                let physical: ScanSplit = serde_json::from_value(json["split"].clone()).unwrap();
+                physical.shard.ranges.iter().any(|range| {
+                    boundary_bucket >= *range.start() && boundary_bucket <= *range.end()
+                })
+            })
+            .unwrap();
+    let original_rows = assigned
+        .create_scanner(worker_runtime.clone())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut assignment = serde_json::to_value(&assigned).unwrap();
+    let physical: ScanSplit = serde_json::from_value(assignment["split"].clone()).unwrap();
+    let partition = physical.split_after(boundary_bucket, boundary_key).unwrap();
+    assignment["split"] = serde_json::to_value(partition.before).unwrap();
+    let before = serde_json::from_value::<cobble_table::TableScanSplit>(assignment.clone())
+        .unwrap()
+        .create_scanner(worker_runtime.clone())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assignment["split"] = serde_json::to_value(partition.after).unwrap();
+    let after = serde_json::from_value::<cobble_table::TableScanSplit>(assignment)
+        .unwrap()
+        .create_scanner(worker_runtime.clone())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        before.iter().chain(&after).cloned().collect::<Vec<_>>(),
+        original_rows
+    );
+    assert!(before.contains(&rows[0]));
+    assert!(!after.contains(&rows[0]));
+    let mut invalid = serde_json::to_value(&assigned).unwrap();
+    invalid["split"]["start_bucket"] = serde_json::json!(boundary_bucket);
+    assert!(
+        serde_json::from_value::<cobble_table::TableScanSplit>(invalid)
+            .unwrap()
+            .create_scanner(worker_runtime.clone())
+            .is_err()
+    );
+    let mut invalid = serde_json::to_value(&assigned).unwrap();
+    invalid["split"]["end_bucket"] = serde_json::json!(4);
+    invalid["split"]["end_key_inclusive"] = serde_json::json!([1]);
+    assert!(
+        serde_json::from_value::<cobble_table::TableScanSplit>(invalid)
+            .unwrap()
+            .create_scanner(worker_runtime.clone())
+            .is_err()
+    );
 
     let updated = vec![rows[0][0].clone(), Value::String("updated".into())];
     if keys[0].bucket() < 2 {

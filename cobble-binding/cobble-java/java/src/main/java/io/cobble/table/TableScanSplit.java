@@ -5,6 +5,7 @@ import io.cobble.DirectScanCursor;
 import io.cobble.NativeLoader;
 import io.cobble.NativeObject;
 import io.cobble.ScanCursor;
+import io.cobble.ScanSplit;
 import io.cobble.ShardSnapshot;
 
 import com.google.gson.JsonObject;
@@ -75,6 +76,71 @@ public class TableScanSplit implements Serializable {
 
     public final String metadataJson() {
         return metadataJson;
+    }
+
+    boolean sameNativeAssignment(TableScanSplit other) {
+        return splitJson != null && splitJson.equals(other.splitJson);
+    }
+
+    static final class Partition {
+        final TableScanSplit before;
+        final TableScanSplit after;
+
+        Partition(TableScanSplit before, TableScanSplit after) {
+            this.before = before;
+            this.after = after;
+        }
+    }
+
+    Partition partitionAfter(int bucket, byte[] encodedKeyInclusive) {
+        requireNative();
+        JsonObject envelope = JsonParser.parseString(splitJson).getAsJsonObject();
+        ScanSplit physical = ScanSplit.fromJson(envelope.get("split").toString());
+        if ((physical.startBucket == null) != (physical.startKeyExclusive == null)
+                || (physical.endBucket == null) != (physical.endKeyInclusive == null)) {
+            throw new IllegalArgumentException("parent split has an incomplete bucket/key bound");
+        }
+        if (encodedKeyInclusive == null || encodedKeyInclusive.length == 0 || bucket < 0) {
+            throw new IllegalArgumentException("split boundary requires a bucket and encoded key");
+        }
+        if ((physical.startBucket != null
+                        && compareBoundary(
+                                        bucket,
+                                        encodedKeyInclusive,
+                                        physical.startBucket,
+                                        physical.startKeyExclusive)
+                                < 0)
+                || (physical.endBucket != null
+                        && compareBoundary(
+                                        bucket,
+                                        encodedKeyInclusive,
+                                        physical.endBucket,
+                                        physical.endKeyInclusive)
+                                > 0)) {
+            throw new IllegalArgumentException("split boundary is outside its parent assignment");
+        }
+        ScanSplit.Partition partition = physical.splitAfter(bucket, encodedKeyInclusive);
+        return new Partition(
+                withPhysicalSplit(envelope, partition.before),
+                withPhysicalSplit(envelope, partition.after));
+    }
+
+    private static int compareBoundary(
+            int leftBucket, byte[] leftKey, int rightBucket, byte[] rightKey) {
+        int bucketOrder = Integer.compare(leftBucket, rightBucket);
+        if (bucketOrder != 0) return bucketOrder;
+        int commonLength = Math.min(leftKey.length, rightKey.length);
+        for (int index = 0; index < commonLength; index++) {
+            int byteOrder = Integer.compare(leftKey[index] & 0xff, rightKey[index] & 0xff);
+            if (byteOrder != 0) return byteOrder;
+        }
+        return Integer.compare(leftKey.length, rightKey.length);
+    }
+
+    private static TableScanSplit withPhysicalSplit(JsonObject envelope, ScanSplit physicalSplit) {
+        JsonObject copy = envelope.deepCopy();
+        copy.add("split", JsonParser.parseString(physicalSplit.toJson()));
+        return new TableScanSplit(copy.toString());
     }
 
     static String requireText(String value, String name) {

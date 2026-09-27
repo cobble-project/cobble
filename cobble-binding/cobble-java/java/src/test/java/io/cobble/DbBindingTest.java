@@ -13,6 +13,7 @@ import io.cobble.table.Table;
 import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableKey;
 import io.cobble.table.TableProjection;
+import io.cobble.table.TableReadEntry;
 import io.cobble.table.TableReader;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableScanPlan;
@@ -361,6 +362,11 @@ class DbBindingTest {
                 List<Value> projected1 = Arrays.asList(row1.get(4), row1.get(0), row1.get(2));
                 List<Value> projected2 = Arrays.asList(row2.get(4), row2.get(0), row2.get(2));
                 assertEquals(projected1, projection.get(key1));
+                TableReadEntry<List<Value>> entry = projection.getEntry(key1);
+                assertEquals(projected1, entry.value());
+                assertTrue(entry.countsPhysicalEntry());
+                assertTrue(entry.physicalBytes() > 0L);
+                assertNull(projection.getEntry(missing));
                 assertEquals(
                         Arrays.asList(projected2, projected1, projected2, null),
                         projection.multiGet(Arrays.asList(key2, key1, key2, missing)));

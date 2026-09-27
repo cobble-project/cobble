@@ -129,6 +129,26 @@ public final class TableProjection implements AutoCloseable {
         }
     }
 
+    /** Reads one projected row and reports the physical key and selected-column bytes read. */
+    public TableReadEntry<List<Value>> getEntry(TableKey key) {
+        ensureUsable();
+        Objects.requireNonNull(key, "key");
+        try (DirectColumns columns =
+                DirectColumns.read(directReader, key.bucket(), key.encodedInternal())) {
+            if (columns == null) return null;
+            long physicalBytes = key.encodedInternal().length;
+            for (int index = 0; index < columns.size(); index++) {
+                ByteBuffer value = columns.get(index);
+                if (value != null) physicalBytes += value.remaining();
+            }
+            return new TableReadEntry<List<Value>>(
+                    new TableReadPosition(key.bucket(), null, 1),
+                    decodeDirectRow(key.valuesInternal(), columns),
+                    physicalBytes,
+                    true);
+        }
+    }
+
     /** Reads projected rows in input order, preserving duplicates and misses. */
     public List<List<Value>> multiGet(List<TableKey> primaryKeys) {
         ensureUsable();
