@@ -118,7 +118,7 @@ impl TableScanPlan {
     }
 }
 
-/// A serializable full-table scan assignment for one shard snapshot.
+/// A serializable table scan assignment for one shard snapshot, optionally key-bounded.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TableScanSplit {
     format: String,
@@ -230,16 +230,36 @@ impl TableScanSplit {
                 "table scan split has no bucket ranges".to_string(),
             ));
         }
-        if self.split.start.is_some()
-            || self.split.end.is_some()
-            || self.split.start_bucket.is_some()
-            || self.split.start_key_exclusive.is_some()
-            || self.split.end_bucket.is_some()
-            || self.split.end_key_inclusive.is_some()
-        {
-            return Err(TableError::InvalidSchema(
-                "table scan split must cover its complete shard".to_string(),
-            ));
+        for (bucket, key, label) in [
+            (
+                self.split.start_bucket,
+                self.split.start_key_exclusive.as_ref(),
+                "start",
+            ),
+            (
+                self.split.end_bucket,
+                self.split.end_key_inclusive.as_ref(),
+                "end",
+            ),
+        ] {
+            if bucket.is_some() != key.is_some() {
+                return Err(TableError::InvalidSchema(format!(
+                    "table scan split {label} bucket and key must be set together"
+                )));
+            }
+            if let Some(bucket) = bucket
+                && (u32::from(bucket) >= self.total_buckets
+                    || !self
+                        .split
+                        .shard
+                        .ranges
+                        .iter()
+                        .any(|range| bucket >= *range.start() && bucket <= *range.end()))
+            {
+                return Err(TableError::InvalidSchema(format!(
+                    "table scan split {label} bucket is outside its shard"
+                )));
+            }
         }
         Ok(())
     }

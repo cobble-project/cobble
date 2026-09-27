@@ -165,6 +165,31 @@ public final class TableScanPlan implements Serializable {
     /** Keeps only the worker's assigned split while preserving schema and projection. */
     public TableScanPlan forSplit(TableScanSplit split) {
         requireAssignedSplit(split);
+        return withOnlySplit(split);
+    }
+
+    /** Partitions an assigned native split at an encoded physical key for exact scan resume. */
+    public Partition partitionAfter(TableScanSplit split, int bucket, byte[] encodedKeyInclusive) {
+        requireAssignedSplit(split);
+        if (snapshot != null) {
+            throw new UnsupportedOperationException(
+                    "physical-key split partitioning requires a native table");
+        }
+        TableScanSplit.Partition partition = split.partitionAfter(bucket, encodedKeyInclusive);
+        return new Partition(withOnlySplit(partition.before), withOnlySplit(partition.after));
+    }
+
+    public static final class Partition {
+        public final TableScanPlan before;
+        public final TableScanPlan after;
+
+        private Partition(TableScanPlan before, TableScanPlan after) {
+            this.before = before;
+            this.after = after;
+        }
+    }
+
+    private TableScanPlan withOnlySplit(TableScanSplit split) {
         return new TableScanPlan(
                 formatId,
                 nativeSchema,
@@ -212,6 +237,9 @@ public final class TableScanPlan implements Serializable {
     }
 
     private static boolean sameSplit(TableScanSplit left, TableScanSplit right) {
+        if (TableMetadata.FORMAT.equals(left.formatId())) {
+            return left.sameNativeAssignment(right);
+        }
         if (!left.formatId().equals(right.formatId())
                 || !left.columnFamily().equals(right.columnFamily())
                 || !left.metadataJson().equals(right.metadataJson())) {
