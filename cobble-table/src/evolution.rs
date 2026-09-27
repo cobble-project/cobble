@@ -1,3 +1,4 @@
+use crate::catalog::FieldTransform;
 use crate::logical_type::{assign_fresh_field_ids, assign_fresh_type_ids};
 use crate::metadata::TableMetadata;
 use crate::transform::compile_table_transform;
@@ -41,13 +42,6 @@ pub enum SchemaChange {
         logical_type: LogicalType,
         transform: TransformSpec,
     },
-}
-
-/// One persisted field transform for a single catalog schema version.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FieldTransform {
-    pub(crate) field_id: FieldId,
-    pub(crate) transform: TransformSpec,
 }
 
 /// Apply sequential schema edits while retaining every historical field id.
