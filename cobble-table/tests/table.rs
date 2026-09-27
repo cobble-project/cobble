@@ -1,5 +1,6 @@
 use cobble::{
-    Config, CoordinatorConfig, DbBuilder, DbCoordinator, Reader, ReaderConfig, VolumeDescriptor,
+    Config, CoordinatorConfig, DbBuilder, DbCoordinator, FileSystemRegistry, Reader, ReaderConfig,
+    VolumeDescriptor, VolumeUsageKind,
 };
 use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
@@ -488,6 +489,106 @@ fn single_bucket_writer_uses_stable_identity_and_empty_baseline() {
             .create(schema)
             .is_err()
     );
+}
+
+#[test]
+fn single_bucket_writer_supports_non_file_meta_and_validates_baseline() {
+    let meta_root = tempfile::tempdir().unwrap();
+    let data_root = tempfile::tempdir().unwrap();
+    let meta_volume = VolumeDescriptor::new(
+        format!("fs://{}", meta_root.path().display()),
+        vec![VolumeUsageKind::Meta, VolumeUsageKind::Snapshot],
+    );
+    let config = Config {
+        volumes: vec![
+            meta_volume.clone(),
+            VolumeDescriptor::new(
+                format!("file://{}", data_root.path().display()),
+                vec![VolumeUsageKind::PrimaryDataPriorityHigh],
+            ),
+        ],
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let schema = runtime_schema(LogicalType::string().nullable());
+    let writer = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .create(schema.clone())
+        .unwrap();
+    let row = vec![Value::Int64(1), Value::String("first".into())];
+    writer.put(&row).unwrap();
+    let snapshot = writer.snapshot_and_wait().unwrap();
+    drop(writer);
+
+    let resumed = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .resume_from_snapshot(snapshot.snapshot_id)
+        .unwrap();
+    assert_eq!(
+        resumed.get(&build_key(&resumed, &row[..1])).unwrap(),
+        Some(row)
+    );
+    drop(resumed);
+
+    let wrong_schema = runtime_schema(LogicalType::int64().nullable());
+    let error = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .create(wrong_schema)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("not this standalone table"));
+
+    let error = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .resume_from_snapshot(999)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("missing snapshot 999"));
+
+    let fs = FileSystemRegistry::new()
+        .get_or_register_volume(&meta_volume)
+        .unwrap();
+    fs.delete("bucket-0/snapshot/SNAPSHOT-0").unwrap();
+    let error = TableWriterBuilder::new(config)
+        .table_name("events")
+        .bucket(0)
+        .create(schema)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("no empty baseline snapshot 0"));
+}
+
+#[test]
+fn single_bucket_writer_accepts_relative_local_meta_path() {
+    let root = tempfile::tempdir_in(".").unwrap();
+    let relative_root = root
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(relative_root),
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let schema = runtime_schema(LogicalType::string().nullable());
+    let writer = TableWriterBuilder::new(config.clone())
+        .table_name("events")
+        .bucket(0)
+        .create(schema.clone())
+        .unwrap();
+    drop(writer);
+    let resumed = TableWriterBuilder::new(config)
+        .table_name("events")
+        .bucket(0)
+        .create(schema)
+        .unwrap();
+    drop(resumed);
 }
 
 #[test]

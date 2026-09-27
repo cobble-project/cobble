@@ -111,8 +111,9 @@ use it for a first write or overwrite. `resume_from_snapshot(committed_shard_sna
 restores committed data for append and applies the captured catalog definition. Standalone
 `create(schema)` also starts from the empty baseline; standalone snapshot resumes use the stored
 schema. File and snapshot IDs do not rewind. Fixed snapshot readers always use the stored schema.
-Writers require local/shared filesystem META storage with working file locks; keep automatic
-snapshot pruning disabled so the empty baseline and historical snapshots remain available.
+META may use any configured filesystem. The caller must ensure that only one writer owns each
+bucket at a time; keep automatic snapshot pruning disabled so the empty baseline and historical
+snapshots remain available.
 
 ## Global snapshots
 

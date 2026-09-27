@@ -68,13 +68,9 @@ class TableWriterBuilderTest {
     }
 
     @Test
-    void bucketWriterRejectsConcurrentHandleAndInvalidBaselineSchemaBeforeWrites() {
+    void bucketWriterValidatesBaselineSchemaAndSelectedSnapshotBeforeWrites() {
         TableSchema schema = schema();
-        try (Table first = newWriter(0).create(schema)) {
-            IllegalStateException concurrent =
-                    assertThrows(IllegalStateException.class, () -> newWriter(0).create(schema));
-            assertTrue(concurrent.getMessage().contains("already active"), concurrent::getMessage);
-        }
+        newWriter(0).create(schema).close();
 
         TableSchema incompatible =
                 new TableSchema(
