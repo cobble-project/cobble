@@ -5,6 +5,12 @@ use thiserror::Error;
 
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+impl From<cobble::Error> for CatalogError {
+    fn from(error: cobble::Error) -> Self {
+        Self::Backend(Box::new(error))
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CatalogError {

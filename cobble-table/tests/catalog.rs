@@ -490,12 +490,42 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("CATALOG-"))
     }));
+    let mut schema_files = 0;
     for path in files {
-        let bytes = std::fs::read(path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        if path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("schemas")
+        {
+            schema_files += 1;
+            let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let record = record.as_object().unwrap();
+            for key in [
+                "format",
+                "version",
+                "table_id",
+                "catalog_schema_id",
+                "schema",
+                "used_field_ids",
+                "field_transforms",
+            ] {
+                assert!(
+                    record.contains_key(key),
+                    "missing {key} in {}",
+                    path.display()
+                );
+            }
+            assert!(!record.contains_key("schema_version"));
+            assert_eq!(record["format"], "cobble-table-catalog");
+            assert_eq!(record["version"], 1);
+        }
         for needle in [b"runtime-access-id".as_slice(), b"runtime-secret-key"] {
             assert!(!bytes.windows(needle.len()).any(|value| value == needle));
         }
     }
+    assert!(schema_files > 0);
 }
 
 fn table_schema() -> TableSchema {

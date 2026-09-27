@@ -1,145 +1,22 @@
+use super::runtime::CatalogRuntimeContext;
 use super::store::CatalogStore;
 use crate::catalog::{
-    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogTable, SchemaChange, TableId,
-    TableIdentifier,
+    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogSchemaVersion, CatalogTable,
+    SchemaChange, ShardSchemaMapping, TableId, TableIdentifier, physical_table_name,
 };
-use crate::evolution::{
-    FieldTransform, apply_schema_changes, compile_column_evolution, schema_field_ids,
-};
+use crate::evolution::schema_field_ids;
 use crate::metadata::TableMetadata;
-use crate::snapshot::TableSnapshotCommitter;
-use crate::write::{TABLE_WRITE_PLAN_FORMAT, TABLE_WRITE_PLAN_VERSION};
-use crate::{
-    FieldId, ReadOnlyTableBuilder, Table, TableError, TableReaderBuilder, TableSchema,
-    TableWriteBuilder, TableWritePlan, TableWriterBuilder,
-};
-use cobble::{
-    ColumnFamilyOptions, Config, CoordinatorConfig, Db, DbCoordinator, VolumeDescriptor,
-    VolumeUsageKind,
-};
+use crate::{Table, TableError, TableSchema, TableWritePlan};
+use cobble::{Config, Db};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use url::Url;
 use uuid::Uuid;
-
-#[cfg(test)]
-#[path = "../../tests/unit/catalog_storage.rs"]
-mod storage_tests;
-
-impl From<cobble::Error> for CatalogError {
-    fn from(error: cobble::Error) -> Self {
-        Self::Backend(Box::new(error))
-    }
-}
 
 const CATALOG_FORMAT: &str = "cobble-table-catalog";
 const CATALOG_VERSION: u32 = 1;
-
-/// Runtime storage association captured while opening a file catalog.
-///
-/// The configuration is process-local and intentionally never serialized into catalog metadata.
-pub(crate) struct CatalogRuntimeContext {
-    config: Config,
-    storage_id: String,
-}
-
-impl CatalogRuntimeContext {
-    fn scoped_config(&self, runtime: Config, table_id: TableId) -> Config {
-        scoped_table_config(&self.config.volumes, &self.storage_id, table_id, runtime)
-    }
-}
-
-fn scoped_table_config(
-    shared_volumes: &[VolumeDescriptor],
-    storage_id: &str,
-    table_id: TableId,
-    mut runtime: Config,
-) -> Config {
-    let relative_root = format!("{storage_id}/tables/TABLE-{table_id}");
-    let mut volumes = shared_volumes
-        .iter()
-        .filter_map(|volume| shared_volume(volume, &relative_root))
-        .collect::<Vec<_>>();
-    volumes.extend(
-        runtime
-            .volumes
-            .iter()
-            .flat_map(|volume| runtime_volumes(volume, &relative_root)),
-    );
-    runtime.volumes = volumes;
-    runtime
-}
-
-fn shared_volume(source: &VolumeDescriptor, relative_root: &str) -> Option<VolumeDescriptor> {
-    plan_shared_volume(source).map(|mut volume| {
-        volume.base_dir = append_relative_path(&volume.base_dir, relative_root);
-        volume
-    })
-}
-
-fn plan_shared_volume(source: &VolumeDescriptor) -> Option<VolumeDescriptor> {
-    let mut volume = source.clone();
-    volume.kinds = 0;
-    for kind in [
-        VolumeUsageKind::Meta,
-        VolumeUsageKind::Snapshot,
-        VolumeUsageKind::Wal,
-    ] {
-        if source.supports(kind) {
-            volume.set_usage(kind);
-        }
-    }
-    (volume.kinds != 0).then_some(volume)
-}
-
-fn runtime_volumes(source: &VolumeDescriptor, relative_root: &str) -> Vec<VolumeDescriptor> {
-    let mut owned = source.clone();
-    owned.kinds = 0;
-    for kind in [
-        VolumeUsageKind::PrimaryDataPriorityHigh,
-        VolumeUsageKind::PrimaryDataPriorityMedium,
-        VolumeUsageKind::PrimaryDataPriorityLow,
-        VolumeUsageKind::Cache,
-    ] {
-        if source.supports(kind) {
-            owned.set_usage(kind);
-        }
-    }
-    let mut volumes = Vec::new();
-    if owned.kinds != 0 {
-        owned.base_dir = append_relative_path(&owned.base_dir, relative_root);
-        volumes.push(owned);
-    }
-    if source.supports(VolumeUsageKind::Readonly) {
-        let mut readonly = source.clone();
-        readonly.kinds = 0;
-        readonly.set_usage(VolumeUsageKind::Readonly);
-        volumes.push(readonly);
-    }
-    volumes
-}
-
-fn append_relative_path(base: &str, relative: &str) -> String {
-    if let Ok(mut url) = Url::parse(base) {
-        let parent = url.path().trim_end_matches('/');
-        let child = relative.trim_matches('/');
-        let path = match (parent, child) {
-            ("", child) => format!("/{child}"),
-            (parent, "") => parent.to_string(),
-            (parent, child) => format!("{parent}/{child}"),
-        };
-        url.set_path(&path);
-        return url.to_string();
-    }
-    Path::new(base)
-        .join(relative)
-        .to_string_lossy()
-        .into_owned()
-}
 
 /// Runtime-only configuration for a file catalog.
 ///
@@ -162,32 +39,6 @@ impl FileCatalogConfig {
     }
 }
 
-/// One catalog schema version materialized into a shard's core schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShardSchemaMapping {
-    table_id: TableId,
-    db_id: String,
-    catalog_schema_id: CatalogSchemaId,
-    core_schema_id: u64,
-}
-
-impl ShardSchemaMapping {
-    pub fn table_id(&self) -> TableId {
-        self.table_id
-    }
-
-    pub fn db_id(&self) -> &str {
-        &self.db_id
-    }
-
-    pub fn catalog_schema_id(&self) -> CatalogSchemaId {
-        self.catalog_schema_id
-    }
-
-    pub fn core_schema_id(&self) -> u64 {
-        self.core_schema_id
-    }
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CurrentPointer {
     format: String,
@@ -250,11 +101,18 @@ struct TableIdentity {
 struct TableSchemaRecord {
     format: String,
     version: u32,
-    table_id: TableId,
-    catalog_schema_id: CatalogSchemaId,
-    schema: TableSchema,
-    used_field_ids: Vec<FieldId>,
-    field_transforms: Vec<FieldTransform>,
+    #[serde(flatten)]
+    schema_version: CatalogSchemaVersion,
+}
+
+impl TableSchemaRecord {
+    fn new(schema_version: CatalogSchemaVersion) -> Self {
+        Self {
+            format: CATALOG_FORMAT.to_string(),
+            version: CATALOG_VERSION,
+            schema_version,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -379,8 +237,8 @@ impl FileCatalog {
         CatalogTable {
             identifier,
             table_id: identity.table_id,
-            catalog_schema_id: schema.catalog_schema_id,
-            schema: schema.schema,
+            catalog_schema_id: schema.schema_version.catalog_schema_id(),
+            schema: schema.schema_version.schema().clone(),
             runtime_context: Arc::clone(&self.runtime_context),
         }
     }
@@ -432,13 +290,63 @@ fn materialize_loaded_table(
     db: &Db,
     table: &CatalogTable,
 ) -> CatalogResult<(String, TableMetadata)> {
-    materialize_table_definition(
+    materialize_with_store(
         store,
         db,
         table.table_id,
         table.catalog_schema_id,
         &table.schema,
     )
+}
+
+fn materialize_with_store(
+    store: &CatalogStore,
+    db: &Db,
+    table_id: TableId,
+    catalog_schema_id: CatalogSchemaId,
+    schema: &TableSchema,
+) -> CatalogResult<(String, TableMetadata)> {
+    super::materialize::materialize_table_definition(
+        db,
+        table_id,
+        catalog_schema_id,
+        schema,
+        |schema_id| Ok(load_table_schema_record(store, table_id, schema_id)?.schema_version),
+        |schema_id, core_schema_id| {
+            write_schema_mapping(
+                store,
+                shard_schema_mapping(table_id, db, schema_id, core_schema_id),
+            )
+        },
+    )
+}
+
+pub(crate) fn materialize_catalog_table(table: &CatalogTable, db: Arc<Db>) -> CatalogResult<Table> {
+    let store = CatalogStore::open(
+        &table.runtime_context.config,
+        &table.runtime_context.storage_id,
+    )?;
+    let (physical_name, target) = materialize_loaded_table(&store, db.as_ref(), table)?;
+    Table::from_metadata(db, physical_name, target).map_err(Into::into)
+}
+
+pub(crate) fn refresh_catalog_table_writer(
+    table: &CatalogTable,
+    writer: &mut Table,
+) -> CatalogResult<bool> {
+    let physical_name = physical_table_name(table.table_id);
+    if writer.name() != physical_name {
+        return Err(TableError::InvalidSchema(
+            "Table does not belong to this catalog table".to_string(),
+        )
+        .into());
+    }
+    let store = CatalogStore::open(
+        &table.runtime_context.config,
+        &table.runtime_context.storage_id,
+    )?;
+    materialize_loaded_table(&store, writer.db(), table)?;
+    writer.refresh_schema().map_err(Into::into)
 }
 
 pub(crate) fn materialize_write_plan(
@@ -449,7 +357,7 @@ pub(crate) fn materialize_write_plan(
     plan.validate()?;
     let store = CatalogStore::open(store_config, &plan.storage_id)
         .map_err(|error| TableError::internal(error.to_string()))?;
-    materialize_table_definition(
+    materialize_with_store(
         &store,
         db,
         plan.table_id,
@@ -457,126 +365,6 @@ pub(crate) fn materialize_write_plan(
         &plan.schema,
     )
     .map_err(|error| TableError::internal(error.to_string()))
-}
-
-fn materialize_table_definition(
-    store: &CatalogStore,
-    db: &Db,
-    table_id: TableId,
-    catalog_schema_id: CatalogSchemaId,
-    schema: &TableSchema,
-) -> CatalogResult<(String, TableMetadata)> {
-    let physical_name = physical_table_name(table_id);
-    let target = TableMetadata::compile_catalog(schema.clone(), table_id, catalog_schema_id)?;
-    let current = db.current_schema();
-    let materialized = if let Some(column_family_id) =
-        current.column_family_ids().get(&physical_name).copied()
-    {
-        let options = current.column_family_options_in_family(column_family_id);
-        let existing = options.metadata.as_ref().ok_or_else(|| {
-            TableError::InvalidSchema(format!(
-                "column family '{physical_name}' is not a catalog table"
-            ))
-        })?;
-        let existing = TableMetadata::from_value(existing)?;
-        let binding = existing.catalog_binding.ok_or_else(|| {
-            TableError::InvalidSchema(format!(
-                "column family '{physical_name}' is not a catalog table"
-            ))
-        })?;
-        if binding.table_id != table_id {
-            return Err(TableError::InvalidSchema(format!(
-                "column family '{physical_name}' belongs to another catalog table"
-            ))
-            .into());
-        }
-        if binding.catalog_schema_id > catalog_schema_id {
-            return Err(TableError::InvalidSchema(format!(
-                "catalog schema {} cannot replace newer materialized schema {}",
-                catalog_schema_id, binding.catalog_schema_id
-            ))
-            .into());
-        }
-        let source_record = load_table_schema_record(store, table_id, binding.catalog_schema_id)?;
-        let mut materialized = TableMetadata::compile_catalog(
-            source_record.schema,
-            table_id,
-            binding.catalog_schema_id,
-        )?;
-        if existing != materialized
-            || current.num_columns_in_family(column_family_id)
-                != Some(materialized.layout.value_columns.len().max(1))
-        {
-            return Err(TableError::InvalidSchema(
-                "materialized table metadata does not match the catalog".to_string(),
-            )
-            .into());
-        }
-        write_schema_mapping(
-            store,
-            shard_schema_mapping(table_id, db, binding.catalog_schema_id, current.version()),
-        )?;
-        let mut materialized_catalog_schema_id = binding.catalog_schema_id;
-        while materialized_catalog_schema_id < catalog_schema_id {
-            let next_catalog_schema_id =
-                materialized_catalog_schema_id.next().ok_or_else(|| {
-                    CatalogError::InvalidSchemaEvolution(
-                        "catalog schema id space exhausted".to_string(),
-                    )
-                })?;
-            let next_record = load_table_schema_record(store, table_id, next_catalog_schema_id)?;
-            let next = TableMetadata::compile_catalog(
-                next_record.schema,
-                table_id,
-                next_catalog_schema_id,
-            )?;
-            let remap =
-                compile_column_evolution(&materialized, &next, &next_record.field_transforms)?;
-            let mut builder = db.update_schema();
-            builder.remap_columns(Some(physical_name.clone()), remap)?;
-            builder.set_column_family_options(
-                Some(physical_name.clone()),
-                ColumnFamilyOptions {
-                    metadata: Some(next.to_value()?),
-                    ..ColumnFamilyOptions::default()
-                },
-            )?;
-            let core_schema_id = builder.commit().version();
-            write_schema_mapping(
-                store,
-                shard_schema_mapping(table_id, db, next_catalog_schema_id, core_schema_id),
-            )?;
-            materialized = next;
-            materialized_catalog_schema_id = next_catalog_schema_id;
-        }
-        materialized
-    } else {
-        let mut builder = db.update_schema();
-        builder.ensure_column_family_exists(physical_name.clone())?;
-        for column in 0..target.layout.value_columns.len().max(1) {
-            builder.add_column(column, None, None, Some(physical_name.clone()))?;
-        }
-        builder.set_column_family_options(
-            Some(physical_name.clone()),
-            ColumnFamilyOptions {
-                metadata: Some(target.to_value()?),
-                ..ColumnFamilyOptions::default()
-            },
-        )?;
-        let core_schema_id = builder.commit().version();
-        write_schema_mapping(
-            store,
-            shard_schema_mapping(table_id, db, catalog_schema_id, core_schema_id),
-        )?;
-        return Ok((physical_name, target));
-    };
-    if materialized != target {
-        return Err(TableError::InvalidSchema(
-            "materialized table metadata does not match the requested catalog schema".to_string(),
-        )
-        .into());
-    }
-    Ok((physical_name, materialized))
 }
 
 fn shard_schema_mapping(
@@ -624,183 +412,34 @@ fn load_table_schema_record(
     let record: TableSchemaRecord =
         read_json(store, &table_schema_path(table_id, catalog_schema_id))?;
     validate_header(&record.format, record.version)?;
-    if record.table_id != table_id || record.catalog_schema_id != catalog_schema_id {
+    if record.schema_version.table_id() != table_id
+        || record.schema_version.catalog_schema_id() != catalog_schema_id
+    {
         return Err(CatalogError::InvalidMetadata(
             "table schema record does not match its lookup key".to_string(),
         ));
     }
     #[cfg(debug_assertions)]
     {
-        debug_assert!(record.schema.validate().is_ok());
+        debug_assert!(record.schema_version.schema().validate().is_ok());
         debug_assert!(
             record
-                .used_field_ids
+                .schema_version
+                .used_field_ids()
                 .windows(2)
                 .all(|window| window[0] < window[1])
         );
         debug_assert!(
-            schema_field_ids(&record.schema)
+            schema_field_ids(record.schema_version.schema())
                 .iter()
-                .all(|field_id| record.used_field_ids.binary_search(field_id).is_ok())
+                .all(|field_id| record
+                    .schema_version
+                    .used_field_ids()
+                    .binary_search(field_id)
+                    .is_ok())
         );
     }
     Ok(record)
-}
-
-impl CatalogTable {
-    /// Return the stable physical column-family name for this catalog table.
-    #[cfg(feature = "ffi")]
-    #[doc(hidden)]
-    pub fn physical_name(&self) -> String {
-        physical_table_name(self.table_id)
-    }
-
-    /// Materialize this captured catalog schema into one writable shard.
-    ///
-    /// Calls for a shard must not run concurrently with other core schema updates.
-    pub fn materialize_table(&self, db: Arc<Db>) -> CatalogResult<Table> {
-        let store = CatalogStore::open(
-            &self.runtime_context.config,
-            &self.runtime_context.storage_id,
-        )?;
-        let (physical_name, target) = materialize_loaded_table(&store, db.as_ref(), self)?;
-        Table::from_metadata(db, physical_name, target).map_err(Into::into)
-    }
-
-    /// Start building a portable writer initialization plan for this table.
-    pub fn new_write_builder(&self) -> TableWriteBuilder {
-        TableWriteBuilder::new(self.clone(), self.runtime_context.config.total_buckets)
-    }
-
-    /// Build an owned writer for this table using its catalog-managed shared storage.
-    pub fn writer_builder(&self, runtime: Config) -> CatalogResult<TableWriterBuilder> {
-        self.new_write_builder()
-            .total_buckets(runtime.total_buckets)
-            .build()?
-            .writer_builder(runtime)
-    }
-
-    /// Materialize this loaded catalog version into a writable table and refresh its local layout.
-    ///
-    /// The caller controls which catalog version is loaded; this method never follows catalog
-    /// CURRENT implicitly.
-    pub fn refresh_writer(&self, table: &mut Table) -> CatalogResult<bool> {
-        let physical_name = physical_table_name(self.table_id);
-        if table.name() != physical_name {
-            return Err(TableError::InvalidSchema(
-                "Table does not belong to this catalog table".to_string(),
-            )
-            .into());
-        }
-        materialize_loaded_table(
-            &CatalogStore::open(
-                &self.runtime_context.config,
-                &self.runtime_context.storage_id,
-            )?,
-            table.db(),
-            self,
-        )?;
-        table.refresh_schema().map_err(Into::into)
-    }
-
-    /// Build an owned snapshot reader for this table using its catalog-managed shared storage.
-    pub fn reader_builder(&self, runtime: Config) -> CatalogResult<TableReaderBuilder> {
-        let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
-        Ok(TableReaderBuilder::from_catalog(
-            config,
-            physical_table_name(self.table_id),
-            self.table_id,
-        ))
-    }
-
-    /// Build an owned shard snapshot table for this catalog table.
-    pub fn readonly_table_builder(&self, runtime: Config) -> CatalogResult<ReadOnlyTableBuilder> {
-        let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
-        Ok(ReadOnlyTableBuilder::from_catalog(
-            config,
-            physical_table_name(self.table_id),
-            self.table_id,
-        ))
-    }
-
-    /// Build an in-process committer in this table's global snapshot namespace.
-    pub fn snapshot_committer(
-        &self,
-        runtime: Config,
-        max_pending_commits: usize,
-    ) -> CatalogResult<TableSnapshotCommitter> {
-        let total_buckets = runtime.total_buckets;
-        let coordinator = Arc::new(self.coordinator(runtime)?);
-        Ok(TableSnapshotCommitter::new(
-            coordinator,
-            total_buckets,
-            max_pending_commits,
-        )?)
-    }
-
-    /// Open the core coordinator in this table's global snapshot namespace.
-    pub fn coordinator(&self, runtime: Config) -> CatalogResult<DbCoordinator> {
-        let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
-        Ok(DbCoordinator::open(CoordinatorConfig::from_config(
-            &config,
-        ))?)
-    }
-}
-
-pub(crate) fn build_write_plan(
-    table: CatalogTable,
-    total_buckets: u32,
-) -> CatalogResult<TableWritePlan> {
-    let context = &table.runtime_context;
-    let shared_volumes = context
-        .config
-        .volumes
-        .iter()
-        .filter_map(plan_shared_volume)
-        .map(|volume| volume.without_credentials())
-        .collect();
-    let plan = TableWritePlan {
-        format: TABLE_WRITE_PLAN_FORMAT.to_string(),
-        version: TABLE_WRITE_PLAN_VERSION,
-        identifier: table.identifier,
-        table_id: table.table_id,
-        catalog_schema_id: table.catalog_schema_id,
-        schema: table.schema,
-        storage_id: context.storage_id.clone(),
-        shared_volumes,
-        total_buckets,
-        auth_source: Some(context.config.clone()),
-    };
-    plan.validate()?;
-    Ok(plan)
-}
-
-pub(crate) fn writer_builder_from_write_plan(
-    plan: &TableWritePlan,
-    runtime: Config,
-) -> CatalogResult<TableWriterBuilder> {
-    plan.validate()?;
-    let credential_source = plan.auth_source.as_ref().unwrap_or(&runtime);
-    let shared_volumes = plan
-        .shared_volumes
-        .iter()
-        .map(|volume| volume.with_credentials_from(credential_source))
-        .collect::<Vec<_>>();
-    let store_config = Config {
-        volumes: shared_volumes.clone(),
-        ..Config::default()
-    };
-    let mut config = scoped_table_config(&shared_volumes, &plan.storage_id, plan.table_id, runtime);
-    config.total_buckets = plan.total_buckets;
-    Ok(TableWriterBuilder::from_write_plan(
-        config,
-        physical_table_name(plan.table_id),
-        plan.clone(),
-        store_config,
-    ))
 }
 
 impl FileCatalog {
@@ -920,25 +559,17 @@ impl Catalog for FileCatalog {
                 physical_name: physical_table_name(table_id),
             };
             write_json(&self.store, &table_identity_path(table_id), &identity)?;
-            let schema = TableSchemaRecord {
-                format: CATALOG_FORMAT.to_string(),
-                version: CATALOG_VERSION,
-                table_id,
-                catalog_schema_id: CatalogSchemaId::INITIAL,
-                used_field_ids: sorted_field_ids(schema_field_ids(&schema)),
-                field_transforms: Vec::new(),
-                schema,
-            };
+            let schema = TableSchemaRecord::new(CatalogSchemaVersion::initial(table_id, schema)?);
             write_json(
                 &self.store,
-                &table_schema_path(table_id, schema.catalog_schema_id),
+                &table_schema_path(table_id, schema.schema_version.catalog_schema_id()),
                 &schema,
             )?;
             namespace.generation += 1;
             namespace.tables.push(TableEntry {
                 name: identifier.name().to_string(),
                 table_id,
-                catalog_schema_id: schema.catalog_schema_id,
+                catalog_schema_id: schema.schema_version.catalog_schema_id(),
             });
             namespace
                 .tables
@@ -984,7 +615,11 @@ impl Catalog for FileCatalog {
                     catalog_schema_id,
                 });
             }
-            Ok(self.load_schema(entry.table_id, catalog_schema_id)?.schema)
+            Ok(self
+                .load_schema(entry.table_id, catalog_schema_id)?
+                .schema_version
+                .schema()
+                .clone())
         })
     }
 
@@ -1006,26 +641,8 @@ impl Catalog for FileCatalog {
             let table_id = namespace.tables[entry_index].table_id;
             let current_catalog_schema_id = namespace.tables[entry_index].catalog_schema_id;
             let current_schema = self.load_schema(table_id, current_catalog_schema_id)?;
-            let used_field_ids = current_schema
-                .used_field_ids
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>();
-            let (next_schema, used_field_ids, field_transforms) =
-                apply_schema_changes(current_schema.schema, changes, used_field_ids)
-                    .map_err(|error| CatalogError::InvalidSchemaEvolution(error.to_string()))?;
-            let next_catalog_schema_id = current_catalog_schema_id.next().ok_or_else(|| {
-                CatalogError::InvalidSchemaEvolution("schema id space exhausted".to_string())
-            })?;
-            let record = TableSchemaRecord {
-                format: CATALOG_FORMAT.to_string(),
-                version: CATALOG_VERSION,
-                table_id,
-                catalog_schema_id: next_catalog_schema_id,
-                schema: next_schema,
-                used_field_ids: sorted_field_ids(used_field_ids),
-                field_transforms,
-            };
+            let record = TableSchemaRecord::new(current_schema.schema_version.evolve(changes)?);
+            let next_catalog_schema_id = record.schema_version.catalog_schema_id();
             write_json(
                 &self.store,
                 &table_schema_path(table_id, next_catalog_schema_id),
@@ -1200,10 +817,6 @@ fn table_identity_path(table_id: TableId) -> String {
     format!("tables/TABLE-{table_id}/IDENTITY")
 }
 
-pub(crate) fn physical_table_name(table_id: TableId) -> String {
-    format!("t{table_id}")
-}
-
 fn table_schema_path(table_id: TableId, schema_id: CatalogSchemaId) -> String {
     format!(
         "tables/TABLE-{table_id}/schemas/SCHEMA-{}",
@@ -1242,12 +855,6 @@ fn validate_schema_mapping_key(
         ));
     }
     Ok(())
-}
-
-fn sorted_field_ids(field_ids: HashSet<FieldId>) -> Vec<FieldId> {
-    let mut field_ids = field_ids.into_iter().collect::<Vec<_>>();
-    field_ids.sort_unstable();
-    field_ids
 }
 
 fn read_json<T: DeserializeOwned>(store: &CatalogStore, path: &str) -> CatalogResult<T> {
