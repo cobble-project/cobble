@@ -38,7 +38,27 @@ impl BucketHash {
     #[must_use]
     #[inline]
     pub fn bucket(&self, encoded_bucket_key: &[u8]) -> u16 {
-        let hash = Self::hash(encoded_bucket_key);
+        self.bucket_from_hash(Self::hash(encoded_bucket_key))
+    }
+
+    /// Bucket of a single non-null Binary bucket-key field, without allocating
+    /// its escaped key encoding. Matches hashing that field through `KeyCodec`.
+    #[must_use]
+    pub fn binary_key_bucket(&self, bytes: &[u8]) -> u16 {
+        let mut hash = 1_i32;
+        for &byte in bytes {
+            hash = hash.wrapping_mul(31).wrapping_add(byte as i8 as i32);
+            // KeyCodec escapes each zero as 0x00, 0xff.
+            if byte == 0 {
+                hash = hash.wrapping_mul(31).wrapping_sub(1);
+            }
+        }
+        // The encoded field ends with 0x00, 0x00.
+        self.bucket_from_hash(hash.wrapping_mul(31).wrapping_mul(31))
+    }
+
+    #[inline]
+    fn bucket_from_hash(&self, hash: i32) -> u16 {
         // floorMod by a power of two is exactly the corresponding low bits, including for
         // negative two's-complement hashes.
         if self.power_of_two_mask >= 0 {
