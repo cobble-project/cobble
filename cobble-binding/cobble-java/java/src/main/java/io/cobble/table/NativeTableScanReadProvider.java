@@ -1,8 +1,11 @@
 package io.cobble.table;
 
 import io.cobble.Config;
+import io.cobble.DirectColumns;
+import io.cobble.DirectScanEntry;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -15,11 +18,67 @@ public final class NativeTableScanReadProvider implements TableReadProvider<List
 
     private final Config config;
     private final TableScanSplit split;
+    private final TableReadSchema readSchema;
+    private final List<String> fieldNames;
+    private final Table.Compiled compiled;
+    private final int[] keyIndexes;
+    private final int[] valueIndexes;
+    private final boolean hasKey;
+    private final boolean hasValues;
     private boolean opened;
 
     public NativeTableScanReadProvider(Config config, TableScanSplit split) {
+        this(config, split, identityProjection(split.schema()));
+    }
+
+    NativeTableScanReadProvider(Config config, TableScanSplit split, int[] projection) {
         this.config = Objects.requireNonNull(config, "config");
         this.split = Objects.requireNonNull(split, "split");
+        Objects.requireNonNull(projection, "projection");
+        TableSchema schema = split.schema();
+        this.compiled = Table.Compiled.from(schema, split.totalBuckets());
+        this.keyIndexes = new int[projection.length];
+        this.valueIndexes = new int[projection.length];
+        Arrays.fill(keyIndexes, -1);
+        Arrays.fill(valueIndexes, -1);
+        List<DataField> fields = new ArrayList<DataField>(projection.length);
+        List<String> names = new ArrayList<String>(projection.length);
+        int valueCount = 0;
+        boolean keySelected = false;
+        for (int i = 0; i < projection.length; i++) {
+            int source = projection[i];
+            if (source < 0 || source >= schema.fields().size()) {
+                throw new IllegalArgumentException("projection index outside table schema");
+            }
+            DataField field = schema.fields().get(source);
+            fields.add(field);
+            names.add(field.name());
+            int keyIndex = indexOf(compiled.keyPositions, source);
+            if (keyIndex >= 0) {
+                keyIndexes[i] = keyIndex;
+                keySelected = true;
+            } else {
+                valueIndexes[i] = valueCount++;
+            }
+        }
+        // Native scans require a field even when the logical projection is empty. A key
+        // keeps the row-existence column available without decoding any values.
+        if (names.isEmpty()) names.add(schema.fields().get(compiled.keyPositions[0]).name());
+        this.fieldNames = Collections.unmodifiableList(names);
+        this.readSchema = new TableReadSchema(fields);
+        this.hasKey = keySelected;
+        this.hasValues = valueCount > 0;
+    }
+
+    private static int[] identityProjection(TableSchema schema) {
+        int[] indexes = new int[schema.fields().size()];
+        for (int i = 0; i < indexes.length; i++) indexes[i] = i;
+        return indexes;
+    }
+
+    private static int indexOf(int[] positions, int source) {
+        for (int i = 0; i < positions.length; i++) if (positions[i] == source) return i;
+        return -1;
     }
 
     @Override
@@ -46,7 +105,7 @@ public final class NativeTableScanReadProvider implements TableReadProvider<List
 
         @Override
         public TableReadSchema schema() {
-            return new TableReadSchema(split.schema().fields());
+            return readSchema;
         }
 
         @Override
@@ -65,15 +124,10 @@ public final class NativeTableScanReadProvider implements TableReadProvider<List
                 throw new UnsupportedOperationException(
                         "native table scan range is fixed by its split");
             }
-            List<String> names = new ArrayList<String>();
-            for (DataField field : split.schema().fields()) names.add(field.name());
-            Table.Compiled compiled = Table.Compiled.from(split.schema(), split.totalBuckets());
             TableDirectScanCursor<List<Value>> cursor =
                     TableDirectScanCursor.fixed(
-                            split.openDirectScanner(config, names, 0),
-                            (entry, ignoredKey) ->
-                                    Collections.singletonList(
-                                            Table.decodeDirectScannedRowOwned(compiled, entry)));
+                            split.openDirectScanner(config, fieldNames, 0),
+                            (entry, ignoredKey) -> Collections.singletonList(decode(entry)));
             cursors.add(cursor);
             return cursor;
         }
@@ -95,5 +149,32 @@ public final class NativeTableScanReadProvider implements TableReadProvider<List
         private void ensureOpen() {
             if (closed) throw new IllegalStateException("native table scan session is closed");
         }
+    }
+
+    private List<Value> decode(DirectScanEntry entry) {
+        if (keyIndexes.length == 0) return Collections.emptyList();
+        List<Value> keys = hasKey ? KeyCodec.decodeOwned(compiled.keyTypes, entry.getKey()) : null;
+        DirectColumns columns = hasValues ? entry.columnsView() : null;
+        ArrayList<Value> row = new ArrayList<Value>(keyIndexes.length);
+        for (int i = 0; i < keyIndexes.length; i++) {
+            if (keyIndexes[i] >= 0) {
+                row.add(keys.get(keyIndexes[i]));
+            } else {
+                int columnIndex = valueIndexes[i];
+                if (columnIndex >= columns.size()) {
+                    throw new IllegalStateException("table row has an incompatible projection");
+                }
+                java.nio.ByteBuffer value = columns.get(columnIndex);
+                LogicalType type = readSchema.fields().get(i).logicalType();
+                if (value == null) {
+                    if (!type.isNullable())
+                        throw new IllegalStateException("table row is missing a value column");
+                    row.add(Value.nullValue());
+                } else {
+                    row.add(ValueCodec.decodeOwned(type, value));
+                }
+            }
+        }
+        return Collections.unmodifiableList(row);
     }
 }
