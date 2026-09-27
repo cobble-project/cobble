@@ -178,8 +178,9 @@ Every writer requires `.bucket(id)` and owns exactly one bucket, with database i
 `bucket-<id>`. A worker assigned multiple buckets opens one writer per bucket.
 Use `resumeFromSnapshot(committedShardSnapshotId)` for append; `open()` initializes or resumes
 the retained empty snapshot 0, for a first write or overwrite. Snapshot and file IDs do not rewind.
-Writers require local/shared filesystem META storage with working file locks and disabled
-automatic snapshot pruning. `materializeTable(db)` is a separate lower-level API using an existing Db.
+META may use any configured filesystem. The caller must ensure that only one writer owns each
+bucket at a time and disable automatic snapshot pruning. `materializeTable(db)` is a separate
+lower-level API using an existing Db.
 
 To read one fixed shard snapshot through the catalog:
 

@@ -12,18 +12,15 @@ use crate::{
 use arc_swap::{ArcSwap, Guard};
 use bytes::Bytes;
 use cobble::{
-    Config, Db, DbBuilder, DbGovernance, DbIterator, FileSystemDbGovernance, GovernanceMode,
-    NoopDbGovernance, ReadOnlyDbBuilder, ReadOptions, Reader, ReaderBuilder, ReaderConfig,
-    ScanOptions, SchemaTransformRegistrar, VolumeUsageKind, bucket_snapshot_manifest_path,
+    Config, Db, DbBuilder, DbGovernance, DbIterator, FileSystem, FileSystemDbGovernance,
+    FileSystemRegistry, GovernanceMode, NoopDbGovernance, ReadOnlyDbBuilder, ReadOptions, Reader,
+    ReaderBuilder, ReaderConfig, ScanOptions, SchemaTransformRegistrar, VolumeUsageKind,
+    bucket_snapshot_manifest_path,
 };
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use url::Url;
 
 type SchemaTransformCallback =
     Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
@@ -122,8 +119,7 @@ impl TableWriterBuilder {
 
     /// Own exactly one physical bucket using the stable database identity `bucket-N`.
     ///
-    /// The writer keeps a local-filesystem advisory lock for that database until its underlying
-    /// [`Db`] is dropped.
+    /// The caller must ensure that only one writer owns a bucket at a time.
     pub fn bucket(mut self, bucket: u16) -> Self {
         self.bucket = Some(bucket);
         self
@@ -251,7 +247,7 @@ impl TableWriterBuilder {
         catalog_table_id: Option<crate::catalog::TableId>,
     ) -> Result<(Arc<Db>, bool)> {
         let bucket = self.required_bucket()?;
-        let governance = self.bucket_governance(bucket)?;
+        let governance = self.bucket_governance()?;
         if bucket_snapshot_exists(&self.config, bucket, 0)? {
             self.validate_bucket_snapshot(0, table_name, standalone_schema, catalog_table_id)?;
             let db = Arc::new(
@@ -276,8 +272,7 @@ impl TableWriterBuilder {
         table_name: &str,
         catalog_table_id: Option<crate::catalog::TableId>,
     ) -> Result<Arc<Db>> {
-        let bucket = self.required_bucket()?;
-        let governance = self.bucket_governance(bucket)?;
+        let governance = self.bucket_governance()?;
         self.validate_bucket_snapshot(snapshot_id, table_name, None, catalog_table_id)?;
         Ok(Arc::new(
             self.bucket_db_builder(governance)?
@@ -285,13 +280,9 @@ impl TableWriterBuilder {
         ))
     }
 
-    fn bucket_governance(&self, bucket: u16) -> Result<Arc<dyn DbGovernance>> {
+    fn bucket_governance(&self) -> Result<Arc<dyn DbGovernance>> {
         self.bucket_config()?;
-        Ok(Arc::new(LockedDbGovernance::new(
-            &self.config,
-            bucket,
-            default_governance(&self.config)?,
-        )?))
+        Ok(default_governance(&self.config)?)
     }
 
     fn bucket_db_builder(&self, governance: Arc<dyn DbGovernance>) -> Result<DbBuilder> {
@@ -316,8 +307,7 @@ impl TableWriterBuilder {
         let config = self.bucket_config()?;
         let db_id = bucket_db_id(bucket);
         let manifest_path = bucket_snapshot_manifest_path(&db_id, snapshot_id);
-        let absolute_manifest = configured_local_meta_root(&config)?.join(manifest_path);
-        if !absolute_manifest.exists() {
+        if !metadata_fs(&config)?.exists(&manifest_path)? {
             return Err(TableError::InvalidSchema(format!(
                 "single-bucket writer is missing snapshot {snapshot_id} for {}",
                 bucket_db_id(bucket)
@@ -326,7 +316,7 @@ impl TableWriterBuilder {
         let snapshot = cobble::load_shard_snapshot_metadata(
             &config,
             &db_id,
-            &absolute_manifest.to_string_lossy(),
+            &metadata_absolute_path(&config, &manifest_path)?,
         )?;
         if snapshot.snapshot_id != snapshot_id || snapshot.ranges.as_slice() != [bucket..=bucket] {
             return Err(TableError::InvalidSchema(format!(
@@ -381,116 +371,51 @@ fn default_governance(config: &Config) -> cobble::Result<Arc<dyn DbGovernance>> 
     }
 }
 
-struct LockedDbGovernance {
-    inner: Arc<dyn DbGovernance>,
-    _lock: LocalBucketLock,
-}
-
-impl LockedDbGovernance {
-    fn new(config: &Config, bucket: u16, inner: Arc<dyn DbGovernance>) -> cobble::Result<Self> {
-        Ok(Self {
-            inner,
-            _lock: LocalBucketLock::acquire(config, bucket)?,
-        })
-    }
-}
-
-impl DbGovernance for LockedDbGovernance {
-    fn register_db(
-        &self,
-        db_id: &str,
-        ranges: &[RangeInclusive<u16>],
-        total_buckets: u32,
-    ) -> cobble::Result<()> {
-        self.inner.register_db(db_id, ranges, total_buckets)
-    }
-
-    fn unregister_db(&self, db_id: &str) -> cobble::Result<()> {
-        self.inner.unregister_db(db_id)
-    }
-}
-
-struct LocalBucketLock {
-    _file: File,
-}
-
-impl LocalBucketLock {
-    fn acquire(config: &Config, bucket: u16) -> cobble::Result<Self> {
-        let root = local_meta_root(config)?;
-        let bucket_dir = root.join(bucket_db_id(bucket));
-        std::fs::create_dir_all(&bucket_dir).map_err(lock_io_error)?;
-        let bucket_dir = std::fs::canonicalize(&bucket_dir).map_err(lock_io_error)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(bucket_dir.join(".cobble-table-writer.lock"))
-            .map_err(lock_io_error)?;
-        file.try_lock().map_err(|error| {
-            cobble::Error::InvalidState(format!("single-bucket writer is already active: {error}"))
-        })?;
-        Ok(Self { _file: file })
-    }
-}
-
-fn local_meta_root(config: &Config) -> cobble::Result<PathBuf> {
-    let root = configured_local_meta_root(config)?;
-    std::fs::create_dir_all(&root).map_err(lock_io_error)?;
-    std::fs::canonicalize(root).map_err(lock_io_error)
-}
-
-fn configured_local_meta_root(config: &Config) -> cobble::Result<PathBuf> {
-    let volume = config
+fn metadata_volume(config: &Config) -> cobble::Result<&cobble::VolumeDescriptor> {
+    config
         .volumes
         .iter()
         .find(|volume| volume.supports(VolumeUsageKind::Meta))
         .ok_or_else(|| {
             cobble::Error::ConfigError("single-bucket writer requires a META volume".into())
-        })?;
-    let root = match Url::parse(&volume.base_dir) {
-        Ok(url) if url.scheme() == "file" => url.to_file_path().map_err(|_| {
-            cobble::Error::ConfigError("single-bucket META volume is not a local path".into())
-        })?,
-        Ok(_) => {
-            return Err(cobble::Error::ConfigError(
-                "single-bucket table writers require a local file:// META volume".into(),
-            ));
-        }
-        Err(_) if volume.base_dir.contains("://") => {
-            return Err(cobble::Error::ConfigError(format!(
-                "invalid single-bucket META volume URL: {}",
-                volume.base_dir
-            )));
-        }
-        Err(_) => PathBuf::from(&volume.base_dir),
+        })
+}
+
+fn metadata_fs(config: &Config) -> cobble::Result<Arc<dyn FileSystem>> {
+    FileSystemRegistry::new().get_or_register_volume(metadata_volume(config)?)
+}
+
+fn metadata_absolute_path(config: &Config, relative_path: &str) -> cobble::Result<String> {
+    let volume = metadata_volume(config)?;
+    let base = volume.base_dir.as_str();
+    let base = if base.contains("://") || Path::new(base).is_absolute() {
+        base.to_string()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| cobble::Error::IoError(error.to_string()))?
+            .join(base)
+            .to_string_lossy()
+            .to_string()
     };
-    Ok(root)
+    let separator = if base.ends_with('/') { "" } else { "/" };
+    Ok(format!("{base}{separator}{relative_path}"))
 }
 
 fn bucket_has_persisted_state(config: &Config, bucket: u16) -> Result<bool> {
-    let bucket_dir = local_meta_root(config)?.join(bucket_db_id(bucket));
-    if !bucket_dir.exists() {
-        return Ok(false);
-    }
-    for entry in std::fs::read_dir(bucket_dir).map_err(lock_io_error)? {
-        let entry = entry.map_err(lock_io_error)?;
-        if entry.file_name() != ".cobble-table-writer.lock" {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let fs = metadata_fs(config)?;
+    let bucket_name = bucket_db_id(bucket);
+    let bucket_dir = format!("{bucket_name}/");
+    fs.create_dir(&bucket_dir)?;
+    // Some filesystems include the directory itself in its listing.
+    Ok(fs
+        .list(&bucket_dir)?
+        .iter()
+        .any(|entry| entry != &bucket_name && entry != &bucket_dir))
 }
 
 fn bucket_snapshot_exists(config: &Config, bucket: u16, snapshot_id: u64) -> Result<bool> {
     let db_id = bucket_db_id(bucket);
-    Ok(configured_local_meta_root(config)?
-        .join(bucket_snapshot_manifest_path(&db_id, snapshot_id))
-        .exists())
-}
-
-fn lock_io_error(error: io::Error) -> cobble::Error {
-    cobble::Error::IoError(format!("single-bucket writer lock: {error}"))
+    Ok(metadata_fs(config)?.exists(&bucket_snapshot_manifest_path(&db_id, snapshot_id))?)
 }
 
 fn open_materialized_catalog_table(
