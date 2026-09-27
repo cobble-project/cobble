@@ -144,6 +144,67 @@ fn codec_contract_vectors_round_trip_and_reject_invalid_input() {
     }
 }
 
+#[test]
+fn value_serde_json_transport_contract() {
+    let original = value();
+    let encoded = serde_json::to_string(&original).unwrap();
+    let decoded: Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, original);
+
+    let json: JsonValue = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(json["Struct"][7]["Decimal"]["unscaled"], "-42");
+
+    for bits in [0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_1234] {
+        let encoded = serde_json::to_string(&Value::Float32(f32::from_bits(bits))).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        let Value::Float32(value) = decoded else {
+            panic!("expected float32");
+        };
+        assert_eq!(value.to_bits(), bits);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&encoded).unwrap()["Float32"],
+            bits
+        );
+    }
+
+    for bits in [
+        0,
+        0x8000_0000_0000_0000,
+        0x7ff0_0000_0000_0000,
+        0xfff0_0000_0000_0000,
+        0x7ff8_0000_0000_1234,
+    ] {
+        let encoded = serde_json::to_string(&Value::Float64(f64::from_bits(bits))).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        let Value::Float64(value) = decoded else {
+            panic!("expected float64");
+        };
+        assert_eq!(value.to_bits(), bits);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&encoded).unwrap()["Float64"],
+            bits
+        );
+    }
+
+    for unscaled in [
+        i128::MIN,
+        -9_007_199_254_740_993,
+        9_007_199_254_740_993,
+        i128::MAX,
+    ] {
+        let original = Value::Decimal {
+            precision: 38,
+            scale: 0,
+            unscaled,
+        };
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, original);
+        let json: JsonValue = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(json["Decimal"]["unscaled"], unscaled.to_string());
+    }
+}
+
 fn key_types() -> Vec<LogicalType> {
     vec![
         LogicalType::boolean(),
