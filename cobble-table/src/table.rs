@@ -36,6 +36,16 @@ pub struct TableKey {
 }
 
 impl TableKey {
+    /// Storage key encoded by the table codec, suitable for cursor boundaries.
+    pub fn encoded(&self) -> &[u8] {
+        &self.inner.encoded
+    }
+
+    /// Primary-key values in schema primary-key order.
+    pub fn values(&self) -> &[Value] {
+        &self.inner.values
+    }
+
     /// Return the bucket selected for this key.
     #[must_use]
     pub fn bucket(&self) -> u16 {
@@ -230,6 +240,66 @@ impl Table {
         self.put_bound(row, &bound)
     }
 
+    /// Write all non-key fields in schema order, reusing an encoded table key.
+    pub fn put_values(
+        &self,
+        key: &TableKey,
+        values: &[Value],
+        options: &WriteOptions,
+    ) -> Result<()> {
+        if values.len() != self.compiled.value_types.len() {
+            return Err(TableError::codec("value field count does not match schema"));
+        }
+        let mut columns = self
+            .compiled
+            .value_types
+            .iter()
+            .zip(values)
+            .map(|(ty, value)| ValueCodec::encode_validated(ty, value))
+            .collect::<Result<Vec<_>>>()?;
+        // Key-only tables still need a physical column to represent row existence.
+        if columns.is_empty() {
+            columns.push(vec![1]);
+        }
+        self.db.put_columns_with_options(
+            key.bucket(),
+            key.encoded(),
+            &columns,
+            &self.rebound_write_options(options),
+        )?;
+        Ok(())
+    }
+
+    /// Read all non-key fields in schema order, without assembling the key fields.
+    pub fn get_values(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
+        self.db
+            .get_with_options(key.bucket(), key.encoded(), &self.read_options)?
+            .map(|columns| decode_values(&self.compiled, &columns))
+            .transpose()
+    }
+
+    /// Read non-key fields, preserving input order, duplicate keys and misses.
+    pub fn multi_get_values(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        let requests = keys
+            .iter()
+            .map(|key| (key.bucket(), key.encoded()))
+            .collect::<Vec<_>>();
+        self.db
+            .multi_get_with_options(&requests, &self.read_options)?
+            .into_iter()
+            .map(|columns| {
+                columns
+                    .map(|columns| decode_values(&self.compiled, &columns))
+                    .transpose()
+            })
+            .collect()
+    }
+
+    /// Decode a complete storage key using this table's schema.
+    pub fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
+        decode_table_key(&self.compiled, encoded)
+    }
+
     /// Delete one complete row.
     pub fn delete(&self, key: &TableKey) -> Result<()> {
         self.db.delete_row_with_options(
@@ -301,6 +371,43 @@ impl Table {
     /// Scan all rows in one bucket.
     pub fn scan(&self, bucket: u16) -> Result<TableScan> {
         self.scan_bounds(bucket, None, None)
+    }
+
+    /// Scan complete leading primary-key fields, including the entire bucket key.
+    /// Returns full rows from the single bucket selected by that prefix.
+    pub fn scan_key_prefix(&self, values: &[Value]) -> Result<TableScan> {
+        if values.len() < self.compiled.bucket_key_fields
+            || values.len() > self.compiled.key_types.len()
+        {
+            return Err(TableError::codec(
+                "prefix must contain the bucket key and at most the full primary key",
+            ));
+        }
+        let mut prefix = Vec::new();
+        let bucket_end = KeyCodec::encode_row_with_prefix_validated(
+            &self.compiled.key_types[..values.len()],
+            values,
+            self.compiled.bucket_key_fields,
+            &mut prefix,
+        )?;
+        let bucket = self.compiled.bucket_hash.bucket(&prefix[..bucket_end]);
+        let mut end = prefix.clone();
+        while end.last() == Some(&255) {
+            end.pop();
+        }
+        if let Some(last) = end.last_mut() {
+            *last += 1;
+        }
+        Ok(TableScan {
+            inner: self.read_backend.scan_with_options_bounds(
+                bucket,
+                Some(&prefix),
+                if end.is_empty() { None } else { Some(&end) },
+                &self.scan_options,
+            )?,
+            _read_backend: self.read_backend.clone(),
+            compiled: Arc::clone(&self.compiled),
+        })
     }
 
     /// Scan one bucket from an inclusive primary-key bound to an exclusive bound.
@@ -480,6 +587,11 @@ fn ensure_table_schema(db: &Db, name: &str, schema: TableSchema) -> Result<Table
 }
 
 impl ReadOnlyTable {
+    /// Decode a complete storage key using this snapshot's table schema.
+    pub fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
+        self.typed.key_from_encoded(encoded)
+    }
+
     /// Open a table from metadata stored in this snapshot's schema.
     pub fn open(db: Arc<ReadOnlyDb>, name: impl Into<String>) -> Result<Self> {
         let name = validate_name(name.into())?;
@@ -559,6 +671,28 @@ impl ReadOnlyTable {
 }
 
 impl TypedRead {
+    pub(crate) fn scan_encoded_bounds(
+        &self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<TableScan> {
+        Ok(TableScan {
+            inner: self.read_backend.scan_with_options_bounds(
+                bucket,
+                start,
+                end,
+                &self.scan_options,
+            )?,
+            _read_backend: self.read_backend.clone(),
+            compiled: Arc::clone(&self.compiled),
+        })
+    }
+
+    pub(crate) fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
+        decode_table_key(&self.compiled, encoded)
+    }
+
     pub(crate) fn from_shard_metadata(
         db: Arc<ReadOnlyDb>,
         name: String,
@@ -674,16 +808,11 @@ impl TypedRead {
     ) -> Result<TableScan> {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
-        Ok(TableScan {
-            inner: self.read_backend.scan_with_options_bounds(
-                bucket,
-                start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
-                end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
-                &self.scan_options,
-            )?,
-            _read_backend: self.read_backend.clone(),
-            compiled: Arc::clone(&self.compiled),
-        })
+        self.scan_encoded_bounds(
+            bucket,
+            start_key_inclusive.map(TableKey::encoded),
+            end_key_exclusive.map(TableKey::encoded),
+        )
     }
 }
 
@@ -818,6 +947,29 @@ pub(crate) fn decode_table_scan_row(
     )?;
     decode_value_columns(compiled, &mut row, columns)?;
     Ok(row)
+}
+
+fn decode_table_key(compiled: &Arc<CompiledTable>, encoded: &[u8]) -> Result<TableKey> {
+    TableKeyBuilder {
+        compiled: Arc::clone(compiled),
+        values: KeyCodec::decode_row_validated(&compiled.key_types, encoded)?,
+    }
+    .build()
+}
+
+fn decode_values(compiled: &CompiledTable, columns: &[Option<Bytes>]) -> Result<Vec<Value>> {
+    compiled
+        .value_types
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| {
+            let value = columns
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| TableError::codec("table row is missing a value column"))?;
+            ValueCodec::decode_bytes_validated(ty, value.clone())
+        })
+        .collect()
 }
 
 fn assemble_row_from_key_values(
