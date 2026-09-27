@@ -125,6 +125,23 @@ fn codec_contract_vectors_round_trip_and_reject_invalid_input() {
     assert!(BucketHash::new(65_537).is_err());
     assert_eq!(BucketHash::new(1).unwrap().bucket(&key), 0);
     assert_eq!(BucketHash::new(65_536).unwrap().bucket(&[0xc5]), 65_508);
+
+    let all_bytes = (u8::MIN..=u8::MAX).collect::<Vec<_>>();
+    for binary in [&[][..], &[0][..], &[0, 0x7f, 0x80, 0xff][..], &all_bytes] {
+        let encoded = KeyCodec::encode_scalar(
+            &LogicalType::binary(),
+            &Value::Binary(Bytes::copy_from_slice(binary)),
+        )
+        .unwrap();
+        for count in [1, 16, 17, 32_768, 65_536] {
+            let bucket_hash = BucketHash::new(count).unwrap();
+            assert_eq!(
+                bucket_hash.binary_key_bucket(binary),
+                bucket_hash.bucket(&encoded),
+                "binary={binary:?}, bucket_count={count}"
+            );
+        }
+    }
 }
 
 fn key_types() -> Vec<LogicalType> {
