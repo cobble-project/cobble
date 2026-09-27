@@ -146,6 +146,43 @@ class TableScanPlanTest {
 
         plan = roundTrip(plan);
 
+        TableScanPlan reordered =
+                roundTrip(plan.project(Arrays.asList("second", "id", "first")))
+                        .project(Arrays.asList("first", "id"));
+        assertEquals(
+                Arrays.asList(schema.fields().get(1), schema.fields().get(0)),
+                reordered.readSchema().fields());
+        assertEquals(
+                Arrays.asList(
+                        Arrays.asList(Value.string("first"), Value.int64(7)),
+                        Arrays.asList(Value.string(large), Value.int64(8)),
+                        Arrays.asList(Value.string("tail"), Value.int64(9))),
+                readProjected(config, reordered));
+        assertEquals(
+                Arrays.asList(
+                        Arrays.asList(
+                                Value.string("second"), Value.string("first"), Value.int64(7)),
+                        Arrays.asList(Value.string("large"), Value.string(large), Value.int64(8)),
+                        Arrays.asList(Value.string("end"), Value.string("tail"), Value.int64(9))),
+                readProjected(config, plan.project(Arrays.asList("second", "first", "id"))));
+        assertTrue(
+                physicalBytes(config, plan.project(Collections.singletonList("second"))) + 8192
+                        < physicalBytes(config, plan));
+        assertEquals(
+                Arrays.asList(
+                        Collections.singletonList(Value.int64(7)),
+                        Collections.singletonList(Value.int64(8)),
+                        Collections.singletonList(Value.int64(9))),
+                readProjected(config, plan.project(Collections.singletonList("id"))));
+        assertEquals(
+                Arrays.asList(
+                        Collections.<Value>emptyList(),
+                        Collections.<Value>emptyList(),
+                        Collections.<Value>emptyList()),
+                readProjected(config, plan.project(Collections.<String>emptyList())));
+        assertThrows(
+                IllegalArgumentException.class, () -> reordered.project(Arrays.asList("id", "id")));
+
         List<TableScanSplit> splits = plan.splits();
         assertEquals(1, splits.size());
         TableScanSplit split = roundTrip(splits.get(0));
@@ -205,6 +242,88 @@ class TableScanPlanTest {
         assertEquals(largeRow, retained);
         cursor.close();
         assertThrows(IllegalStateException.class, cursor::nextRow);
+    }
+
+    private static List<List<Value>> readProjected(Config config, TableScanPlan plan)
+            throws Exception {
+        List<List<Value>> rows = new ArrayList<List<Value>>();
+        for (TableScanSplit split : plan.splits()) {
+            try (TableReadProvider<List<Value>, ?> provider = plan.open(config, split);
+                    TableReadSession<List<Value>, ?> session = provider.open();
+                    TableReadCursor<List<Value>> cursor =
+                            session.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
+                assertEquals(plan.readSchema().fields(), session.schema().fields());
+                TableReadEntry<List<Value>> entry;
+                while ((entry = cursor.next()) != null) {
+                    assertTrue(entry.countsPhysicalEntry());
+                    rows.add(entry.value());
+                }
+            }
+        }
+        return rows;
+    }
+
+    private static long physicalBytes(Config config, TableScanPlan plan) throws Exception {
+        long bytes = 0;
+        for (TableScanSplit split : plan.splits()) {
+            try (TableReadProvider<List<Value>, ?> provider = plan.open(config, split);
+                    TableReadSession<List<Value>, ?> session = provider.open();
+                    TableReadCursor<List<Value>> cursor =
+                            session.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
+                TableReadEntry<List<Value>> entry;
+                while ((entry = cursor.next()) != null) bytes += entry.physicalBytes();
+            }
+        }
+        return bytes;
+    }
+
+    @Test
+    void projectedScanReadsNullableColumnAddedAfterExistingRows() throws Exception {
+        Path dataDir = Files.createTempDirectory("cobble-java-table-scan-evolution-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        TableSchema initialSchema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(2, "old", LogicalTypes.string())),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        List<String> namespace = Collections.singletonList("test");
+        TableIdentifier identifier = new TableIdentifier(namespace, "data");
+        GlobalSnapshot snapshot;
+        String physicalName;
+        try (FileCatalog catalog = FileCatalog.open(config, "scan-evolution");
+                Db db = Db.open(config)) {
+            catalog.createNamespace(namespace);
+            try (CatalogTable initial = catalog.createTable(identifier, initialSchema);
+                    Table writer = initial.materializeTable(db)) {
+                physicalName = writer.name();
+                writer.put(Arrays.asList(Value.int64(1), Value.string("existing")));
+                try (CatalogTable evolved =
+                        catalog.evolveSchema(
+                                identifier,
+                                Collections.singletonList(
+                                        TableSchemaChange.addField(
+                                                "added", LogicalTypes.string().nullable())))) {
+                    assertTrue(evolved.refreshWriter(writer));
+                    try (TableSnapshotCommitter committer =
+                            TableSnapshotCommitter.open(config, 1, 1)) {
+                        snapshot =
+                                committer.commitBatch(1L, Collections.singletonList(db.snapshot()));
+                    }
+                }
+            }
+        }
+        TableScanPlan plan;
+        try (TableReader reader = TableReader.open(config, physicalName, snapshot.id)) {
+            plan = roundTrip(reader.scanPlan());
+        }
+        assertEquals(
+                Collections.singletonList(Collections.singletonList(Value.nullValue())),
+                readProjected(config, plan.project(Collections.singletonList("added"))));
+        assertEquals(
+                Collections.singletonList(Arrays.asList(Value.nullValue(), Value.int64(1))),
+                readProjected(config, plan.project(Arrays.asList("added", "id"))));
     }
 
     @Test

@@ -188,8 +188,7 @@ public final class TableScanPlan implements Serializable {
         if (!formatId.equals(split.formatId()))
             throw new IllegalArgumentException("split format differs from plan format");
         if (snapshot == null) {
-            return TableReadProjection.apply(
-                    new NativeTableScanReadProvider(config, split), readSchema, projection);
+            return new NativeTableScanReadProvider(config, split, projection);
         }
         TableFormatPlugin plugin = TableFormatPluginRegistry.resolve(formatId);
         return new PhysicalProvider(
