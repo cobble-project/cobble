@@ -9,6 +9,9 @@ use cobble::{
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
+#[path = "batch.rs"]
+mod batch;
+
 pub(crate) struct CompiledTable {
     schema: Arc<TableSchema>,
     column_family_options: ColumnFamilyOptions,
@@ -247,6 +250,17 @@ impl Table {
         values: &[Value],
         options: &WriteOptions,
     ) -> Result<()> {
+        let columns = self.encode_values(values)?;
+        self.db.put_columns_with_options(
+            key.bucket(),
+            key.encoded(),
+            &columns,
+            &self.rebound_write_options(options),
+        )?;
+        Ok(())
+    }
+
+    fn encode_values(&self, values: &[Value]) -> Result<Vec<Vec<u8>>> {
         if values.len() != self.compiled.value_types.len() {
             return Err(TableError::codec("value field count does not match schema"));
         }
@@ -261,13 +275,7 @@ impl Table {
         if columns.is_empty() {
             columns.push(vec![1]);
         }
-        self.db.put_columns_with_options(
-            key.bucket(),
-            key.encoded(),
-            &columns,
-            &self.rebound_write_options(options),
-        )?;
-        Ok(())
+        Ok(columns)
     }
 
     /// Read all non-key fields in schema order, without assembling the key fields.

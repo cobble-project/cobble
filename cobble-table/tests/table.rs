@@ -1,6 +1,6 @@
 use cobble::{
     Config, CoordinatorConfig, DbBuilder, DbCoordinator, FileSystemRegistry, Reader, ReaderConfig,
-    ScanSplit, VolumeDescriptor, VolumeUsageKind, WriteOptions,
+    ScanSplit, VolumeDescriptor, VolumeUsageKind, WriteBatch, WriteBatchOperationRef, WriteOptions,
 };
 use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
@@ -1001,6 +1001,138 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
     assert_eq!(coordinator.load_current_global_snapshot().unwrap(), current);
     drop(incompatible);
     drop(left);
+}
+
+#[test]
+fn table_batch_appends_rows_values_and_deletes_across_tables() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let db = Arc::new(
+        DbBuilder::new(config)
+            .bucket_ranges(std::iter::once(0..=0).collect())
+            .open()
+            .unwrap(),
+    );
+    // Interleaved key/value fields exercise both complete-row and value-only mapping.
+    let schema = TableSchema::builder()
+        .field("count", LogicalType::int64())
+        .field("id", LogicalType::int64())
+        .field("note", LogicalType::string().nullable())
+        .primary_key(["id"])
+        .bucket_key(["id"])
+        .build()
+        .unwrap();
+    let left = Table::create(db.clone(), "left", schema.clone()).unwrap();
+    let right = Table::create(db.clone(), "right", schema).unwrap();
+    let keys = Table::create(
+        db.clone(),
+        "keys",
+        TableSchema::builder()
+            .field("id", LogicalType::int64())
+            .primary_key(["id"])
+            .bucket_key(["id"])
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    let key = build_key(&left, &[Value::Int64(7)]);
+    let row = vec![
+        Value::Int64(1),
+        Value::Int64(7),
+        Value::String("initial".into()),
+    ];
+    let mut batch = WriteBatch::new();
+    left.append_put(&mut batch, &row).unwrap();
+    right.append_put(&mut batch, &row).unwrap();
+    left.append_delete(&mut batch, &key);
+
+    let mut options = WriteOptions::with_column_family("wrong-family");
+    options.ttl_seconds = Some(600);
+    left.append_put_values(&mut batch, &key, &[Value::Int64(2), Value::Null], &options)
+        .unwrap();
+    let updated = vec![
+        Value::Int64(3),
+        Value::Int64(7),
+        Value::String("updated".into()),
+    ];
+    right
+        .append_put_with_options(&mut batch, &updated, &options)
+        .unwrap();
+
+    let marker = build_key(&keys, &[Value::Int64(9)]);
+    keys.append_put(&mut batch, &[Value::Int64(9)]).unwrap();
+    keys.append_delete(&mut batch, &marker);
+    let kept_marker = build_key(&keys, &[Value::Int64(10)]);
+    keys.append_put_values(&mut batch, &kept_marker, &[], &WriteOptions::default())
+        .unwrap();
+
+    let before = batch.operations().count();
+    assert!(left.append_put(&mut batch, &[Value::Int64(4)]).is_err());
+    // Failure in a later value column must not append an earlier column.
+    assert!(
+        left.append_put_with_options(
+            &mut batch,
+            &[Value::Int64(4), Value::Int64(7), Value::Int64(5)],
+            &options
+        )
+        .is_err()
+    );
+    assert!(
+        left.append_put_values(
+            &mut batch,
+            &key,
+            &[Value::Int64(4), Value::Int64(5)],
+            &options
+        )
+        .is_err()
+    );
+    assert!(
+        left.append_put_values(&mut batch, &key, &[], &options)
+            .is_err()
+    );
+    assert_eq!(batch.operations().count(), before);
+    let mut ttl_columns = 0;
+    for operation in batch.operations() {
+        match operation {
+            WriteBatchOperationRef::Put {
+                column_family,
+                ttl_seconds,
+                ..
+            } => {
+                assert!(matches!(column_family, Some("left" | "right" | "keys")));
+                ttl_columns += usize::from(ttl_seconds == Some(600));
+            }
+            WriteBatchOperationRef::Delete { column_family, .. } => {
+                assert!(matches!(column_family, Some("left" | "keys")));
+            }
+            WriteBatchOperationRef::Merge { .. } => panic!("unexpected merge"),
+        }
+    }
+    assert_eq!(ttl_columns, 4);
+    assert_eq!(left.get(&key).unwrap(), None);
+    assert_eq!(right.get(&key).unwrap(), None);
+    assert_eq!(keys.get(&kept_marker).unwrap(), None);
+    db.write_batch(batch).unwrap();
+    assert_eq!(
+        left.get_values(&key).unwrap(),
+        Some(vec![Value::Int64(2), Value::Null])
+    );
+    assert_eq!(right.get(&key).unwrap(), Some(updated));
+    assert_eq!(keys.get(&marker).unwrap(), None);
+    assert_eq!(keys.get_values(&kept_marker).unwrap(), Some(vec![]));
+
+    let mut deletes = WriteBatch::new();
+    left.append_delete(&mut deletes, &key);
+    right.append_delete(&mut deletes, &key);
+    keys.append_delete(&mut deletes, &kept_marker);
+    db.write_batch(deletes).unwrap();
+    assert_eq!(left.get(&key).unwrap(), None);
+    assert_eq!(right.get(&key).unwrap(), None);
+    assert_eq!(keys.get(&kept_marker).unwrap(), None);
 }
 
 fn runtime_schema(value_type: LogicalType) -> TableSchema {
