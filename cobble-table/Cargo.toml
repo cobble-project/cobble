@@ -16,7 +16,7 @@ ffi = ["dep:size"]
 [dependencies]
 arc-swap = { workspace = true }
 cobble = { workspace = true }
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

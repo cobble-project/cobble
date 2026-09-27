@@ -5,7 +5,7 @@ use std::ops::Range;
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// Schema-directed dynamic value used by the `cobble-table-v1` codec.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Boolean(bool),
@@ -13,11 +13,12 @@ pub enum Value {
     Int16(i16),
     Int32(i32),
     Int64(i64),
-    Float32(f32),
-    Float64(f64),
+    Float32(#[serde(with = "float32_bits")] f32),
+    Float64(#[serde(with = "float64_bits")] f64),
     Decimal {
         precision: u8,
         scale: u8,
+        #[serde(with = "decimal_i128")]
         unscaled: i128,
     },
     Date(i32),
@@ -42,6 +43,45 @@ pub enum Value {
 impl From<Vec<u8>> for Value {
     fn from(value: Vec<u8>) -> Self {
         Self::Binary(Bytes::from(value))
+    }
+}
+
+// Preserve NaN payloads, infinities and signed zero in JSON transport.
+mod float32_bits {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(value.to_bits())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+        u32::deserialize(deserializer).map(f32::from_bits)
+    }
+}
+
+mod float64_bits {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(value.to_bits())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        u64::deserialize(deserializer).map(f64::from_bits)
+    }
+}
+
+mod decimal_i128 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &i128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
