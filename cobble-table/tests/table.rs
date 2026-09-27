@@ -1,6 +1,6 @@
 use cobble::{
     Config, CoordinatorConfig, DbBuilder, DbCoordinator, FileSystemRegistry, Reader, ReaderConfig,
-    ScanSplit, VolumeDescriptor, VolumeUsageKind,
+    ScanSplit, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
@@ -86,7 +86,64 @@ fn table_runtime_create_open_and_typed_rows() {
         let key2 = build_key(&table, &key2);
         let missing = build_key(&table, &missing);
         table.put(&row1).unwrap();
-        table.put(&row2).unwrap();
+        table
+            .put_values(&key2, &row2[2..], &WriteOptions::default())
+            .unwrap();
+        assert!(
+            table
+                .put_values(&key2, &row2[2..3], &WriteOptions::default())
+                .is_err()
+        );
+        assert!(
+            table
+                .put_values(
+                    &key2,
+                    &[Value::Int64(1), Value::Null, Value::Null],
+                    &WriteOptions::default()
+                )
+                .is_err()
+        );
+        assert_eq!(table.get_values(&key2).unwrap(), Some(row2[2..].to_vec()));
+        assert_eq!(table.get_values(&missing).unwrap(), None);
+        assert_eq!(
+            table
+                .multi_get_values(&[key2.clone(), missing.clone(), key1.clone(), key2.clone()])
+                .unwrap(),
+            vec![
+                Some(row2[2..].to_vec()),
+                None,
+                Some(row1[2..].to_vec()),
+                Some(row2[2..].to_vec())
+            ]
+        );
+        assert!(table.multi_get_values(&[]).unwrap().is_empty());
+        let decoded = table.key_from_encoded(key2.encoded()).unwrap();
+        assert_eq!(decoded.values(), key2.values());
+        assert_eq!(decoded.encoded(), key2.encoded());
+        assert_eq!(decoded.bucket(), key2.bucket());
+        assert!(
+            table
+                .key_from_encoded(&key2.encoded()[..key2.encoded().len() - 1])
+                .is_err()
+        );
+        assert_eq!(
+            table
+                .scan_key_prefix(&row1[..1])
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![row1.clone(), row2.clone()]
+        );
+        assert_eq!(
+            table
+                .scan_key_prefix(key2.values())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![row2.clone()]
+        );
+        assert!(table.scan_key_prefix(&[]).is_err());
+        assert!(table.scan_key_prefix(&row1[..3]).is_err());
         assert_eq!(table.get(&key1).unwrap(), Some(row1.clone()));
         assert_eq!(table.get(&missing).unwrap(), None);
         let multi_keys = vec![key2.clone(), key1.clone(), key2.clone(), missing.clone()];
@@ -184,7 +241,28 @@ fn table_runtime_create_open_and_typed_rows() {
             })
             .find(|(_, key)| key.bucket() != key_only_key.bucket())
             .unwrap();
-        keys.put(&key_only).unwrap();
+        keys.put_values(&key_only_key, &[], &WriteOptions::default())
+            .unwrap();
+        assert_eq!(keys.get_values(&key_only_key).unwrap(), Some(vec![]));
+        // An all-0xff encoded prefix has no finite exclusive upper bound.
+        let max_key = build_key(&keys, &[Value::Int64(i64::MAX)]);
+        keys.put_values(&max_key, &[], &WriteOptions::default())
+            .unwrap();
+        assert_eq!(
+            keys.scan_key_prefix(max_key.values())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![vec![Value::Int64(i64::MAX)]]
+        );
+        keys.delete(&max_key).unwrap();
+        assert_eq!(
+            keys.scan_key_prefix(key_only_key.values())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![key_only.clone()]
+        );
         keys.put(&other_key_only).unwrap();
         assert_eq!(keys.get(&key_only_key).unwrap(), Some(key_only));
         let key_only_projection = keys.project_by_names(&["id"]).unwrap();
@@ -220,6 +298,9 @@ fn table_runtime_create_open_and_typed_rows() {
             &table,
             &[Value::String("tenant-a".to_string()), Value::Int64(2)],
         );
+        let decoded = table.key_from_encoded(key2.encoded()).unwrap();
+        assert_eq!(decoded.values(), key2.values());
+        assert_eq!(decoded.bucket(), key2.bucket());
         let missing = build_read_only_key(
             &table,
             &[Value::String("tenant-a".to_string()), Value::Int64(9)],
@@ -672,6 +753,35 @@ fn standalone_table_global_reader_routes_pins_and_validates_schema() {
         .iter()
         .map(|row| build_runtime_key(reader.key_builder(), &row[..1]))
         .collect::<Vec<_>>();
+    let decoded = reader.key_from_encoded(reader_keys[0].encoded()).unwrap();
+    assert_eq!(decoded.values(), reader_keys[0].values());
+    assert_eq!(decoded.bucket(), reader_keys[0].bucket());
+    let bucket = reader_keys[0].bucket();
+    let bucket_rows = reader
+        .scan(bucket)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let start = reader_keys[0].encoded();
+    let mut end = start.to_vec();
+    // Appending a byte creates an exclusive bound immediately after this full key.
+    end.push(0);
+    assert_eq!(
+        reader
+            .scan_encoded_bounds(bucket, Some(start), Some(&end))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![rows[0].clone()]
+    );
+    assert_eq!(
+        reader
+            .scan_encoded_bounds(bucket, None, None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        bucket_rows
+    );
     assert_eq!(
         reader_keys.iter().map(TableKey::bucket).collect::<Vec<_>>(),
         keys.iter().map(TableKey::bucket).collect::<Vec<_>>()

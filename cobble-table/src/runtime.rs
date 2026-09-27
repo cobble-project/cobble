@@ -544,6 +544,23 @@ impl TableReader {
         self.typed.load().key_builder()
     }
 
+    /// Decode a complete storage key using the selected snapshot's table schema.
+    pub fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
+        self.view_for_access()?.key_from_encoded(encoded)
+    }
+
+    /// Scan one bucket using inclusive/exclusive storage-key bounds.
+    /// Bounds may be complete encoded keys or partial encoded prefixes.
+    pub fn scan_encoded_bounds(
+        &self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<TableScan> {
+        self.view_for_access()?
+            .scan_encoded_bounds(bucket, start, end)
+    }
+
     /// Compile a reusable read projection from top-level field names.
     pub fn project_by_names<S: AsRef<str>>(&self, field_names: &[S]) -> Result<TableProjection> {
         self.view_for_access()?.project_by_names(field_names)
