@@ -11,6 +11,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -24,6 +25,86 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class TableWriterBuilderTest {
 
     @TempDir Path root;
+
+    @Test
+    void scansCompoundKeyPrefixesWithoutPostFiltering() {
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1L, "first", LogicalTypes.int8()),
+                                new DataField(2L, "second", LogicalTypes.int8()),
+                                new DataField(3L, "suffix", LogicalTypes.binary()),
+                                new DataField(4L, "value", LogicalTypes.string())),
+                        Arrays.asList(1L, 2L, 3L),
+                        Arrays.asList(1L, 2L));
+        Config config = new Config().addVolume(root.toUri().toString()).totalBuckets(8);
+        List<Value> first =
+                Arrays.asList(
+                        Value.int8((byte) 1),
+                        Value.int8((byte) 2),
+                        Value.binary(new byte[] {0, (byte) 0xff}),
+                        Value.string("first"));
+        List<Value> second =
+                Arrays.asList(
+                        Value.int8((byte) 1),
+                        Value.int8((byte) 2),
+                        Value.binary(new byte[] {0, (byte) 0xff, 0}),
+                        Value.string("second"));
+        List<Value> other =
+                Arrays.asList(
+                        Value.int8((byte) 1),
+                        Value.int8((byte) 3),
+                        Value.binary(new byte[] {0, (byte) 0xff}),
+                        Value.string("other"));
+        List<Value> maximum =
+                Arrays.asList(
+                        Value.int8((byte) 127),
+                        Value.int8((byte) 127),
+                        Value.binary(new byte[] {1}),
+                        Value.string("maximum"));
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "prefixes", schema)) {
+            table.put(first);
+            table.put(second);
+            table.put(other);
+            table.put(maximum);
+            List<List<Value>> rows = new ArrayList<List<Value>>();
+            try (TableScanCursor cursor = table.scanKeyPrefix(first.subList(0, 2))) {
+                for (List<Value> row : cursor) rows.add(row);
+            }
+            assertEquals(Arrays.asList(first, second), rows);
+            rows.clear();
+            try (TableScanCursor cursor = table.scanKeyPrefix(first.subList(0, 3))) {
+                for (List<Value> row : cursor) rows.add(row);
+            }
+            assertEquals(Collections.singletonList(first), rows);
+
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> table.scanKeyPrefix(Collections.emptyList()));
+            assertThrows(
+                    IllegalArgumentException.class, () -> table.scanKeyPrefix(first.subList(0, 1)));
+            assertThrows(IllegalArgumentException.class, () -> table.scanKeyPrefix(first));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            table.scanKeyPrefix(
+                                    Arrays.asList(Value.int8((byte) 1), Value.string("bad"))));
+
+            List<Value> maxPrefix = maximum.subList(0, 2);
+            assertTrue(
+                    Arrays.equals(
+                            new byte[] {(byte) 0xff, (byte) 0xff},
+                            KeyCodec.encode(
+                                    Arrays.asList(LogicalTypes.int8(), LogicalTypes.int8()),
+                                    maxPrefix)));
+            rows.clear();
+            try (TableScanCursor cursor = table.scanKeyPrefix(maxPrefix)) {
+                for (List<Value> row : cursor) rows.add(row);
+            }
+            assertEquals(Collections.singletonList(maximum), rows);
+        }
+    }
 
     @Test
     void valueOnlyWritesAndReadsUseSchemaOrderAndOwnNestedBytes() {

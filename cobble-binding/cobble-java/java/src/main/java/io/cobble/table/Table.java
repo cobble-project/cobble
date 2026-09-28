@@ -14,6 +14,7 @@ import io.cobble.WriteOptions;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -446,6 +447,32 @@ public final class Table extends NativeObject {
         return scanBounds(bucket, null, null);
     }
 
+    /** Scans complete leading primary-key fields, including the entire bucket key. */
+    public TableScanCursor scanKeyPrefix(List<Value> leadingKeyFields) {
+        TableState state = state();
+        Objects.requireNonNull(leadingKeyFields, "leadingKeyFields");
+        Compiled compiled = state.compiled;
+        int fields = leadingKeyFields.size();
+        if (fields < compiled.bucketKeyFields || fields > compiled.keyTypes.size())
+            throw new IllegalArgumentException(
+                    "prefix must contain the bucket key and at most the full primary key");
+        List<LogicalType> types = compiled.keyTypes.subList(0, fields);
+        ByteBuffer encoded = ByteBuffer.allocate(KeyCodec.encodedSize(types, leadingKeyFields));
+        int bucketEnd =
+                KeyCodec.encodeToWithPrefix(
+                        types, leadingKeyFields, compiled.bucketKeyFields, encoded);
+        byte[] start = encoded.array();
+        int bucket = compiled.bucketHash.bucket(ByteBuffer.wrap(start, 0, bucketEnd));
+        int successorLength = start.length;
+        while (successorLength > 0 && start[successorLength - 1] == (byte) 0xff) successorLength--;
+        byte[] end = null;
+        if (successorLength > 0) {
+            end = Arrays.copyOf(start, successorLength);
+            end[successorLength - 1]++;
+        }
+        return scanEncodedBounds(state, bucket, start, end);
+    }
+
     /** Opens a typed scan over an inclusive/exclusive primary-key range in one bucket. */
     public TableScanCursor scanBounds(int bucket, TableKey startInclusive, TableKey endExclusive) {
         TableState state = state();
@@ -453,6 +480,11 @@ public final class Table extends NativeObject {
         validateBound(bucket, endExclusive);
         byte[] start = startInclusive == null ? null : startInclusive.encodedInternal();
         byte[] end = endExclusive == null ? null : endExclusive.encodedInternal();
+        return scanEncodedBounds(state, bucket, start, end);
+    }
+
+    private TableScanCursor scanEncodedBounds(
+            TableState state, int bucket, byte[] start, byte[] end) {
         TableReadView view = new TableReadView(createReadViewNative(nativeHandle, null));
         try {
             return new TableScanCursor(
