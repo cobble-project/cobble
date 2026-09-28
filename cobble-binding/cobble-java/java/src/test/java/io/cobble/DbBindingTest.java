@@ -568,9 +568,18 @@ class DbBindingTest {
                                 .push(secondKeyOnly.get(0))
                                 .push(secondKeyOnly.get(1))
                                 .build();
-                keys.put(keyOnly);
+                keys.putValues(key, Collections.emptyList());
                 keys.put(secondKeyOnly);
                 assertEquals(keyOnly, keys.get(key));
+                assertEquals(Collections.emptyList(), keys.getValues(key));
+                TableKey missingKey =
+                        keys.keyBuilder()
+                                .push(Value.int64(1))
+                                .push(Value.binary(new byte[] {9}))
+                                .build();
+                assertEquals(
+                        Arrays.asList(Collections.emptyList(), null, Collections.emptyList()),
+                        keys.multiGetValues(Arrays.asList(key, missingKey, key)));
                 try (TableScanCursor cursor = keys.scan(key.bucket())) {
                     List<Value> firstScanned = cursor.nextRow();
                     assertEquals(secondKeyOnly, cursor.nextRow());
@@ -590,9 +599,10 @@ class DbBindingTest {
                     }
                     keys.delete(key);
                     assertNull(keys.get(key));
+                    assertNull(keys.getValues(key));
                     assertNull(keyOnlyProjection.get(key));
                     assertEquals(secondKeyOnly, keys.get(secondKey));
-                    keys.put(keyOnly);
+                    keys.putValues(key, Collections.emptyList());
                 }
             }
 

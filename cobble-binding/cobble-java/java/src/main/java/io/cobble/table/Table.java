@@ -192,6 +192,23 @@ public final class Table extends NativeObject {
         putNative(nativeHandle, key.bucket, key.bytes, payload, writeOptionsHandle);
     }
 
+    /** Writes non-key fields in schema order using an existing encoded table key. */
+    public void putValues(TableKey key, List<Value> values) {
+        putValuesEncoded(key, values, 0L);
+    }
+
+    /** Writes non-key fields with caller TTL and WAL durability settings. */
+    public void putValues(TableKey key, List<Value> values, WriteOptions options) {
+        putValuesEncoded(key, values, writeOptionsHandle(options));
+    }
+
+    private void putValuesEncoded(TableKey key, List<Value> values, long writeOptionsHandle) {
+        TableState state = state();
+        Objects.requireNonNull(key, "key");
+        byte[] payload = encodeValueListValidated(state.compiled, values);
+        putNative(nativeHandle, key.bucket(), key.encodedInternal(), payload, writeOptionsHandle);
+    }
+
     /**
      * Encodes and writes one row using caller-owned direct buffers.
      *
@@ -326,17 +343,23 @@ public final class Table extends NativeObject {
         }
     }
 
+    /** Returns owned non-key fields in schema order, or {@code null} when the key is absent. */
+    public List<Value> getValues(TableKey key) {
+        TableState state = state();
+        Objects.requireNonNull(key, "key");
+        try (DirectColumns columns =
+                DirectColumns.read(directReader, key.bucket(), key.encodedInternal())) {
+            return columns == null ? null : decodeDirectValuesOwned(state.compiled, columns);
+        }
+    }
+
     /** Reads keys in one native multi-get while preserving input order and duplicates. */
     public List<List<Value>> multiGet(List<TableKey> primaryKeys) {
         TableState state = state();
         Objects.requireNonNull(primaryKeys, "primaryKeys");
         int[] buckets = new int[primaryKeys.size()];
         byte[][] keys = new byte[primaryKeys.size()][];
-        for (int i = 0; i < primaryKeys.size(); i++) {
-            TableKey key = Objects.requireNonNull(primaryKeys.get(i), "primaryKey");
-            buckets[i] = key.bucket();
-            keys[i] = key.encodedInternal();
-        }
+        fillEncodedKeys(primaryKeys, buckets, keys);
         return DirectColumns.readBatch(
                 new DirectColumns.BatchReader() {
                     @Override
@@ -354,6 +377,38 @@ public final class Table extends NativeObject {
                 (index, columns) ->
                         assembleDirectRowOwned(
                                 state.compiled, primaryKeys.get(index).valuesInternal(), columns));
+    }
+
+    /** Reads non-key fields for each key, preserving order, duplicates and absent rows. */
+    public List<List<Value>> multiGetValues(List<TableKey> primaryKeys) {
+        TableState state = state();
+        Objects.requireNonNull(primaryKeys, "primaryKeys");
+        int[] buckets = new int[primaryKeys.size()];
+        byte[][] keys = new byte[primaryKeys.size()][];
+        fillEncodedKeys(primaryKeys, buckets, keys);
+        return DirectColumns.readBatch(
+                new DirectColumns.BatchReader() {
+                    @Override
+                    public int read(ByteBuffer io) {
+                        return multiGetEncodedDirectNative(nativeHandle, io);
+                    }
+
+                    @Override
+                    public ByteBuffer takeOverflowBuffer() {
+                        return takeDirectOverflowNative();
+                    }
+                },
+                buckets,
+                keys,
+                (index, columns) -> decodeDirectValuesOwned(state.compiled, columns));
+    }
+
+    private static void fillEncodedKeys(List<TableKey> primaryKeys, int[] buckets, byte[][] keys) {
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            TableKey key = Objects.requireNonNull(primaryKeys.get(i), "primaryKey");
+            buckets[i] = key.bucket();
+            keys[i] = key.encodedInternal();
+        }
     }
 
     /**
@@ -450,12 +505,50 @@ public final class Table extends NativeObject {
         if (compiled.valuePositions.length == 0) return 10;
         int size = Integer.BYTES;
         for (int i = 0; i < compiled.valuePositions.length; i++) {
-            int encoded =
-                    ValueCodec.encodedSize(
-                            compiled.valueTypes.get(i), row.get(compiled.valuePositions[i]));
-            size = KeyCodec.checkedAdd(size, KeyCodec.checkedAdd(5, encoded));
+            size =
+                    KeyCodec.checkedAdd(
+                            size,
+                            encodedColumnSize(
+                                    compiled.valueTypes.get(i),
+                                    row.get(compiled.valuePositions[i])));
         }
         return size;
+    }
+
+    private static byte[] encodeValueListValidated(Compiled compiled, List<Value> values) {
+        Objects.requireNonNull(values, "values");
+        if (values.size() != compiled.valueTypes.size())
+            throw new IllegalArgumentException("value field count does not match schema");
+        int size = compiled.valueTypes.isEmpty() ? 10 : Integer.BYTES;
+        for (int i = 0; i < values.size(); i++)
+            size =
+                    KeyCodec.checkedAdd(
+                            size, encodedColumnSize(compiled.valueTypes.get(i), values.get(i)));
+        ByteBuffer output = ByteBuffer.allocate(size);
+        if (values.isEmpty()) writeKeyOnlyMarker(output);
+        else {
+            output.putInt(values.size());
+            for (int i = 0; i < values.size(); i++)
+                writeEncodedColumn(output, compiled.valueTypes.get(i), values.get(i));
+        }
+        return output.array();
+    }
+
+    private static int encodedColumnSize(LogicalType type, Value value) {
+        return KeyCodec.checkedAdd(5, ValueCodec.encodedSize(type, value));
+    }
+
+    private static void writeKeyOnlyMarker(ByteBuffer output) {
+        output.putInt(1).put((byte) 1).putInt(1).put((byte) 1);
+    }
+
+    private static void writeEncodedColumn(ByteBuffer output, LogicalType type, Value value) {
+        output.put((byte) 1);
+        int lengthOffset = output.position();
+        output.putInt(0);
+        int valueStart = output.position();
+        ValueCodec.encodeTo(type, value, output);
+        output.putInt(lengthOffset, output.position() - valueStart);
     }
 
     private static void encodeValuesToValidated(
@@ -464,19 +557,13 @@ public final class Table extends NativeObject {
         int start = output.position();
         try {
             if (compiled.valuePositions.length == 0) {
-                output.putInt(1).put((byte) 1).putInt(1).put((byte) 1);
+                writeKeyOnlyMarker(output);
                 return;
             }
             output.putInt(compiled.valuePositions.length);
             for (int i = 0; i < compiled.valuePositions.length; i++) {
                 Value value = row.get(compiled.valuePositions[i]);
-                LogicalType type = compiled.valueTypes.get(i);
-                output.put((byte) 1);
-                int lengthOffset = output.position();
-                output.putInt(0);
-                int valueStart = output.position();
-                ValueCodec.encodeTo(type, value, output);
-                output.putInt(lengthOffset, output.position() - valueStart);
+                writeEncodedColumn(output, compiled.valueTypes.get(i), value);
             }
         } catch (RuntimeException | Error error) {
             ((Buffer) output).position(start);
@@ -526,14 +613,25 @@ public final class Table extends NativeObject {
         for (int i = 0; i < compiled.keyPositions.length; i++)
             row.set(compiled.keyPositions[i], primaryKey.get(i));
         for (int i = 0; i < compiled.valuePositions.length; i++) {
-            ByteBuffer value = columns.get(i);
-            if (value == null)
-                throw new IllegalStateException("table row is missing a value column");
-            row.set(
-                    compiled.valuePositions[i],
-                    ValueCodec.decodeOwned(compiled.valueTypes.get(i), value));
+            row.set(compiled.valuePositions[i], decodeOwnedColumn(compiled, columns, i));
         }
         return Collections.unmodifiableList(row);
+    }
+
+    private static List<Value> decodeDirectValuesOwned(Compiled compiled, DirectColumns columns) {
+        if (columns.size() != compiled.physicalColumns)
+            throw new IllegalStateException("table row has an incompatible physical layout");
+        if (compiled.valueTypes.isEmpty()) return Collections.emptyList();
+        ArrayList<Value> values = new ArrayList<Value>(compiled.valueTypes.size());
+        for (int i = 0; i < compiled.valueTypes.size(); i++)
+            values.add(decodeOwnedColumn(compiled, columns, i));
+        return Collections.unmodifiableList(values);
+    }
+
+    private static Value decodeOwnedColumn(Compiled compiled, DirectColumns columns, int index) {
+        ByteBuffer value = columns.get(index);
+        if (value == null) throw new IllegalStateException("table row is missing a value column");
+        return ValueCodec.decodeOwned(compiled.valueTypes.get(index), value);
     }
 
     static List<Value> decodeDirectScannedRowOwned(Compiled compiled, DirectScanEntry entry) {

@@ -3,23 +3,123 @@ package io.cobble.table;
 import io.cobble.Config;
 import io.cobble.Db;
 import io.cobble.ShardSnapshot;
+import io.cobble.WriteOptions;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TableWriterBuilderTest {
 
     @TempDir Path root;
+
+    @Test
+    void valueOnlyWritesAndReadsUseSchemaOrderAndOwnNestedBytes() {
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1L, "payload", LogicalTypes.binary()),
+                                new DataField(2L, "tenant", LogicalTypes.string()),
+                                new DataField(3L, "count", LogicalTypes.int32().nullable()),
+                                new DataField(4L, "sequence", LogicalTypes.int64()),
+                                new DataField(
+                                        5L,
+                                        "nested",
+                                        LogicalTypes.list(LogicalTypes.binary().nullable()))),
+                        Arrays.asList(2L, 4L),
+                        Collections.singletonList(2L));
+        Config config = new Config().addVolume(root.toUri().toString()).totalBuckets(1);
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "value_only", schema)) {
+            TableKey first =
+                    table.keyBuilder().push(Value.string("tenant")).push(Value.int64(1)).build();
+            TableKey second =
+                    table.keyBuilder().push(Value.string("tenant")).push(Value.int64(2)).build();
+            TableKey missing =
+                    table.keyBuilder().push(Value.string("tenant")).push(Value.int64(3)).build();
+            byte[] payloadBytes = new byte[] {0, (byte) 0xff, 3};
+            byte[] nestedBytes = new byte[] {7, 0, (byte) 0xff};
+            List<Value> firstValues =
+                    Arrays.asList(
+                            Value.binary(ByteBuffer.wrap(payloadBytes)),
+                            Value.nullValue(),
+                            Value.list(
+                                    Arrays.asList(
+                                            Value.binary(ByteBuffer.wrap(nestedBytes)),
+                                            Value.nullValue())));
+            try (WriteOptions options =
+                    new WriteOptions()
+                            .ttlSeconds(3600)
+                            .awaitDurable(true)
+                            .columnFamily("default")) {
+                table.putValues(first, firstValues, options);
+            }
+            payloadBytes[0] = 99;
+            nestedBytes[0] = 99;
+            List<Value> expectedFirst =
+                    Arrays.asList(
+                            Value.binary(new byte[] {0, (byte) 0xff, 3}),
+                            Value.nullValue(),
+                            Value.list(
+                                    Arrays.asList(
+                                            Value.binary(new byte[] {7, 0, (byte) 0xff}),
+                                            Value.nullValue())));
+            List<Value> secondValues =
+                    Arrays.asList(
+                            Value.binary(new byte[] {4}),
+                            Value.int32(9),
+                            Value.list(Collections.singletonList(Value.binary(new byte[] {5}))));
+            table.putValues(second, secondValues);
+
+            List<Value> firstRead = table.getValues(first);
+            assertEquals(expectedFirst, firstRead);
+            assertEquals(
+                    Arrays.asList(
+                            expectedFirst.get(0),
+                            Value.string("tenant"),
+                            expectedFirst.get(1),
+                            Value.int64(1),
+                            expectedFirst.get(2)),
+                    table.get(first));
+            assertNull(table.getValues(missing));
+            List<List<Value>> batchRead =
+                    table.multiGetValues(Arrays.asList(second, missing, first, second));
+            assertEquals(Arrays.asList(secondValues, null, expectedFirst, secondValues), batchRead);
+            table.getValues(second);
+            assertEquals(expectedFirst, firstRead);
+            assertEquals(expectedFirst, batchRead.get(2));
+            assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> table.getValues(first).add(Value.int32(1)));
+
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> table.putValues(first, Collections.singletonList(Value.int32(1))));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            table.putValues(
+                                    first,
+                                    Arrays.asList(
+                                            expectedFirst.get(0),
+                                            Value.string("wrong type"),
+                                            expectedFirst.get(2))));
+            assertEquals(expectedFirst, table.getValues(first));
+            assertNull(table.getValues(missing));
+        }
+    }
 
     @Test
     void bucketWriterUsesStableIdentityAndEmptyBaselineForAppendAndOverwrite() {
