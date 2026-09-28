@@ -210,17 +210,27 @@ final class NativeTableReader extends NativeObject {
 
     public synchronized TableScanCursor scanBounds(int bucket, TableKey start, TableKey end) {
         access();
-        Table.TableState currentState = state;
         Table.validateBound(bucket, start);
         Table.validateBound(bucket, end);
+        return scanEncodedBoundsCurrentView(
+                bucket,
+                start == null ? null : start.encodedInternal(),
+                end == null ? null : end.encodedInternal());
+    }
+
+    public synchronized TableScanCursor scanEncodedBounds(
+            int bucket, byte[] startInclusive, byte[] endExclusive) {
+        access();
+        return scanEncodedBoundsCurrentView(bucket, startInclusive, endExclusive);
+    }
+
+    private TableScanCursor scanEncodedBoundsCurrentView(
+            int bucket, byte[] startInclusive, byte[] endExclusive) {
+        Table.TableState currentState = state;
         TableReaderView retained = view.copy();
         try {
             DirectScanCursor cursor =
-                    retained.scan(
-                            bucket,
-                            start == null ? null : start.encodedInternal(),
-                            end == null ? null : end.encodedInternal(),
-                            currentState.scanOptions);
+                    retained.scan(bucket, startInclusive, endExclusive, currentState.scanOptions);
             return new TableScanCursor(
                     retained,
                     cursor,

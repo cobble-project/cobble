@@ -249,6 +249,17 @@ public final class TableReader implements AutoCloseable {
         return nativeReader.scanBounds(bucket, start, end);
     }
 
+    /**
+     * Scans one bucket using inclusive/exclusive encoded bounds. Bounds may be complete keys,
+     * partial encoded prefixes, or {@code null}; appending a zero byte to a complete key gives a
+     * continuation bound strictly after that key.
+     */
+    public TableScanCursor scanEncodedBounds(
+            int bucket, byte[] startInclusive, byte[] endExclusive) {
+        requireNative();
+        return nativeReader.scanEncodedBounds(bucket, startInclusive, endExclusive);
+    }
+
     public TableScanPlan scanPlan() {
         ensureOpen();
         if (nativeReader != null) return nativeReader.scanPlan();

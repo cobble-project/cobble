@@ -111,6 +111,8 @@ class TableScanPlanTest {
         Path dataDir = Files.createTempDirectory("cobble-java-table-scan-plan-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
         String large = String.join("", Collections.nCopies(8192, "x"));
+        List<Value> firstRow =
+                Arrays.asList(Value.int64(7), Value.string("first"), Value.string("second"));
         List<Value> largeRow =
                 Arrays.asList(Value.int64(8), Value.string(large), Value.string("large"));
         List<Value> tailRow =
@@ -129,7 +131,7 @@ class TableScanPlanTest {
         TableScanPlan plan;
         try (Db db = Db.open(config);
                 Table table = Table.create(db, "data", schema)) {
-            table.put(Arrays.asList(Value.int64(7), Value.string("first"), Value.string("second")));
+            table.put(firstRow);
             table.put(largeRow);
             table.put(tailRow);
             ShardSnapshot shard = db.snapshot();
@@ -150,6 +152,32 @@ class TableScanPlanTest {
         }
         assertNotNull(global);
         assertNotNull(latest);
+
+        try (TableReader reader = TableReader.open(config, "data", global.id)) {
+            TableKey middle = reader.keyBuilder().push(Value.int64(8)).build();
+            TableKey end = reader.keyBuilder().push(Value.int64(9)).build();
+            try (TableScanCursor cursor = reader.scanEncodedBounds(0, null, null)) {
+                assertEquals(firstRow, cursor.nextRow());
+                assertEquals(largeRow, cursor.nextRow());
+                assertEquals(tailRow, cursor.nextRow());
+                assertNull(cursor.nextRow());
+            }
+            byte[] partial = Arrays.copyOf(middle.encoded(), middle.encoded().length - 1);
+            try (TableScanCursor cursor = reader.scanEncodedBounds(0, partial, middle.encoded())) {
+                assertEquals(firstRow, cursor.nextRow());
+                assertNull(cursor.nextRow());
+            }
+            try (TableScanCursor cursor =
+                    reader.scanEncodedBounds(0, middle.encoded(), end.encoded())) {
+                assertEquals(largeRow, cursor.nextRow());
+                assertNull(cursor.nextRow());
+            }
+            byte[] continuation = Arrays.copyOf(middle.encoded(), middle.encoded().length + 1);
+            try (TableScanCursor cursor = reader.scanEncodedBounds(0, continuation, null)) {
+                assertEquals(tailRow, cursor.nextRow());
+                assertNull(cursor.nextRow());
+            }
+        }
 
         assertEquals(schema, plan.schema());
         assertEquals(global.id, plan.snapshotId());
