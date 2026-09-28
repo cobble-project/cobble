@@ -208,6 +208,12 @@ public final class TableReader implements AutoCloseable {
         return nativeReader.keyBuilder();
     }
 
+    /** Decodes a complete encoded primary key using this native reader's current schema. */
+    public TableKey keyFromEncoded(byte[] encoded) {
+        requireNative();
+        return nativeReader.keyFromEncoded(encoded);
+    }
+
     public boolean refresh() {
         ensureOpen();
         return nativeReader != null && nativeReader.refresh();

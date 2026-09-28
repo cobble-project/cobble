@@ -118,6 +118,11 @@ final class NativeTableReader extends NativeObject {
         return new TableKeyBuilder(state().compiled);
     }
 
+    public synchronized TableKey keyFromEncoded(byte[] encoded) {
+        access();
+        return state.compiled.keyFromEncoded(encoded);
+    }
+
     /** Checks for a newer committed snapshot; returns false for fixed or unchanged readers. */
     public synchronized boolean refresh() {
         ensureUsable();

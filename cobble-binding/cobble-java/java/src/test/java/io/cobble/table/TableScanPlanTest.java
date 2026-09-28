@@ -3,6 +3,7 @@ package io.cobble.table;
 import io.cobble.Config;
 import io.cobble.Db;
 import io.cobble.GlobalSnapshot;
+import io.cobble.ReadOnlyDb;
 import io.cobble.ScanCursor;
 import io.cobble.ShardSnapshot;
 
@@ -55,8 +56,20 @@ class TableScanPlanTest {
                 while (table.keyBuilder().push(Value.int64(id)).build().bucket() != bucket) id++;
                 List<Value> row = Arrays.asList(Value.int64(id), Value.string("bucket-" + bucket));
                 table.put(row);
+                TableKey reconstructed =
+                        table.keyFromEncoded(table.keyBuilder().push(row.get(0)).build().encoded());
+                assertEquals(bucket, reconstructed.bucket());
+                assertEquals(Collections.singletonList(row.get(0)), reconstructed.values());
+                assertEquals(row, table.get(reconstructed));
                 expected.add(row);
-                shards.add(table.snapshot());
+                ShardSnapshot shard = table.snapshot();
+                shards.add(shard);
+                try (ReadOnlyDb readDb =
+                                ReadOnlyDb.open(bucketConfig, shard.snapshotId, shard.dbId);
+                        ReadOnlyTable readOnly = ReadOnlyTable.open(readDb, "data")) {
+                    TableKey readKey = readOnly.keyFromEncoded(reconstructed.encoded());
+                    assertEquals(row, readOnly.get(readKey));
+                }
             }
         }
         GlobalSnapshot global;
@@ -82,7 +95,8 @@ class TableScanPlanTest {
         assertTrue(rows.containsAll(expected));
         try (TableReader reader = TableReader.open(coordinatorConfig, "data", global.id)) {
             for (List<Value> row : expected) {
-                assertEquals(row, reader.get(reader.keyBuilder().push(row.get(0)).build()));
+                TableKey key = reader.keyBuilder().push(row.get(0)).build();
+                assertEquals(row, reader.get(reader.keyFromEncoded(key.encoded())));
             }
         }
         for (ShardSnapshot shard : shards) {

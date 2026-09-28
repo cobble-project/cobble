@@ -198,6 +198,55 @@ class TableCodecTest {
         assertEquals(start, rollback.position());
     }
 
+    @Test
+    void reconstructsOwnedCompoundKeysAndRejectsMalformedEncodings() {
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "name", LogicalTypes.string()),
+                                new DataField(2, "binary", LogicalTypes.binary()),
+                                new DataField(3, "sequence", LogicalTypes.int64())),
+                        Arrays.asList(1L, 2L, 3L),
+                        Arrays.asList(1L, 2L));
+        Table.Compiled compiled = Table.Compiled.from(schema, 16);
+        byte[] sourceBinary = new byte[] {0, (byte) 0xff, 4};
+        TableKey original =
+                new TableKeyBuilder(compiled)
+                        .push(Value.string("a\u0000b"))
+                        .push(Value.binary(ByteBuffer.wrap(sourceBinary)))
+                        .push(Value.int64(9))
+                        .build();
+        byte[] source = original.encoded();
+        TableKey restored = compiled.keyFromEncoded(source);
+        byte[] prefix =
+                KeyCodec.encode(compiled.keyTypes.subList(0, 2), restored.values().subList(0, 2));
+        assertEquals(compiled.bucketHash.bucket(ByteBuffer.wrap(prefix)), restored.bucket());
+        assertEquals(original.bucket(), restored.bucket());
+        assertEquals(original.values(), restored.values());
+        assertTrue(Arrays.equals(original.encoded(), restored.encoded()));
+        assertThrows(
+                UnsupportedOperationException.class, () -> restored.values().add(Value.int64(1)));
+        assertTrue(((ByteBuffer) restored.values().get(1).raw()).isReadOnly());
+
+        sourceBinary[0] = 42;
+        source[0] ^= 1;
+        byte[] exposed = restored.encoded();
+        exposed[0] ^= 1;
+        assertTrue(Arrays.equals(original.encoded(), restored.encoded()));
+        assertEquals(Value.binary(new byte[] {0, (byte) 0xff, 4}), restored.values().get(1));
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        compiled.keyFromEncoded(
+                                Arrays.copyOf(original.encoded(), original.encoded().length - 1)));
+        byte[] trailing = Arrays.copyOf(original.encoded(), original.encoded().length + 1);
+        assertThrows(IllegalArgumentException.class, () -> compiled.keyFromEncoded(trailing));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> compiled.keyFromEncoded(new byte[] {'a', 0, 1}));
+    }
+
     private static List<LogicalType> keyTypes() {
         return Arrays.asList(
                 LogicalTypes.bool(),

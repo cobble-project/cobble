@@ -113,6 +113,12 @@ public final class ReadOnlyTable implements AutoCloseable {
         return new TableKeyBuilder(compiled);
     }
 
+    /** Decodes a complete encoded primary key using this snapshot's schema. */
+    public TableKey keyFromEncoded(byte[] encoded) {
+        ensureUsable();
+        return compiled.keyFromEncoded(encoded);
+    }
+
     /** Compiles a reusable typed projection from top-level field names. */
     public TableProjection projectByNames(List<String> fieldNames) {
         ensureUsable();
