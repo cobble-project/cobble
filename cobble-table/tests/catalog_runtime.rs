@@ -110,7 +110,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     let write_plan_json = serde_json::to_string(&write_plan).unwrap();
     assert!(!write_plan_json.contains("catalog-runtime-access"));
     assert!(!write_plan_json.contains("catalog-runtime-secret"));
-    let unsupported_plan_json = write_plan_json.replacen("\"version\":1", "\"version\":2", 1);
+    let unsupported_plan_json = write_plan_json.replacen("\"version\":2", "\"version\":3", 1);
     let unsupported_plan =
         serde_json::from_str::<cobble_table::TableWritePlan>(&unsupported_plan_json).unwrap();
     assert!(unsupported_plan.writer_builder(runtime.clone()).is_err());

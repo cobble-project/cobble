@@ -1,12 +1,13 @@
+use super::model::{validate_identifier, validate_namespace};
 use super::runtime::CatalogRuntimeContext;
 use super::store::CatalogStore;
 use crate::catalog::{
-    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogSchemaVersion, CatalogTable,
-    SchemaChange, ShardSchemaMapping, TableId, TableIdentifier, physical_table_name,
+    Catalog, CatalogError, CatalogResult, CatalogSchemaId, CatalogSchemaStore,
+    CatalogSchemaVersion, CatalogTable, SchemaChange, ShardSchemaMapping, TableId, TableIdentifier,
+    physical_table_name,
 };
 use crate::evolution::schema_field_ids;
-use crate::metadata::TableMetadata;
-use crate::{Table, TableError, TableSchema, TableWritePlan};
+use crate::{Table, TableSchema};
 use cobble::{Config, Db};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -137,15 +138,49 @@ pub struct FileCatalog {
     operation_lock: Arc<Mutex<()>>,
 }
 
+struct FileCatalogSchemaStore {
+    store: CatalogStore,
+}
+
+impl CatalogSchemaStore for FileCatalogSchemaStore {
+    fn load_schema_version(
+        &self,
+        table_id: TableId,
+        schema_id: CatalogSchemaId,
+    ) -> CatalogResult<CatalogSchemaVersion> {
+        Ok(load_table_schema_record(&self.store, table_id, schema_id)?.schema_version)
+    }
+
+    fn record_shard_schema_mapping(&self, mapping: ShardSchemaMapping) -> CatalogResult<()> {
+        write_schema_mapping(&self.store, ShardSchemaMappingFile::from(mapping))
+    }
+}
+
+impl From<ShardSchemaMapping> for ShardSchemaMappingFile {
+    fn from(mapping: ShardSchemaMapping) -> Self {
+        Self {
+            format: CATALOG_FORMAT.to_string(),
+            version: CATALOG_VERSION,
+            table_id: mapping.table_id,
+            db_id: mapping.db_id,
+            catalog_schema_id: mapping.catalog_schema_id,
+            core_schema_id: mapping.core_schema_id,
+        }
+    }
+}
+
 impl FileCatalog {
     pub fn open(config: &Config, catalog_config: FileCatalogConfig) -> CatalogResult<Self> {
         let store = CatalogStore::open(config, catalog_config.storage_id())?;
         let manifest = load_catalog_manifest(&store)?;
         let operation_lock = process_operation_lock(catalog_config.storage_id())?;
-        let runtime_context = Arc::new(CatalogRuntimeContext {
-            config: config.clone(),
-            storage_id: catalog_config.storage_id().to_string(),
-        });
+        let runtime_context = Arc::new(CatalogRuntimeContext::new(
+            config.clone(),
+            catalog_config.storage_id(),
+            Arc::new(FileCatalogSchemaStore {
+                store: store.clone(),
+            }),
+        )?);
         Ok(Self {
             store,
             runtime_context,
@@ -162,9 +197,7 @@ impl FileCatalog {
         db: Arc<Db>,
         identifier: &TableIdentifier,
     ) -> CatalogResult<Table> {
-        let table = self.load_table(identifier)?;
-        let (physical_name, target) = materialize_loaded_table(&self.store, db.as_ref(), &table)?;
-        Table::from_metadata(db, physical_name, target).map_err(Into::into)
+        self.load_table(identifier)?.materialize_table(db)
     }
 
     fn with_current<T>(
@@ -233,14 +266,13 @@ impl FileCatalog {
         identifier: TableIdentifier,
         identity: TableIdentity,
         schema: TableSchemaRecord,
-    ) -> CatalogTable {
-        CatalogTable {
+    ) -> CatalogResult<CatalogTable> {
+        debug_assert_eq!(identity.table_id, schema.schema_version.table_id());
+        CatalogTable::new(
             identifier,
-            table_id: identity.table_id,
-            catalog_schema_id: schema.schema_version.catalog_schema_id(),
-            schema: schema.schema_version.schema().clone(),
-            runtime_context: Arc::clone(&self.runtime_context),
-        }
+            schema.schema_version,
+            Arc::clone(&self.runtime_context),
+        )
     }
 
     fn commit_catalog(
@@ -282,104 +314,6 @@ impl FileCatalog {
                 generation: manifest.generation,
             },
         )
-    }
-}
-
-fn materialize_loaded_table(
-    store: &CatalogStore,
-    db: &Db,
-    table: &CatalogTable,
-) -> CatalogResult<(String, TableMetadata)> {
-    materialize_with_store(
-        store,
-        db,
-        table.table_id,
-        table.catalog_schema_id,
-        &table.schema,
-    )
-}
-
-fn materialize_with_store(
-    store: &CatalogStore,
-    db: &Db,
-    table_id: TableId,
-    catalog_schema_id: CatalogSchemaId,
-    schema: &TableSchema,
-) -> CatalogResult<(String, TableMetadata)> {
-    super::materialize::materialize_table_definition(
-        db,
-        table_id,
-        catalog_schema_id,
-        schema,
-        |schema_id| Ok(load_table_schema_record(store, table_id, schema_id)?.schema_version),
-        |schema_id, core_schema_id| {
-            write_schema_mapping(
-                store,
-                shard_schema_mapping(table_id, db, schema_id, core_schema_id),
-            )
-        },
-    )
-}
-
-pub(crate) fn materialize_catalog_table(table: &CatalogTable, db: Arc<Db>) -> CatalogResult<Table> {
-    let store = CatalogStore::open(
-        &table.runtime_context.config,
-        &table.runtime_context.storage_id,
-    )?;
-    let (physical_name, target) = materialize_loaded_table(&store, db.as_ref(), table)?;
-    Table::from_metadata(db, physical_name, target).map_err(Into::into)
-}
-
-pub(crate) fn refresh_catalog_table_writer(
-    table: &CatalogTable,
-    writer: &mut Table,
-) -> CatalogResult<bool> {
-    let physical_name = physical_table_name(table.table_id);
-    if writer.name() != physical_name {
-        return Err(TableError::InvalidSchema(
-            "Table does not belong to this catalog table".to_string(),
-        )
-        .into());
-    }
-    let store = CatalogStore::open(
-        &table.runtime_context.config,
-        &table.runtime_context.storage_id,
-    )?;
-    materialize_loaded_table(&store, writer.db(), table)?;
-    writer.refresh_schema().map_err(Into::into)
-}
-
-pub(crate) fn materialize_write_plan(
-    store_config: &Config,
-    db: &Db,
-    plan: &TableWritePlan,
-) -> crate::Result<(String, TableMetadata)> {
-    plan.validate()?;
-    let store = CatalogStore::open(store_config, &plan.storage_id)
-        .map_err(|error| TableError::internal(error.to_string()))?;
-    materialize_with_store(
-        &store,
-        db,
-        plan.table_id,
-        plan.catalog_schema_id,
-        &plan.schema,
-    )
-    .map_err(|error| TableError::internal(error.to_string()))
-}
-
-fn shard_schema_mapping(
-    table_id: TableId,
-    db: &Db,
-    catalog_schema_id: CatalogSchemaId,
-    core_schema_id: u64,
-) -> ShardSchemaMappingFile {
-    ShardSchemaMappingFile {
-        format: CATALOG_FORMAT.to_string(),
-        version: CATALOG_VERSION,
-        table_id,
-        db_id: db.id().to_string(),
-        catalog_schema_id,
-        core_schema_id,
     }
 }
 
@@ -451,7 +385,7 @@ impl FileCatalog {
         catalog_schema_id: CatalogSchemaId,
     ) -> CatalogResult<ShardSchemaMapping> {
         let table = self.load_table(identifier)?;
-        if catalog_schema_id > table.catalog_schema_id {
+        if catalog_schema_id > table.catalog_schema_id() {
             return Err(CatalogError::SchemaNotFound {
                 table: identifier.clone(),
                 catalog_schema_id,
@@ -459,10 +393,10 @@ impl FileCatalog {
         }
         let mapping: ShardSchemaMappingFile = read_json(
             &self.store,
-            &schema_mapping_path(table.table_id, db_id, catalog_schema_id),
+            &schema_mapping_path(table.table_id(), db_id, catalog_schema_id),
         )?;
         validate_header(&mapping.format, mapping.version)?;
-        validate_schema_mapping_key(&mapping, table.table_id, db_id, catalog_schema_id)?;
+        validate_schema_mapping_key(&mapping, table.table_id(), db_id, catalog_schema_id)?;
         Ok(ShardSchemaMapping {
             table_id: mapping.table_id,
             db_id: mapping.db_id,
@@ -575,7 +509,7 @@ impl Catalog for FileCatalog {
                 .tables
                 .sort_by(|left, right| left.name.cmp(&right.name));
             self.commit_namespace(&namespace_entry, &namespace)?;
-            Ok(self.catalog_table(identifier, identity, schema))
+            self.catalog_table(identifier, identity, schema)
         })
     }
 
@@ -591,7 +525,7 @@ impl Catalog for FileCatalog {
                 .ok_or_else(|| CatalogError::TableNotFound(identifier.clone()))?;
             let identity = self.load_identity(entry.table_id)?;
             let schema = self.load_schema(entry.table_id, entry.catalog_schema_id)?;
-            Ok(self.catalog_table(identifier.clone(), identity, schema))
+            self.catalog_table(identifier.clone(), identity, schema)
         })
     }
 
@@ -651,7 +585,7 @@ impl Catalog for FileCatalog {
             namespace.tables[entry_index].catalog_schema_id = next_catalog_schema_id;
             namespace.generation += 1;
             self.commit_namespace(&namespace_entry, &namespace)?;
-            Ok(self.catalog_table(identifier.clone(), self.load_identity(table_id)?, record))
+            self.catalog_table(identifier.clone(), self.load_identity(table_id)?, record)
         })
     }
 
@@ -718,7 +652,7 @@ impl Catalog for FileCatalog {
             self.commit_namespace(&namespace_entry, &namespace)?;
             let identity = self.load_identity(table_id)?;
             let schema = self.load_schema(table_id, catalog_schema_id)?;
-            Ok(self.catalog_table(new_identifier, identity, schema))
+            self.catalog_table(new_identifier, identity, schema)
         })
     }
 
@@ -778,32 +712,6 @@ fn validate_header(format: &str, version: u32) -> CatalogResult<()> {
     if format != CATALOG_FORMAT || version != CATALOG_VERSION {
         return Err(CatalogError::InvalidMetadata(format!(
             "unsupported format/version: {format}/{version}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_namespace(namespace: &[String]) -> CatalogResult<()> {
-    if namespace.is_empty() {
-        return Err(CatalogError::InvalidIdentifier(
-            "namespace must contain at least one component".to_string(),
-        ));
-    }
-    for component in namespace {
-        validate_name("namespace component", component)?;
-    }
-    Ok(())
-}
-
-fn validate_identifier(identifier: &TableIdentifier) -> CatalogResult<()> {
-    validate_namespace(identifier.namespace())?;
-    validate_name("table name", identifier.name())
-}
-
-fn validate_name(label: &str, value: &str) -> CatalogResult<()> {
-    if value.is_empty() || value != value.trim() || value.chars().any(char::is_control) {
-        return Err(CatalogError::InvalidIdentifier(format!(
-            "invalid {label}: {value:?}"
         )));
     }
     Ok(())

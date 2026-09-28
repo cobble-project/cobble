@@ -93,13 +93,37 @@ impl TableIdentifier {
     }
 }
 
+pub(crate) fn validate_namespace(namespace: &[String]) -> CatalogResult<()> {
+    if namespace.is_empty() {
+        return Err(CatalogError::InvalidIdentifier(
+            "namespace must contain at least one component".to_string(),
+        ));
+    }
+    for component in namespace {
+        validate_name("namespace component", component)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_identifier(identifier: &TableIdentifier) -> CatalogResult<()> {
+    validate_namespace(identifier.namespace())?;
+    validate_name("table name", identifier.name())
+}
+
+fn validate_name(label: &str, value: &str) -> CatalogResult<()> {
+    if value.is_empty() || value != value.trim() || value.chars().any(char::is_control) {
+        return Err(CatalogError::InvalidIdentifier(format!(
+            "invalid {label}: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Semantic table descriptor returned by a catalog.
 #[derive(Clone)]
 pub struct CatalogTable {
     pub(crate) identifier: TableIdentifier,
-    pub(crate) table_id: TableId,
-    pub(crate) catalog_schema_id: CatalogSchemaId,
-    pub(crate) schema: TableSchema,
+    pub(crate) schema_version: CatalogSchemaVersion,
     pub(crate) runtime_context: Arc<CatalogRuntimeContext>,
 }
 
@@ -108,28 +132,43 @@ impl std::fmt::Debug for CatalogTable {
         formatter
             .debug_struct("CatalogTable")
             .field("identifier", &self.identifier)
-            .field("table_id", &self.table_id)
-            .field("catalog_schema_id", &self.catalog_schema_id)
-            .field("schema", &self.schema)
+            .field("table_id", &self.table_id())
+            .field("catalog_schema_id", &self.catalog_schema_id())
+            .field("schema", self.schema())
             .finish()
     }
 }
 
 impl CatalogTable {
+    /// Bind one committed schema version to runtime data locations and a schema store.
+    pub fn new(
+        identifier: TableIdentifier,
+        schema_version: CatalogSchemaVersion,
+        runtime_context: Arc<CatalogRuntimeContext>,
+    ) -> CatalogResult<Self> {
+        validate_identifier(&identifier)?;
+        schema_version.schema().validate()?;
+        Ok(Self {
+            identifier,
+            schema_version,
+            runtime_context,
+        })
+    }
+
     pub fn identifier(&self) -> &TableIdentifier {
         &self.identifier
     }
 
     pub fn table_id(&self) -> TableId {
-        self.table_id
+        self.schema_version.table_id()
     }
 
     pub fn catalog_schema_id(&self) -> CatalogSchemaId {
-        self.catalog_schema_id
+        self.schema_version.catalog_schema_id()
     }
 
     pub fn schema(&self) -> &TableSchema {
-        &self.schema
+        self.schema_version.schema()
     }
 }
 
@@ -232,6 +271,19 @@ pub struct ShardSchemaMapping {
 }
 
 impl ShardSchemaMapping {
+    pub fn new(
+        table_id: TableId,
+        db_id: impl Into<String>,
+        catalog_schema_id: CatalogSchemaId,
+        core_schema_id: u64,
+    ) -> Self {
+        Self {
+            table_id,
+            db_id: db_id.into(),
+            catalog_schema_id,
+            core_schema_id,
+        }
+    }
     pub fn table_id(&self) -> TableId {
         self.table_id
     }

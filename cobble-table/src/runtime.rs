@@ -81,7 +81,7 @@ pub struct TableWriterBuilder {
     config: Config,
     table_name: Option<String>,
     bucket: Option<u16>,
-    catalog_binding: Option<(TableWritePlan, Config)>,
+    catalog_binding: Option<TableWritePlan>,
     transforms: TableSchemaTransformFactories,
 }
 
@@ -100,13 +100,12 @@ impl TableWriterBuilder {
         config: Config,
         table_name: String,
         plan: TableWritePlan,
-        catalog_store_config: Config,
     ) -> Self {
         Self {
             config,
             table_name: Some(table_name),
             bucket: None,
-            catalog_binding: Some((plan, catalog_store_config)),
+            catalog_binding: Some(plan),
             transforms: TableSchemaTransformFactories::default(),
         }
     }
@@ -165,14 +164,14 @@ impl TableWriterBuilder {
     ///
     /// A subsequent call starts again from that empty baseline, for overwrite semantics.
     pub fn open(self) -> Result<Table> {
-        let (plan, store_config) = self.catalog_binding.as_ref().ok_or_else(|| {
+        let plan = self.catalog_binding.as_ref().ok_or_else(|| {
             TableError::InvalidSchema("TableWriterBuilder::open requires a catalog table".into())
         })?;
         let name = self.required_table_name()?;
         let bucket = self.required_bucket()?;
         let (db, needs_baseline) =
             self.open_or_resume_bucket_baseline(&name, None, Some(plan.table_id()))?;
-        let table = open_materialized_catalog_table(db, plan, store_config)?;
+        let table = open_materialized_catalog_table(db, plan)?;
         if needs_baseline {
             ensure_empty_baseline(&table)?;
         } else {
@@ -187,12 +186,10 @@ impl TableWriterBuilder {
         let db = self.resume_bucket_snapshot(
             snapshot_id,
             &name,
-            self.catalog_binding
-                .as_ref()
-                .map(|(plan, _)| plan.table_id()),
+            self.catalog_binding.as_ref().map(TableWritePlan::table_id),
         )?;
         match self.catalog_binding {
-            Some((plan, store_config)) => open_materialized_catalog_table(db, &plan, &store_config),
+            Some(plan) => open_materialized_catalog_table(db, &plan),
             None => Table::open(db, name),
         }
     }
@@ -205,7 +202,7 @@ impl TableWriterBuilder {
                 TableError::InvalidSchema("TableWriterBuilder requires table_name".into())
             })
             .and_then(validate_name)?;
-        if let Some((plan, _)) = &self.catalog_binding
+        if let Some(plan) = &self.catalog_binding
             && name != physical_table_name(plan.table_id())
         {
             return Err(TableError::InvalidSchema(
@@ -418,12 +415,8 @@ fn bucket_snapshot_exists(config: &Config, bucket: u16, snapshot_id: u64) -> Res
     Ok(metadata_fs(config)?.exists(&bucket_snapshot_manifest_path(&db_id, snapshot_id))?)
 }
 
-fn open_materialized_catalog_table(
-    db: Arc<Db>,
-    plan: &TableWritePlan,
-    store_config: &Config,
-) -> Result<Table> {
-    let (name, metadata) = crate::catalog::materialize_write_plan(store_config, db.as_ref(), plan)?;
+fn open_materialized_catalog_table(db: Arc<Db>, plan: &TableWritePlan) -> Result<Table> {
+    let (name, metadata) = crate::catalog::materialize_write_plan(db.as_ref(), plan)?;
     Table::from_metadata(db, name, metadata)
 }
 

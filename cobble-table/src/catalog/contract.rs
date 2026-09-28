@@ -1,4 +1,7 @@
-use super::model::{CatalogSchemaId, CatalogTable, TableIdentifier};
+use super::model::{
+    CatalogSchemaId, CatalogSchemaVersion, CatalogTable, ShardSchemaMapping, TableId,
+    TableIdentifier,
+};
 use crate::evolution::SchemaChange;
 use crate::{TableError, TableSchema};
 use thiserror::Error;
@@ -70,4 +73,20 @@ pub trait Catalog: Send + Sync {
         new_name: String,
     ) -> CatalogResult<CatalogTable>;
     fn drop_table(&self, identifier: &TableIdentifier) -> CatalogResult<()>;
+}
+
+/// Schema history and shard-mapping persistence required by a connected catalog table.
+///
+/// Implementations own their metadata storage and commit coordination; runtime data locations
+/// are configured separately in [`super::CatalogRuntimeContext`]. Published schema versions must
+/// be immutable, and recording a shard mapping must be idempotent so a failed caller can retry.
+/// Detached worker plans contain their own history and do not report shard mappings.
+pub trait CatalogSchemaStore: Send + Sync {
+    fn load_schema_version(
+        &self,
+        table_id: TableId,
+        schema_id: CatalogSchemaId,
+    ) -> CatalogResult<CatalogSchemaVersion>;
+
+    fn record_shard_schema_mapping(&self, mapping: ShardSchemaMapping) -> CatalogResult<()>;
 }

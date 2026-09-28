@@ -1,10 +1,11 @@
-use crate::catalog::{CatalogResult, CatalogSchemaId, CatalogTable, TableId, TableIdentifier};
-use crate::{Result, TableError, TableSchema, TableWriterBuilder};
+use crate::catalog::{CatalogResult, CatalogSchemaVersion, CatalogTable, TableId, TableIdentifier};
+use crate::catalog::{valid_storage_id, validate_identifier};
+use crate::{Result, TableError, TableWriterBuilder};
 use cobble::{Config, VolumeDescriptor, VolumeUsageKind};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const TABLE_WRITE_PLAN_FORMAT: &str = "cobble-table-write-plan";
-pub(crate) const TABLE_WRITE_PLAN_VERSION: u32 = 1;
+pub(crate) const TABLE_WRITE_PLAN_VERSION: u32 = 2;
 
 /// Builds a portable writer initialization plan from one catalog table definition.
 pub struct TableWriteBuilder {
@@ -34,16 +35,16 @@ impl TableWriteBuilder {
 
 /// Serializable, catalog-independent initialization for one table writer shard.
 ///
-/// The plan carries only shared metadata, snapshot, and WAL locations. Workers supply their own
-/// primary-data, cache, and read-only runtime volumes when creating a writer.
+/// The plan carries complete schema history through the target version and only shared metadata,
+/// snapshot, and WAL locations. Workers supply their own primary-data, cache, and read-only
+/// runtime volumes when creating a writer; no live catalog is needed to apply schema evolution.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TableWritePlan {
     pub(crate) format: String,
     pub(crate) version: u32,
     pub(crate) identifier: TableIdentifier,
     pub(crate) table_id: TableId,
-    pub(crate) catalog_schema_id: CatalogSchemaId,
-    pub(crate) schema: TableSchema,
+    pub(crate) schema_history: Vec<CatalogSchemaVersion>,
     pub(crate) storage_id: String,
     pub(crate) shared_volumes: Vec<VolumeDescriptor>,
     pub(crate) total_buckets: u32,
@@ -65,20 +66,27 @@ impl TableWritePlan {
                 self.version
             )));
         }
-        if self.identifier.namespace().is_empty()
-            || self.identifier.name().is_empty()
-            || self.identifier.name() != self.identifier.name().trim()
-        {
+        if validate_identifier(&self.identifier).is_err() {
             return Err(TableError::InvalidSchema(
                 "table write plan has an invalid identifier".to_string(),
             ));
         }
-        self.schema.validate()?;
-        if self.storage_id.is_empty()
-            || self.storage_id == "."
-            || self.storage_id == ".."
-            || self.storage_id.contains(['/', '\\'])
+        if self.schema_history.is_empty()
+            || self
+                .schema_history
+                .iter()
+                .enumerate()
+                .any(|(index, version)| {
+                    version.table_id() != self.table_id
+                        || usize::try_from(version.catalog_schema_id().as_u32()).ok() != Some(index)
+                        || version.schema().validate().is_err()
+                })
         {
+            return Err(TableError::InvalidSchema(
+                "table write plan has invalid schema history".to_string(),
+            ));
+        }
+        if !valid_storage_id(&self.storage_id) {
             return Err(TableError::InvalidSchema(
                 "table write plan has an invalid storage id".to_string(),
             ));
@@ -110,6 +118,12 @@ impl TableWritePlan {
 
     pub(crate) fn table_id(&self) -> TableId {
         self.table_id
+    }
+
+    pub(crate) fn target_schema(&self) -> &CatalogSchemaVersion {
+        self.schema_history
+            .last()
+            .expect("validated table write plan must have schema history")
     }
 
     /// Initialize a shard writer builder using this fixed table definition.
