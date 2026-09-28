@@ -1,18 +1,201 @@
 use crate::db::db_arc_from_handle_or_throw;
 use crate::table::table_open_response;
 use crate::util::{
-    decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong, parse_config_json,
-    throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
+    FrameError, decode_java_string, decode_u16, decode_u32, decode_u64_from_jlong,
+    parse_config_json, throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
 use cobble_table::catalog::{
-    Catalog, CatalogSchemaId, CatalogTable as RustCatalogTable, FileCatalog as RustFileCatalog,
-    FileCatalogConfig,
+    Catalog, CatalogError, CatalogResult, CatalogRuntimeContext, CatalogSchemaId,
+    CatalogSchemaStore as RustCatalogSchemaStore, CatalogSchemaVersion,
+    CatalogTable as RustCatalogTable, FileCatalog as RustFileCatalog, FileCatalogConfig,
+    ShardSchemaMapping, TableId,
 };
 use cobble_table::{SchemaChange, TableSchema, TableWritePlan, TableWriterBuilder};
-use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jobject, jstring};
+use jni::{JNIEnv, JavaVM};
 use std::sync::Arc;
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogSchemaVersion_initialNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    table_id: jlong,
+    schema_json: JString,
+) -> jstring {
+    let table_id = match u32::try_from(table_id) {
+        Ok(value) => TableId::new(value),
+        Err(_) => return throw_argument_and_null(&mut env, "tableId out of range"),
+    };
+    let Some(schema) = parse_json(&mut env, schema_json, "table schema") else {
+        return std::ptr::null_mut();
+    };
+    json_result(&mut env, CatalogSchemaVersion::initial(table_id, schema))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogSchemaVersion_evolveNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    version_json: JString,
+    changes_json: JString,
+) -> jstring {
+    let Some(version): Option<CatalogSchemaVersion> =
+        parse_json(&mut env, version_json, "catalog schema version")
+    else {
+        return std::ptr::null_mut();
+    };
+    let Some(changes): Option<Vec<SchemaChange>> =
+        parse_json(&mut env, changes_json, "schema changes")
+    else {
+        return std::ptr::null_mut();
+    };
+    json_result(&mut env, version.evolve(changes))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_table_CatalogTable_connectNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    identifier_json: JString,
+    version_json: JString,
+    config_json: JString,
+    storage_id: JString,
+    schema_store: JObject,
+) -> jlong {
+    let Some(identifier) = parse_json(&mut env, identifier_json, "table identifier") else {
+        return 0;
+    };
+    let Some(version) = parse_json(&mut env, version_json, "catalog schema version") else {
+        return 0;
+    };
+    let config_json = match decode_java_string(&mut env, config_json) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_zero(&mut env, error),
+    };
+    let Some(config) = parse_config_json(&mut env, &config_json) else {
+        return 0;
+    };
+    let storage_id = match decode_java_string(&mut env, storage_id) {
+        Ok(value) => value,
+        Err(error) => return throw_argument_and_zero(&mut env, error),
+    };
+    let vm = match env.get_java_vm() {
+        Ok(value) => value,
+        Err(error) => return throw_state_and_zero(&mut env, error),
+    };
+    let object = match env.new_global_ref(schema_store) {
+        Ok(value) => value,
+        Err(error) => return throw_state_and_zero(&mut env, error),
+    };
+    let store: Arc<dyn RustCatalogSchemaStore> = Arc::new(JavaCatalogSchemaStore { vm, object });
+    let context = match CatalogRuntimeContext::new(config, storage_id, store) {
+        Ok(value) => Arc::new(value),
+        Err(error) => return throw_state_and_zero(&mut env, error),
+    };
+    catalog_table_handle(
+        &mut env,
+        RustCatalogTable::new(identifier, version, context),
+    )
+}
+
+struct JavaCatalogSchemaStore {
+    vm: JavaVM,
+    object: GlobalRef,
+}
+
+impl RustCatalogSchemaStore for JavaCatalogSchemaStore {
+    fn load_schema_version(
+        &self,
+        table_id: TableId,
+        schema_id: CatalogSchemaId,
+    ) -> CatalogResult<CatalogSchemaVersion> {
+        let mut env = self.vm.attach_current_thread().map_err(|error| {
+            callback_backend_error(format!("failed to attach JVM thread: {error}"))
+        })?;
+        env.with_local_frame(16, |env| {
+            let json = env
+                .call_method(
+                    self.object.as_obj(),
+                    "loadSchemaVersionJson",
+                    "(JJ)Ljava/lang/String;",
+                    &[
+                        JValue::Long(table_id.as_u32() as jlong),
+                        JValue::Long(schema_id.as_u32() as jlong),
+                    ],
+                )
+                .and_then(|value| value.l())
+                .map_err(|error| FrameError(callback_failure(env, "loadSchemaVersion", error)))?;
+            if json.is_null() {
+                return Err(FrameError(
+                    "loadSchemaVersion returned an empty version".to_string(),
+                ));
+            }
+            let json = decode_java_string(env, JString::from(json)).map_err(FrameError)?;
+            serde_json::from_str(&json)
+                .map_err(|error| FrameError(format!("invalid catalog schema version: {error}")))
+        })
+        .map_err(|error: FrameError| callback_backend_error(error.0))
+    }
+
+    fn record_shard_schema_mapping(&self, mapping: ShardSchemaMapping) -> CatalogResult<()> {
+        let mut env = self.vm.attach_current_thread().map_err(|error| {
+            callback_backend_error(format!("failed to attach JVM thread: {error}"))
+        })?;
+        env.with_local_frame(16, |env| {
+            let db_id = env.new_string(mapping.db_id()).map_err(FrameError::from)?;
+            let db_id = JObject::from(db_id);
+            env.call_method(
+                self.object.as_obj(),
+                "recordMapping",
+                "(JLjava/lang/String;JJ)V",
+                &[
+                    JValue::Long(mapping.table_id().as_u32() as jlong),
+                    JValue::Object(&db_id),
+                    JValue::Long(mapping.catalog_schema_id().as_u32() as jlong),
+                    JValue::Long(mapping.core_schema_id() as jlong),
+                ],
+            )
+            .map_err(|error| {
+                FrameError(callback_failure(env, "recordShardSchemaMapping", error))
+            })?;
+            Ok(())
+        })
+        .map_err(|error: FrameError| callback_backend_error(error.0))
+    }
+}
+
+fn callback_backend_error(message: String) -> CatalogError {
+    CatalogError::Backend(Box::new(std::io::Error::other(message)))
+}
+
+fn callback_failure(env: &mut JNIEnv, operation: &str, error: jni::errors::Error) -> String {
+    let detail = if env.exception_check().unwrap_or(false) {
+        let throwable = env.exception_occurred().ok();
+        let _ = env.exception_clear();
+        throwable.and_then(|throwable| {
+            let result = env
+                .call_method(&throwable, "toString", "()Ljava/lang/String;", &[])
+                .and_then(|value| value.l());
+            match result {
+                Ok(value) if !value.is_null() => decode_java_string(env, JString::from(value)).ok(),
+                _ => {
+                    let _ = env.exception_clear();
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    format!(
+        "{operation} callback failed: {}",
+        detail.unwrap_or_else(|| error.to_string())
+    )
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_FileCatalog_openNative(

@@ -2,6 +2,7 @@ package io.cobble;
 
 import io.cobble.structured.ColumnValue;
 import io.cobble.structured.Row;
+import io.cobble.table.Catalog;
 import io.cobble.table.CatalogTable;
 import io.cobble.table.DataField;
 import io.cobble.table.DirectTableRow;
@@ -770,7 +771,7 @@ class DbBindingTest {
                         Arrays.asList(1L, 2L),
                         Collections.singletonList(1L));
         CatalogTable initial;
-        try (FileCatalog catalog = FileCatalog.open(config, "warehouse")) {
+        try (Catalog catalog = FileCatalog.open(config, "warehouse")) {
             catalog.createNamespace(namespace);
             initial = catalog.createTable(users, initialSchema);
             assertTrue(catalog.tableExists(users));
@@ -802,7 +803,7 @@ class DbBindingTest {
             try (TableProjection staleProjection =
                     writer.projectByNames(Collections.singletonList("payload"))) {
                 CatalogTable evolved;
-                try (FileCatalog catalog = FileCatalog.open(config, "warehouse")) {
+                try (Catalog catalog = FileCatalog.open(config, "warehouse")) {
                     assertThrows(
                             IllegalStateException.class,
                             () ->
@@ -876,7 +877,7 @@ class DbBindingTest {
             initial.close();
         }
 
-        try (FileCatalog catalog = FileCatalog.open(config, "warehouse")) {
+        try (Catalog catalog = FileCatalog.open(config, "warehouse")) {
             catalog.dropTable(users);
             catalog.dropNamespace(namespace);
             assertTrue(catalog.listNamespaces().isEmpty());

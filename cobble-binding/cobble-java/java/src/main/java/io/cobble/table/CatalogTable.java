@@ -40,6 +40,31 @@ public final class CatalogTable extends NativeObject {
         }
     }
 
+    /**
+     * Binds a published schema version to shared data locations and external metadata storage. The
+     * store is retained while this table is open but remains caller-owned and must stay usable.
+     */
+    public static CatalogTable connect(
+            TableIdentifier identifier,
+            CatalogSchemaVersion version,
+            Config sharedConfig,
+            String storageId,
+            CatalogSchemaStore schemaStore) {
+        Objects.requireNonNull(identifier, "identifier");
+        Objects.requireNonNull(version, "version");
+        Objects.requireNonNull(sharedConfig, "sharedConfig");
+        Objects.requireNonNull(storageId, "storageId");
+        Objects.requireNonNull(schemaStore, "schemaStore");
+        NativeLoader.load();
+        return fromNativeHandle(
+                connectNative(
+                        identifier.toJson(),
+                        version.nativeJson(),
+                        sharedConfig.toJson(),
+                        storageId,
+                        new SchemaStoreBridge(schemaStore)));
+    }
+
     public TableIdentifier identifier() {
         ensureOpen();
         return identifier;
@@ -151,6 +176,33 @@ public final class CatalogTable extends NativeObject {
     protected native void disposeInternal(long nativeHandle);
 
     private static native String descriptorNative(long nativeHandle);
+
+    private static native long connectNative(
+            String identifierJson,
+            String versionJson,
+            String sharedConfigJson,
+            String storageId,
+            SchemaStoreBridge schemaStore);
+
+    private static final class SchemaStoreBridge {
+        private final CatalogSchemaStore store;
+
+        SchemaStoreBridge(CatalogSchemaStore store) {
+            this.store = store;
+        }
+
+        String loadSchemaVersionJson(long tableId, long catalogSchemaId) {
+            return Objects.requireNonNull(
+                            store.loadSchemaVersion(tableId, catalogSchemaId),
+                            "loadSchemaVersion returned null")
+                    .nativeJson();
+        }
+
+        void recordMapping(long tableId, String dbId, long catalogSchemaId, long coreSchemaId) {
+            store.recordShardSchemaMapping(
+                    new ShardSchemaMapping(tableId, dbId, catalogSchemaId, coreSchemaId));
+        }
+    }
 
     private static native void disposeNative(long nativeHandle);
 

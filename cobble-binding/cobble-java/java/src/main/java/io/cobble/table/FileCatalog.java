@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.Objects;
 
 /** File-backed catalog for namespaces, table identities, and table schema history. */
-public final class FileCatalog extends NativeObject {
+public final class FileCatalog extends NativeObject implements Catalog {
     private static final Gson GSON = new Gson();
 
     private FileCatalog(long nativeHandle) {
@@ -31,10 +31,12 @@ public final class FileCatalog extends NativeObject {
         return new FileCatalog(handle);
     }
 
+    @Override
     public synchronized void createNamespace(List<String> namespace) {
         createNamespaceNative(openHandle(), namespaceJson(namespace));
     }
 
+    @Override
     public synchronized List<List<String>> listNamespaces() {
         JsonArray values =
                 JsonParser.parseString(listNamespacesNative(openHandle())).getAsJsonArray();
@@ -43,10 +45,12 @@ public final class FileCatalog extends NativeObject {
         return Collections.unmodifiableList(namespaces);
     }
 
+    @Override
     public synchronized void dropNamespace(List<String> namespace) {
         dropNamespaceNative(openHandle(), namespaceJson(namespace));
     }
 
+    @Override
     public synchronized CatalogTable createTable(TableIdentifier identifier, TableSchema schema) {
         Objects.requireNonNull(identifier, "identifier");
         Objects.requireNonNull(schema, "schema");
@@ -54,11 +58,13 @@ public final class FileCatalog extends NativeObject {
                 createTableNative(openHandle(), identifier.toJson(), TableJson.toJson(schema)));
     }
 
+    @Override
     public synchronized CatalogTable loadTable(TableIdentifier identifier) {
         Objects.requireNonNull(identifier, "identifier");
         return CatalogTable.fromNativeHandle(loadTableNative(openHandle(), identifier.toJson()));
     }
 
+    @Override
     public synchronized TableSchema loadTableSchema(
             TableIdentifier identifier, long catalogSchemaId) {
         Objects.requireNonNull(identifier, "identifier");
@@ -68,6 +74,7 @@ public final class FileCatalog extends NativeObject {
                 loadTableSchemaNative(openHandle(), identifier.toJson(), catalogSchemaId));
     }
 
+    @Override
     public synchronized CatalogTable evolveSchema(
             TableIdentifier identifier, List<TableSchemaChange> changes) {
         Objects.requireNonNull(identifier, "identifier");
@@ -76,6 +83,7 @@ public final class FileCatalog extends NativeObject {
                         openHandle(), identifier.toJson(), TableSchemaChange.toJson(changes)));
     }
 
+    @Override
     public synchronized List<TableIdentifier> listTables(List<String> namespace) {
         JsonArray values =
                 JsonParser.parseString(listTablesNative(openHandle(), namespaceJson(namespace)))
@@ -86,11 +94,13 @@ public final class FileCatalog extends NativeObject {
         return Collections.unmodifiableList(tables);
     }
 
+    @Override
     public synchronized boolean tableExists(TableIdentifier identifier) {
         Objects.requireNonNull(identifier, "identifier");
         return tableExistsNative(openHandle(), identifier.toJson());
     }
 
+    @Override
     public synchronized CatalogTable renameTable(TableIdentifier identifier, String newName) {
         Objects.requireNonNull(identifier, "identifier");
         Objects.requireNonNull(newName, "newName");
@@ -98,6 +108,7 @@ public final class FileCatalog extends NativeObject {
                 renameTableNative(openHandle(), identifier.toJson(), newName));
     }
 
+    @Override
     public synchronized void dropTable(TableIdentifier identifier) {
         Objects.requireNonNull(identifier, "identifier");
         dropTableNative(openHandle(), identifier.toJson());
