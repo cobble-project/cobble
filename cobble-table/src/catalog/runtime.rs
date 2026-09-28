@@ -1,9 +1,10 @@
-use super::CatalogResult;
-use super::model::{CatalogTable, TableId};
+use super::materialize::materialize_table_definition;
+use super::model::{CatalogSchemaId, CatalogTable, ShardSchemaMapping, TableId};
+use super::{CatalogError, CatalogResult, CatalogSchemaStore};
 use crate::snapshot::TableSnapshotCommitter;
 use crate::write::{TABLE_WRITE_PLAN_FORMAT, TABLE_WRITE_PLAN_VERSION};
 use crate::{
-    ReadOnlyTableBuilder, Table, TableReaderBuilder, TableWriteBuilder, TableWritePlan,
+    ReadOnlyTableBuilder, Table, TableError, TableReaderBuilder, TableWriteBuilder, TableWritePlan,
     TableWriterBuilder,
 };
 use cobble::{Config, CoordinatorConfig, Db, DbCoordinator, VolumeDescriptor, VolumeUsageKind};
@@ -15,18 +16,53 @@ use url::Url;
 #[path = "../../tests/unit/catalog_storage.rs"]
 mod storage_tests;
 
-/// Process-local storage association for a catalog table.
+/// Process-local data storage routing and schema-store association for a catalog table.
 ///
-/// It is not part of catalog metadata. In this stage, FileCatalog supplies this association.
-pub(crate) struct CatalogRuntimeContext {
+/// `config` supplies shared Meta, Snapshot, and WAL locations. Writer and reader builders receive
+/// their own primary-data and cache locations at runtime; the schema store manages its metadata
+/// location independently. Neither credentials nor the store implementation are serialized into
+/// writer plans.
+pub struct CatalogRuntimeContext {
     pub(crate) config: Config,
     pub(crate) storage_id: String,
+    pub(crate) schema_store: Arc<dyn CatalogSchemaStore>,
 }
 
 impl CatalogRuntimeContext {
+    pub fn new(
+        config: Config,
+        storage_id: impl Into<String>,
+        schema_store: Arc<dyn CatalogSchemaStore>,
+    ) -> CatalogResult<Self> {
+        let storage_id = storage_id.into();
+        if !valid_storage_id(&storage_id) {
+            return Err(CatalogError::InvalidIdentifier(format!(
+                "invalid catalog storage id: {storage_id}"
+            )));
+        }
+        if !config
+            .volumes
+            .iter()
+            .any(|volume| volume.supports(VolumeUsageKind::Meta))
+        {
+            return Err(CatalogError::InvalidMetadata(
+                "catalog runtime requires a shared metadata volume".to_string(),
+            ));
+        }
+        Ok(Self {
+            config,
+            storage_id,
+            schema_store,
+        })
+    }
+
     fn scoped_config(&self, runtime: Config, table_id: TableId) -> Config {
         scoped_table_config(&self.config.volumes, &self.storage_id, table_id, runtime)
     }
+}
+
+pub(crate) fn valid_storage_id(value: &str) -> bool {
+    !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\'])
 }
 
 fn scoped_table_config(
@@ -126,14 +162,15 @@ impl CatalogTable {
     #[cfg(feature = "ffi")]
     #[doc(hidden)]
     pub fn physical_name(&self) -> String {
-        physical_table_name(self.table_id)
+        physical_table_name(self.table_id())
     }
 
     /// Materialize this captured catalog schema into one writable shard.
     ///
     /// Calls for a shard must not run concurrently with other core schema updates.
     pub fn materialize_table(&self, db: Arc<Db>) -> CatalogResult<Table> {
-        super::file_catalog::materialize_catalog_table(self, db)
+        let (physical_name, metadata) = materialize_connected(self, db.as_ref())?;
+        Table::from_metadata(db, physical_name, metadata).map_err(Into::into)
     }
 
     /// Start building a portable writer initialization plan for this table.
@@ -154,28 +191,35 @@ impl CatalogTable {
     /// The caller controls which catalog version is loaded; this method never follows catalog
     /// CURRENT implicitly.
     pub fn refresh_writer(&self, table: &mut Table) -> CatalogResult<bool> {
-        super::file_catalog::refresh_catalog_table_writer(self, table)
+        if table.name() != physical_table_name(self.table_id()) {
+            return Err(TableError::InvalidSchema(
+                "Table does not belong to this catalog table".to_string(),
+            )
+            .into());
+        }
+        materialize_connected(self, table.db())?;
+        table.refresh_schema().map_err(Into::into)
     }
 
     /// Build an owned snapshot reader for this table using its catalog-managed shared storage.
     pub fn reader_builder(&self, runtime: Config) -> CatalogResult<TableReaderBuilder> {
         let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
+        let config = context.scoped_config(runtime, self.table_id());
         Ok(TableReaderBuilder::from_catalog(
             config,
-            physical_table_name(self.table_id),
-            self.table_id,
+            physical_table_name(self.table_id()),
+            self.table_id(),
         ))
     }
 
     /// Build an owned shard snapshot table for this catalog table.
     pub fn readonly_table_builder(&self, runtime: Config) -> CatalogResult<ReadOnlyTableBuilder> {
         let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
+        let config = context.scoped_config(runtime, self.table_id());
         Ok(ReadOnlyTableBuilder::from_catalog(
             config,
-            physical_table_name(self.table_id),
-            self.table_id,
+            physical_table_name(self.table_id()),
+            self.table_id(),
         ))
     }
 
@@ -197,11 +241,33 @@ impl CatalogTable {
     /// Open the core coordinator in this table's global snapshot namespace.
     pub fn coordinator(&self, runtime: Config) -> CatalogResult<DbCoordinator> {
         let context = &self.runtime_context;
-        let config = context.scoped_config(runtime, self.table_id);
+        let config = context.scoped_config(runtime, self.table_id());
         Ok(DbCoordinator::open(CoordinatorConfig::from_config(
             &config,
         ))?)
     }
+}
+
+fn materialize_connected(
+    table: &CatalogTable,
+    db: &Db,
+) -> CatalogResult<(String, crate::metadata::TableMetadata)> {
+    let store = &table.runtime_context.schema_store;
+    materialize_table_definition(
+        db,
+        table.table_id(),
+        table.catalog_schema_id(),
+        table.schema(),
+        |schema_id| store.load_schema_version(table.table_id(), schema_id),
+        |schema_id, core_schema_id| {
+            store.record_shard_schema_mapping(ShardSchemaMapping::new(
+                table.table_id(),
+                db.id(),
+                schema_id,
+                core_schema_id,
+            ))
+        },
+    )
 }
 
 pub(crate) fn build_write_plan(
@@ -209,6 +275,19 @@ pub(crate) fn build_write_plan(
     total_buckets: u32,
 ) -> CatalogResult<TableWritePlan> {
     let context = &table.runtime_context;
+    let schema_history = (0..=table.catalog_schema_id().as_u32())
+        .map(|schema_id| {
+            context
+                .schema_store
+                .load_schema_version(table.table_id(), CatalogSchemaId::from(schema_id))
+        })
+        .collect::<CatalogResult<Vec<_>>>()?;
+    if schema_history.last() != Some(&table.schema_version) {
+        return Err(CatalogError::InvalidMetadata(
+            "loaded schema history does not match the catalog table".to_string(),
+        ));
+    }
+    let table_id = table.table_id();
     let shared_volumes = context
         .config
         .volumes
@@ -220,9 +299,8 @@ pub(crate) fn build_write_plan(
         format: TABLE_WRITE_PLAN_FORMAT.to_string(),
         version: TABLE_WRITE_PLAN_VERSION,
         identifier: table.identifier,
-        table_id: table.table_id,
-        catalog_schema_id: table.catalog_schema_id,
-        schema: table.schema,
+        table_id,
+        schema_history,
         storage_id: context.storage_id.clone(),
         shared_volumes,
         total_buckets,
@@ -243,16 +321,37 @@ pub(crate) fn writer_builder_from_write_plan(
         .iter()
         .map(|volume| volume.with_credentials_from(credential_source))
         .collect::<Vec<_>>();
-    let store_config = Config {
-        volumes: shared_volumes.clone(),
-        ..Config::default()
-    };
     let mut config = scoped_table_config(&shared_volumes, &plan.storage_id, plan.table_id, runtime);
     config.total_buckets = plan.total_buckets;
     Ok(TableWriterBuilder::from_write_plan(
         config,
         physical_table_name(plan.table_id),
         plan.clone(),
-        store_config,
     ))
+}
+
+pub(crate) fn materialize_write_plan(
+    db: &Db,
+    plan: &TableWritePlan,
+) -> crate::Result<(String, crate::metadata::TableMetadata)> {
+    plan.validate()?;
+    let target = plan.target_schema();
+    materialize_table_definition(
+        db,
+        plan.table_id,
+        target.catalog_schema_id(),
+        target.schema(),
+        |schema_id| {
+            plan.schema_history
+                .get(schema_id.as_u32() as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    CatalogError::InvalidMetadata(
+                        "table write plan is missing a schema version".to_string(),
+                    )
+                })
+        },
+        |_, _| Ok(()),
+    )
+    .map_err(|error| TableError::internal(error.to_string()))
 }
