@@ -1,5 +1,8 @@
 package io.cobble.table;
 
+import java.io.InvalidObjectException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -7,8 +10,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** Dynamic value used by the schema-directed table codec. */
-public final class Value {
+/**
+ * Dynamic value used by the schema-directed table codec. Java serialization is separate from the
+ * storage codec and snapshots borrowed binary bytes while their source remains valid.
+ */
+public final class Value implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     public enum Kind {
         NULL,
         BOOLEAN,
@@ -30,7 +38,9 @@ public final class Value {
         EXTENSION
     }
 
-    public static final class Decimal {
+    public static final class Decimal implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         public final int precision, scale;
         public final java.math.BigInteger unscaled;
 
@@ -54,7 +64,9 @@ public final class Value {
         }
     }
 
-    public static final class Timestamp {
+    public static final class Timestamp implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         public final int precision;
         public final TimestampKind kind;
         public final long seconds;
@@ -82,7 +94,9 @@ public final class Value {
         }
     }
 
-    public static final class Extension {
+    public static final class Extension implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         public final String typeId;
         public final Value value;
 
@@ -238,5 +252,63 @@ public final class Value {
         ByteBuffer duplicate = value.duplicate();
         while (duplicate.hasRemaining()) hash = 31 * hash + duplicate.get();
         return hash;
+    }
+
+    private Object writeReplace() {
+        Object serialized = value;
+        switch (kind) {
+            case BINARY:
+                ByteBuffer bytes = ((ByteBuffer) value).duplicate();
+                byte[] owned = new byte[bytes.remaining()];
+                bytes.get(owned);
+                serialized = owned;
+                break;
+            case FLOAT32:
+                // Default float serialization canonicalizes NaNs and loses their payload bits.
+                serialized = Float.floatToRawIntBits((Float) value);
+                break;
+            case FLOAT64:
+                serialized = Double.doubleToRawLongBits((Double) value);
+                break;
+            default:
+                break;
+        }
+        return new SerializationProxy(kind, serialized);
+    }
+
+    private void readObject(ObjectInputStream input) throws InvalidObjectException {
+        throw new InvalidObjectException("serialization proxy required");
+    }
+
+    private static final class SerializationProxy implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        private final Kind kind;
+        private final Object value;
+
+        private SerializationProxy(Kind kind, Object value) {
+            this.kind = kind;
+            this.value = value;
+        }
+
+        @SuppressWarnings("unchecked")
+        private Object readResolve() {
+            switch (kind) {
+                case BINARY:
+                    return Value.binaryOwned((byte[]) value);
+                case FLOAT32:
+                    return Value.float32(Float.intBitsToFloat((Integer) value));
+                case FLOAT64:
+                    return Value.float64(Double.longBitsToDouble((Long) value));
+                case LIST:
+                    return Value.list((List<Value>) value);
+                case MAP:
+                    return Value.map((List<Map.Entry<Value, Value>>) value);
+                case STRUCT:
+                    return Value.struct((List<Value>) value);
+                default:
+                    return new Value(kind, value);
+            }
+        }
     }
 }
