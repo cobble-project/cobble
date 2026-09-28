@@ -33,6 +33,27 @@ public final class BucketHash {
         return bucket(hash(encodedBucketKey));
     }
 
+    /** Computes the bucket for one non-null Binary field without allocating its key encoding. */
+    public int binaryKeyBucket(byte[] bytes) {
+        int hash = 1;
+        for (byte value : bytes) hash = hashBinaryByte(hash, value);
+        return bucket(hash * 31 * 31);
+    }
+
+    /** Uses the buffer's remaining bytes without changing its position or limit. */
+    public int binaryKeyBucket(ByteBuffer bytes) {
+        int hash = 1;
+        for (int index = bytes.position(); index < bytes.limit(); index++)
+            hash = hashBinaryByte(hash, bytes.get(index));
+        return bucket(hash * 31 * 31);
+    }
+
+    private static int hashBinaryByte(int hash, byte value) {
+        hash = 31 * hash + value;
+        // KeyCodec escapes zero as 0x00, 0xff; the field terminator is two zero bytes.
+        return value == 0 ? 31 * hash - 1 : hash;
+    }
+
     private int bucket(int hash) {
         // floorMod by a power of two is exactly the corresponding low bits, including for
         // negative two's-complement hashes.

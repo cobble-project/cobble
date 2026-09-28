@@ -149,6 +149,33 @@ class TableCodecTest {
         assertEquals(0, new BucketHash(1).bucket(key));
         assertEquals(-28, BucketHash.hash(new byte[] {(byte) 0xc5}));
         assertEquals(65508, new BucketHash(65536).bucket(new byte[] {(byte) 0xc5}));
+        byte[] allBytes = new byte[256];
+        for (int i = 0; i < allBytes.length; i++) allBytes[i] = (byte) i;
+        for (byte[] binary :
+                new byte[][] {new byte[0], new byte[] {0, 0, (byte) 0xff, 0}, allBytes}) {
+            byte[] encodedBinary =
+                    KeyCodec.encode(
+                            Collections.singletonList(LogicalTypes.binary()),
+                            Collections.singletonList(Value.binary(binary)));
+            ByteBuffer heap = ByteBuffer.allocate(binary.length + 2);
+            heap.put((byte) 99).put(binary).put((byte) 99);
+            ((Buffer) heap).position(1).limit(binary.length + 1);
+            ByteBuffer directBinary = ByteBuffer.allocateDirect(heap.capacity());
+            directBinary.put((byte) 99).put(heap.duplicate()).put((byte) 99);
+            ((Buffer) directBinary).position(1).limit(binary.length + 1);
+            for (int count : new int[] {1, 7, 16, 65535, 65536}) {
+                BucketHash hash = new BucketHash(count);
+                int expected = hash.bucket(encodedBinary);
+                assertEquals(expected, hash.binaryKeyBucket(binary));
+                assertEquals(expected, hash.binaryKeyBucket(heap));
+                assertEquals(expected, hash.binaryKeyBucket(heap.slice().asReadOnlyBuffer()));
+                assertEquals(expected, hash.binaryKeyBucket(directBinary.asReadOnlyBuffer()));
+                assertEquals(1, heap.position());
+                assertEquals(binary.length + 1, heap.limit());
+                assertEquals(1, directBinary.position());
+                assertEquals(binary.length + 1, directBinary.limit());
+            }
+        }
         assertThrows(
                 IllegalArgumentException.class,
                 () -> ValueCodec.decode(LogicalTypes.bool(), ByteBuffer.wrap(new byte[] {2})));
