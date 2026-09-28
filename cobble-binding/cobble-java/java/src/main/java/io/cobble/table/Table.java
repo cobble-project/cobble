@@ -125,6 +125,11 @@ public final class Table extends NativeObject {
         return new TableKeyBuilder(state().compiled);
     }
 
+    /** Decodes a complete encoded primary key using this table's current schema. */
+    public TableKey keyFromEncoded(byte[] encoded) {
+        return state().compiled.keyFromEncoded(encoded);
+    }
+
     /** Compiles a reusable typed projection from top-level field names. */
     public TableProjection projectByNames(List<String> fieldNames) {
         TableState state = state();
@@ -711,6 +716,17 @@ public final class Table extends NativeObject {
             this.valueTypes = valueTypes;
             this.physicalColumns = Math.max(1, valuePositions.length);
             this.bucketHash = bucketHash;
+        }
+
+        TableKey keyFromEncoded(byte[] encoded) {
+            List<Value> values =
+                    KeyCodec.decodeOwned(
+                            keyTypes, ByteBuffer.wrap(Objects.requireNonNull(encoded, "encoded")));
+            TableKeyBuilder builder = new TableKeyBuilder(this);
+            for (Value value : values) builder.push(value);
+            // Re-encoding computes the bucket from the validated bucket-key prefix and owns the
+            // returned bytes, matching the native key reconstruction path.
+            return builder.build();
         }
 
         static Compiled from(TableSchema schema, int totalBuckets) {

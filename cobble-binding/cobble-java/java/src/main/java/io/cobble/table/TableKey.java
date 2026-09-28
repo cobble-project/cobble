@@ -1,5 +1,6 @@
 package io.cobble.table;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
@@ -18,6 +19,16 @@ public final class TableKey {
     /** Returns the bucket selected for this key. */
     public int bucket() {
         return bucket;
+    }
+
+    /** Returns an immutable list of the decoded primary-key values in schema order. */
+    public List<Value> values() {
+        return values;
+    }
+
+    /** Returns a copy of the complete encoded primary key. */
+    public byte[] encoded() {
+        return Arrays.copyOf(encoded, encoded.length);
     }
 
     List<Value> valuesInternal() {
