@@ -682,6 +682,49 @@ fn test_db_delete_with_large_values() {
 
 #[test]
 #[serial_test::serial(file)]
+fn test_db_merge_after_delete_preserves_barrier_across_flush() {
+    for memtable_type in [
+        MemtableType::Skiplist,
+        MemtableType::Hash,
+        MemtableType::Vec,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_str().unwrap();
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{root_path}")),
+            memtable_type,
+            active_memtable_incremental_snapshot_ratio: 0.0,
+            num_columns: 1,
+            ..Config::default()
+        };
+        let db = open_db(config.clone());
+        db.put(0, b"key", 0, b"old,".as_slice()).unwrap();
+        let old_snapshot = db.snapshot().unwrap();
+        wait_for_manifest_in_db(root_path, db.id(), old_snapshot);
+
+        db.delete(0, b"key", 0).unwrap();
+        db.merge(0, b"key", 0, b"new,".as_slice()).unwrap();
+        let assert_new = |value: Option<Vec<Option<bytes::Bytes>>>| {
+            assert_eq!(value.unwrap()[0].as_deref(), Some(b"new,".as_slice()));
+        };
+        assert_new(db.get(0, b"key").unwrap());
+
+        let snapshot = db.snapshot().unwrap();
+        wait_for_manifest_in_db(root_path, db.id(), snapshot);
+        assert_new(db.get(0, b"key").unwrap());
+        let restored = Db::open_read_only(config.clone(), snapshot, db.id().to_string()).unwrap();
+        assert_new(restored.get(0, b"key").unwrap());
+        let old = Db::open_read_only(config, old_snapshot, db.id().to_string()).unwrap();
+        assert_eq!(
+            old.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+            Some(b"old,".as_slice())
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+#[serial_test::serial(file)]
 fn test_db_merge_with_large_values() {
     let root = "/tmp/db_it_merge_large_values";
     cleanup_test_root(root);

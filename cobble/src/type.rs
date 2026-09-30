@@ -419,6 +419,19 @@ impl Column {
         RefColumn::new(self.value_type, self.data())
     }
 
+    /// Reuse the newer payload without losing an empty Put/Delete's history barrier.
+    fn merge_empty_base(&self, mut newer: Column) -> Column {
+        if self.value_type.is_terminal() {
+            newer.value_type = match newer.value_type {
+                ValueType::Merge => ValueType::Put,
+                ValueType::MergeSeparated => ValueType::PutSeparated,
+                ValueType::MergeSeparatedArray => ValueType::PutSeparatedArray,
+                terminal => terminal,
+            };
+        }
+        newer
+    }
+
     /// Merges this column with a newer column, consuming both.
     ///
     /// Merge semantics:
@@ -750,8 +763,7 @@ impl Value {
                 match merged_columns[column_idx].as_ref() {
                     None => merged_columns[column_idx] = Some(newer),
                     Some(existing) if existing.data().is_empty() => {
-                        // Preserve `merge_with_callback`'s no-operator fast path for an empty base.
-                        merged_columns[column_idx] = Some(newer);
+                        merged_columns[column_idx] = Some(existing.merge_empty_base(newer));
                         pending_operands[column_idx].clear();
                     }
                     Some(_) => pending_operands[column_idx].push(newer),
@@ -813,7 +825,7 @@ impl Value {
                 (Some(old), Some(new)) => {
                     on_merge(Some(&old), Some(&new));
                     if old.data().is_empty() {
-                        Some(new)
+                        Some(old.merge_empty_base(new))
                     } else {
                         Some(old.merge(
                             new,

@@ -364,6 +364,34 @@ fn test_value_merge_all_terminal_put_resets_pending_separated_chain() {
 
 #[test]
 fn test_value_merge_all_merge_after_delete_keeps_empty_base_semantics() {
+    let schema = Schema::new(0, 1, vec![Arc::new(PanicMergeOperator)]);
+    for base in [ValueType::Delete, ValueType::Put, ValueType::Merge] {
+        for (operand, terminal) in [
+            (ValueType::Merge, ValueType::Put),
+            (ValueType::MergeSeparated, ValueType::PutSeparated),
+            (ValueType::MergeSeparatedArray, ValueType::PutSeparatedArray),
+        ] {
+            // Even an empty operand must retain the barrier for future merges.
+            for payload in [b"".as_slice(), b"new".as_slice()] {
+                let values = vec![
+                    Value::new(vec![Some(Column::new(base, Bytes::new()))]),
+                    Value::new(vec![Some(Column::new(operand, payload))]),
+                ];
+                assert_batch_matches_pairwise(values.clone(), &schema);
+                assert_fallible_batch_matches_pairwise(values.clone(), &schema);
+                let column = merge_single_column(values, &schema);
+                assert_eq!(column.data().as_ref(), payload);
+                assert_eq!(
+                    column.value_type,
+                    if base.is_terminal() {
+                        terminal
+                    } else {
+                        operand
+                    }
+                );
+            }
+        }
+    }
     let values = vec![
         Value::new(vec![Some(Column::new(ValueType::Put, b"old".as_slice()))]),
         Value::new(vec![Some(Column::new(ValueType::Delete, Bytes::new()))]),
@@ -380,9 +408,9 @@ fn test_value_merge_all_merge_after_delete_keeps_empty_base_semantics() {
     let column = merge_single_column(values, Schema::empty().as_ref());
     assert_separated_array(
         &column,
-        ValueType::MergeSeparatedArray,
+        ValueType::PutSeparatedArray,
         &[
-            (ValueType::MergeSeparated, b"after-delete".as_slice()),
+            (ValueType::PutSeparated, b"after-delete".as_slice()),
             (ValueType::Merge, b"-tail".as_slice()),
         ],
     );
@@ -659,6 +687,6 @@ fn test_value_merge_skips_operator_when_old_empty() {
     let schema = Schema::new(0, 1, vec![Arc::new(PanicMergeOperator)]);
     let merged = old.merge(new, &schema, None).unwrap();
     let col = merged.columns()[0].as_ref().unwrap();
-    assert_eq!(col.value_type, ValueType::Merge);
+    assert_eq!(col.value_type, ValueType::Put);
     assert_eq!(col.data().as_ref(), b"m");
 }
