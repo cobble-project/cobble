@@ -14,15 +14,12 @@ pub(crate) struct ColumnMaskingIterator<I> {
 impl<I> ColumnMaskingIterator<I> {
     pub(crate) fn new(inner: I, num_columns: usize, selected_columns: &[usize]) -> Self {
         let mask_size = num_columns.div_ceil(8).max(1);
-        let last_bits = (num_columns - 1) % 8 + 1;
-        let last_mask = (1u8 << last_bits) - 1;
         let mut decode_mask = vec![0u8; mask_size];
         for &column_idx in selected_columns {
             if column_idx < num_columns {
                 decode_mask[column_idx / 8] |= 1 << (column_idx % 8);
             }
         }
-        decode_mask[mask_size - 1] &= last_mask;
         Self {
             inner,
             num_columns,

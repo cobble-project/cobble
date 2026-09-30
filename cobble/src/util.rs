@@ -6,6 +6,16 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use url::Url;
 
+/// Valid column bits in the last bitmap byte; a full byte must retain all eight bits.
+#[inline]
+pub(crate) fn column_mask_last_byte(num_columns: usize) -> u8 {
+    match (num_columns, num_columns % 8) {
+        (0, _) => 0,
+        (_, 0) => u8::MAX,
+        (_, bits) => (1u8 << bits) - 1,
+    }
+}
+
 /// Creates a `Bytes` instance that shares the same underlying data as the input slice.
 #[inline]
 pub(crate) fn unsafe_bytes(target: &[u8]) -> Bytes {

@@ -27,6 +27,7 @@ use crate::r#type::{
     Column, ENCODED_KEY_BUCKET_BYTES, ENCODED_KEY_PREFIX_BYTES, Key, RefColumn, RefKey, RefValue,
     Value, ValueType, decode_bucket_prefix, encode_bucket_prefix,
 };
+use crate::util::column_mask_last_byte;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Encodes a ValueType to a single byte.
@@ -419,8 +420,7 @@ pub(crate) fn decode_value_masked(
     if num_columns == 1 {
         last_present_idx = Some(0);
     } else if bmp_size > 0 {
-        let last_byte_bits = (num_columns - 1) % 8 + 1;
-        let last_byte_mask = (1u8 << last_byte_bits) - 1;
+        let last_byte_mask = column_mask_last_byte(num_columns);
         for byte_idx in (0..bmp_size).rev() {
             let mut byte = bitmap[byte_idx];
             if byte_idx == bmp_size - 1 {
