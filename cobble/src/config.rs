@@ -4,7 +4,9 @@ use crate::data_file::DataFileType;
 use crate::error::{Error, Result};
 use crate::schema::Schema;
 use crate::time::TimeProviderKind;
-use crate::util::{normalize_storage_path_to_url, size_to_u64, size_to_usize};
+use crate::util::{
+    column_mask_last_byte, normalize_storage_path_to_url, size_to_u64, size_to_usize,
+};
 use arc_swap::ArcSwapOption;
 use config::{Config as ConfigLoader, File as ConfigFile, FileFormat as ConfigFileFormat};
 use log::warn;
@@ -957,8 +959,7 @@ impl ReadOptions {
 
     fn build_masks(&self, num_columns: usize) -> ReadOptionsMasks {
         let mask_size = num_columns.div_ceil(8).max(1);
-        let last_bits = (num_columns - 1) % 8 + 1;
-        let last_mask = (1u8 << last_bits) - 1;
+        let last_mask = column_mask_last_byte(num_columns);
         let selected_mask = self.column_indices.as_ref().map(|columns| {
             let mut mask = vec![0u8; mask_size];
             for &column_idx in columns {

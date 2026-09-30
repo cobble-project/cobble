@@ -26,6 +26,7 @@ use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
 use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions, SSTPointReader};
 use crate::r#type::{key_bucket, key_column_family};
+use crate::util::column_mask_last_byte;
 use bytes::Bytes;
 use log::{debug, error, warn};
 use std::collections::{BTreeMap, HashMap};
@@ -1216,8 +1217,7 @@ impl LSMTree {
             .unwrap_or(0);
         let mut values = Vec::new();
         let mask_size = num_columns.div_ceil(8).max(1);
-        let last_bits = (num_columns - 1) % 8 + 1;
-        let last_mask = (1u8 << last_bits) - 1;
+        let last_mask = column_mask_last_byte(num_columns);
         let mut decode_mask = vec![0xFF; mask_size];
         decode_mask[mask_size - 1] &= last_mask;
         if let Some(ref cols) = terminal_mask {
@@ -1763,9 +1763,7 @@ impl LSMTree {
                     decode_mask[idx] &= !*mask_byte;
                 }
                 if mask_size > 0 {
-                    let last_bits = (num_columns - 1) % 8 + 1;
-                    let last_mask = (1u8 << last_bits) - 1;
-                    decode_mask[mask_size - 1] &= last_mask;
+                    decode_mask[mask_size - 1] &= column_mask_last_byte(num_columns);
                 }
             }
             out_values.push(SchemaValue {

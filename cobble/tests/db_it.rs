@@ -3756,10 +3756,13 @@ fn test_db_scan_put_range_keeps_latest_value() {
 #[test]
 #[serial_test::serial(file)]
 fn test_db_scan_with_column_indices_flush_and_read_only_sst() {
-    run_scan_with_column_indices_flush_and_read_only_case(
-        "/tmp/db_it_scan_column_indices_flush_ro_sst",
-        "sst",
-    );
+    for num_columns in [3, 8, 16] {
+        run_scan_with_column_indices_flush_and_read_only_case(
+            "/tmp/db_it_scan_column_indices_flush_ro_sst",
+            "sst",
+            num_columns,
+        );
+    }
 }
 
 #[test]
@@ -3768,17 +3771,22 @@ fn test_db_scan_with_column_indices_flush_and_read_only_parquet() {
     run_scan_with_column_indices_flush_and_read_only_case(
         "/tmp/db_it_scan_column_indices_flush_ro_parquet",
         "parquet",
+        3,
     );
 }
 
-fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_type: &str) {
+fn run_scan_with_column_indices_flush_and_read_only_case(
+    root: &str,
+    data_file_type: &str,
+    num_columns: usize,
+) {
     cleanup_test_root(root);
     let config = config_with_data_file_type(
         Config {
             volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
             memtable_capacity: Size::from_kib(1),
             memtable_buffer_count: 2,
-            num_columns: 3,
+            num_columns,
             block_cache_size: Size::from_const(0),
             sst_bloom_filter_enabled: true,
             ..Config::default()
@@ -3789,12 +3797,35 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
 
     for i in 0..256u32 {
         let key = format!("proj:{:04}", i).into_bytes();
-        db.put(0, &key, 0, format!("c0-{i:04}").into_bytes())
+        for column in 0..num_columns {
+            db.put(
+                0,
+                &key,
+                column as u16,
+                format!("c{column}-{i:04}").into_bytes(),
+            )
             .unwrap();
-        db.put(0, &key, 1, format!("c1-{i:04}").into_bytes())
-            .unwrap();
-        db.put(0, &key, 2, format!("c2-{i:04}").into_bytes())
-            .unwrap();
+        }
+        if i == 0 {
+            // Exercise projection before the explicit snapshot/restore below.
+            let row = db
+                .scan_with_options(
+                    0,
+                    b"proj:0000".as_slice()..b"proj:9999".as_slice(),
+                    &ScanOptions::for_columns(vec![num_columns - 1]),
+                )
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.1,
+                vec![Some(bytes::Bytes::from(format!(
+                    "c{}-0000",
+                    num_columns - 1
+                )))]
+            );
+        }
     }
     db.put(0, b"proj:0042", 0, b"c0-updated").unwrap();
     db.put(0, b"proj:0042", 2, b"c2-updated").unwrap();
@@ -3808,6 +3839,28 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
         "expected {data_file_type} files in manifest, got {:?}",
         file_types
     );
+
+    let expected: Vec<_> = (0..num_columns)
+        .map(|column| Some(bytes::Bytes::from(format!("c{column}-0000"))))
+        .collect();
+    let keys = [(0, b"proj:0000".as_slice()), (0, b"missing".as_slice())];
+    assert_eq!(db.get(0, b"proj:0000").unwrap(), Some(expected.clone()));
+    assert_eq!(
+        db.multi_get(&keys).unwrap(),
+        vec![Some(expected.clone()), None]
+    );
+    for (column, value) in expected.iter().enumerate() {
+        let options = ReadOptions::for_column(column);
+        let projected = Some(vec![value.clone()]);
+        assert_eq!(
+            db.get_with_options(0, b"proj:0000", &options).unwrap(),
+            projected
+        );
+        assert_eq!(
+            db.multi_get_with_options(&keys, &options).unwrap(),
+            vec![projected, None]
+        );
+    }
 
     let mut scan_options = ScanOptions::for_columns(vec![2, 0]);
     scan_options.read_ahead_bytes = Size::from_const(256);
@@ -3853,6 +3906,23 @@ fn run_scan_with_column_indices_flush_and_read_only_case(root: &str, data_file_t
     db.close().unwrap();
 
     let ro = Db::open_read_only(config, snapshot_id, db.id()).unwrap();
+    assert_eq!(ro.get(0, b"proj:0000").unwrap(), Some(expected.clone()));
+    assert_eq!(
+        ro.multi_get(&keys).unwrap(),
+        vec![Some(expected.clone()), None]
+    );
+    for (column, value) in expected.iter().enumerate() {
+        let options = ReadOptions::for_column(column);
+        let projected = Some(vec![value.clone()]);
+        assert_eq!(
+            ro.get_with_options(0, b"proj:0000", &options).unwrap(),
+            projected
+        );
+        assert_eq!(
+            ro.multi_get_with_options(&keys, &options).unwrap(),
+            vec![projected, None]
+        );
+    }
     let ro_iter = ro
         .scan_with_options(
             0,

@@ -214,6 +214,57 @@ fn test_encode_decode_value_many_columns() {
     assert!(cols[1].is_none());
     assert!(cols[8].is_some());
     assert!(cols[15].is_some());
+
+    // Exercise the masked decoder as well: the last bitmap byte is full at
+    // multiples of eight, and the last present column omits its length field.
+    for num_columns in [1usize, 7, 8, 9, 15, 16, 17, 24, 32] {
+        for sparse in [false, true] {
+            let columns: Vec<_> = (0..num_columns)
+                .map(|i| {
+                    (!sparse || i == 0 || i + 2 == num_columns).then(|| {
+                        Column::new(ValueType::Put, (100 + i as u64).to_le_bytes().to_vec())
+                    })
+                })
+                .collect();
+            let value = Value::new(columns);
+            let encoded = encode_value(&value, num_columns);
+            let unmasked = decode_value(&mut encoded.clone(), num_columns).unwrap();
+            for (actual, expected) in unmasked.columns().iter().zip(value.columns()) {
+                assert_eq!(
+                    actual.as_ref().map(|c| c.data()),
+                    expected.as_ref().map(|c| c.data())
+                );
+            }
+            let mut projections = vec![(0..num_columns).collect::<Vec<_>>(), vec![]];
+            projections.extend((0..num_columns).map(|i| vec![i]));
+            for selected in projections {
+                let mut mask = vec![0; num_columns.div_ceil(8)];
+                for &i in &selected {
+                    mask[i / 8] |= 1 << (i % 8);
+                }
+                let mut terminal = vec![0; mask.len()];
+                let decoded = decode_value_masked(
+                    &mut encoded.clone(),
+                    num_columns,
+                    &mask,
+                    Some(&mut terminal),
+                )
+                .unwrap();
+                for (i, column) in value.columns().iter().enumerate() {
+                    assert_eq!(
+                        decoded.columns()[i].as_ref().map(|c| c.data()),
+                        if selected.contains(&i) {
+                            column.as_ref().map(|c| c.data())
+                        } else {
+                            None
+                        },
+                        "columns={num_columns}, sparse={sparse}, selected={selected:?}"
+                    );
+                    assert_eq!(terminal[i / 8] & (1 << (i % 8)) != 0, column.is_some());
+                }
+            }
+        }
+    }
 }
 
 #[test]
