@@ -6,12 +6,14 @@ use std::sync::{Arc, Barrier, mpsc};
 #[test]
 fn segments_round_trip_and_list_in_wal_id_order() {
     let temp = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.wal_enabled = true;
-    config.volumes = vec![VolumeDescriptor::new(
-        format!("file://{}", temp.path().display()),
-        vec![VolumeUsageKind::Wal],
-    )];
+    let config = Config {
+        wal_enabled: true,
+        volumes: vec![VolumeDescriptor::new(
+            format!("file://{}", temp.path().display()),
+            vec![VolumeUsageKind::Wal],
+        )],
+        ..Config::default()
+    };
     let store = WalStore::open(&config, "shard-1", &FileSystemRegistry::new())
         .unwrap()
         .unwrap();
@@ -45,17 +47,19 @@ fn segments_round_trip_and_list_in_wal_id_order() {
 fn writer_groups_concurrent_writes_and_publishes_batches_and_cursors() {
     let temp = tempfile::tempdir().unwrap();
     let root = format!("file://{}", temp.path().display());
-    let mut config = Config::default();
-    config.wal_enabled = true;
-    config.wal_flush_interval_ms = 25;
-    config.volumes = vec![VolumeDescriptor::new(
-        root,
-        vec![
-            VolumeUsageKind::Meta,
-            VolumeUsageKind::PrimaryDataPriorityHigh,
-            VolumeUsageKind::Wal,
-        ],
-    )];
+    let config = Config {
+        wal_enabled: true,
+        wal_flush_interval_ms: 25,
+        volumes: vec![VolumeDescriptor::new(
+            root,
+            vec![
+                VolumeUsageKind::Meta,
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Wal,
+            ],
+        )],
+        ..Config::default()
+    };
     let db = Arc::new(
         DbBuilder::new(config.clone())
             .bucket_ranges(vec![0..=0])

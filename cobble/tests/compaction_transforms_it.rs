@@ -32,9 +32,9 @@ fn parse_number(value: Option<Bytes>) -> cobble::Result<Option<Bytes>> {
         .transpose()
 }
 
-fn parse_number_plugin(
-    spec: &[u8],
-) -> cobble::Result<fn(Option<Bytes>) -> cobble::Result<Option<Bytes>>> {
+type ColumnTransformFn = fn(Option<Bytes>) -> cobble::Result<Option<Bytes>>;
+
+fn parse_number_plugin(spec: &[u8]) -> cobble::Result<ColumnTransformFn> {
     if spec != b"\x00parse-number\xff" {
         return Err(cobble::Error::InvalidState(
             "unexpected parse plugin spec".into(),

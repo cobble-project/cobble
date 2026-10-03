@@ -49,7 +49,7 @@ impl PyStructuredColumnKind {
     eq_int,
     from_py_object
 )]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PyListRetainMode {
     #[pyo3(name = "FIRST")]
     First = 0,
@@ -105,7 +105,7 @@ impl PyListConfig {
             py.get_type::<Self>().getattr("_restore")?.unbind(),
             (
                 self.max_elements,
-                self.retain_mode,
+                self.retain_mode.clone(),
                 self.preserve_element_ttl,
             ),
         ))
