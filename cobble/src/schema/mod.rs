@@ -539,7 +539,8 @@ impl Schema {
 pub(crate) struct SchemaManager {
     latest_schema: Arc<ArcSwap<Schema>>,
     schemas: Arc<RwLock<BTreeMap<u64, Arc<Schema>>>>,
-    max_persisted_schema_id: Arc<RwLock<Option<u64>>>,
+    // Restored schema histories can be sparse; do not infer persistence from a maximum version.
+    persisted_schema_ids: Arc<RwLock<BTreeSet<u64>>>,
     next_version: Arc<AtomicU64>,
     resolver: Option<Arc<dyn MergeOperatorResolver>>,
     transforms: Arc<SchemaTransformRegistry>,
@@ -618,7 +619,7 @@ impl SchemaManager {
             return Self {
                 latest_schema: Arc::new(ArcSwap::from(initial)),
                 schemas: Arc::new(RwLock::new(versions)),
-                max_persisted_schema_id: Arc::new(RwLock::new(None)),
+                persisted_schema_ids: Arc::new(RwLock::new(BTreeSet::new())),
                 next_version: Arc::new(AtomicU64::new(1)),
                 resolver,
                 transforms: Arc::new(SchemaTransformRegistry::default()),
@@ -631,8 +632,8 @@ impl SchemaManager {
             .expect("versions not empty");
         Self {
             latest_schema: Arc::new(ArcSwap::from(latest)),
+            persisted_schema_ids: Arc::new(RwLock::new(versions.keys().copied().collect())),
             schemas: Arc::new(RwLock::new(versions)),
-            max_persisted_schema_id: Arc::new(RwLock::new(Some(max_version))),
             next_version: Arc::new(AtomicU64::new(max_version.saturating_add(1))),
             resolver,
             transforms: Arc::new(SchemaTransformRegistry::default()),
@@ -702,7 +703,7 @@ impl SchemaManager {
             })
             .collect::<Result<Vec<_>>>()?;
         let manager = Self::from_schemas(schemas, 1, resolver);
-        manager.set_max_persisted_schema_id(None);
+        manager.persisted_schema_ids.write().unwrap().clear();
         Ok(manager)
     }
 
@@ -723,7 +724,7 @@ impl SchemaManager {
         Self {
             latest_schema: Arc::new(ArcSwap::from(initial)),
             schemas: Arc::new(RwLock::new(versions)),
-            max_persisted_schema_id: Arc::new(RwLock::new(None)),
+            persisted_schema_ids: Arc::new(RwLock::new(BTreeSet::new())),
             next_version: Arc::new(AtomicU64::new(next_version)),
             resolver: None,
             transforms,
@@ -878,30 +879,20 @@ impl SchemaManager {
         file_manager: &FileManager,
         max_schema_id: u64,
     ) -> Result<()> {
-        let start = self
-            .max_persisted_schema_id
-            .read()
-            .unwrap()
-            .map_or(0, |id| id.saturating_add(1));
-        if start > max_schema_id {
-            return Ok(());
-        }
         let schemas_to_persist: Vec<Arc<Schema>> = {
             let schemas = self.schemas.read().unwrap();
-            let mut out = Vec::with_capacity((max_schema_id - start + 1) as usize);
-            for schema_id in start..=max_schema_id {
-                let schema = schemas.get(&schema_id).ok_or_else(|| {
-                    Error::InvalidState(format!("Missing schema version {}", schema_id))
-                })?;
-                out.push(Arc::clone(schema));
+            if !schemas.contains_key(&max_schema_id) {
+                return Err(Error::InvalidState(format!(
+                    "Missing schema version {}",
+                    max_schema_id
+                )));
             }
-            out
+            schemas
+                .range(..=max_schema_id)
+                .map(|(_, schema)| Arc::clone(schema))
+                .collect()
         };
-        for schema in schemas_to_persist {
-            persist_schema(file_manager, schema.as_ref())?;
-        }
-        *self.max_persisted_schema_id.write().unwrap() = Some(max_schema_id);
-        Ok(())
+        self.persist_schema_versions(file_manager, &schemas_to_persist)
     }
 
     pub(crate) fn persist_loaded_schemas(&self, file_manager: &FileManager) -> Result<()> {
@@ -909,29 +900,41 @@ impl SchemaManager {
             let schemas = self.schemas.read().unwrap();
             schemas.values().cloned().collect()
         };
-        if schemas_to_persist.is_empty() {
-            return Ok(());
+        self.persist_schema_versions(file_manager, &schemas_to_persist)
+    }
+
+    fn persist_schema_versions(
+        &self,
+        file_manager: &FileManager,
+        schemas: &[Arc<Schema>],
+    ) -> Result<()> {
+        let mut persisted = self.persisted_schema_ids.write().unwrap();
+        for schema in schemas {
+            if !persisted.contains(&schema.version()) {
+                persist_schema(file_manager, schema.as_ref())?;
+                persisted.insert(schema.version());
+            }
         }
-        let mut max_schema_id = 0;
-        for schema in schemas_to_persist {
-            max_schema_id = max_schema_id.max(schema.version());
-            persist_schema(file_manager, schema.as_ref())?;
-        }
-        *self.max_persisted_schema_id.write().unwrap() = Some(max_schema_id);
         Ok(())
     }
 
-    pub(crate) fn max_persisted_schema_id(&self) -> Option<u64> {
-        *self.max_persisted_schema_id.read().unwrap()
-    }
-
-    pub(crate) fn set_max_persisted_schema_id(&self, max_schema_id: Option<u64>) {
-        *self.max_persisted_schema_id.write().unwrap() = max_schema_id;
-    }
-
-    pub(crate) fn update_max_persisted_schema_id_from_live(&self, live_schema_ids: &BTreeSet<u64>) {
-        *self.max_persisted_schema_id.write().unwrap() =
-            live_schema_ids.iter().next_back().copied();
+    pub(crate) fn remove_unreferenced_schema_files(
+        &self,
+        file_manager: &FileManager,
+        live_schema_ids: &BTreeSet<u64>,
+    ) -> Result<()> {
+        // Serialize deletion with persistence. Invalidate before any I/O so a partial failure
+        // cannot cause a later snapshot to skip rewriting a missing schema.
+        let mut persisted = self.persisted_schema_ids.write().unwrap();
+        let obsolete = persisted
+            .difference(live_schema_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        for id in obsolete {
+            persisted.remove(&id);
+            file_manager.remove_metadata_file(&schema_file_relative_path(id))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn register_schema_from_file(
@@ -962,6 +965,7 @@ impl SchemaManager {
         let mut schema = load_schema(file_manager, schema_id, resolver)?;
         self.resolve_schema_transforms(&mut schema)?;
         self.register_loaded_schema(schema);
+        self.persisted_schema_ids.write().unwrap().insert(schema_id);
         Ok(())
     }
 
