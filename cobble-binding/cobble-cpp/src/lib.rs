@@ -594,6 +594,14 @@ mod ffi {
             db: &NativeShardedDatabase,
             timeout_millis: i64,
         ) -> Result<()>;
+        fn native_sharded_database_expand_bucket_from_manifest(
+            db: &NativeShardedDatabase,
+            source_db_id: &str,
+            source_manifest_path: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeRange>,
+            storage_mode: u8,
+        ) -> Result<u64>;
         fn native_sharded_database_shrink_bucket(
             db: &NativeShardedDatabase,
             ranges: Vec<NativeRange>,

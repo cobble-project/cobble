@@ -26,6 +26,23 @@ SnapshotId Db::ExpandBucket(std::string_view source_db_id,
   });
 }
 
+SnapshotId Db::ExpandBucketFromManifest(
+    std::string_view source_db_id, std::string_view source_manifest_path,
+    std::optional<std::span<const BucketRange>> ranges,
+    ExpandStorageMode storage_mode) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  auto native_ranges =
+      ranges ? detail::ToNativeRanges(*ranges) : rust::Vec<ffi::NativeRange>();
+  return detail::Translate([&] {
+    return ffi::native_sharded_database_expand_bucket_from_manifest(
+        *impl_->native, detail::RustStr(source_db_id),
+        detail::RustStr(source_manifest_path), ranges.has_value(),
+        std::move(native_ranges), static_cast<std::uint8_t>(storage_mode));
+  });
+}
+
 void Db::WaitForExpandAdoption(std::chrono::milliseconds timeout) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");

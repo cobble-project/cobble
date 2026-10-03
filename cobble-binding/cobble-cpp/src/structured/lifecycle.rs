@@ -425,6 +425,27 @@ pub(crate) fn native_structured_db_expand_bucket(
         )
         .map_err(format_error)
 }
+pub(crate) fn native_structured_db_expand_bucket_from_manifest(
+    db: &NativeStructuredDb,
+    source_db_id: &str,
+    source_manifest_path: &str,
+    has_ranges: bool,
+    values: Vec<ffi::NativeBucketRange>,
+    storage_mode: u8,
+) -> BridgeResult<u64> {
+    let ranges = has_ranges
+        .then(|| unchecked_ranges(values, "expand"))
+        .transpose()?;
+    db.db
+        .expand_bucket_from_manifest(
+            source_db_id,
+            source_manifest_path,
+            ranges,
+            expand_storage_mode(storage_mode)?,
+        )
+        .map_err(format_error)
+}
+
 pub(crate) fn native_structured_db_wait_for_expand_adoption(
     db: &NativeStructuredDb,
     timeout_millis: i64,

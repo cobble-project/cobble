@@ -601,6 +601,14 @@ pub(crate) mod ffi {
             db: &NativeStructuredDb,
             timeout_millis: i64,
         ) -> Result<()>;
+        fn native_structured_db_expand_bucket_from_manifest(
+            db: &NativeStructuredDb,
+            source_db_id: &str,
+            source_manifest_path: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeBucketRange>,
+            storage_mode: u8,
+        ) -> Result<u64>;
         fn native_structured_db_shrink_bucket(
             db: &NativeStructuredDb,
             ranges: Vec<NativeBucketRange>,
