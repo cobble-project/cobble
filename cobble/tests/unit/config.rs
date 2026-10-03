@@ -23,31 +23,39 @@ fn test_default_memtable_type_is_adaptive() {
 fn wal_is_opt_in_and_requires_one_explicit_volume() {
     assert!(!Config::from_json_str("{}").unwrap().wal_enabled);
 
-    let mut missing = Config::default();
-    missing.wal_enabled = true;
+    let missing = Config {
+        wal_enabled: true,
+        ..Config::default()
+    };
     assert!(missing.normalize_volume_paths().is_err());
 
-    let mut duplicate = Config::default();
-    duplicate.wal_enabled = true;
-    duplicate.volumes = vec![
-        VolumeDescriptor::new("file:///tmp/wal-a", vec![VolumeUsageKind::Wal]),
-        VolumeDescriptor::new("file:///tmp/wal-b", vec![VolumeUsageKind::Wal]),
-    ];
+    let duplicate = Config {
+        wal_enabled: true,
+        volumes: vec![
+            VolumeDescriptor::new("file:///tmp/wal-a", vec![VolumeUsageKind::Wal]),
+            VolumeDescriptor::new("file:///tmp/wal-b", vec![VolumeUsageKind::Wal]),
+        ],
+        ..Config::default()
+    };
     assert!(duplicate.normalize_volume_paths().is_err());
 
-    let mut enabled = Config::default();
-    enabled.wal_enabled = true;
-    enabled.volumes = vec![VolumeDescriptor::new(
-        "file:///tmp/wal",
-        vec![VolumeUsageKind::Wal],
-    )];
+    let enabled = Config {
+        wal_enabled: true,
+        volumes: vec![VolumeDescriptor::new(
+            "file:///tmp/wal",
+            vec![VolumeUsageKind::Wal],
+        )],
+        ..Config::default()
+    };
     assert!(enabled.normalize_volume_paths().is_ok());
 }
 
 #[test]
 fn snapshot_retention_must_be_positive_when_configured() {
-    let mut direct = Config::default();
-    direct.snapshot_retention = Some(0);
+    let direct = Config {
+        snapshot_retention: Some(0),
+        ..Config::default()
+    };
     let error = direct.normalize_volume_paths().unwrap_err();
     assert!(matches!(error, Error::ConfigError(_)));
     assert!(error.to_string().contains("snapshot_retention"));

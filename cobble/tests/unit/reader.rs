@@ -99,7 +99,9 @@ fn bang(value: Option<Bytes>) -> Result<Option<Bytes>> {
     Ok(value.map(|value| [value.as_ref(), b"!"].concat().into()))
 }
 
-fn bang_plugin(spec: &[u8]) -> Result<fn(Option<Bytes>) -> Result<Option<Bytes>>> {
+type ColumnTransformFn = fn(Option<Bytes>) -> Result<Option<Bytes>>;
+
+fn bang_plugin(spec: &[u8]) -> Result<ColumnTransformFn> {
     if spec != b"reader-bang-v1" {
         return Err(Error::InvalidState("unexpected reader plugin spec".into()));
     }

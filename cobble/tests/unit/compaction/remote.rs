@@ -67,7 +67,9 @@ fn remote_parse_number(value: Option<Bytes>) -> Result<Option<Bytes>> {
         .transpose()
 }
 
-fn remote_parse_number_plugin(spec: &[u8]) -> Result<fn(Option<Bytes>) -> Result<Option<Bytes>>> {
+type ColumnTransformFn = fn(Option<Bytes>) -> Result<Option<Bytes>>;
+
+fn remote_parse_number_plugin(spec: &[u8]) -> Result<ColumnTransformFn> {
     if spec != b"\x01remote-parse\x80" {
         return Err(Error::InvalidState("unexpected remote plugin spec".into()));
     }

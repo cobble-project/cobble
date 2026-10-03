@@ -21,7 +21,7 @@ pub(crate) fn enum_reduce<T: PyTypeInfo>(
     eq_int,
     from_py_object
 )]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PyRecoveryMode {
     #[pyo3(name = "SNAPSHOT_ONLY")]
     SnapshotOnly = 0,
@@ -49,7 +49,7 @@ impl PyRecoveryMode {
     eq_int,
     from_py_object
 )]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PyMemtableType {
     #[pyo3(name = "HASH")]
     Hash = 0,
@@ -83,7 +83,7 @@ impl PyMemtableType {
     eq_int,
     from_py_object
 )]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PyExpandStorageMode {
     #[pyo3(name = "ADOPT_ASYNC")]
     AdoptAsync = 0,

@@ -48,7 +48,7 @@ impl ManualTimeProvider {
     /// Sets the current time to `next` if it is greater than the current time.
     pub fn set_time(&self, next: u32) {
         self.watermark
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |current| Some(current.max(next)),
