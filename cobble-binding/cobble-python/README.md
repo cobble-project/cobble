@@ -66,6 +66,13 @@ assert bytes(row.list_element(1, 0)) == b"a"
 db.close()
 ```
 
+`Db.expand_bucket_from_manifest(source_db_id, source_manifest_path, *,
+ranges=None, storage_mode=ExpandStorageMode.ADOPT_ASYNC)` and the equivalent
+`StructuredDb` method import an exact source manifest across metadata roots.
+The target configuration must include the source volume (READONLY is allowed),
+with credentials supplied by that current configuration. Omitted ranges import
+all source ranges; native work runs with the GIL released.
+
 For snapshot reads, `StructuredReader.open_current(config)` follows the latest
 global snapshot on access and also supports explicit `refresh()`, while
 `StructuredReader.open(config, id)` stays fixed.
