@@ -75,6 +75,7 @@ jobs:
         with:
           command: build
           maturin-version: v1.14.1
+          rust-toolchain: "1.95.0"
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
           args: >-
@@ -101,6 +102,7 @@ jobs:
         with:
           command: sdist
           maturin-version: v1.14.1
+          rust-toolchain: "1.95.0"
           args: >-
             --out dist
             --manifest-path cobble-binding/cobble-python/Cargo.toml

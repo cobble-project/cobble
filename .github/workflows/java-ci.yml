@@ -49,9 +49,7 @@ jobs:
           cache: maven
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo registry
         uses: actions/cache@v4

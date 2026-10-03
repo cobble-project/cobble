@@ -18,9 +18,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Validate release tag and crate versions
         shell: bash

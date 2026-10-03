@@ -53,7 +53,7 @@ jobs:
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
