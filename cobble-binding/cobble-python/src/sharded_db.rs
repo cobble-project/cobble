@@ -572,6 +572,32 @@ impl PyDb {
         })
     }
 
+    /// Import an exact source manifest; its root must be configured (READONLY is allowed).
+    #[pyo3(signature = (source_db_id, source_manifest_path, *, ranges=None, storage_mode=PyExpandStorageMode::AdoptAsync))]
+    fn expand_bucket_from_manifest(
+        &self,
+        py: Python<'_>,
+        source_db_id: String,
+        source_manifest_path: String,
+        ranges: Option<Vec<PyBucketRange>>,
+        storage_mode: PyExpandStorageMode,
+    ) -> PyResult<u64> {
+        self.ensure_open()?;
+        let ranges = ranges
+            .map(|ranges| Self::unchecked_ranges(ranges, "expand"))
+            .transpose()?;
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.expand_bucket_from_manifest(
+                source_db_id,
+                source_manifest_path,
+                ranges,
+                storage_mode.into(),
+            )
+            .map_err(map_error)
+        })
+    }
+
     fn wait_for_expand_adoption(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
         self.ensure_open()?;
         if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
