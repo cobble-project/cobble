@@ -202,7 +202,10 @@ pub(crate) fn build_vlog_version_from_files(
                 file.origin.clone(),
             )?;
             file_manager.set_data_file_priority(file.file_id, VLOG_FILE_PRIORITY)?;
-            TrackedFileId::untracked(file.file_id)
+            let logical = file_manager.get_logical_file(file.file_id).ok_or_else(|| {
+                Error::InvalidState(format!("Logical file {} is not tracked", file.file_id))
+            })?;
+            TrackedFileId::retained(logical)
         } else {
             if !file_manager.has_data_file(file.file_id) {
                 match &file.origin {

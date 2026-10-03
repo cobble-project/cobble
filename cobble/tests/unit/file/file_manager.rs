@@ -1024,7 +1024,7 @@ fn test_file_manager_snapshot_volume_for_metadata_and_copy() {
     };
     let metrics_manager = Arc::new(MetricsManager::new("file-manager-snapshot"));
     let db_id = "file-manager-storage-metrics";
-    let fm = FileManager::from_config(&config, db_id, metrics_manager).unwrap();
+    let fm = Arc::new(FileManager::from_config(&config, db_id, metrics_manager).unwrap());
 
     let (source_file_id, mut source_writer) = fm.create_data_file().unwrap();
     source_writer.write(b"source-bytes").unwrap();
@@ -1044,8 +1044,35 @@ fn test_file_manager_snapshot_volume_for_metadata_and_copy() {
     assert_storage_file_bytes(db_id, "0", 12.0);
     assert_storage_file_bytes(db_id, "1", 16.0);
 
+    // Imported VLOG views retain the same logical file, but neither owns its registration.
+    let descriptor = crate::manifest_model::ManifestVlogFile {
+        file_seq: 0,
+        file_id: source_file_id,
+        path: fm.get_data_file_full_path(source_file_id).unwrap(),
+        valid_entries: 1,
+        origin: ReplicaOrigin::Owned,
+    };
+    let build_view = || {
+        crate::manifest_model::build_vlog_version_from_files(
+            &fm,
+            std::slice::from_ref(&descriptor),
+            true,
+        )
+        .unwrap()
+    };
+    let first_view = build_view();
+    let second_view = build_view();
+    drop(first_view);
+    assert!(fm.has_data_file(source_file_id));
     let source = fm.data_file_ref(source_file_id).unwrap();
-    let logical = fm.get_logical_file(source_file_id).unwrap();
+    // Capture just as a snapshot does, then remove the live index and both read-only views.
+    let logical = second_view.tracked_files()[0].logical_file().unwrap();
+    assert!(Arc::ptr_eq(
+        &logical,
+        &fm.get_logical_file(source_file_id).unwrap()
+    ));
+    drop(second_view);
+    assert!(fm.has_data_file(source_file_id));
     fm.remove_data_file(source_file_id).unwrap();
     assert!(!fm.has_data_file(source_file_id));
     let copied = fm
