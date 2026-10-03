@@ -3350,6 +3350,48 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucket(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_Db_expandBucketFromManifest(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    source_db_id: JString,
+    source_manifest_path: JString,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    storage_mode: jint,
+) -> jlong {
+    let Some(db) = db_from_handle(&mut env, native_handle) else {
+        return 0;
+    };
+    let args = (|| {
+        let source_db_id = decode_java_string(&mut env, source_db_id)?;
+        let source_manifest_path = decode_java_string(&mut env, source_manifest_path)?;
+        let ranges = decode_bucket_ranges(&mut env, range_starts, range_ends)?;
+        let storage_mode = expand_storage_mode(storage_mode)?;
+        Ok::<_, String>((source_db_id, source_manifest_path, ranges, storage_mode))
+    })();
+    let (source_db_id, source_manifest_path, ranges, storage_mode) = match args {
+        Ok(args) => args,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    let ranges = if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    };
+    match db.expand_bucket_from_manifest(source_db_id, source_manifest_path, ranges, storage_mode) {
+        Ok(v) => v as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_Db_waitForExpandAdoption(
     mut env: JNIEnv,
     _class: JClass,

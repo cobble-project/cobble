@@ -20,6 +20,7 @@ pub(crate) struct ImportRecord {
     pub(crate) version: u32,
     pub(crate) export_id: String,
     pub(crate) source_db_id: String,
+    pub(crate) source_manifest_path: String,
     pub(crate) snapshot_id: u64,
     pub(crate) target_db_id: String,
     pub(crate) ranges: Vec<RangeInclusive<u16>>,

@@ -9,7 +9,7 @@ use crate::file::logical_file::ReplicaOrigin;
 use crate::file::{File, FileManager, MetadataReader, SequentialWriteFile};
 use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
-use crate::paths::schema_file_relative_path;
+use crate::paths::{schema_file_relative_path, snapshot_manifest_relative_path};
 use crate::rescale_protocol::{
     ExportLease, ImportRecord, export_lease_name, has_import_records, import_record_name,
     load_import_records, write_export_lease, write_import_record,
@@ -20,8 +20,8 @@ use crate::snapshot::{
     list_snapshot_manifest_ids, load_manifest_entry,
 };
 use crate::util::{
-    normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap, subtract_range_by_cuts,
-    subtract_ranges,
+    normalize_bucket_ranges, normalize_storage_path_to_url, range_is_covered_by_ranges,
+    ranges_overlap, subtract_range_by_cuts, subtract_ranges,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
@@ -30,6 +30,83 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 const RESCALE_PUBLICATION_OWNER_PREFIX: &str = "rescale";
+
+pub(super) fn snapshot_source_file_manager(
+    config: &crate::Config,
+    source_db_id: &str,
+    manifest_path: &str,
+) -> Result<(Arc<FileManager>, u64)> {
+    let location = if manifest_path.trim().contains("://") {
+        manifest_path.trim().to_string()
+    } else {
+        normalize_storage_path_to_url(manifest_path)?
+    };
+    let mut root = url::Url::parse(&location)?;
+    if !root.username().is_empty()
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+    {
+        return Err(Error::ConfigError(
+            "Source manifest location must not contain credentials or URL options".into(),
+        ));
+    }
+    let segments = root
+        .path_segments()
+        .ok_or_else(|| Error::ConfigError("Source manifest location has no path".into()))?
+        .collect::<Vec<_>>();
+    let snapshot_id = segments
+        .last()
+        .and_then(|name| name.strip_prefix("SNAPSHOT-"))
+        .and_then(|id| id.parse::<u64>().ok())
+        .ok_or_else(|| {
+            Error::ConfigError("Source manifest location must name a snapshot".into())
+        })?;
+    if segments.last().copied() != Some(format!("SNAPSHOT-{snapshot_id}").as_str()) {
+        return Err(Error::ConfigError(
+            "Source manifest location must use a canonical snapshot name".into(),
+        ));
+    }
+    if segments.len() < 3
+        || segments[segments.len() - 2] != "snapshot"
+        || segments[segments.len() - 3] != source_db_id
+    {
+        return Err(Error::ConfigError(
+            "Source manifest location does not match the source DB".into(),
+        ));
+    }
+    root.path_segments_mut()
+        .map_err(|_| Error::ConfigError("Invalid source manifest location".into()))?
+        .pop()
+        .pop()
+        .pop();
+    let source_root = root.as_str().trim_end_matches('/');
+    let mut source_volume = config
+        .volumes
+        .iter()
+        .find(|volume| {
+            crate::config::volume_descriptor_identity(volume).trim_end_matches('/') == source_root
+        })
+        .cloned()
+        .ok_or_else(|| {
+            Error::ConfigError(format!(
+                "Source metadata volume is not configured: {source_root}"
+            ))
+        })?;
+    source_volume.kinds = 0;
+    source_volume.set_usage(crate::VolumeUsageKind::Meta);
+    source_volume.set_usage(crate::VolumeUsageKind::Snapshot);
+    // The first metadata route selects the source's snapshot/lease root. Preserve the other
+    // configured routes for absolute file reads and FileManager's primary-storage invariant.
+    let mut source_config = config.clone();
+    source_config.volumes.insert(0, source_volume);
+    let manager = FileManager::from_config_readonly(
+        &source_config,
+        source_db_id,
+        Arc::new(MetricsManager::new(format!("{source_db_id}-expand-source"))),
+    )?;
+    Ok((Arc::new(manager), snapshot_id))
+}
 
 struct RuntimePublicationSuspension {
     publisher: Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
@@ -275,13 +352,10 @@ impl AdoptionCoordinator {
             {
                 continue;
             }
-            let source = FileManager::from_config(
+            let (source, _) = snapshot_source_file_manager(
                 &self.config,
                 &record.source_db_id,
-                Arc::new(MetricsManager::new(format!(
-                    "{}-adoption-source",
-                    record.source_db_id
-                ))),
+                &record.source_manifest_path,
             )?;
             source.remove_metadata_file(&export_lease_name(&record.export_id))?;
             self.file_manager
@@ -386,7 +460,7 @@ impl Db {
             "{}-expand-source",
             source_db_id
         )));
-        let source_file_manager = Arc::new(FileManager::from_config(
+        let source_file_manager = Arc::new(FileManager::from_config_readonly(
             &self.config,
             &source_db_id,
             source_metrics,
@@ -403,6 +477,34 @@ impl Db {
                 })?
             }
         };
+        self.expand_bucket_from_manifest(
+            source_db_id,
+            source_file_manager
+                .metadata_file_full_path(&snapshot_manifest_relative_path(source_snapshot_id)),
+            ranges,
+            storage_mode,
+        )
+    }
+
+    /// Expands buckets from an explicit source snapshot location using configured storage credentials.
+    /// The source metadata volume must be configured, including when its role is read-only.
+    pub fn expand_bucket_from_manifest(
+        &self,
+        source_db_id: impl Into<String>,
+        source_manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ExpandStorageMode,
+    ) -> Result<u64> {
+        let source_db_id = source_db_id.into();
+        if source_db_id == self.id {
+            return Err(Error::ConfigError(
+                "cannot expand bucket from the same db".into(),
+            ));
+        }
+        let source_manifest_path = source_manifest_path.into();
+        let (source_file_manager, source_snapshot_id) =
+            snapshot_source_file_manager(&self.config, &source_db_id, &source_manifest_path)?;
+        let source_manifest_path = normalize_storage_path_to_url(source_manifest_path)?;
         let source_entry =
             load_manifest_entry(&source_file_manager, source_snapshot_id, &HashMap::new())?;
         let mut source_manifest = source_entry.manifest;
@@ -476,6 +578,7 @@ impl Db {
                 version: 1,
                 export_id: export_id.clone(),
                 source_db_id: source_db_id.clone(),
+                source_manifest_path: source_manifest_path.clone(),
                 snapshot_id: source_snapshot_id,
                 target_db_id: self.id.clone(),
                 ranges: expand_ranges.clone(),
@@ -743,6 +846,7 @@ impl Db {
                             version: 1,
                             export_id: export_id.clone(),
                             source_db_id: source_db_id.clone(),
+                            source_manifest_path: source_manifest_path.clone(),
                             snapshot_id: source_snapshot_id,
                             target_db_id: self.id.clone(),
                             ranges: expand_ranges.clone(),
