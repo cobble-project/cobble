@@ -425,6 +425,88 @@ fn test_cancel_snapshot_returns_false_once_publication_starts() {
 
 #[test]
 #[serial(file)]
+fn cancelled_snapshot_preserves_retained_schema_before_and_after_capture() {
+    for (cancel_before_capture, persist_before_cancel) in
+        [(true, false), (false, false), (false, true)]
+    {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+            total_buckets: 4,
+            num_columns: 1,
+            memtable_capacity: Size::from_mib(16),
+            snapshot_retention: None,
+            ..Config::default()
+        };
+        let db = open_db(config.clone());
+        db.put(0, b"retained", 0, b"checkpoint-one").unwrap();
+        db.switch_memtable_type(MemtableType::Skiplist, true)
+            .unwrap();
+        let first = db
+            .create_snapshot_and_wait("retained schema regression")
+            .unwrap();
+        assert!(db.retain_snapshot(first));
+        let schema_path = root.path().join(db.id()).join("schema/schema-0");
+        assert!(schema_path.exists());
+        let mut builder = db.update_schema();
+        builder.add_column(1, None, None, None).unwrap();
+        builder.commit();
+
+        let pending = db.snapshot_manager.create_snapshot(None);
+        if cancel_before_capture {
+            assert!(db.cancel_snapshot(pending.id).unwrap());
+            assert!(!db.cancel_snapshot(pending.id).unwrap());
+        }
+        let captured = db.snapshot_manager.finish_snapshot(
+            pending.id,
+            &db.db_state.load(),
+            Vec::new(),
+            &db.db_state,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(captured, !cancel_before_capture);
+        if !cancel_before_capture {
+            if persist_before_cancel {
+                db.schema_manager
+                    .persist_schemas_up_to(&db.file_manager, 1)
+                    .unwrap();
+                assert!(schema_path.with_file_name("schema-1").exists());
+            }
+            assert!(db.cancel_snapshot(pending.id).unwrap());
+            assert!(!db.cancel_snapshot(pending.id).unwrap());
+            assert!(matches!(
+                db.snapshot_manager.materialize(pending.id),
+                Err(Error::CancelledError(_))
+            ));
+        }
+        assert!(!db.cancel_snapshot(pending.id).unwrap());
+        assert!(!db.expire_snapshot(pending.id).unwrap());
+        assert!(!schema_path.with_file_name("schema-1").exists());
+        assert!(!db.expire_snapshot(pending.id).unwrap());
+        assert!(
+            schema_path.exists(),
+            "cancel_before_capture={cancel_before_capture}"
+        );
+        let id = db.id().to_string();
+        db.close().unwrap();
+        drop(db);
+        let reopened = DbBuilder::new(config)
+            .db_id(id)
+            .resume_from_snapshot(first)
+            .unwrap();
+        assert_eq!(
+            reopened.get(0, b"retained").unwrap().unwrap()[0].as_deref(),
+            Some(&b"checkpoint-one"[..])
+        );
+        assert_eq!(reopened.current_schema().version(), 0);
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+#[serial(file)]
 fn test_failed_snapshot_completes_callback_and_releases_snapshot() {
     let root = "/tmp/db_failed_snapshot_callback";
     cleanup_test_root(root);

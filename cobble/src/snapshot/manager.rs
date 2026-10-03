@@ -18,7 +18,6 @@ use crate::file::{
     BufferedWriter, File, FileManager, SnapshotCopyResourceRegistry, TrackedFile, TrackedFileId,
 };
 use crate::lsm::{LSMTreeVersion, Level};
-use crate::paths::schema_file_relative_path;
 use crate::schema::SchemaManager;
 use crate::time::TimeProvider;
 use crate::vlog::VlogVersion;
@@ -514,16 +513,18 @@ impl SnapshotManager {
         };
         snapshot.active_memtable_data = active_memtable_data;
         let snapshot = Arc::new(snapshot);
+        // Publish captured resources only after acquiring all of their references. Cancellation
+        // cleanup uses the same state lock and must release exactly what capture acquired.
+        increment_schema_ref_counts(
+            &mut state.schema_ref_counts,
+            &snapshot.referenced_schema_ids,
+        );
         state.snapshots.insert(id, Arc::clone(&snapshot));
         if snapshot.is_cancelled() {
             drop(state);
             self.cleanup_unpublished_snapshot(id);
             return false;
         }
-        increment_schema_ref_counts(
-            &mut state.schema_ref_counts,
-            &snapshot.referenced_schema_ids,
-        );
         state.completed.insert(id);
         // Retention runs immediately after this snapshot is enqueued for materialization. Pin a
         // published incremental base before releasing the state lock so retention cannot remove
@@ -793,9 +794,12 @@ impl SnapshotManager {
                                         id
                                     )));
                                 }
+                                for schema_id in &prepared.snapshot.referenced_schema_ids {
+                                    self.schema_manager.schema(*schema_id)?;
+                                }
                                 self.schema_manager.persist_schemas_up_to(
                                     &self.file_manager,
-                                    prepared.snapshot.latest_schema_id,
+                                    *prepared.snapshot.referenced_schema_ids.last().unwrap(),
                                 )?;
                                 let writer = self
                                     .file_manager
@@ -1094,13 +1098,7 @@ impl SnapshotManager {
         if crate::rescale_protocol::snapshot_has_export_lease(&self.file_manager, id)? {
             return Ok(false);
         }
-        let (
-            removed_snapshots,
-            removed_requested_snapshot,
-            removed_schema_ids,
-            live_schema_ids,
-            live_active_data_paths,
-        ) = {
+        let (removed_snapshots, removed_requested_snapshot, live_active_data_paths) = {
             let mut state = self.state.lock().unwrap();
             let Some(snapshot) = state.snapshots.get(&id).cloned() else {
                 return Ok(false);
@@ -1108,7 +1106,6 @@ impl SnapshotManager {
             if snapshot.request_expire_after_publication_start() {
                 return Ok(true);
             }
-            let mut removed_schema_ids = BTreeSet::new();
             let mut removed_requested_snapshot = false;
             if let Some(refs) = state.incremental_references.get_mut(&id) {
                 removed_requested_snapshot = refs.remove(&id);
@@ -1147,7 +1144,6 @@ impl SnapshotManager {
                 decrement_schema_ref_counts(
                     &mut state.schema_ref_counts,
                     &snapshot.referenced_schema_ids,
-                    &mut removed_schema_ids,
                 );
                 for referenced_id in referenced {
                     if referenced_id == snapshot_id {
@@ -1165,12 +1161,6 @@ impl SnapshotManager {
             (
                 removed_snapshots,
                 removed_requested_snapshot,
-                removed_schema_ids.into_iter().collect::<Vec<_>>(),
-                state
-                    .schema_ref_counts
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>(),
                 state
                     .snapshots
                     .values()
@@ -1201,22 +1191,22 @@ impl SnapshotManager {
                 .values()
                 .for_each(|file| file.dereference());
         }
-        let max_persisted_schema_id = self.schema_manager.max_persisted_schema_id();
-        let mut schema_ids_to_remove: BTreeSet<u64> = removed_schema_ids.into_iter().collect();
-        if let Some(max_schema_id) = max_persisted_schema_id {
-            for schema_id in 0..=max_schema_id {
-                if !live_schema_ids.contains(&schema_id) {
-                    schema_ids_to_remove.insert(schema_id);
-                }
-            }
-        }
-        for schema_id in schema_ids_to_remove {
-            self.file_manager
-                .remove_metadata_file(&schema_file_relative_path(schema_id))?;
-        }
-        self.schema_manager
-            .update_max_persisted_schema_id_from_live(&live_schema_ids);
+        self.cleanup_expired_schema_files()?;
         Ok(removed_requested_snapshot)
+    }
+
+    fn cleanup_expired_schema_files(&self) -> Result<()> {
+        // Capture can acquire schema refs after snapshot/data cleanup releases the state lock.
+        // Recheck and delete under this lock so a stale cleanup cannot delete newly acquired refs.
+        // Only schema metadata deletion holds the lock; data-file cleanup stays outside it.
+        let state = self.state.lock().unwrap();
+        let live_schema_ids = state
+            .schema_ref_counts
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.schema_manager
+            .remove_unreferenced_schema_files(&self.file_manager, &live_schema_ids)
     }
 
     /// Enqueue a manifest materialization job on the background worker.
@@ -1340,11 +1330,10 @@ fn increment_schema_ref_counts(
     }
 }
 
-/// Decrement schema reference counts for the given schema IDs, and collect any schema IDs that are no longer referenced.
+/// Decrement schema reference counts for the given schema IDs.
 fn decrement_schema_ref_counts(
     schema_ref_counts: &mut HashMap<u64, usize>,
     schema_ids: &BTreeSet<u64>,
-    removed_schema_ids: &mut BTreeSet<u64>,
 ) {
     for schema_id in schema_ids {
         let Some(count) = schema_ref_counts.get_mut(schema_id) else {
@@ -1353,7 +1342,6 @@ fn decrement_schema_ref_counts(
         *count = count.saturating_sub(1);
         if *count == 0 {
             schema_ref_counts.remove(schema_id);
-            removed_schema_ids.insert(*schema_id);
         }
     }
 }
