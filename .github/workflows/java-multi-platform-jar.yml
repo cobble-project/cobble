@@ -126,7 +126,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_sha }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
 
