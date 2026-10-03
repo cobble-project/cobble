@@ -525,6 +525,15 @@ impl TrackedFileId {
         })
     }
 
+    /// Retains a runtime file without unregistering it when this read-only view is dropped.
+    pub(crate) fn retained(logical_file: Arc<LogicalFile>) -> Arc<Self> {
+        Arc::new(Self {
+            file_id: logical_file.file_id,
+            file_manager: Weak::new(),
+            logical_file: Some(logical_file),
+        })
+    }
+
     pub(crate) fn set_priority(&self, priority: u8) -> Result<()> {
         let Some(file_manager) = self.file_manager.upgrade() else {
             return Ok(());
