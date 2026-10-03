@@ -13,12 +13,286 @@ fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
 
+fn snapshot_for_rescale_test(db: &Db) -> crate::ShardSnapshotMetadata {
+    let (tx, rx) = mpsc::channel();
+    db.snapshot_with_callback(move |result| {
+        let _ = tx.send(result);
+    })
+    .unwrap();
+    rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap()
+}
+
+#[test]
+fn expand_source_location_requires_configured_volume_and_canonical_snapshot() {
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume("file:///configured"),
+        ..Config::default()
+    };
+    for path in [
+        "file:///configured/source/snapshot/SNAPSHOT-01",
+        "file:///configured/other/snapshot/SNAPSHOT-1",
+        "file:///unconfigured/source/snapshot/SNAPSHOT-1",
+        "file:///configured/source/snapshot/SNAPSHOT-1?secret_key=secret",
+    ] {
+        assert!(
+            snapshot_source_file_manager(&config, "source", path).is_err(),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+#[serial(file)]
+fn test_expand_bucket_from_changed_root_manifest() {
+    for active_ratio in [0.0, 1.0] {
+        let root = tempfile::tempdir().unwrap();
+        let old_root = root.path().join("old");
+        let new_root = root.path().join("new");
+        let source_config = Config {
+            total_buckets: 128,
+            memtable_capacity: Size::from_mib(1),
+            l0_file_limit: 100,
+            num_columns: 1,
+            snapshot_only_track: true,
+            snapshot_on_flush: false,
+            value_separation_threshold: Some(Size::from_const(1024)),
+            active_memtable_incremental_snapshot_ratio: active_ratio,
+            volumes: vec![
+                VolumeDescriptor::new(
+                    format!("file://{}/primary", old_root.display()),
+                    vec![
+                        crate::VolumeUsageKind::Meta,
+                        crate::VolumeUsageKind::PrimaryDataPriorityHigh,
+                    ],
+                ),
+                VolumeDescriptor::new(
+                    format!("file://{}/snapshots", old_root.display()),
+                    vec![crate::VolumeUsageKind::Snapshot],
+                ),
+            ],
+            ..Config::default()
+        };
+        let left = Db::open(source_config.clone(), vec![0..=63]).unwrap();
+        let right = Db::open(source_config.clone(), vec![64..=127]).unwrap();
+        let value = vec![7; 1537];
+        left.put(43, b"left", 0, &value).unwrap();
+        let base = snapshot_for_rescale_test(&left);
+        right.put(64, b"first", 0, &value).unwrap();
+        right.memtable_manager.flush_active().unwrap();
+        for result in right.memtable_manager.wait_for_flushes() {
+            result.unwrap();
+        }
+        snapshot_for_rescale_test(&right);
+        right.put(65, b"second", 0, &value).unwrap();
+        if active_ratio == 1.0 {
+            right.memtable_manager.flush_active().unwrap();
+            for result in right.memtable_manager.wait_for_flushes() {
+                result.unwrap();
+            }
+        }
+        right.put(66, b"active", 0, &value).unwrap();
+        let source = snapshot_for_rescale_test(&right);
+        let source_manager = Arc::new(
+            FileManager::from_config_readonly(
+                &source_config,
+                right.id(),
+                Arc::new(MetricsManager::new("changed-root-source")),
+            )
+            .unwrap(),
+        );
+        let chain =
+            crate::snapshot::load_manifest_chain_from_path(&source_manager, &source.manifest_path)
+                .unwrap();
+        assert!(
+            chain.len() > 1,
+            "fixture must cover incremental source manifests"
+        );
+        let manifest = &chain.last().unwrap().manifest;
+        if active_ratio == 0.0 {
+            assert!(!manifest.vlog_files.is_empty());
+        } else {
+            assert!(!manifest.active_memtable_data.is_empty());
+        }
+        let mut target_config = source_config.clone();
+        target_config.volumes = vec![
+            VolumeDescriptor::new(
+                format!("file://{}/primary", new_root.display()),
+                vec![
+                    crate::VolumeUsageKind::Meta,
+                    crate::VolumeUsageKind::PrimaryDataPriorityHigh,
+                ],
+            ),
+            VolumeDescriptor::new(
+                format!("file://{}/snapshots", new_root.display()),
+                vec![crate::VolumeUsageKind::Snapshot],
+            ),
+        ];
+        for mut volume in source_config.volumes.clone() {
+            volume.kinds = 0;
+            volume.set_usage(crate::VolumeUsageKind::Readonly);
+            target_config.volumes.push(volume);
+        }
+        let target =
+            Db::open_new_with_manifest_path(target_config.clone(), base.manifest_path).unwrap();
+        target.shrink_bucket(vec![0..=42]).unwrap();
+        assert!(
+            target
+                .expand_bucket_from_manifest(
+                    right.id(),
+                    format!("{}?secret_key=secret", source.manifest_path),
+                    Some(vec![64..=85]),
+                    ExpandStorageMode::AdoptAsync,
+                )
+                .is_err()
+        );
+        assert!(
+            source_manager
+                .list_metadata_names("exports")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            target
+                .file_manager
+                .list_metadata_names("imports")
+                .unwrap()
+                .is_empty()
+        );
+        target
+            .expand_bucket_from_manifest(
+                right.id(),
+                &source.manifest_path,
+                Some(vec![64..=85]),
+                ExpandStorageMode::AdoptAsync,
+            )
+            .unwrap();
+        for (bucket, key) in [
+            (43, &b"left"[..]),
+            (64, &b"first"[..]),
+            (65, &b"second"[..]),
+            (66, &b"active"[..]),
+        ] {
+            assert_eq!(
+                target.get(bucket, key).unwrap().unwrap()[0].as_deref(),
+                Some(value.as_slice())
+            );
+        }
+        target
+            .wait_for_expand_adoption(Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            source_manager
+                .list_metadata_names("exports")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!new_root.join("primary").join(right.id()).exists());
+        let target_snapshot = snapshot_for_rescale_test(&target);
+        let target_id = target.id().to_string();
+        drop(target);
+        let reopened =
+            Db::open_from_snapshot(target_config, target_snapshot.snapshot_id, target_id).unwrap();
+        assert_eq!(
+            reopened.get(65, b"second").unwrap().unwrap()[0].as_deref(),
+            Some(value.as_slice())
+        );
+        snapshot_for_rescale_test(&reopened);
+    }
+}
+
+#[test]
+#[serial(file)]
+fn test_changed_root_adoption_lease_cleanup_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let source_root = format!("file://{}/source", root.path().display());
+    let target_root = format!("file://{}/target", root.path().display());
+    let source_config = Config {
+        total_buckets: 8,
+        num_columns: 1,
+        volumes: VolumeDescriptor::single_volume(&source_root),
+        ..Config::default()
+    };
+    let source = Db::open(source_config, vec![4..=7]).unwrap();
+    let source_snapshot = snapshot_for_rescale_test(&source);
+    let target_config = Config {
+        total_buckets: 8,
+        num_columns: 1,
+        volumes: vec![
+            VolumeDescriptor::new(
+                &target_root,
+                vec![
+                    crate::VolumeUsageKind::Meta,
+                    crate::VolumeUsageKind::PrimaryDataPriorityHigh,
+                ],
+            ),
+            VolumeDescriptor::new(&source_root, vec![crate::VolumeUsageKind::Readonly]),
+        ],
+        ..Config::default()
+    };
+    let target = Db::open(target_config.clone(), vec![0..=3]).unwrap();
+    let barrier = snapshot_for_rescale_test(&target);
+    let target_id = target.id().to_string();
+    let target_manager = Arc::clone(&target.file_manager);
+    drop(target);
+    let (source_manager, _) =
+        snapshot_source_file_manager(&target_config, source.id(), &source_snapshot.manifest_path)
+            .unwrap();
+    let export_id = "restart-cleanup".to_string();
+    write_export_lease(
+        &source_manager,
+        &ExportLease {
+            version: 1,
+            export_id: export_id.clone(),
+            source_db_id: source.id().to_string(),
+            snapshot_id: source_snapshot.snapshot_id,
+            target_db_id: target_id.clone(),
+            ranges: vec![4..=7],
+        },
+    )
+    .unwrap();
+    // Persist the post-barrier/pre-cleanup crash cut, then let normal startup finish adoption.
+    write_import_record(
+        &target_manager,
+        &ImportRecord {
+            version: 1,
+            export_id,
+            source_db_id: source.id().to_string(),
+            source_manifest_path: source_snapshot.manifest_path,
+            snapshot_id: source_snapshot.snapshot_id,
+            target_db_id: target_id.clone(),
+            ranges: vec![4..=7],
+            import_snapshot_id: None,
+            adoption_barrier_snapshot_id: Some(barrier.snapshot_id),
+        },
+    )
+    .unwrap();
+    assert!(!source.expire_snapshot(source_snapshot.snapshot_id).unwrap());
+    let reopened = Db::open_from_snapshot(target_config, barrier.snapshot_id, target_id).unwrap();
+    reopened
+        .wait_for_expand_adoption(Duration::from_secs(10))
+        .unwrap();
+    assert!(
+        source_manager
+            .list_metadata_names("exports")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        target_manager
+            .list_metadata_names("imports")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!root.path().join("target").join(source.id()).exists());
+}
+
 #[test]
 fn adoption_barrier_requires_every_live_import() {
     let record = |barrier| ImportRecord {
         version: 1,
         export_id: "export".to_string(),
         source_db_id: "source".to_string(),
+        source_manifest_path: "file:///source/source/snapshot/SNAPSHOT-1".to_string(),
         snapshot_id: 1,
         target_db_id: "target".to_string(),
         ranges: vec![0..=0],

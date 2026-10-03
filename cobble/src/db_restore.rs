@@ -346,6 +346,7 @@ fn open_restored_db_from_manifest(
     suggested_base_snapshot_id: Option<u64>,
     advance_next_id_from_existing_manifests: bool,
     retained_owned_source_id: Option<String>,
+    active_memtable_source: Option<Arc<FileManager>>,
     recovery_wal_volume: Option<VolumeDescriptor>,
     governance: Option<Arc<dyn crate::governance::DbGovernance>>,
 ) -> Result<Db> {
@@ -426,7 +427,11 @@ fn open_restored_db_from_manifest(
         db.snapshot_manager
             .advance_next_id(max_snapshot_id.saturating_add(1));
     }
-    db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
+    if let Some(source) = active_memtable_source.as_ref() {
+        db.restore_active_memtable_snapshot_to_l0_with_source(source, &active_memtable_data)?;
+    } else {
+        db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
+    }
     db.memtable_manager.open()?;
     if let Some(recovery_wal_volume) = recovery_wal_volume.as_ref() {
         db.replay_wal_after_checkpoint(manifest.wal_checkpoint_id, recovery_wal_volume)?;
@@ -587,6 +592,7 @@ impl Db {
             Some(snapshot_id),
             true,
             retained_owned_source_id,
+            None,
             recovery_wal_volume,
             governance,
         )
@@ -725,6 +731,26 @@ impl Db {
             .with_transform_registry(transforms)?,
         );
         schema_manager.persist_loaded_schemas(&file_manager)?;
+        let active_memtable_source = if manifest.active_memtable_data.is_empty() {
+            None
+        } else {
+            let source_db_id = manifest_path.rsplit('/').nth(2).ok_or_else(|| {
+                Error::InvalidState("Source manifest path is missing the database ID".into())
+            })?;
+            let source = if manifest_path.contains("://")
+                || std::path::Path::new(&manifest_path).is_absolute()
+            {
+                super::rescale::snapshot_source_file_manager(&config, source_db_id, &manifest_path)?
+                    .0
+            } else {
+                Arc::new(FileManager::from_config_readonly(
+                    &config,
+                    source_db_id,
+                    Arc::clone(&metrics_manager),
+                )?)
+            };
+            Some(source)
+        };
         open_restored_db_from_manifest(
             config,
             file_manager,
@@ -736,6 +762,7 @@ impl Db {
             None,
             false,
             Some(retained_owned_source_id),
+            active_memtable_source,
             None,
             governance,
         )

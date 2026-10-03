@@ -1515,6 +1515,21 @@ impl StructuredDb {
         self.db.wait_for_expand_adoption(timeout)
     }
 
+    pub fn expand_bucket_from_manifest(
+        &self,
+        source_db_id: impl Into<String>,
+        source_manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ExpandStorageMode,
+    ) -> Result<u64> {
+        self.db.expand_bucket_from_manifest(
+            source_db_id,
+            source_manifest_path,
+            ranges,
+            storage_mode,
+        )
+    }
+
     pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
         self.db.shrink_bucket(ranges)
     }

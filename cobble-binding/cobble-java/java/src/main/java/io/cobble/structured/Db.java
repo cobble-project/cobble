@@ -471,6 +471,28 @@ public final class Db extends NativeObject {
                 ExpandStorageMode.ADOPT_ASYNC);
     }
 
+    /**
+     * Expand bucket ownership from an explicit source manifest location. The source metadata volume
+     * must be configured (READONLY is supported); credentials are taken from that configuration.
+     */
+    public long expandBucketFromManifest(
+            String sourceDbId,
+            String sourceManifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ExpandStorageMode storageMode) {
+        if (storageMode == null) {
+            throw new IllegalArgumentException("storageMode must not be null");
+        }
+        return expandBucketFromManifest(
+                nativeHandle,
+                sourceDbId,
+                sourceManifestPath,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                storageMode.ordinal());
+    }
+
     /** Wait for asynchronous expansion adoption to finish. */
     public void waitForExpandAdoption(long timeoutMillis) {
         waitForExpandAdoption(nativeHandle, timeoutMillis);
@@ -1634,6 +1656,14 @@ public final class Db extends NativeObject {
             long nativeHandle,
             String sourceDbId,
             long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
+
+    private static native long expandBucketFromManifest(
+            long nativeHandle,
+            String sourceDbId,
+            String sourceManifestPath,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
             int storageMode);
