@@ -117,6 +117,12 @@ class COBBLE_CPP_API Db final {
       std::optional<SnapshotId> source_snapshot = std::nullopt,
       std::optional<std::span<const BucketRange>> ranges = std::nullopt,
       ExpandStorageMode storage_mode = ExpandStorageMode::kAdoptAsync) const;
+  // Imports the exact source manifest, including from a different metadata
+  // root. The source root must be configured (READONLY is allowed).
+  [[nodiscard]] SnapshotId ExpandBucketFromManifest(
+      std::string_view source_db_id, std::string_view source_manifest_path,
+      std::optional<std::span<const BucketRange>> ranges = std::nullopt,
+      ExpandStorageMode storage_mode = ExpandStorageMode::kAdoptAsync) const;
   void WaitForExpandAdoption(std::chrono::milliseconds timeout) const;
   [[nodiscard]] SnapshotId ShrinkBucket(
       std::span<const BucketRange> ranges) const;

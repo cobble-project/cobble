@@ -157,6 +157,11 @@ endif()
 
 if(COBBLE_CPP_BUILD_TESTS)
   enable_testing()
+  add_executable(cobble_cpp_rescale_manifest_test tests/rescale_manifest_test.cpp)
+  target_link_libraries(cobble_cpp_rescale_manifest_test PRIVATE cobble::cobble)
+  add_test(NAME cobble_cpp_rescale_manifest
+           COMMAND cobble_cpp_rescale_manifest_test)
+  set_tests_properties(cobble_cpp_rescale_manifest PROPERTIES TIMEOUT 240)
   add_executable(cobble_cpp_test tests/binding_test.cpp)
   target_link_libraries(cobble_cpp_test PRIVATE cobble::cobble)
   add_test(NAME cobble_cpp_binding COMMAND cobble_cpp_test)

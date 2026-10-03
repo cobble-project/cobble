@@ -214,6 +214,13 @@ Release all scan cursors, schema builders, and priority queues before an explici
 `Database::Close` or `Db::Close`. Normal RAII destruction is safe because these
 dependent objects retain their database owner.
 
+`Db::ExpandBucketFromManifest(source_db_id, source_manifest_path, ranges, mode)`
+and its structured counterpart import an exact source manifest even when the
+target uses a different metadata root. Configure the source volume in the target
+configuration (READONLY is allowed), with credentials supplied by that current
+configuration. Omitted ranges import all source ranges; the default storage mode
+is asynchronous adoption, as with `ExpandBucket`.
+
 `Db::SwitchToSnapshot` is an exclusive operation on the same handle. It fails
 with `ErrorCode::kInvalidState` while a scan cursor, schema builder, or priority queue retains
 that database; release those children and externally serialize the switch with

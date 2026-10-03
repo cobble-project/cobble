@@ -394,6 +394,27 @@ pub(crate) fn native_sharded_database_expand_bucket(
         .map_err(format_cobble_error)
 }
 
+pub(crate) fn native_sharded_database_expand_bucket_from_manifest(
+    db: &NativeShardedDatabase,
+    source_db_id: &str,
+    source_manifest_path: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeRange>,
+    storage_mode: u8,
+) -> BridgeResult<u64> {
+    let ranges = has_ranges
+        .then(|| bucket_ranges_from_values(ranges, "expand"))
+        .transpose()?;
+    db.db
+        .expand_bucket_from_manifest(
+            source_db_id,
+            source_manifest_path,
+            ranges,
+            expand_storage_mode(storage_mode)?,
+        )
+        .map_err(format_cobble_error)
+}
+
 fn bucket_ranges_from_values(
     ranges: Vec<ffi::NativeRange>,
     operation: &str,
