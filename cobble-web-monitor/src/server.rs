@@ -312,6 +312,7 @@ struct HealthResponse {
 }
 
 async fn healthz_handler() -> Json<HealthResponse> {
+    // Liveness only: this endpoint does not access the database or storage backend.
     Json(HealthResponse { status: "ok" })
 }
 
@@ -342,7 +343,9 @@ async fn ui_spa_handler(Path(path): Path<String>) -> Response {
 async fn meta_handler(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<MetaResponse>, Error> {
-    let response = build_meta_response(&state)?;
+    let response = tokio::task::spawn_blocking(move || build_meta_response(&state))
+        .await
+        .map_err(|e| Error::HttpServerError(format!("metadata task failed: {e}")))??;
     Ok(Json(response))
 }
 
@@ -369,13 +372,22 @@ async fn inspect_handler(
         state.inspect_default_limit,
         state.inspect_max_limit,
     )?;
-    let response = run_inspect_query(&state, &query)?;
+    let response = tokio::task::spawn_blocking(move || run_inspect_query(&state, &query))
+        .await
+        .map_err(|e| Error::HttpServerError(format!("inspect task failed: {e}")))??;
     Ok(Json(response))
 }
 
 async fn list_snapshots_handler(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<SnapshotListResponse>, Error> {
+    let response = tokio::task::spawn_blocking(move || list_snapshots_blocking(&state))
+        .await
+        .map_err(|e| Error::HttpServerError(format!("snapshot list task failed: {e}")))??;
+    Ok(Json(response))
+}
+
+fn list_snapshots_blocking(state: &AppState) -> Result<SnapshotListResponse> {
     let guard = state
         .proxy
         .lock()
@@ -391,10 +403,10 @@ async fn list_snapshots_handler(
             is_current: summary.is_current,
         })
         .collect();
-    Ok(Json(SnapshotListResponse {
+    Ok(SnapshotListResponse {
         current_global_snapshot_id: current_id,
         snapshots,
-    }))
+    })
 }
 
 #[derive(Debug, Deserialize)]

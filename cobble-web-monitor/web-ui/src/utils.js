@@ -1,3 +1,10 @@
+export function displayTableValue(value, logicalType) {
+  if (value === null || value === undefined) return 'null'
+  if (logicalType?.kind === 'binary') return `base64: ${value.base64}`
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
 export function encodeUtf8ToBase64(value) {
   try {
     const bytes = new TextEncoder().encode(value)
