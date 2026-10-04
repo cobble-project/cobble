@@ -884,6 +884,13 @@ pub(crate) fn build_runs_for_plan(
                 }
             }
         }
+        // A rewrite can combine sparse input files into an SST spanning their entire key range.
+        // Include output files in gaps between inputs too, even if they overlap no input file.
+        output_range = overlap_range_for_key_range(
+            &input_level.files[min_idx].start_key,
+            &input_level.files[max_idx].end_key,
+            output_candidates,
+        );
         // We try to expand the selected input files to cover all overlapping files with the output
         // level to maximize compaction efficiency.
         if let Some(output_level) = output_level
@@ -1263,17 +1270,25 @@ fn overlap_size(file: &DataFile, candidates: &[Arc<DataFile>]) -> usize {
 }
 
 fn overlap_range_for_file(file: &DataFile, candidates: &[Arc<DataFile>]) -> Option<(usize, usize)> {
+    overlap_range_for_key_range(&file.start_key, &file.end_key, candidates)
+}
+
+fn overlap_range_for_key_range(
+    start_key: &[u8],
+    end_key: &[u8],
+    candidates: &[Arc<DataFile>],
+) -> Option<(usize, usize)> {
     let mut start: Option<usize> = None;
     let mut end: Option<usize> = None;
     for (idx, candidate) in candidates.iter().enumerate() {
-        if file_overlap(file, candidate) {
+        if file_overlaps_key_range(candidate, start_key, end_key) {
             if start.is_none() {
                 start = Some(idx);
             }
             end = Some(idx);
             continue;
         }
-        if candidate.start_key.as_slice() > file.end_key.as_slice() {
+        if candidate.start_key.as_slice() > end_key {
             break;
         }
     }

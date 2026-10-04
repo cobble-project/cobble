@@ -397,6 +397,66 @@ fn test_min_overlap_prefers_smaller_overlap() {
 }
 
 #[test]
+fn test_build_runs_for_plan_includes_output_files_in_input_gaps() {
+    let first = encode_key(&Key::new(0, Bytes::new()));
+    let last = encode_key(&Key::new(3, Bytes::new()));
+    let middle = encode_key(&Key::new(1, Bytes::from_static(b"middle")));
+    let outside = encode_key(&Key::new(3, Bytes::from_static(b"outside")));
+    let input = Level {
+        ordinal: 1,
+        tiered: false,
+        files: vec![
+            make_file(1, &first, &first, 100),
+            make_file(2, &last, &last, 100),
+        ],
+    };
+    let plan = CompactionPlan {
+        input_level: 1,
+        output_level: 2,
+        base_file_id: 1,
+        trivial_move: false,
+        drop_truncated: false,
+        drop_expired: false,
+    };
+    let config = CompactionConfig {
+        l1_base_bytes: 1,
+        ..CompactionConfig::default()
+    };
+
+    // Rewriting these two tiny sparse files can place both empty user keys in one SST.
+    // Its key range bridges the gap, so the middle output-level file must also be rewritten.
+    for (overlap_first, overlap_last) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mut output_files = Vec::new();
+        if overlap_first {
+            output_files.push(make_file(4, &first, &first, 100));
+        }
+        output_files.push(make_file(3, &middle, &middle, 100));
+        if overlap_last {
+            output_files.push(make_file(5, &last, &last, 100));
+        }
+        let expected_output = output_files
+            .iter()
+            .map(|file| file.file_id)
+            .collect::<Vec<_>>();
+        output_files.push(make_file(6, &outside, &outside, 100));
+        let levels = vec![
+            input.clone(),
+            Level {
+                ordinal: 2,
+                tiered: false,
+                files: output_files,
+            },
+        ];
+        assert_eq!(
+            run_file_ids(&build_runs_for_plan(&levels, &plan, &config)),
+            vec![(1, vec![1, 2]), (2, expected_output)]
+        );
+    }
+}
+
+#[test]
 fn test_build_runs_for_plan_expands_input() {
     let config = CompactionConfig {
         l0_file_limit: 4,
