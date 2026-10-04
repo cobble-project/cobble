@@ -417,6 +417,7 @@ fn is_sensitive_volume_option(key: &str) -> bool {
             | "aws_access_key_id"
             | "secret_key"
             | "secret_access_key"
+            | "access_key_secret"
             | "aws_secret_access_key"
             | "session_token"
             | "aws_session_token"

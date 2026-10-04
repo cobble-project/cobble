@@ -24,8 +24,17 @@ fn properties_are_plain_toml_without_volume_credentials() {
         ("region".to_string(), "test-region".to_string()),
         ("secret_access_key".to_string(), "option-sk".to_string()),
     ]));
+    let mut oss_volume = VolumeDescriptor::new(
+        "oss://example-bucket/data?access_key_secret=oss-query-sk",
+        vec![VolumeUsageKind::Snapshot],
+    );
+    oss_volume.custom_options = Some(HashMap::from([
+        ("endpoint".to_string(), "https://oss.example".to_string()),
+        ("access_key_id".to_string(), "oss-option-ak".to_string()),
+        ("access_key_secret".to_string(), "oss-option-sk".to_string()),
+    ]));
     let config = Config {
-        volumes: vec![volume],
+        volumes: vec![volume, oss_volume],
         l0_file_limit: 17,
         wal_enabled: true,
         ..Config::default()
@@ -51,6 +60,9 @@ fn properties_are_plain_toml_without_volume_credentials() {
     assert_eq!(rebound.access_id, config.volumes[0].access_id);
     assert_eq!(rebound.secret_key, config.volumes[0].secret_key);
     assert_eq!(rebound.custom_options, config.volumes[0].custom_options);
+    let oss_route = decoded.config.volumes[1].with_credentials_from(&config);
+    assert_eq!(oss_route.base_dir, config.volumes[1].base_dir);
+    assert_eq!(oss_route.custom_options, config.volumes[1].custom_options);
 
     assert_eq!(decoded.version, DB_PROPERTIES_VERSION_CURRENT);
     assert_eq!(decoded.db_id, "shard-7");
@@ -78,6 +90,9 @@ fn properties_are_plain_toml_without_volume_credentials() {
         "field-ak",
         "field-sk",
         "option-sk",
+        "oss-query-sk",
+        "oss-option-ak",
+        "oss-option-sk",
     ] {
         assert!(!contents.contains(secret), "PROPERTIES leaked {secret}");
     }
