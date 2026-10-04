@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { fetchTables, inspectTable } from '../api'
-import { formatTimestamp, safeLocalStorageGet, safeLocalStorageSet } from '../utils'
+import { displayTableValue, formatTimestamp, safeLocalStorageGet, safeLocalStorageSet } from '../utils'
 
 const props = defineProps({ mode: { type: String, required: true } })
 const saved = safeLocalStorageGet('cobble-web-monitor-table-inspect-v1', {})
@@ -55,11 +55,9 @@ function displayType(type) {
   return `${type.kind}${type.nullable ? '?' : ''}`
 }
 
-function displayValue(value) {
-  if (value === null || value === undefined) return 'null'
-  if (typeof value === 'object' && 'base64' in value) return `base64: ${value.base64}`
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
+function displayValue(value, cellIndex) {
+  const field = fields.value.find((field) => field.name === resultFields.value[cellIndex])
+  return displayTableValue(value, field?.logical_type)
 }
 
 function inputHint(type) {
@@ -278,7 +276,7 @@ watch(keyInputs, () => { lookup.value = null; lookupAttempted.value = false; per
         <thead><tr class="text-left text-stone-500"><th v-for="name in resultFields" :key="name" class="px-2 py-2">{{ name }}<span class="block text-xs font-normal text-stone-400">{{ displayType(fields.find((field) => field.name === name)?.logical_type) }}</span></th></tr></thead>
         <tbody class="divide-y divide-stone-200">
           <tr v-for="(row, index) in (mode === 'lookup' ? (lookup ? [lookup] : []) : (scan?.items || []))" :key="index">
-            <td v-for="(value, cellIndex) in row.values" :key="cellIndex" class="px-2 py-2 font-mono text-xs" :class="value === null ? 'text-stone-400 italic' : ''" :title="displayValue(value)">{{ displayValue(value) }}</td>
+            <td v-for="(value, cellIndex) in row.values" :key="cellIndex" class="px-2 py-2 font-mono text-xs" :class="value === null ? 'text-stone-400 italic' : ''" :title="displayValue(value, cellIndex)">{{ displayValue(value, cellIndex) }}</td>
           </tr>
           <tr v-if="!busy && (mode === 'lookup' ? !lookup : !scan?.items?.length)">
             <td :colspan="Math.max(resultFields.length, 1)" class="px-2 py-4 text-center text-stone-500">{{ mode === 'lookup' ? (lookupAttempted ? 'No matching row.' : 'Enter a key to look up a row.') : 'No rows on this page.' }}</td>

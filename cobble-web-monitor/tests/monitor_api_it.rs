@@ -53,7 +53,10 @@ fn wait_until_ready(base_url: &str) {
 #[serial(file)]
 fn test_monitor_snapshots_mode_switch_and_inspect() {
     let root = test_root("monitor_mode_switch");
-    let (_config_path, config) = write_config_file(&root);
+    let (_config_path, mut config) = write_config_file(&root);
+    // Use OpenDAL's async filesystem backend rather than POSIX, exercising the same
+    // synchronous runtime bridge as remote storage without an external S3 service.
+    config.volumes = VolumeDescriptor::single_volume(format!("fs://{root}"));
 
     let db = SingleDb::open(config.clone()).unwrap();
     db.put(0, b"user:0001", 0, b"alice").unwrap();
