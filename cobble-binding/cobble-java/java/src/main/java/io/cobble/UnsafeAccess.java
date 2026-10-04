@@ -3,18 +3,35 @@ package io.cobble;
 import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /** Internal unsafe helper for direct-memory access in hot paths. */
 public final class UnsafeAccess {
     private static final Unsafe UNSAFE = loadUnsafe();
     private static final long BYTE_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
+    private static final long BUFFER_ADDRESS_OFFSET = bufferAddressOffset();
     private static final boolean LITTLE_ENDIAN = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
 
     private UnsafeAccess() {}
 
     public static long byteArrayBaseOffset() {
         return BYTE_ARRAY_BASE_OFFSET;
+    }
+
+    static long directAddress(ByteBuffer buffer) {
+        return UNSAFE.getLong(buffer, BUFFER_ADDRESS_OFFSET);
+    }
+
+    private static long bufferAddressOffset() {
+        try {
+            // Obtaining the offset does not require reflective access to java.nio. Keep address
+            // reads in Java hot paths without depending on the non-exported DirectBuffer class.
+            return UNSAFE.objectFieldOffset(Buffer.class.getDeclaredField("address"));
+        } catch (NoSuchFieldException e) {
+            throw new IllegalStateException("failed to locate direct buffer address", e);
+        }
     }
 
     public static byte getByte(long address) {

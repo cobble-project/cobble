@@ -12,7 +12,7 @@ public final class DirectIoUtils {
         if (buffer == null || !buffer.isDirect()) {
             throw new IllegalArgumentException("buffer must be a direct ByteBuffer");
         }
-        return ((sun.nio.ch.DirectBuffer) buffer).address();
+        return UnsafeAccess.directAddress(buffer);
     }
 
     public static ByteBuffer resolveEncodedBuffer(
