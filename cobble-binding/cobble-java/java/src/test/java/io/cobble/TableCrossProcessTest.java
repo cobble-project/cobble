@@ -26,6 +26,8 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -54,6 +56,15 @@ public class TableCrossProcessTest {
 
     @TempDir Path root;
     private final List<Child> children = new ArrayList<Child>();
+
+    @Test
+    void heapScanWorksInJvmWithoutModuleAccessFlags() throws Exception {
+        try {
+            awaitChild(startChild("heap-scan", root.resolve("heap-scan").toString()), "heap scan");
+        } finally {
+            terminateChildren();
+        }
+    }
 
     @Test
     void tableLifecycleCrossesIndependentWriterReaderAndScanJvmProcesses() throws Exception {
@@ -228,8 +239,38 @@ public class TableCrossProcessTest {
                 reader(args);
             } else if ("scanner".equals(command)) {
                 scanner(args);
+            } else if ("heap-scan".equals(command)) {
+                heapScan(args);
             } else {
                 throw new IllegalArgumentException("unknown worker command: " + command);
+            }
+        }
+
+        private static void heapScan(String[] args) {
+            ByteBuffer direct = ByteBuffer.allocateDirect(16);
+            long address = DirectIoUtils.directAddress(direct);
+            ((Buffer) direct).position(3);
+            if (address == 0L
+                    || DirectIoUtils.directAddress(direct) != address
+                    || DirectIoUtils.directAddress(direct.duplicate()) != address
+                    || DirectIoUtils.directAddress(direct.asReadOnlyBuffer()) != address
+                    || DirectIoUtils.directAddress(direct.slice()) != address + 3) {
+                throw new AssertionError("unexpected direct buffer view address");
+            }
+            Config config = new Config().addVolume(args[1]).totalBuckets(1);
+            byte[] key = new byte[] {1, 2};
+            byte[] value = new byte[] {3, 4};
+            try (Db db = Db.open(config)) {
+                db.put(0, key, 0, value);
+                try (ScanCursor cursor = db.scan(0, null, null)) {
+                    ScanCursor.Entry entry = cursor.nextEntry();
+                    if (entry == null
+                            || !Arrays.equals(key, entry.key)
+                            || !Arrays.equals(value, entry.columns[0])
+                            || cursor.nextEntry() != null) {
+                        throw new AssertionError("unexpected heap scan result");
+                    }
+                }
             }
         }
 
@@ -395,10 +436,7 @@ public class TableCrossProcessTest {
     private Child startChild(String command, String... args) throws IOException {
         List<String> commandLine = new ArrayList<String>();
         commandLine.add(javaExecutable());
-        // Child JVMs do not inherit Surefire's module access flags. Java 8 has no modules.
-        if (!System.getProperty("java.specification.version").startsWith("1.")) {
-            commandLine.add("--add-exports=java.base/sun.nio.ch=ALL-UNNAMED");
-        }
+        // Keep child JVMs free of module access flags, as ordinary applications are.
         String profile = nativeProfile();
         if (profile != null) commandLine.add("-Dcobble.native.profile=" + profile);
         commandLine.add("-cp");
