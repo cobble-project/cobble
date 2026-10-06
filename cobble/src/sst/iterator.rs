@@ -976,10 +976,22 @@ impl SSTIterator {
     }
 
     fn seek_in_current_block(&mut self, target: &Bytes) -> Result<()> {
-        if let Some(block) = &self.current_data_block {
-            self.current_entry_idx = block.find_equal_or_greater_idx(target)?;
-        }
         self.position_after_random_access();
+        if let Some(block) = &self.current_data_block {
+            self.current_entry_idx = if block.is_prefix_compressed() {
+                let idx = block.find_equal_or_greater_idx_prefix_into(
+                    target,
+                    &mut self.cached_prefix_key_bytes.borrow_mut(),
+                )?;
+                if idx < block.offsets_len() {
+                    self.cached_prefix_key_block_id.set(Some(block.block_id()));
+                    self.cached_prefix_key_entry_idx.set(Some(idx));
+                }
+                idx
+            } else {
+                block.find_equal_or_greater_idx(target)?
+            };
+        }
         Ok(())
     }
 
