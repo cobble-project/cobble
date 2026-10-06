@@ -677,6 +677,29 @@ impl Block {
         })
     }
 
+    /// Seek a prefix-compressed data block, preserving the decoded hit for the scan cursor.
+    pub(crate) fn find_equal_or_greater_idx_prefix_into(
+        &self,
+        target: &Bytes,
+        key: &mut Vec<u8>,
+    ) -> Result<usize> {
+        let (start_idx, end_idx) = self.prefix_restart_search_window(target)?;
+        key.clear();
+        for entry_idx in start_idx..end_idx {
+            self.apply_prefix_entry(entry_idx, start_idx, key)?;
+            if key.as_slice() >= target.as_ref() {
+                return Ok(entry_idx);
+            }
+        }
+        if end_idx < self.offsets_len() {
+            // The lower bound can be the next restart, outside the searched window.
+            self.advance_prefix_key(end_idx, key)?;
+        } else {
+            key.clear();
+        }
+        Ok(end_idx)
+    }
+
     fn find_equal_or_greater_idx_prefix_in_window(
         &self,
         target_bytes: &[u8],

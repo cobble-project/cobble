@@ -396,3 +396,80 @@ fn test_block_prefix_seek_uses_target_prefix_and_key_len() {
         2
     );
 }
+
+#[test]
+fn test_block_prefix_seek_preserves_full_hit_key() {
+    let mut builder = BlockBuilder::new_with_prefix(4096, 3, true);
+    let keys: Vec<_> = (0..11)
+        .map(|idx| Bytes::from(format!("map:key:{:04}:long-suffix", idx * 2)))
+        .collect();
+    for key in &keys {
+        builder.add(key, b"value");
+    }
+    let block = builder.build();
+    let mut key = vec![b'z'; 100];
+    for target in [
+        "",
+        "map",
+        "map:key:0000",
+        "map:key:0001",
+        "map:key:0005",
+        "map:key:0006:long-suffix",
+        "map:key:0011",
+        "z",
+    ] {
+        let target = Bytes::from(target);
+        let idx = block
+            .find_equal_or_greater_idx_prefix_into(&target, &mut key)
+            .unwrap();
+        assert_eq!(idx, block.find_equal_or_greater_idx(&target).unwrap());
+        assert_eq!(
+            key.as_slice(),
+            keys.get(idx).map_or(&[][..], |key| key.as_ref())
+        );
+    }
+    let empty = BlockBuilder::new_with_prefix(16, 3, true).build();
+    assert_eq!(
+        empty
+            .find_equal_or_greater_idx_prefix_into(&Bytes::new(), &mut key)
+            .unwrap(),
+        0
+    );
+    assert!(key.is_empty());
+}
+
+#[test]
+fn test_block_prefix_seek_key_reuse_rejects_corruption() {
+    let mut builder = BlockBuilder::new_with_prefix(4096, 3, true);
+    for key in [b"aaa", b"aab", b"aac", b"aad"] {
+        builder.add(key, b"v");
+    }
+    let block = builder.build();
+    for (entry, field, corrupt_bytes) in [
+        (0, 0, vec![1, 0]),
+        (1, 0, vec![255, 255]),
+        (1, 2, u32::MAX.to_le_bytes().to_vec()),
+        (3, 0, vec![1, 0]),
+    ] {
+        let mut corrupted = block.clone();
+        let mut data = corrupted.data.to_vec();
+        let offset = corrupted.offsets[entry] as usize + field;
+        data[offset..offset + corrupt_bytes.len()].copy_from_slice(&corrupt_bytes);
+        corrupted.data = Bytes::from(data);
+        for target in [Bytes::from("aac"), Bytes::from("aacz")] {
+            assert!(corrupted.find_equal_or_greater_idx(&target).is_err());
+            assert!(
+                corrupted
+                    .find_equal_or_greater_idx_prefix_into(&target, &mut Vec::new())
+                    .is_err()
+            );
+        }
+    }
+    let mut truncated = block;
+    truncated.data = truncated.data.slice(..5);
+    assert!(
+        truncated
+            .find_equal_or_greater_idx_prefix_into(&Bytes::from("aaa"), &mut Vec::new())
+            .is_err()
+    );
+}

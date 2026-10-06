@@ -613,6 +613,104 @@ fn test_sst_iterator_prefix_scan_reuses_current_key_across_next() {
 }
 
 #[test]
+fn test_sst_seek_preserves_decoded_key_and_invalidates_old_position() {
+    for restart_interval in [1, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(dir.path().to_str().unwrap())
+            .unwrap();
+        let mut writer = SSTWriter::new(
+            fs.open_write("seek.sst").unwrap(),
+            SSTWriterOptions {
+                block_size: 256,
+                data_block_restart_interval: restart_interval,
+                partitioned_index: true,
+                ..SSTWriterOptions::default()
+            },
+        );
+        let keys: Vec<_> = (0..50)
+            .map(|idx| format!("map:key:{:04}", idx * 2))
+            .collect();
+        for key in &keys {
+            writer.add(key.as_bytes(), b"v").unwrap();
+        }
+        writer.finish().unwrap();
+        let mut iter = SSTIterator::with_cache(
+            fs.open_read("seek.sst").unwrap(),
+            0,
+            SSTIteratorOptions {
+                preload_next_data_block: true,
+                ..SSTIteratorOptions::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        for target in [
+            "map:key:0004",
+            "map:key:0000",
+            "map:key:0015",
+            "map:key:0097",
+            "z",
+            "",
+            "map:key:0020",
+        ] {
+            iter.seek(target.as_bytes()).unwrap();
+            let expected = keys.iter().position(|key| key.as_str() >= target);
+            if let Some(idx) = expected {
+                let block = iter.current_data_block.as_ref().unwrap();
+                if restart_interval > 1 && iter.current_entry_idx > 0 {
+                    assert_eq!(
+                        iter.cached_prefix_key_block_id.get(),
+                        Some(block.block_id())
+                    );
+                    assert_eq!(
+                        iter.cached_prefix_key_entry_idx.get(),
+                        Some(iter.current_entry_idx)
+                    );
+                    assert_eq!(
+                        iter.cached_prefix_key_bytes.borrow().as_slice(),
+                        keys[idx].as_bytes()
+                    );
+                }
+                assert_eq!(iter.key().unwrap().unwrap().as_ref(), keys[idx].as_bytes());
+                assert_eq!(iter.current().unwrap().unwrap().1.as_ref(), b"v");
+                if idx + 1 < keys.len() {
+                    assert!(iter.next().unwrap());
+                    assert_eq!(
+                        iter.key().unwrap().unwrap().as_ref(),
+                        keys[idx + 1].as_bytes()
+                    );
+                } else {
+                    assert!(!iter.next().unwrap());
+                }
+            } else {
+                assert!(!iter.valid());
+                assert!(iter.key().unwrap().is_none());
+                assert!(iter.cached_prefix_key_entry_idx.get().is_none());
+            }
+        }
+        if restart_interval > 1 {
+            iter.seek(keys[2].as_bytes()).unwrap();
+            let old_index = iter.current_entry_idx;
+            let block = iter.current_data_block.as_ref().unwrap();
+            let mut encoded = block.encode().to_vec();
+            encoded[6..8].copy_from_slice(&1u16.to_le_bytes());
+            let mut corrupted = Block::decode(Bytes::from(encoded)).unwrap();
+            corrupted.set_block_id(block.block_id());
+            iter.current_data_block = Some(Arc::new(corrupted));
+            assert!(iter.seek_in_current_block(&Bytes::new()).is_err());
+            assert_eq!(iter.current_entry_idx, old_index);
+            assert!(iter.cached_prefix_key_block_id.get().is_none());
+            assert!(iter.cached_prefix_key_entry_idx.get().is_none());
+            assert!(iter.cached_key_entry_idx.get().is_none());
+            assert!(iter.cached_value_entry_idx.get().is_none());
+        }
+    }
+}
+
+#[test]
 #[serial_test::serial(file)]
 fn test_sst_iterator_can_resume_after_block_boundary_stop() {
     let _ = std::fs::remove_dir_all("/tmp/sst_block_boundary_resume_test");
