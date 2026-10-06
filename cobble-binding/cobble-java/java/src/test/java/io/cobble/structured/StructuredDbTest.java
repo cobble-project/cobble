@@ -1316,6 +1316,25 @@ class StructuredDbTest {
     }
 
     @Test
+    void structuredDirectScanBatchHandlesEmptyAndUnboundedRowLimit() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-structured-direct-batch-empty-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        try (Db db = Db.open(config)) {
+            try (DirectScanCursor cursor = db.scanDirectWithOptions(0, null, 0, null, 0, null)) {
+                assertTrue(cursor.nextBatch(Integer.MAX_VALUE).isEmpty());
+                assertTrue(cursor.nextBatch(1).isEmpty());
+            }
+            db.put(0, new byte[] {1}, 0, ColumnValue.ofBytes(new byte[] {2}));
+            try (DirectScanCursor cursor = db.scanDirectWithOptions(0, null, 0, null, 0, null)) {
+                DirectScanBatch batch = cursor.nextBatch(Integer.MAX_VALUE);
+                assertEquals(1, batch.size());
+                assertArrayEquals(new byte[] {1}, readDirectBytes(batch.get(0).getKey()));
+                assertTrue(cursor.nextBatch(1).isEmpty());
+            }
+        }
+    }
+
+    @Test
     void structuredDirectScanBatchRejectsImpossibleRowCount() {
         ByteBuffer encoded = ByteBuffer.allocateDirect(2 * Integer.BYTES);
         encoded.putInt(0, Integer.MAX_VALUE);
