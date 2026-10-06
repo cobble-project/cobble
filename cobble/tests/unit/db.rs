@@ -3861,6 +3861,138 @@ fn test_db_scan_with_column_indices() {
 
 #[test]
 #[serial(file)]
+fn test_full_projection_preserves_merge_delete_ttl_and_vlog_rows() {
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        for separated in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = open_db(Config {
+                volumes: VolumeDescriptor::single_volume(format!(
+                    "file://{}",
+                    root.path().display()
+                )),
+                num_columns: 2,
+                memtable_type,
+                memtable_capacity: Size::from_mib(1),
+                snapshot_on_flush: false,
+                l0_file_limit: 1000,
+                ttl_enabled: true,
+                time_provider: TimeProviderKind::Manual,
+                value_separation_threshold: separated.then(|| Size::from_const(1)),
+                ..Config::default()
+            });
+            let mut schema = db.update_schema();
+            schema
+                .set_column_operator(None, 0, Arc::new(PipeMergeOperator))
+                .unwrap();
+            schema.commit();
+            db.set_time(100);
+            for key in [b"a".as_slice(), b"dead", b"expired", b"merge", b"partial"] {
+                db.put_columns_with_options(
+                    0,
+                    key,
+                    &[b"base".as_slice(), b"payload"],
+                    &WriteOptions::default(),
+                )
+                .unwrap();
+            }
+            db.memtable_manager.flush_active().unwrap();
+            for result in db.memtable_manager.wait_for_flushes() {
+                result.unwrap();
+            }
+            db.merge(0, b"merge", 0, b"a").unwrap();
+            db.merge(0, b"merge", 0, b"b").unwrap();
+            db.delete(0, b"dead", 0).unwrap();
+            db.delete(0, b"dead", 1).unwrap();
+            db.delete(0, b"partial", 0).unwrap();
+            db.put_columns_with_options(
+                0,
+                b"expired",
+                &[b"new".as_slice(); 2],
+                &WriteOptions::with_ttl(1),
+            )
+            .unwrap();
+            db.put_columns_with_options(
+                0,
+                b"ttl-only",
+                &[b"new".as_slice(); 2],
+                &WriteOptions::with_ttl(1),
+            )
+            .unwrap();
+            db.set_time(102);
+
+            let expected = vec![
+                (
+                    Bytes::from_static(b"a"),
+                    vec![
+                        Some(Bytes::from_static(b"base")),
+                        Some(Bytes::from_static(b"payload")),
+                    ],
+                ),
+                (
+                    // Compatible scans discard expired inputs before merging older values.
+                    Bytes::from_static(b"expired"),
+                    vec![
+                        Some(Bytes::from_static(b"base")),
+                        Some(Bytes::from_static(b"payload")),
+                    ],
+                ),
+                (
+                    Bytes::from_static(b"merge"),
+                    vec![
+                        Some(Bytes::from_static(b"base|a|b")),
+                        Some(Bytes::from_static(b"payload")),
+                    ],
+                ),
+                (
+                    Bytes::from_static(b"partial"),
+                    vec![None, Some(Bytes::from_static(b"payload"))],
+                ),
+            ];
+            for flushed in [false, true] {
+                if flushed {
+                    db.memtable_manager.flush_active().unwrap();
+                    for result in db.memtable_manager.wait_for_flushes() {
+                        result.unwrap();
+                    }
+                }
+                for selection in [vec![0, 1], vec![1, 0], vec![0], vec![1], vec![0, 0]] {
+                    let projected: Vec<_> = expected
+                        .iter()
+                        .filter_map(|(key, columns)| {
+                            let mut columns = columns.clone();
+                            let columns: Vec<_> =
+                                selection.iter().map(|&i| columns[i].take()).collect();
+                            columns
+                                .iter()
+                                .any(Option::is_some)
+                                .then(|| (key.clone(), columns))
+                        })
+                        .collect();
+                    let actual: Vec<_> = db
+                        .scan_with_options(
+                            0,
+                            b""..b"z",
+                            &ScanOptions::for_columns(selection.clone()),
+                        )
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    assert_eq!(
+                        actual, projected,
+                        "{memtable_type:?}, separated={separated}, flushed={flushed}, {selection:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[serial(file)]
 fn test_db_scan_with_read_ahead_option() {
     let root = "/tmp/db_scan_read_ahead";
     cleanup_test_root(root);

@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::iterator::{
     DeduplicatingIterator, MergingIterator, SchemaAwareDeduplicatingIterator,
-    TruncationFilterIterator,
+    TruncationFilterIterator, selects_all_columns,
 };
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
@@ -194,7 +194,9 @@ impl DbIterator {
                 Some(self.ttl_provider.time_provider()),
             )?;
             if let Some(columns) = columns {
-                let columns = if let Some(selected_columns) = &self.selected_columns {
+                let columns = if let Some(selected_columns) = &self.selected_columns
+                    && !selects_all_columns(selected_columns, columns.len())
+                {
                     selected_columns
                         .iter()
                         .map(|&index| columns.get(index).cloned().unwrap_or(None))

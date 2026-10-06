@@ -15,6 +15,58 @@ fn cleanup_root(path: &str) {
 
 #[test]
 #[serial(file)]
+fn test_full_projection_preserves_encoded_terminal_memtable_rows() {
+    for memtable_type in [
+        crate::MemtableType::Hash,
+        crate::MemtableType::Skiplist,
+        crate::MemtableType::Vec,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::open(
+            Config {
+                volumes: VolumeDescriptor::single_volume(format!(
+                    "file://{}",
+                    root.path().display()
+                )),
+                num_columns: 2,
+                total_buckets: 4,
+                memtable_type,
+                ..Config::default()
+            },
+            vec![0u16..=3u16],
+        )
+        .unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(0, b"key", 0, b"a");
+        batch.put(0, b"key", 1, b"b");
+        db.write_batch(batch).unwrap();
+
+        let mut full = db
+            .scan_with_options(
+                0,
+                b"key"..b"kez",
+                &crate::ScanOptions::for_columns(vec![0, 1]),
+            )
+            .unwrap();
+        assert!(
+            full.inner.take_value().unwrap().unwrap().is_encoded(),
+            "{memtable_type:?}: full projection should defer value decoding"
+        );
+        drop(full);
+
+        let mut reordered = db
+            .scan_with_options(
+                0,
+                b"key"..b"kez",
+                &crate::ScanOptions::for_columns(vec![1, 0]),
+            )
+            .unwrap();
+        assert!(!reordered.inner.take_value().unwrap().unwrap().is_encoded());
+    }
+}
+
+#[test]
+#[serial(file)]
 fn test_db_iterator_uses_projected_family_schema_width() {
     let root = "/tmp/db_iterator_projected_family_schema_width";
     let _ = std::fs::remove_dir_all(root);

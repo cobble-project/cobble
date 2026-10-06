@@ -17,7 +17,7 @@ use crate::file::{File, FileManager, MetadataReader, TrackedFileId};
 use crate::format::{FileBuildResult, FileBuilder, FileBuilderFactory};
 use crate::iterator::{
     ColumnMaskingIterator, DeduplicatingIterator, KvIterator, SchemaEvolvingIterator,
-    SchemaTaggedIterator,
+    SchemaTaggedIterator, selects_all_columns,
 };
 use crate::lsm::LSMTree;
 use crate::memtable::vlog::rewrite_kv_value_for_flush;
@@ -2225,7 +2225,10 @@ impl MemtableManager {
                     column_family_id,
                 ))
             };
-            let iter: DynKvIterator = if let Some(columns) = selected_columns {
+            // Preserve encoded rows for full projection, after schema evolution.
+            let iter: DynKvIterator = if let Some(columns) = selected_columns
+                && !selects_all_columns(columns, target_num_columns)
+            {
                 Box::new(ColumnMaskingIterator::new(
                     iter,
                     target_num_columns,
@@ -2288,7 +2291,9 @@ impl MemtableManager {
                     column_family_id,
                 ))
             };
-            let iter: DynKvIterator = if let Some(columns) = selected_columns {
+            let iter: DynKvIterator = if let Some(columns) = selected_columns
+                && !selects_all_columns(columns, target_num_columns)
+            {
                 Box::new(ColumnMaskingIterator::new(
                     iter,
                     target_num_columns,

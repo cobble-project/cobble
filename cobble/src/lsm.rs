@@ -17,7 +17,7 @@ use crate::file::{
 };
 use crate::iterator::{
     BucketFilterIterator, ColumnMaskingIterator, KvIterator, SchemaEvolvingIterator,
-    SchemaTaggedIterator, SortedRun, VlogSeqOffsetIterator,
+    SchemaTaggedIterator, SortedRun, VlogSeqOffsetIterator, selects_all_columns,
 };
 use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
@@ -1470,7 +1470,10 @@ impl LSMTree {
                         ))
                     }
                 };
-                let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref() {
+                // Schema and VLOG offset handling above still apply to full projection.
+                let iter: DynKvIterator = if let Some(columns) = selected_columns.as_deref()
+                    && !selects_all_columns(columns, target_num_columns)
+                {
                     Box::new(ColumnMaskingIterator::new(
                         iter,
                         target_num_columns,
