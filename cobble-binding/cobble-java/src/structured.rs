@@ -3449,6 +3449,20 @@ pub extern "system" fn Java_io_cobble_structured_Db_shrinkBucket(
 
 // ── structured scan cursor ──────────────────────────────────────────────────
 
+// Match the default Java IO buffer without eagerly allocating for empty or row-only cursors.
+const DIRECT_SCAN_BATCH_INITIAL_CAPACITY: usize = 2 * 1024;
+
+fn initialize_direct_scan_batch(encoded: &mut Vec<u8>, io_capacity: usize) {
+    if encoded.capacity() == 0 {
+        encoded.reserve_exact(io_capacity.min(DIRECT_SCAN_BATCH_INITIAL_CAPACITY));
+    }
+    encoded.extend_from_slice(&0u32.to_be_bytes());
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/structured.rs"]
+mod tests;
+
 pub(crate) struct StructuredScanCursorHandle {
     iter: StructuredScanCursorIter,
     exhausted: bool,
@@ -3515,7 +3529,6 @@ impl StructuredScanCursorHandle {
         }
         let mut encoded = std::mem::take(&mut self.batch_buffer);
         encoded.clear();
-        encoded.extend_from_slice(&0u32.to_be_bytes());
         let mut row_count = 0u32;
         while row_count < max_rows as u32 {
             let row = self.consume_next_row_with_bucket(|bucket, key, cols| {
@@ -3526,6 +3539,9 @@ impl StructuredScanCursorHandle {
                         "structured direct scan row too large".to_string(),
                     )
                 })?;
+                if row_count == 0 {
+                    initialize_direct_scan_batch(&mut encoded, io_capacity);
+                }
                 encoded.extend_from_slice(&row_len.to_be_bytes());
                 let row_offset = encoded.len();
                 encoded.resize(row_offset + row_len as usize, 0);
