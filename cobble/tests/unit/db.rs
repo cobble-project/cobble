@@ -3094,7 +3094,6 @@ fn test_db_value_separation_get_from_memtable_before_flush() {
 #[test]
 #[serial(file)]
 fn test_db_value_separation_flush_and_get() {
-    use crate::sst::row_codec::decode_value;
     use crate::sst::{SSTIterator, SSTIteratorOptions};
 
     let root = "/tmp/db_value_separation";
@@ -3128,8 +3127,8 @@ fn test_db_value_separation_flush_and_get() {
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (_, mut raw_value) = iter.current().unwrap().unwrap();
-    let decoded = decode_value(&mut raw_value, 1).unwrap();
+    let (_, raw_value) = iter.current().unwrap().unwrap();
+    let decoded = raw_value.decode(1).unwrap();
     let column = decoded
         .columns()
         .first()
@@ -3924,7 +3923,7 @@ fn test_full_projection_preserves_merge_delete_ttl_and_vlog_rows() {
             .unwrap();
             db.set_time(102);
 
-            let expected = vec![
+            let expected = [
                 (
                     Bytes::from_static(b"a"),
                     vec![
@@ -3989,6 +3988,127 @@ fn test_full_projection_preserves_merge_delete_ttl_and_vlog_rows() {
             }
         }
     }
+}
+
+#[test]
+#[serial(file)]
+fn test_no_ttl_sst_point_batch_projection_and_mixed_layout_merge() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open_db(Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", directory.path().display())),
+        num_columns: 2,
+        memtable_capacity: Size::from_mib(1),
+        l0_file_limit: 1000,
+        snapshot_on_flush: false,
+        ttl_enabled: true,
+        time_provider: TimeProviderKind::Manual,
+        ..Config::default()
+    });
+    let mut schema = db.update_schema();
+    schema.set_column_family_value_has_ttl(None, false).unwrap();
+    schema
+        .set_column_operator(None, 0, Arc::new(PipeMergeOperator))
+        .unwrap();
+    schema.commit();
+    db.set_time(100);
+    db.put_columns_with_options(
+        0,
+        b"merge",
+        &[b"base".as_slice(), b"right"],
+        &WriteOptions::with_ttl(1),
+    )
+    .unwrap();
+    db.put_columns_with_options(
+        0,
+        b"empty",
+        &[b"".as_slice(), b""],
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    db.put_columns_with_options(
+        0,
+        b"dead",
+        &[b"gone".as_slice(); 2],
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    db.memtable_manager.flush_active().unwrap();
+    for result in db.memtable_manager.wait_for_flushes() {
+        result.unwrap();
+    }
+    let keys = [
+        (0, b"merge".as_slice()),
+        (0, b"empty"),
+        (0, b"missing"),
+        (0, b"merge"),
+    ];
+    for options in [
+        ReadOptions::default(),
+        ReadOptions::for_columns(vec![1, 0]),
+        ReadOptions::for_columns(vec![1]),
+    ] {
+        let expected = keys
+            .iter()
+            .map(|(bucket, key)| db.get_with_options(*bucket, key, &options))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            db.multi_get_with_options(&keys, &options).unwrap(),
+            expected
+        );
+        assert!(expected[0].is_some());
+        assert!(expected[1].is_some());
+    }
+
+    let mut schema = db.update_schema();
+    schema.set_column_family_value_has_ttl(None, true).unwrap();
+    schema.commit();
+    db.merge(0, b"merge", 0, b"new").unwrap();
+    db.delete(0, b"dead", 0).unwrap();
+    db.delete(0, b"dead", 1).unwrap();
+    db.put_columns_with_options(
+        0,
+        b"expire",
+        &[b"temporary".as_slice(); 2],
+        &WriteOptions::with_ttl(1),
+    )
+    .unwrap();
+    db.memtable_manager.flush_active().unwrap();
+    for result in db.memtable_manager.wait_for_flushes() {
+        result.unwrap();
+    }
+    db.set_time(102);
+    let expected = vec![
+        Some(Bytes::from_static(b"base|new")),
+        Some(Bytes::from_static(b"right")),
+    ];
+    assert_eq!(db.get(0, b"merge").unwrap(), Some(expected.clone()));
+    assert!(db.get(0, b"dead").unwrap().is_none());
+    assert!(db.get(0, b"expire").unwrap().is_none());
+    assert_eq!(
+        db.multi_get(&keys).unwrap(),
+        vec![
+            Some(expected.clone()),
+            Some(vec![Some(Bytes::new()); 2]),
+            None,
+            Some(expected.clone())
+        ]
+    );
+    let scanned = db
+        .scan_with_options(0, b""..b"z", &ScanOptions::for_columns(vec![1, 0]))
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        scanned,
+        vec![
+            (Bytes::from_static(b"empty"), vec![Some(Bytes::new()); 2]),
+            (
+                Bytes::from_static(b"merge"),
+                vec![expected[1].clone(), expected[0].clone()]
+            ),
+        ]
+    );
 }
 
 #[test]

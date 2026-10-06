@@ -4,6 +4,87 @@ use crate::sst::row_codec::encode_value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn encoded_value_layout_decodes_and_masks_original_bytes() {
+    for has_ttl in [false, true] {
+        for num_columns in [1, 3] {
+            for value_type in [ValueType::Put, ValueType::Delete, ValueType::Merge] {
+                let columns = if num_columns == 1 {
+                    vec![Some(Column::new(value_type, Bytes::new()))]
+                } else {
+                    vec![
+                        Some(Column::new(ValueType::Put, Bytes::new())),
+                        None,
+                        Some(Column::new(value_type, Bytes::from_static(b"payload"))),
+                    ]
+                };
+                let source = Value::new_with_expired_at(columns, Some(123));
+                let bytes = encode_value(&source, num_columns);
+                let bytes = if has_ttl { bytes } else { bytes.slice(4..) };
+                let start = bytes.as_ptr() as usize;
+                let end = start + bytes.len();
+                let encoded = EncodedValue::new(bytes, has_ttl);
+                let kv = KvValue::Encoded(encoded.clone());
+                assert_eq!(kv.expired_at().unwrap(), has_ttl.then_some(123));
+                assert_eq!(kv.is_terminal(num_columns).unwrap(), source.is_terminal());
+
+                let decoded = encoded.clone().decode(num_columns).unwrap();
+                let mut terminal = [0];
+                let masked = encoded
+                    .decode_masked(num_columns, &[0xff], Some(&mut terminal))
+                    .unwrap();
+                assert_eq!(decoded.expired_at(), has_ttl.then_some(123));
+                assert_eq!(masked.expired_at(), decoded.expired_at());
+                for ((expected, actual), masked) in source
+                    .columns()
+                    .iter()
+                    .zip(decoded.columns())
+                    .zip(masked.columns())
+                {
+                    match (expected, actual, masked) {
+                        (Some(expected), Some(actual), Some(masked)) => {
+                            assert_eq!(actual.value_type(), expected.value_type());
+                            assert_eq!(actual.data(), expected.data());
+                            assert_eq!(masked.data(), actual.data());
+                            assert_eq!(masked.data().as_ptr(), actual.data().as_ptr());
+                            if !actual.data().is_empty() {
+                                assert!((start..end).contains(&(actual.data().as_ptr() as usize)));
+                            }
+                        }
+                        (None, None, None) => {}
+                        _ => panic!("column presence changed"),
+                    }
+                }
+                let expected_terminal = if num_columns == 1 {
+                    u8::from(value_type.is_terminal())
+                } else {
+                    1 | if value_type.is_terminal() { 4 } else { 0 }
+                };
+                assert_eq!(terminal[0], expected_terminal);
+            }
+        }
+    }
+}
+
+#[test]
+fn encoded_value_layout_rejects_truncated_rows() {
+    for (bytes, has_ttl, num_columns) in [
+        (Bytes::new(), false, 1),
+        (Bytes::from_static(&[7]), false, 3),
+        (Bytes::from_static(&[0, 0, 0]), true, 1),
+    ] {
+        let encoded = EncodedValue::new(bytes, has_ttl);
+        assert!(encoded.clone().decode(num_columns).is_err());
+        assert!(
+            encoded
+                .clone()
+                .decode_masked(num_columns, &[0xff], None)
+                .is_err()
+        );
+        assert!(KvValue::Encoded(encoded).is_terminal(num_columns).is_err());
+    }
+}
+
 struct PanicMergeOperator;
 
 impl MergeOperator for PanicMergeOperator {
@@ -226,7 +307,7 @@ fn test_value_try_merge_all_stops_after_decode_error() {
     }
 
     let encoded = |value_type, data: &'static [u8]| {
-        KvValue::Encoded(encode_value(
+        KvValue::encoded(encode_value(
             &Value::new(vec![Some(Column::new(value_type, data))]),
             1,
         ))
@@ -235,7 +316,7 @@ fn test_value_try_merge_all_stops_after_decode_error() {
     let values = DecodingValues {
         values: vec![
             encoded(ValueType::Put, b"base"),
-            KvValue::Encoded(Bytes::from_static(&[0])),
+            KvValue::encoded(Bytes::from_static(&[0])),
             encoded(ValueType::Merge, b"-unread"),
         ]
         .into_iter(),

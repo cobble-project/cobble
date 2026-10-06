@@ -587,7 +587,7 @@ impl<'a> KvIterator<'a> for SkiplistScanCursor {
     }
 
     fn take_value(&mut self) -> Result<Option<KvValue>> {
-        Ok(self.current_value.take().map(KvValue::Encoded))
+        Ok(self.current_value.take().map(KvValue::encoded))
     }
 }
 
@@ -809,7 +809,7 @@ fn row_counts_toward_max_rows(
     encoded_value: &Bytes,
     row_filter: &MemtableRowFilter,
 ) -> Result<bool> {
-    let decoded = KvValue::Encoded(encoded_value.clone()).into_decoded(row_filter.num_columns)?;
+    let decoded = KvValue::encoded(encoded_value.clone()).into_decoded(row_filter.num_columns)?;
     let has_visible_column = if let Some(selected_columns) = row_filter.selected_columns.as_ref() {
         selected_columns.iter().any(|&index| {
             decoded.columns().get(index).is_some_and(|column| {
@@ -973,7 +973,7 @@ impl<'a> KvIterator<'a> for MemtableScanIterator {
         if let Some(iter) = self.skiplist_iter.as_mut() {
             return iter.take_value();
         }
-        Ok(self.current_value.take().map(KvValue::Encoded))
+        Ok(self.current_value.take().map(KvValue::encoded))
     }
 }
 

@@ -636,9 +636,9 @@ fn test_compaction_with_duplicates() {
 
     // Key "a" - newer value should win
     assert!(iter.valid());
-    let (key, mut value) = iter.current().unwrap().unwrap();
+    let (key, value) = iter.current().unwrap().unwrap();
     assert_eq!(&key[..], b"a");
-    let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+    let decoded = value.decode(num_columns).unwrap();
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),
         b"new_a"
@@ -647,9 +647,9 @@ fn test_compaction_with_duplicates() {
     // Key "b" - newer value should win
     iter.next().unwrap();
     assert!(iter.valid());
-    let (key, mut value) = iter.current().unwrap().unwrap();
+    let (key, value) = iter.current().unwrap().unwrap();
     assert_eq!(&key[..], b"b");
-    let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+    let decoded = value.decode(num_columns).unwrap();
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),
         b"new_b"
@@ -658,9 +658,9 @@ fn test_compaction_with_duplicates() {
     // Key "c" - only in older file
     iter.next().unwrap();
     assert!(iter.valid());
-    let (key, mut value) = iter.current().unwrap().unwrap();
+    let (key, value) = iter.current().unwrap().unwrap();
     assert_eq!(&key[..], b"c");
-    let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+    let decoded = value.decode(num_columns).unwrap();
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),
         b"old_c"
@@ -788,9 +788,9 @@ fn test_compaction_lazy_merge_with_separated_values() {
 
     iter.seek_to_first().unwrap();
     assert!(iter.valid());
-    let (key, mut value) = iter.current().unwrap().unwrap();
+    let (key, value) = iter.current().unwrap().unwrap();
     assert_eq!(&key[..], b"a");
-    let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+    let decoded = value.decode(num_columns).unwrap();
     let column = decoded.columns()[0].as_ref().unwrap();
     assert_eq!(column.value_type, ValueType::PutSeparatedArray);
     let merged_items = decode_merge_separated_array(column.data()).unwrap();
@@ -802,9 +802,9 @@ fn test_compaction_lazy_merge_with_separated_values() {
 
     iter.next().unwrap();
     assert!(iter.valid());
-    let (key, mut value) = iter.current().unwrap().unwrap();
+    let (key, value) = iter.current().unwrap().unwrap();
     assert_eq!(&key[..], b"b");
-    let decoded = crate::sst::row_codec::decode_value(&mut value, num_columns).unwrap();
+    let decoded = value.decode(num_columns).unwrap();
     let column = decoded.columns()[0].as_ref().unwrap();
     assert_eq!(column.value_type, ValueType::PutSeparatedArray);
     let merged_items = decode_merge_separated_array(column.data()).unwrap();
@@ -906,9 +906,8 @@ fn test_compaction_evolves_older_schema_values() {
         &result.new_files()[0].sst_read_metadata().unwrap()
     ));
     iter.seek_to_first().unwrap();
-    let (_, mut value) = iter.current().unwrap().unwrap();
-    let decoded =
-        crate::sst::row_codec::decode_value(&mut value, target_schema.num_columns()).unwrap();
+    let (_, value) = iter.current().unwrap().unwrap();
+    let decoded = value.decode(target_schema.num_columns()).unwrap();
     assert_eq!(decoded.columns().len(), 2);
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),
@@ -1050,9 +1049,8 @@ fn test_compaction_materializes_schema_barriers_with_vlog_values() {
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (_, mut value) = iter.current().unwrap().unwrap();
-    let value =
-        crate::sst::row_codec::decode_value(&mut value, target_schema.num_columns()).unwrap();
+    let (_, value) = iter.current().unwrap().unwrap();
+    let value = value.decode(target_schema.num_columns()).unwrap();
     assert_eq!(value.columns()[0].as_ref().unwrap().data().as_ref(), b"abc");
     assert_eq!(value.columns()[1].as_ref().unwrap().data().as_ref(), b"one");
     assert_eq!(value.columns()[2].as_ref().unwrap().data().as_ref(), b"two");
@@ -1144,8 +1142,8 @@ fn test_compaction_keeps_target_schema_when_schema_evolves_after_task_creation()
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (_, mut value) = iter.current().unwrap().unwrap();
-    let decoded = crate::sst::row_codec::decode_value(&mut value, old_num_columns).unwrap();
+    let (_, value) = iter.current().unwrap().unwrap();
+    let decoded = value.decode(old_num_columns).unwrap();
     assert_eq!(decoded.columns().len(), 1);
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),

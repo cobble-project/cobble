@@ -23,8 +23,8 @@ use crate::metrics_manager::MetricsManager;
 use crate::parquet::ParquetIterator;
 use crate::row_merge::SchemaValue;
 use crate::schema::{DEFAULT_COLUMN_FAMILY_ID, Schema, SchemaManager};
-use crate::sst::row_codec::{decode_value, decode_value_masked};
 use crate::sst::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions, SSTPointReader};
+use crate::r#type::EncodedValue;
 use crate::r#type::{key_bucket, key_column_family};
 use crate::util::column_mask_last_byte;
 use bytes::Bytes;
@@ -1673,7 +1673,7 @@ impl LSMTree {
                     && let Some(current_key) = iter.key()?
                     && current_key.as_ref() == encoded_key
                 {
-                    iter.value()?
+                    iter.value()?.map(|bytes| EncodedValue::new(bytes, true))
                 } else {
                     None
                 }
@@ -1715,7 +1715,7 @@ impl LSMTree {
         mut terminal_mask: Option<&mut [u8]>,
         decode_mask: &mut [u8],
         out_values: &mut Vec<SchemaValue>,
-        value_bytes_opt: Option<Bytes>,
+        value_bytes_opt: Option<EncodedValue>,
     ) -> Result<bool> {
         let num_columns = target_schema
             .num_columns_in_family(column_family_id)
@@ -1725,9 +1725,7 @@ impl LSMTree {
         if let Some(value_bytes) = value_bytes_opt {
             let is_target_schema = file.schema_id == target_schema_id;
             let value = if is_target_schema {
-                let mut value_bytes = value_bytes;
-                let value = decode_value_masked(
-                    &mut value_bytes,
+                let value = value_bytes.decode_masked(
                     num_columns,
                     decode_mask,
                     terminal_mask.as_deref_mut(),
@@ -1737,8 +1735,7 @@ impl LSMTree {
                 }
                 value
             } else {
-                let mut value_bytes = value_bytes;
-                let value = decode_value(&mut value_bytes, source_num_columns)?;
+                let value = value_bytes.decode(source_num_columns)?;
                 if self.ttl_provider.expired(&value.expired_at) {
                     return Ok(false);
                 }

@@ -1,6 +1,5 @@
 use crate::error::Result;
 use crate::iterator::KvIterator;
-use crate::sst::row_codec::decode_value_masked;
 use crate::r#type::{KvValue, Value};
 use bytes::Bytes;
 
@@ -43,9 +42,8 @@ impl<I> ColumnMaskingIterator<I> {
 
     fn mask_value(&self, kv_value: KvValue) -> Result<KvValue> {
         match kv_value {
-            KvValue::Encoded(mut value_bytes) => {
-                let value = decode_value_masked(
-                    &mut value_bytes,
+            KvValue::Encoded(value_bytes) => {
+                let value = value_bytes.decode_masked(
                     self.num_columns,
                     self.decode_mask.as_slice(),
                     None,

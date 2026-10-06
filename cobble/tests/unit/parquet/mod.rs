@@ -2,14 +2,68 @@ use super::*;
 use crate::cache::{BlockCache, BlockCacheKey, CachedBlock, MockCache};
 use crate::data_file::{DataFile, DataFileType};
 use crate::file::{FileSystemRegistry, RandomAccessFile, TrackedFileId};
-use crate::format::FileBuildResult;
+use crate::format::{FileBuildResult, FileBuilder};
 use crate::iterator::KvIterator;
 use crate::parquet::meta::decode_meta_row_group_ranges;
 use crate::sst::row_codec::{decode_value, encode_value};
-use crate::r#type::{Column, Value, ValueType};
+use crate::r#type::{Column, EncodedValue, KvValue, Value, ValueType};
+use bytes::Bytes;
 use parquet::file::reader::FileReader;
 use parquet::file::serialized_reader::SerializedFileReader;
 use std::sync::Arc;
+
+#[test]
+fn parquet_builder_accepts_both_encoded_ttl_layouts() {
+    for has_ttl in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let fs = FileSystemRegistry::new()
+            .get_or_register(format!("file://{}", directory.path().display()))
+            .unwrap();
+        let source = Value::new_with_expired_at(
+            vec![
+                Some(Column::new(ValueType::Put, Bytes::new())),
+                None,
+                Some(Column::new(
+                    ValueType::Merge,
+                    Bytes::from_static(b"payload"),
+                )),
+            ],
+            Some(123),
+        );
+        let bytes = encode_value(&source, 3);
+        let bytes = if has_ttl { bytes } else { bytes.slice(4..) };
+        let mut writer = ParquetWriter::with_options(
+            fs.open_write("layout.parquet").unwrap(),
+            ParquetWriterOptions {
+                num_columns: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        FileBuilder::add(
+            &mut writer,
+            b"key",
+            &KvValue::Encoded(EncodedValue::new(bytes, has_ttl)),
+        )
+        .unwrap();
+        writer.finish().unwrap();
+        let mut iter = ParquetIterator::new(fs.open_read("layout.parquet").unwrap()).unwrap();
+        iter.seek_to_first().unwrap();
+        let value = iter.take_value().unwrap().unwrap().into_decoded(3).unwrap();
+        assert_eq!(value.expired_at(), has_ttl.then_some(123));
+        for (expected, actual) in source.columns().iter().zip(value.columns()) {
+            match (expected, actual) {
+                (Some(expected), Some(actual)) => {
+                    assert_eq!(actual.value_type(), expected.value_type());
+                    assert_eq!(actual.data(), expected.data());
+                }
+                (None, None) => {}
+                _ => panic!("column presence changed"),
+            }
+        }
+        assert!(!iter.next().unwrap());
+    }
+}
 
 fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);

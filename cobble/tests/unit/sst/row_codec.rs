@@ -422,9 +422,9 @@ fn test_sst_key_value_codec() {
 
         // First entry: user:1 with name="Alice", email="alice@example.com"
         assert!(iter.valid());
-        let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+        let (mut key_bytes, value_bytes) = iter.current().unwrap().unwrap();
         let decoded_key = decode_key(&mut key_bytes).unwrap();
-        let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
+        let decoded_value = value_bytes.decode(num_columns).unwrap();
         let decoded_cols = decoded_value.columns();
 
         assert_eq!(decoded_key.bucket(), 1);
@@ -441,9 +441,9 @@ fn test_sst_key_value_codec() {
         // Second entry: user:2 with name="Bob", email=None
         iter.next().unwrap();
         assert!(iter.valid());
-        let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+        let (mut key_bytes, value_bytes) = iter.current().unwrap().unwrap();
         let decoded_key = decode_key(&mut key_bytes).unwrap();
-        let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
+        let decoded_value = value_bytes.decode(num_columns).unwrap();
         let decoded_cols = decoded_value.columns();
 
         assert_eq!(decoded_key.bucket(), 1);
@@ -455,9 +455,9 @@ fn test_sst_key_value_codec() {
         // Third entry: order:100 with all columns absent
         iter.next().unwrap();
         assert!(iter.valid());
-        let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+        let (mut key_bytes, value_bytes) = iter.current().unwrap().unwrap();
         let decoded_key = decode_key(&mut key_bytes).unwrap();
-        let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
+        let decoded_value = value_bytes.decode(num_columns).unwrap();
         let decoded_cols = decoded_value.columns();
 
         assert_eq!(decoded_key.bucket(), 2);
@@ -621,9 +621,9 @@ fn test_sst_key_value_codec_multiple_blocks() {
 
         let mut count = 0;
         while iter.valid() {
-            let (mut key_bytes, mut value_bytes) = iter.current().unwrap().unwrap();
+            let (mut key_bytes, value_bytes) = iter.current().unwrap().unwrap();
             let decoded_key = decode_key(&mut key_bytes).unwrap();
-            let decoded_value = decode_value(&mut value_bytes, num_columns).unwrap();
+            let decoded_value = value_bytes.decode(num_columns).unwrap();
             let decoded_cols = decoded_value.columns();
 
             assert_eq!(decoded_key.bucket(), count as u16);

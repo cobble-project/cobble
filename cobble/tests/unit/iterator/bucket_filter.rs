@@ -133,7 +133,7 @@ fn value_is_available_inside_range() {
     let Some(KvValue::Encoded(value)) = iter.take_value().unwrap() else {
         panic!("expected encoded value");
     };
-    assert_eq!(value.as_ref(), &20u16.to_be_bytes());
+    assert_eq!(value.bytes().as_ref(), &20u16.to_be_bytes());
 }
 
 #[test]

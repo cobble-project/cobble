@@ -109,7 +109,7 @@ impl<'a> KvIterator<'a> for SkiplistMemtableIter<'a> {
     fn take_value(&mut self) -> Result<Option<KvValue>> {
         Ok(self
             .current_value
-            .map(|v| KvValue::Encoded(unsafe_bytes(v))))
+            .map(|v| KvValue::encoded(unsafe_bytes(v))))
     }
 }
 

@@ -71,7 +71,7 @@ impl<'a> KvIterator<'a> for MockIterator {
 
     fn take_value(&mut self) -> crate::error::Result<Option<KvValue>> {
         if self.valid() {
-            Ok(Some(KvValue::Encoded(self.entries[self.index].1.clone())))
+            Ok(Some(KvValue::encoded(self.entries[self.index].1.clone())))
         } else {
             Ok(None)
         }

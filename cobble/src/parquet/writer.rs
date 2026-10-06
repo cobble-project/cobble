@@ -363,7 +363,16 @@ impl<W: SequentialWriteFile + Send> ParquetWriter<W> {
 impl<W: SequentialWriteFile + Send + 'static> FileBuilder for ParquetWriter<W> {
     fn add(&mut self, key: &[u8], value: &KvValue) -> Result<()> {
         match value {
-            KvValue::Encoded(bytes) => ParquetWriter::add(self, key, bytes),
+            KvValue::Encoded(bytes) => {
+                let decoded = bytes.clone().decode(self.options.num_columns)?;
+                let encoded_len = bytes.bytes().len() + if bytes.has_ttl() { 0 } else { 4 };
+                self.add_value(
+                    key,
+                    &decoded,
+                    key.len() + encoded_len,
+                    self.options.num_columns,
+                )
+            }
             KvValue::Decoded(v) => {
                 // Estimate entry size for row group flushing decisions.
                 let value_bytes_estimate = v

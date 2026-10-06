@@ -155,6 +155,10 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
     /// Add a key-value pair to the SST file
     /// Keys must be added in sorted order
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.add_encoded(key, value, true)
+    }
+
+    fn add_encoded(&mut self, key: &[u8], value: &[u8], has_ttl: bool) -> Result<()> {
         self.refresh_hot_block_observation();
 
         // Ensure keys are added in sorted order
@@ -175,9 +179,11 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
             self.current_block_first_key = Some(key.to_vec());
         }
 
-        let normalized_value = if self.options.value_has_ttl {
+        // Only a no-TTL source written to a TTL target needs a synthetic header.
+        let with_ttl;
+        let normalized_value = if self.options.value_has_ttl == has_ttl {
             value
-        } else {
+        } else if has_ttl {
             if value.len() < 4 {
                 return Err(Error::IoError(format!(
                     "Invalid encoded value for no-ttl SST writer: expected >= 4 bytes, got {}",
@@ -185,6 +191,12 @@ impl<W: SequentialWriteFile> SSTWriter<W> {
                 )));
             }
             &value[4..]
+        } else {
+            let mut bytes = BytesMut::with_capacity(value.len() + 4);
+            bytes.put_u32_le(0);
+            bytes.extend_from_slice(value);
+            with_ttl = bytes;
+            with_ttl.as_ref()
         };
 
         // Add to current data block
@@ -558,7 +570,7 @@ impl<W: SequentialWriteFile + 'static> FileBuilder for SSTWriter<W> {
             Ok(None) | Err(_) => self.has_no_ttl_entry = true,
         }
         match value {
-            KvValue::Encoded(bytes) => SSTWriter::add(self, key, bytes),
+            KvValue::Encoded(bytes) => self.add_encoded(key, bytes.bytes(), bytes.has_ttl()),
             KvValue::Decoded(v) => {
                 let encoded = encode_value(v, v.columns().len());
                 SSTWriter::add(self, key, &encoded)

@@ -6,7 +6,7 @@ use crate::format::FileBuildResult;
 use crate::iterator::SortedRun;
 use crate::lsm::{LSMTree, LSMTreeVersion, Level};
 use crate::metrics_manager::MetricsManager;
-use crate::sst::row_codec::{decode_value, encode_key, encode_value};
+use crate::sst::row_codec::{encode_key, encode_value};
 use crate::sst::{SSTIterator, SSTIteratorOptions, SSTWriter, SSTWriterOptions};
 use crate::r#type::{Column, Key, Value, ValueType};
 use crate::vlog::VlogVersion;
@@ -203,9 +203,9 @@ fn test_local_compaction_worker_uses_tree_scope_column_family_width() {
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (key, mut value) = iter.current().unwrap().unwrap();
+    let (key, value) = iter.current().unwrap().unwrap();
     assert_eq!(key.as_ref(), expected_key.as_slice());
-    let decoded = decode_value(&mut value, num_columns).unwrap();
+    let decoded = value.decode(num_columns).unwrap();
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),
         b"v1"

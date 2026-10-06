@@ -976,8 +976,8 @@ fn test_memtable_flush_deduplicates() {
     iter.seek_to_first().unwrap();
     let mut entries = Vec::new();
     while iter.valid() {
-        let (key, mut value) = iter.current().unwrap().unwrap();
-        let decoded = decode_value(&mut value, num_columns).unwrap();
+        let (key, value) = iter.current().unwrap().unwrap();
+        let decoded = value.decode(num_columns).unwrap();
         let raw = decoded
             .columns()
             .first()
@@ -1190,8 +1190,8 @@ fn test_memtable_flush_with_separated_value() {
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (_, mut value) = iter.current().unwrap().unwrap();
-    let decoded = decode_value(&mut value, 1).unwrap();
+    let (_, value) = iter.current().unwrap().unwrap();
+    let decoded = value.decode(1).unwrap();
     let column = decoded.columns()[0].as_ref().unwrap();
     assert_eq!(column.value_type, ValueType::PutSeparated);
     assert_eq!(column.data().len(), 8);
@@ -1743,8 +1743,8 @@ fn test_memtable_schema_change_triggers_flush_and_preserves_flush_schema() {
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (_, mut value) = iter.current().unwrap().unwrap();
-    let decoded = decode_value(&mut value, 2).unwrap();
+    let (_, value) = iter.current().unwrap().unwrap();
+    let decoded = value.decode(2).unwrap();
     assert_eq!(decoded.columns().len(), 2);
     assert_eq!(
         decoded.columns()[0].as_ref().unwrap().data().as_ref(),

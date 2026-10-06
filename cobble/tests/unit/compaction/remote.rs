@@ -248,7 +248,7 @@ fn create_test_parquet(
     }));
     let mut writer = factory(Box::new(writer_file));
     for (key, value) in entries {
-        writer.add(&key, &KvValue::Encoded(Bytes::from(value)))?;
+        writer.add(&key, &KvValue::encoded(Bytes::from(value)))?;
     }
     let FileBuildResult {
         first_key,
@@ -1052,8 +1052,8 @@ fn test_remote_compaction_transforms_cross_process_with_unpersisted_chain() {
     )
     .unwrap();
     iter.seek_to_first().unwrap();
-    let (_, mut value) = iter.current().unwrap().unwrap();
-    let value = decode_value(&mut value, target_schema.num_columns()).unwrap();
+    let (_, value) = iter.current().unwrap().unwrap();
+    let value = value.decode(target_schema.num_columns()).unwrap();
     assert_eq!(
         value.columns()[0].as_ref().unwrap().data().as_ref(),
         b"n=42"
@@ -1289,8 +1289,8 @@ fn test_remote_compaction_with_u64_counter_merge_operator_in_non_default_family(
         .unwrap();
         iter.seek_to_first().unwrap();
         while iter.valid() {
-            let (key, mut value) = iter.current().unwrap().unwrap();
-            let decoded = decode_value(&mut value, num_columns).unwrap();
+            let (key, value) = iter.current().unwrap().unwrap();
+            let decoded = value.decode(num_columns).unwrap();
             let bytes = decoded.columns()[0].as_ref().unwrap().data();
             let merged = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
             actual.insert(key.to_vec(), merged);

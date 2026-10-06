@@ -104,7 +104,7 @@ impl<'a> KvIterator<'a> for BoundaryMockIterator {
         Ok(self
             .entries
             .get(self.index)
-            .map(|(_, value)| KvValue::Encoded(value.clone())))
+            .map(|(_, value)| KvValue::encoded(value.clone())))
     }
 
     fn set_stop_at_block_boundary(&mut self, enabled: bool) {
