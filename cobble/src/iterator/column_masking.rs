@@ -4,6 +4,15 @@ use crate::sst::row_codec::decode_value_masked;
 use crate::r#type::{KvValue, Value};
 use bytes::Bytes;
 
+// Identity projection requires the original order and width, not just the same set of indices.
+pub(crate) fn selects_all_columns(columns: &[usize], num_columns: usize) -> bool {
+    columns.iter().copied().eq(0..num_columns)
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/iterator/column_masking.rs"]
+mod tests;
+
 pub(crate) struct ColumnMaskingIterator<I> {
     inner: I,
     num_columns: usize,

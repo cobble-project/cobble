@@ -23,7 +23,7 @@ mod vlog_seq_offset;
 #[allow(unused_imports)]
 pub(crate) use bucket_filter::BucketFilterIterator;
 #[allow(unused_imports)]
-pub(crate) use column_masking::ColumnMaskingIterator;
+pub(crate) use column_masking::{ColumnMaskingIterator, selects_all_columns};
 #[allow(unused_imports)]
 pub(crate) use deduplicating::DeduplicatingIterator;
 #[allow(unused_imports)]
