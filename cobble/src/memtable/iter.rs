@@ -118,6 +118,6 @@ impl<'a> KvIterator<'a> for OrderedMemtableKvIterator<'a> {
         // will be converted to decoded value before returning, so it's also safe.
         Ok(self
             .current_value
-            .map(|v| KvValue::Encoded(unsafe_bytes(v))))
+            .map(|v| KvValue::encoded(unsafe_bytes(v))))
     }
 }

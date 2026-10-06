@@ -11,10 +11,10 @@ use crate::sst::bloom::BloomFilter;
 use crate::sst::compression::{decode_block_bytes, verify_block_checksum};
 use crate::sst::format::{Block, FOOTER_SIZE, Footer, SstReadMetadata};
 use crate::sst::read::read_metadata_block;
-use crate::sst::row_codec::{decode_key, decode_value, encode_key};
-use crate::r#type::{Key, KvValue, Value};
+use crate::sst::row_codec::{decode_key, encode_key};
+use crate::r#type::{EncodedValue, Key, KvValue, Value};
 use crate::util::unsafe_bytes;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use metrics::{Counter, counter};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -189,18 +189,6 @@ enum BoundaryState {
 }
 
 impl SSTIterator {
-    #[inline]
-    fn normalized_encoded_value(&self, value: Bytes) -> Bytes {
-        if self.footer.value_has_ttl {
-            return value;
-        }
-        let mut out = BytesMut::with_capacity(value.len() + 4);
-        out.put_u32_le(0);
-        // todo: avoid copy when ttl is null
-        out.extend_from_slice(value.as_ref());
-        out.freeze()
-    }
-
     pub(crate) fn with_cache_and_file(
         file: Box<dyn RandomAccessFile>,
         data_file: &DataFile,
@@ -1087,14 +1075,17 @@ impl SSTIterator {
     }
 
     /// Get the current key-value pair
-    pub fn current(&self) -> Result<Option<(Bytes, Bytes)>> {
+    pub fn current(&self) -> Result<Option<(Bytes, EncodedValue)>> {
         let Some(key) = self.materialize_current_key()? else {
             return Ok(None);
         };
         let Some(value) = self.materialize_current_value()? else {
             return Ok(None);
         };
-        Ok(Some((key, self.normalized_encoded_value(value))))
+        Ok(Some((
+            key,
+            EncodedValue::new(value, self.footer.value_has_ttl),
+        )))
     }
 
     /// Get the current key only
@@ -1103,10 +1094,10 @@ impl SSTIterator {
     }
 
     /// Get the current value only
-    pub fn value(&self) -> Result<Option<Bytes>> {
+    pub fn value(&self) -> Result<Option<EncodedValue>> {
         Ok(self
             .materialize_current_value()?
-            .map(|value| self.normalized_encoded_value(value)))
+            .map(|value| EncodedValue::new(value, self.footer.value_has_ttl)))
     }
 
     /// Move to the next entry
@@ -1164,8 +1155,8 @@ impl SSTIterator {
     /// Get the current typed Value, decoding from the row codec format.
     /// Returns a Value containing optional columns.
     pub fn current_value(&self) -> Result<Option<Value>> {
-        if let Some(mut bytes) = self.value()? {
-            let value = decode_value(&mut bytes, self.options.num_columns)?;
+        if let Some(bytes) = self.value()? {
+            let value = bytes.decode(self.options.num_columns)?;
             return Ok(Some(value));
         }
         Ok(None)
@@ -1173,9 +1164,9 @@ impl SSTIterator {
 
     /// Get the current typed Key and Value pair, decoding from the row codec format.
     pub fn current_kv(&self) -> Result<Option<(Key, Value)>> {
-        if let Some((mut key_bytes, mut value_bytes)) = self.current()? {
+        if let Some((mut key_bytes, value_bytes)) = self.current()? {
             let key = decode_key(&mut key_bytes)?;
-            let value = decode_value(&mut value_bytes, self.options.num_columns)?;
+            let value = value_bytes.decode(self.options.num_columns)?;
             return Ok(Some((key, value)));
         }
         Ok(None)

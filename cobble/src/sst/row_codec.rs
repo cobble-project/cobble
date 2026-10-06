@@ -129,14 +129,8 @@ fn value_type_is_terminal(byte: u8) -> Result<bool> {
 }
 
 pub(crate) fn value_expired_at(data: &[u8]) -> Result<Option<u32>> {
-    if data.len() < 4 {
-        return Err(Error::IoError(format!(
-            "Value data too small: expected at least 4 bytes for expired_at, got {}",
-            data.len()
-        )));
-    }
     let mut buf = data;
-    let expired_at = buf.get_u32_le();
+    let expired_at = read_expired_at(&mut buf, true)?;
     if expired_at == 0 {
         Ok(None)
     } else {
@@ -144,14 +138,13 @@ pub(crate) fn value_expired_at(data: &[u8]) -> Result<Option<u32>> {
     }
 }
 
-pub(crate) fn value_is_terminal(data: &[u8], num_columns: usize) -> Result<bool> {
-    if data.len() < 4 {
-        return Err(Error::IoError(format!(
-            "Value data too small: expected at least 4 bytes for expired_at, got {}",
-            data.len()
-        )));
-    }
-    let mut buf = &data[4..];
+pub(crate) fn value_is_terminal_with_ttl(
+    data: &[u8],
+    num_columns: usize,
+    has_ttl: bool,
+) -> Result<bool> {
+    let mut buf = data;
+    read_expired_at(&mut buf, has_ttl)?;
     let bmp_size = bitmap_size(num_columns);
     if buf.len() < bmp_size {
         return Err(Error::IoError(format!(
@@ -206,6 +199,19 @@ pub(crate) fn value_is_terminal(data: &[u8], num_columns: usize) -> Result<bool>
     }
 
     Ok(true)
+}
+
+fn read_expired_at(data: &mut impl Buf, has_ttl: bool) -> Result<u32> {
+    if !has_ttl {
+        return Ok(0);
+    }
+    if data.remaining() < 4 {
+        return Err(Error::IoError(format!(
+            "Value data too small: expected at least 4 bytes for expired_at, got {}",
+            data.remaining()
+        )));
+    }
+    Ok(data.get_u32_le())
 }
 
 /// Encodes a Value to bytes with optional columns.
@@ -290,13 +296,15 @@ fn encode_value_columns_into<C: ColumnRef>(
 /// # Returns
 /// A Value containing optional columns, where `None` indicates an absent column.
 pub(crate) fn decode_value(data: &mut Bytes, num_columns: usize) -> Result<Value> {
-    if data.len() < 4 {
-        return Err(Error::IoError(format!(
-            "Value data too small: expected at least 4 bytes for expired_at, got {}",
-            data.len()
-        )));
-    }
-    let expired_at = data.get_u32_le();
+    decode_value_with_ttl(data, num_columns, true)
+}
+
+pub(crate) fn decode_value_with_ttl(
+    data: &mut Bytes,
+    num_columns: usize,
+    has_ttl: bool,
+) -> Result<Value> {
+    let expired_at = read_expired_at(data, has_ttl)?;
     let bmp_size = bitmap_size(num_columns);
 
     if data.len() < bmp_size {
@@ -386,15 +394,19 @@ pub(crate) fn decode_value_masked(
     data: &mut Bytes,
     num_columns: usize,
     decode_mask: &[u8],
-    mut terminal_mask: Option<&mut [u8]>,
+    terminal_mask: Option<&mut [u8]>,
 ) -> Result<Value> {
-    if data.len() < 4 {
-        return Err(Error::IoError(format!(
-            "Value data too small: expected at least 4 bytes for expired_at, got {}",
-            data.len()
-        )));
-    }
-    let expired_at = data.get_u32_le();
+    decode_value_masked_with_ttl(data, num_columns, decode_mask, terminal_mask, true)
+}
+
+pub(crate) fn decode_value_masked_with_ttl(
+    data: &mut Bytes,
+    num_columns: usize,
+    decode_mask: &[u8],
+    mut terminal_mask: Option<&mut [u8]>,
+    has_ttl: bool,
+) -> Result<Value> {
+    let expired_at = read_expired_at(data, has_ttl)?;
 
     let mask_size = bitmap_size(num_columns).max(1);
     if decode_mask.len() < mask_size {

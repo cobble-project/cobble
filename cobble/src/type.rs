@@ -116,45 +116,76 @@ pub(crate) struct RefValue<'a> {
     pub(crate) expired_at: Option<u32>,
 }
 
-/// Value representation carried through the storage iterator pipeline.
-///
-/// SST and memtable iterators naturally produce row-codec bytes, while schema evolution, merge
-/// operators, and Parquet may require structured columns. Keeping the representation explicit lets
-/// pass-through paths retain the original bytes and confines conversion to the first consumer that
-/// actually needs the other form.
+/// Owning row-codec bytes and their physical TTL-header layout.
+/// No-TTL SST slices retain their block allocation instead of copying in a zero TTL header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EncodedValue {
+    bytes: Bytes,
+    has_ttl: bool,
+}
+
+impl EncodedValue {
+    pub(crate) fn new(bytes: Bytes, has_ttl: bool) -> Self {
+        Self { bytes, has_ttl }
+    }
+
+    pub(crate) fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    pub(crate) fn has_ttl(&self) -> bool {
+        self.has_ttl
+    }
+
+    pub(crate) fn decode(mut self, num_columns: usize) -> Result<Value> {
+        crate::sst::row_codec::decode_value_with_ttl(&mut self.bytes, num_columns, self.has_ttl)
+    }
+
+    pub(crate) fn decode_masked(
+        mut self,
+        num_columns: usize,
+        decode_mask: &[u8],
+        terminal_mask: Option<&mut [u8]>,
+    ) -> Result<Value> {
+        crate::sst::row_codec::decode_value_masked_with_ttl(
+            &mut self.bytes,
+            num_columns,
+            decode_mask,
+            terminal_mask,
+            self.has_ttl,
+        )
+    }
+}
+
+/// Values carried through iterators, retaining encoded bytes until a consumer needs columns.
 pub(crate) enum KvValue {
     /// Complete row-codec bytes, including the TTL header when the source format stores one.
-    Encoded(Bytes),
+    Encoded(EncodedValue),
     /// Structured columns after decoding, schema evolution, or merge evaluation.
     Decoded(Value),
 }
 
 impl KvValue {
+    /// Memtables and canonical row-codec producers always include a TTL header.
+    pub(crate) fn encoded(bytes: Bytes) -> Self {
+        Self::Encoded(EncodedValue::new(bytes, true))
+    }
+
     /// Returns true if this is an encoded value.
     #[inline]
     pub(crate) fn is_encoded(&self) -> bool {
         matches!(self, KvValue::Encoded(_))
     }
 
-    /// Consumes this KvValue and returns encoded bytes.
-    /// If already Encoded, returns the bytes directly (no copy).
-    /// If Decoded, encodes using the row codec format.
-    pub(crate) fn into_encoded(self, num_columns: usize) -> Bytes {
-        match self {
-            KvValue::Encoded(b) => b,
-            KvValue::Decoded(v) => {
-                use crate::sst::row_codec::encode_value;
-                encode_value(&v, num_columns)
-            }
-        }
-    }
-
-    /// Consumes this KvValue and returns the encoded bytes, panicking if Decoded.
-    /// Use only when the variant is known to be Encoded.
+    /// Takes canonical memtable row-codec bytes without copying.
+    /// Panics for decoded values or a source that omits the TTL header.
     #[inline]
     pub(crate) fn unwrap_encoded(self) -> Bytes {
         match self {
-            KvValue::Encoded(b) => b,
+            KvValue::Encoded(b) => {
+                assert!(b.has_ttl, "expected canonical value with TTL header");
+                b.bytes
+            }
             KvValue::Decoded(_) => panic!("expected KvValue::Encoded, got Decoded"),
         }
     }
@@ -164,10 +195,7 @@ impl KvValue {
     /// If Encoded, decodes using the row codec format.
     pub(crate) fn into_decoded(self, num_columns: usize) -> Result<Value> {
         match self {
-            KvValue::Encoded(mut b) => {
-                use crate::sst::row_codec::decode_value;
-                decode_value(&mut b, num_columns)
-            }
+            KvValue::Encoded(b) => b.decode(num_columns),
             KvValue::Decoded(v) => Ok(v),
         }
     }
@@ -177,7 +205,11 @@ impl KvValue {
         match self {
             KvValue::Encoded(b) => {
                 use crate::sst::row_codec::value_expired_at;
-                value_expired_at(b)
+                if b.has_ttl {
+                    value_expired_at(&b.bytes)
+                } else {
+                    Ok(None)
+                }
             }
             KvValue::Decoded(v) => Ok(v.expired_at),
         }
@@ -187,8 +219,8 @@ impl KvValue {
     pub(crate) fn is_terminal(&self, num_columns: usize) -> Result<bool> {
         match self {
             KvValue::Encoded(b) => {
-                use crate::sst::row_codec::value_is_terminal;
-                value_is_terminal(b, num_columns)
+                use crate::sst::row_codec::value_is_terminal_with_ttl;
+                value_is_terminal_with_ttl(&b.bytes, num_columns, b.has_ttl)
             }
             KvValue::Decoded(v) => Ok(v.is_terminal()),
         }

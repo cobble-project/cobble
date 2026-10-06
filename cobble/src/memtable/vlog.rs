@@ -56,7 +56,7 @@ pub(crate) fn rewrite_kv_value_for_flush(
             Ok((KvValue::Decoded(value), separated))
         }
         KvValue::Encoded(bytes) => {
-            let value = KvValue::Encoded(bytes.clone()).into_decoded(num_columns)?;
+            let value = bytes.clone().decode(num_columns)?;
             let (value, separated) =
                 rewrite_value_columns_for_flush(value, vlog_store, writer, edit)?;
             if separated == 0 {

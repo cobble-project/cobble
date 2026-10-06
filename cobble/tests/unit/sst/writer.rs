@@ -3,7 +3,82 @@ use crate::data_file::DataFile;
 use crate::file::FileSystemRegistry;
 use crate::format::FileBuilder;
 use crate::sst::{SSTIterator, SSTIteratorOptions};
-use crate::r#type::Column;
+use crate::r#type::{Column, EncodedValue, ValueType};
+use bytes::Bytes;
+
+#[test]
+fn encoded_value_rewrite_preserves_source_and_target_ttl_layouts() {
+    for source_has_ttl in [false, true] {
+        for target_has_ttl in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let fs = FileSystemRegistry::new()
+                .get_or_register(format!("file://{}", directory.path().display()))
+                .unwrap();
+            let mut writer = SSTWriter::new(
+                fs.open_write("rewrite.sst").unwrap(),
+                SSTWriterOptions {
+                    value_has_ttl: target_has_ttl,
+                    ..Default::default()
+                },
+            );
+            for (key, value_type, data) in [
+                (b"a".as_slice(), ValueType::Put, b"payload".as_slice()),
+                (b"b".as_slice(), ValueType::Put, b"".as_slice()),
+                (b"c".as_slice(), ValueType::Delete, b"".as_slice()),
+            ] {
+                let source = Value::new_with_expired_at(
+                    vec![Some(Column::new(value_type, Bytes::copy_from_slice(data)))],
+                    Some(123),
+                );
+                let bytes = encode_value(&source, 1);
+                let bytes = if source_has_ttl {
+                    bytes
+                } else {
+                    bytes.slice(4..)
+                };
+                FileBuilder::add(
+                    &mut writer,
+                    key,
+                    &KvValue::Encoded(EncodedValue::new(bytes, source_has_ttl)),
+                )
+                .unwrap();
+            }
+            writer.finish().unwrap();
+            let mut iter = SSTIterator::with_cache(
+                fs.open_read("rewrite.sst").unwrap(),
+                0,
+                SSTIteratorOptions::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            iter.seek_to_first().unwrap();
+            for (key, value_type, data) in [
+                (b"a".as_slice(), ValueType::Put, b"payload".as_slice()),
+                (b"b".as_slice(), ValueType::Put, b"".as_slice()),
+                (b"c".as_slice(), ValueType::Delete, b"".as_slice()),
+            ] {
+                assert_eq!(iter.key().unwrap().unwrap().as_ref(), key);
+                let encoded = iter.value().unwrap().unwrap();
+                assert_eq!(encoded.has_ttl(), target_has_ttl);
+                assert_eq!(
+                    encoded.bytes().len(),
+                    1 + data.len() + if target_has_ttl { 4 } else { 0 }
+                );
+                let decoded = encoded.decode(1).unwrap();
+                assert_eq!(
+                    decoded.expired_at(),
+                    (source_has_ttl && target_has_ttl).then_some(123)
+                );
+                let column = decoded.columns()[0].as_ref().unwrap();
+                assert_eq!(column.value_type(), &value_type);
+                assert_eq!(column.data().as_ref(), data);
+                iter.next().unwrap();
+            }
+            assert!(!iter.valid());
+        }
+    }
+}
 
 #[test]
 fn test_sst_writer_default_buffer_size() {
@@ -145,7 +220,7 @@ fn test_sst_writer_multiple_blocks() {
         let value = format!("value{:03}_with_some_extra_data_to_fill_space", i);
         let (actual_key, actual_value) = iter.current().unwrap().unwrap();
         assert_eq!(actual_key.as_ref(), key.as_bytes());
-        assert_eq!(actual_value.as_ref(), value.as_bytes());
+        assert_eq!(actual_value.bytes().as_ref(), value.as_bytes());
         iter.next().unwrap();
     }
     assert!(!iter.valid());

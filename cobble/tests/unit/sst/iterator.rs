@@ -5,6 +5,7 @@ use crate::file::{File, FileSystemRegistry};
 use crate::format::FileBuildResult;
 use crate::sst::format::{BlockBuilder, Footer};
 use crate::sst::writer::{SSTWriter, SSTWriterOptions};
+use bytes::BytesMut;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub(crate) struct SSTIteratorTestCache {
@@ -379,15 +380,15 @@ fn test_sst_iterator_basic() {
             match count {
                 1 => {
                     assert_eq!(&key[..], b"key1");
-                    assert_eq!(&value[..], b"value1");
+                    assert_eq!(value.bytes().as_ref(), b"value1");
                 }
                 2 => {
                     assert_eq!(&key[..], b"key2");
-                    assert_eq!(&value[..], b"value2");
+                    assert_eq!(value.bytes().as_ref(), b"value2");
                 }
                 3 => {
                     assert_eq!(&key[..], b"key3");
-                    assert_eq!(&value[..], b"value3");
+                    assert_eq!(value.bytes().as_ref(), b"value3");
                 }
                 _ => panic!("Too many entries"),
             }
@@ -442,7 +443,7 @@ fn test_sst_iterator_with_compression() {
         iter.seek_to_first().unwrap();
         let (key, value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"key1");
-        assert_eq!(&value[..], b"value1");
+        assert_eq!(value.bytes().as_ref(), b"value1");
     }
 
     let _ = std::fs::remove_dir_all("/tmp/sst_compressed_test");
@@ -500,21 +501,21 @@ fn test_sst_iterator_seek() {
         assert!(iter.valid());
         let (key, value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"key0003");
-        assert_eq!(&value[..], b"value0003");
+        assert_eq!(value.bytes().as_ref(), b"value0003");
 
         // Seek to key between entries
         iter.seek(b"key0004").unwrap();
         assert!(iter.valid());
         let (key, value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"key0005");
-        assert_eq!(&value[..], b"value0005");
+        assert_eq!(value.bytes().as_ref(), b"value0005");
 
         // Seek to first
         iter.seek(b"key0000").unwrap();
         assert!(iter.valid());
         let (key, value) = iter.current().unwrap().unwrap();
         assert_eq!(&key[..], b"key0001");
-        assert_eq!(&value[..], b"value0001");
+        assert_eq!(value.bytes().as_ref(), b"value0001");
     }
 
     let _ = std::fs::remove_dir_all("/tmp/sst_test");
@@ -600,7 +601,7 @@ fn test_sst_iterator_prefix_scan_reuses_current_key_across_next() {
             assert_eq!(borrowed_key, expected_key.as_bytes());
             let (current_key, current_value) = iter.current().unwrap().unwrap();
             assert_eq!(current_key.as_ref(), expected_key.as_bytes());
-            assert_eq!(current_value.as_ref(), expected_value.as_bytes());
+            assert_eq!(current_value.bytes().as_ref(), expected_value.as_bytes());
             if idx < 5 {
                 assert!(iter.next().unwrap());
             } else {
@@ -675,7 +676,7 @@ fn test_sst_seek_preserves_decoded_key_and_invalidates_old_position() {
                     );
                 }
                 assert_eq!(iter.key().unwrap().unwrap().as_ref(), keys[idx].as_bytes());
-                assert_eq!(iter.current().unwrap().unwrap().1.as_ref(), b"v");
+                assert_eq!(iter.current().unwrap().unwrap().1.bytes().as_ref(), b"v");
                 if idx + 1 < keys.len() {
                     assert!(iter.next().unwrap());
                     assert_eq!(
@@ -935,6 +936,12 @@ fn test_sst_typed_kv_without_ttl_header() {
             Some(12345),
         );
         writer.add_kv(&key, &value).unwrap();
+        writer
+            .add_kv(
+                &Key::new(1, b"user:2".to_vec()),
+                &Value::new(vec![Some(Column::new(ValueType::Put, b"Bob".to_vec()))]),
+            )
+            .unwrap();
         writer.finish().unwrap();
     }
 
@@ -952,8 +959,33 @@ fn test_sst_typed_kv_without_ttl_header() {
         )
         .unwrap();
         iter.seek_to_first().unwrap();
+        let raw = iter.materialize_current_value().unwrap().unwrap();
+        let encoded = <SSTIterator as KvIterator>::take_value(&mut iter)
+            .unwrap()
+            .unwrap();
+        let KvValue::Encoded(encoded) = encoded else {
+            panic!("expected encoded SST value");
+        };
+        assert!(!encoded.has_ttl());
+        assert_eq!(encoded.bytes().as_ptr(), raw.as_ptr());
+        assert_eq!(encoded.bytes().len(), raw.len());
+        assert_eq!(raw.len(), 1 + b"Alice".len());
+        let retained = encoded.clone();
         let value = iter.current_value().unwrap().unwrap();
         assert_eq!(value.expired_at(), None);
+        assert_eq!(
+            value.columns()[0].as_ref().unwrap().data().as_ref(),
+            b"Alice"
+        );
+        assert!(iter.next().unwrap());
+        assert_eq!(
+            iter.current_key().unwrap().unwrap().data().as_ref(),
+            b"user:2"
+        );
+        drop(iter);
+        drop(raw);
+        assert_eq!(retained.bytes().as_ptr(), encoded.bytes().as_ptr());
+        let value = retained.decode(1).unwrap();
         assert_eq!(
             value.columns()[0].as_ref().unwrap().data().as_ref(),
             b"Alice"

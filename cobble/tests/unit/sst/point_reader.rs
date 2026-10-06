@@ -2,9 +2,95 @@ use super::*;
 use crate::cache::CacheHandle;
 use crate::data_file::DataFileType;
 use crate::file::{File, FileSystemRegistry};
+use crate::sst::row_codec::encode_value;
 use crate::sst::{SSTIterator, SSTWriter, SSTWriterOptions};
+use crate::r#type::{Column, Value, ValueType};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+#[test]
+fn point_reader_no_ttl_retains_block_bytes_for_single_and_batch_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let fs = FileSystemRegistry::new()
+        .get_or_register(format!("file://{}", directory.path().display()))
+        .unwrap();
+    let mut writer = SSTWriter::new(
+        fs.open_write("no-ttl.sst").unwrap(),
+        SSTWriterOptions {
+            value_has_ttl: false,
+            ..Default::default()
+        },
+    );
+    let value = Value::new(vec![Some(Column::new(
+        ValueType::Put,
+        Bytes::from_static(b"payload"),
+    ))]);
+    writer.add(b"key", &encode_value(&value, 1)).unwrap();
+    writer.finish().unwrap();
+    let data_file = DataFile::new_untracked(
+        DataFileType::SSTable,
+        b"key".to_vec(),
+        b"key".to_vec(),
+        73,
+        0,
+        fs.open_read("no-ttl.sst").unwrap().size(),
+        0..=0,
+        0..=0,
+    );
+    let cache = Arc::new(RecordingCache::default());
+    let single = SSTPointReader::get_exact(
+        fs.open_read("no-ttl.sst").unwrap(),
+        &data_file,
+        SSTIteratorOptions::default(),
+        Some(cache.clone()),
+        b"key",
+    )
+    .unwrap()
+    .unwrap();
+    let block_bytes = {
+        let entries = cache.entries.lock().unwrap();
+        entries
+            .iter()
+            .find_map(|(key, entry)| {
+                if key.kind == BlockCacheKind::Data
+                    && let CachedBlock::Block(block) = entry
+                {
+                    block.get_exact(b"key").unwrap()
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    };
+    let batch = SSTPointReader::get_exact_many(
+        fs.open_read("no-ttl.sst").unwrap(),
+        &data_file,
+        SSTIteratorOptions::default(),
+        Some(cache.clone()),
+        &[b"key", b"missing", b"key"],
+        &[0, 0, 0],
+    )
+    .unwrap();
+    assert!(batch[1].is_none());
+    for encoded in [
+        &single,
+        batch[0].as_ref().unwrap(),
+        batch[2].as_ref().unwrap(),
+    ] {
+        assert!(!encoded.has_ttl());
+        assert_eq!(encoded.bytes().as_ptr(), block_bytes.as_ptr());
+        assert_eq!(encoded.bytes().len(), block_bytes.len());
+    }
+    drop(cache);
+    drop(block_bytes);
+    let decoded = single.decode(1).unwrap();
+    assert_eq!(decoded.expired_at(), None);
+    assert_eq!(
+        decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+        b"payload"
+    );
+}
 
 #[derive(Default)]
 struct RecordingCache {
@@ -154,6 +240,12 @@ fn get_exact_many_with_default_namespace(
         keys,
         &data_cache_namespaces,
     )
+    .map(|values| {
+        values
+            .into_iter()
+            .map(|value| value.map(|value| value.bytes().clone()))
+            .collect()
+    })
 }
 
 fn assert_only_data_block_cache_accesses(cache: &RecordingCache) {
@@ -385,7 +477,8 @@ fn point_reader_hits_and_misses_without_constructing_scan_state() {
             b"key002",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
     assert!(
@@ -414,7 +507,8 @@ fn point_reader_supports_unpartitioned_index_and_filter() {
             b"key001",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
     assert!(data_file.pinned_sst_read_metadata().is_some());
@@ -435,7 +529,8 @@ fn point_read_pin_is_reused_by_scan_and_compaction_style_iterators() {
             b"key002",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
     assert!(data_file.pinned_sst_read_metadata().is_some());
@@ -508,7 +603,8 @@ fn scan_created_pin_is_reused_by_point_read() {
             b"key002",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
     assert_only_data_block_cache_accesses(&recording_cache);
@@ -563,7 +659,8 @@ fn top_level_pin_keeps_partition_metadata_in_the_block_cache() {
             b"key002",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
 

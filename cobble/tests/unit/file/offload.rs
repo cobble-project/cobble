@@ -1242,7 +1242,8 @@ fn readonly_load_pins_eligible_sst_after_promotion_and_reuses_it() {
             b"key002",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
 }
@@ -1452,7 +1453,8 @@ fn readonly_load_pin_failure_keeps_promotion_and_allows_foreground_retry() {
             b"key001",
         )
         .unwrap()
-        .as_deref(),
+        .as_ref()
+        .map(|value| value.bytes().as_ref()),
         Some(b"value".as_slice())
     );
     assert!(data_file.pinned_sst_read_metadata().is_some());

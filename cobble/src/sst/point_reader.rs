@@ -9,8 +9,8 @@ use crate::sst::iterator::{SSTIterator, SSTIteratorMetrics, SSTIteratorOptions};
 use crate::sst::read::{
     indexed_block_location, read_bloom_filter, read_data_block, read_metadata_block,
 };
+use crate::r#type::EncodedValue;
 use crate::util::unsafe_bytes;
-use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -182,7 +182,7 @@ impl SSTPointReader {
         options: SSTIteratorOptions,
         block_cache: Option<BlockCache>,
         key: &[u8],
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<EncodedValue>> {
         let metrics = SSTIterator::metrics_for(&options);
         if let Some(metadata) = PinnedSstReadMetadata::get_or_load(
             file.as_ref(),
@@ -259,7 +259,7 @@ impl SSTPointReader {
         block_cache: Option<BlockCache>,
         keys: &[&[u8]],
         data_cache_namespaces: &[u64],
-    ) -> Result<Vec<Option<Bytes>>> {
+    ) -> Result<Vec<Option<EncodedValue>>> {
         if keys.len() != data_cache_namespaces.len() {
             return Err(Error::InvalidState(format!(
                 "SST batch key/cache namespace length mismatch: {} keys, {} namespaces",
@@ -348,7 +348,7 @@ impl SSTPointReader {
         pinned: Option<&PinnedSstReadMetadata>,
         keys: &[&[u8]],
         data_cache_namespaces: &[u64],
-    ) -> Result<Vec<Option<Bytes>>> {
+    ) -> Result<Vec<Option<EncodedValue>>> {
         let footer = metadata.footer();
         if index_top.is_empty() {
             return Ok(vec![None; keys.len()]);
@@ -435,7 +435,7 @@ impl SSTPointReader {
             for slot in &request.key_slots {
                 out[*slot] = block
                     .get_exact(keys[*slot])?
-                    .map(|value| normalize_encoded_value(footer, value));
+                    .map(|value| EncodedValue::new(value, footer.value_has_ttl));
             }
         }
         Ok(out)
@@ -664,7 +664,7 @@ impl SSTPointReader {
         metrics: &SSTIteratorMetrics,
         metadata: Arc<PinnedSstReadMetadata>,
         key: &[u8],
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<EncodedValue>> {
         let footer = metadata.read_metadata().footer();
         let index_top = metadata.index_top();
         if index_top.is_empty() {
@@ -732,7 +732,7 @@ impl SSTPointReader {
         metadata: &SstReadMetadata,
         index_top: Arc<Block>,
         key: &[u8],
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<EncodedValue>> {
         let footer = metadata.footer();
         if index_top.is_empty() {
             return Ok(None);
@@ -791,7 +791,7 @@ impl SSTPointReader {
         footer: &Footer,
         partition: &Block,
         key: &[u8],
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<EncodedValue>> {
         let block_idx = partition.find_lower_or_equal_idx(&unsafe_bytes(key))?;
         let (offset, size) = indexed_block_location(partition, block_idx, "data")?;
         let cache_key = BlockCacheKey {
@@ -818,7 +818,7 @@ impl SSTPointReader {
         };
         Ok(block
             .get_exact(key)?
-            .map(|value| normalize_encoded_value(footer, value)))
+            .map(|value| EncodedValue::new(value, footer.value_has_ttl)))
     }
 }
 
@@ -970,16 +970,6 @@ fn load_cached_filter(
     } else {
         read_bloom_filter(file, offset, size)
     }
-}
-
-fn normalize_encoded_value(footer: &Footer, value: Bytes) -> Bytes {
-    if footer.value_has_ttl {
-        return value;
-    }
-    let mut out = BytesMut::with_capacity(value.len() + 4);
-    out.put_u32_le(0);
-    out.extend_from_slice(value.as_ref());
-    out.freeze()
 }
 
 #[cfg(test)]
