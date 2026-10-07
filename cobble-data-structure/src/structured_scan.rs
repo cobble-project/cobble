@@ -192,23 +192,20 @@ impl StructuredScanSplitScanner {
     where
         F: FnMut(&Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
     {
-        let structured_schema = Arc::clone(&self.structured_schema);
-        self.inner.consume_next_row(|key, columns| {
-            let decoded = decode_row(&structured_schema, 0, columns.to_vec())?;
-            consumer(key, &decoded)
-        })
+        let Some((_, key, columns)) = self.next().transpose()? else {
+            return Ok(None);
+        };
+        consumer(&key, &columns).map(Some)
     }
 
     pub fn consume_next_row_with_bucket<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
     where
         F: FnMut(u16, &Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
     {
-        let structured_schema = Arc::clone(&self.structured_schema);
-        self.inner
-            .consume_next_row_with_bucket(|bucket, key, columns| {
-                let decoded = decode_row(&structured_schema, 0, columns.to_vec())?;
-                consumer(bucket, key, &decoded)
-            })
+        let Some((bucket, key, columns)) = self.next().transpose()? else {
+            return Ok(None);
+        };
+        consumer(bucket, &key, &columns).map(Some)
     }
 }
 

@@ -159,7 +159,7 @@ pub use config::{
 pub use coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotRef};
 pub use db::{Db, ExpandStorageMode, RecoveryMode};
 pub use db_builder::DbBuilder;
-pub use db_iter::DbIterator;
+pub use db_iter::{BucketedRow, DbIterator};
 pub use error::{Error, Result};
 pub use file::{
     FastCopyDestination, File, FileSystem, FileSystemRegistry, ProcessFileSystemRegistry,

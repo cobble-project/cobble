@@ -5,7 +5,8 @@ use crate::{
     StructuredWriteOptions,
 };
 use cobble::{
-    CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata, VolumeDescriptor, VolumeUsageKind,
+    CoordinatorConfig, DbCoordinator, Error, ScanOptions, ShardSnapshotMetadata, VolumeDescriptor,
+    VolumeUsageKind,
 };
 use std::collections::BTreeMap;
 
@@ -158,14 +159,18 @@ fn test_structured_scan_split_scanner_consume_next_row() {
         .unwrap();
     coordinator.materialize_global_snapshot(&global).unwrap();
 
-    let mut scanner = StructuredScanPlan::new(global)
+    let plan = StructuredScanPlan::new(global);
+    let mut scanner = plan
         .splits()
         .remove(0)
-        .create_scanner(config, &StructuredScanOptions::default())
+        .create_scanner(config.clone(), &StructuredScanOptions::default())
         .unwrap();
+    let schema = Arc::clone(&scanner.structured_schema);
+    let schema_references = Arc::strong_count(&schema);
     let mut rows = Vec::new();
     while let Some(row) = scanner
         .consume_next_row_with_bucket(|bucket, key, columns| {
+            assert_eq!(Arc::strong_count(&schema), schema_references);
             Ok((bucket, key.clone(), columns.to_vec()))
         })
         .unwrap()
@@ -189,6 +194,54 @@ fn test_structured_scan_split_scanner_consume_next_row() {
         rows[1].2[0],
         Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v2")))
     );
+
+    for bucketed in [false, true] {
+        let options = StructuredScanOptions::from(ScanOptions::default().with_max_rows(2));
+        let mut scanner = plan.splits()[0]
+            .create_scanner(config.clone(), &options)
+            .unwrap();
+        let failure = if bucketed {
+            scanner.consume_next_row_with_bucket::<(), _>(|_, _, _| {
+                Err(Error::InputError("consumer failed".to_string()))
+            })
+        } else {
+            scanner.consume_next_row::<(), _>(|_, _| {
+                Err(Error::InputError("consumer failed".to_string()))
+            })
+        };
+        assert!(failure.is_err());
+        assert_eq!(
+            scanner
+                .consume_next_row(|key, _| Ok(key.clone()))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"k2"
+        );
+        assert!(
+            scanner
+                .consume_next_row_with_bucket(|_, _, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(scanner.next().is_none());
+    }
+
+    let mut scanner = plan.splits()[0]
+        .create_scanner(config, &StructuredScanOptions::for_column(1))
+        .unwrap();
+    let columns = scanner
+        .consume_next_row(|_, columns| Ok(columns.to_vec()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        columns,
+        vec![Some(StructuredColumnValue::List(vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+        ]))]
+    );
+    assert!(scanner.next().is_none());
 
     cleanup_root(root);
 }
