@@ -721,9 +721,12 @@ fn test_structured_db_iterator_consume_next_row() {
             &StructuredScanOptions::default(),
         )
         .unwrap();
+    let schema = Arc::clone(&iter.structured_schema);
+    let schema_references = Arc::strong_count(&schema);
     let mut rows = Vec::new();
     while let Some(row) = iter
         .consume_next_row_with_bucket(|bucket, key, columns| {
+            assert_eq!(Arc::strong_count(&schema), schema_references);
             Ok((bucket, key.clone(), columns.to_vec()))
         })
         .unwrap()
@@ -748,6 +751,158 @@ fn test_structured_db_iterator_consume_next_row() {
         Some(StructuredColumnValue::Bytes(Bytes::from_static(b"v2")))
     );
 
+    drop(iter);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_structured_owned_row_consumption_preserves_error_limits_and_projection() {
+    let root = format!("/tmp/ds_structured_owned_consume_{}", Uuid::new_v4());
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+        num_columns: 2,
+        ..Config::default()
+    };
+    let mut db = StructuredDb::open(config, vec![0..=0]).unwrap();
+    db.apply_schema(default_family_schema(BTreeMap::from([(
+        1,
+        StructuredColumnType::List(ListConfig::default()),
+    )])))
+    .unwrap();
+    db.db.put(0, b"k1", 1, b"invalid list").unwrap();
+    for key in [b"k2", b"k3"] {
+        db.put(0, key, 0, Bytes::from_static(b"value")).unwrap();
+        db.merge(0, key, 1, vec![Bytes::from_static(b"element")])
+            .unwrap();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    db.snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
+    let options = StructuredScanOptions::from(ScanOptions::for_column(1).with_max_rows(1));
+
+    {
+        let mut iter = db.scan_with_options(0, b"k0"..b"k9", &options).unwrap();
+        assert!(iter.consume_next_row(|_, _| Ok(())).is_err());
+        let schema = Arc::clone(&iter.structured_schema);
+        let schema_references = Arc::strong_count(&schema);
+        let row = iter
+            .consume_next_row(|key, columns| {
+                assert_eq!(Arc::strong_count(&schema), schema_references);
+                Ok((key.clone(), columns.to_vec()))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.0.as_ref(), b"k2");
+        assert_eq!(
+            row.1,
+            vec![Some(StructuredColumnValue::List(vec![Bytes::from_static(
+                b"element"
+            )]))]
+        );
+        assert!(iter.consume_next_row(|_, _| Ok(())).unwrap().is_none());
+
+        // The malformed row is already advanced, but non-bucket callback errors
+        // still leave the successful-row budget available for the next row.
+        let mut iter = db.scan_with_options(0, b"k2"..b"k9", &options).unwrap();
+        assert!(
+            iter.consume_next_row::<(), _>(|_, _| Err(Error::InputError(
+                "consumer failed".to_string()
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            iter.consume_next_row(|key, _| Ok(key.clone()))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"k3"
+        );
+        assert!(iter.next().is_none());
+
+        let mut iter = db.scan_with_options(0, b"k0"..b"k9", &options).unwrap();
+        assert!(iter.consume_next_row_with_bucket(|_, _, _| Ok(())).is_err());
+        assert!(
+            iter.consume_next_row_with_bucket(|_, _, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        let mut iter = db.scan_with_options(0, b"k2"..b"k9", &options).unwrap();
+        assert!(
+            iter.consume_next_row_with_bucket::<(), _>(|_, _, _| {
+                Err(Error::InputError("consumer failed".to_string()))
+            })
+            .is_err()
+        );
+        assert!(iter.next().is_none());
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_structured_owned_consumption_resumes_at_sst_block_boundaries() {
+    let root = format!("/tmp/ds_structured_owned_blocks_{}", Uuid::new_v4());
+    let mut db = StructuredDb::open(
+        Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{root}")),
+            num_columns: 2,
+            ..Config::default()
+        },
+        vec![0..=0],
+    )
+    .unwrap();
+    db.apply_schema(default_family_schema(BTreeMap::from([(
+        1,
+        StructuredColumnType::List(ListConfig::default()),
+    )])))
+    .unwrap();
+    let element = Bytes::from(vec![b'x'; 2048]);
+    for i in 0..128 {
+        db.merge(0, format!("k{i:03}"), 1, vec![element.clone()])
+            .unwrap();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    db.snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
+
+    let options = StructuredScanOptions::for_column(1).with_stop_at_block_boundary(true);
+    let mut iter = db.scan_with_options(0, b"k"..b"l", &options).unwrap();
+    let mut rows = 0;
+    let mut pauses = 0;
+    loop {
+        let check_row = |key: &Bytes, columns: &[Option<StructuredColumnValue>]| {
+            assert_eq!(key.as_ref(), format!("k{rows:03}").as_bytes());
+            assert_eq!(
+                columns,
+                &[Some(StructuredColumnValue::List(vec![element.clone()]))]
+            );
+            Ok(())
+        };
+        let row = if rows % 2 == 0 {
+            iter.consume_next_row(check_row)
+        } else {
+            iter.consume_next_row_with_bucket(|bucket, key, columns| {
+                assert_eq!(bucket, 0);
+                check_row(key, columns)
+            })
+        }
+        .unwrap();
+        if row.is_some() {
+            rows += 1;
+        } else if iter.inner.stopped_at_block_boundary() {
+            pauses += 1;
+            assert!(pauses < 128, "scan must make progress");
+            iter.inner.clear_stop_at_block_boundary();
+        } else {
+            break;
+        }
+    }
+    assert_eq!(rows, 128);
+    assert!(pauses > 0);
+    assert!(iter.consume_next_row(|_, _| Ok(())).unwrap().is_none());
     drop(iter);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(root);

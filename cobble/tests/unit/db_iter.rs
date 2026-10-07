@@ -170,3 +170,62 @@ fn test_db_iterator_consume_next_row_passes_bytes_key() {
 
     cleanup_root(root);
 }
+
+#[test]
+fn test_owned_row_consumer_preserves_error_and_limit_semantics() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Db::open(
+        Config {
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+            ..Config::default()
+        },
+        vec![0..=0],
+    )
+    .unwrap();
+    for key in [b"k1", b"k2", b"k3"] {
+        db.put(0, key, 0, key).unwrap();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    db.snapshot_with_callback(move |result| tx.send(result).unwrap())
+        .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+
+    let options = crate::ScanOptions::default().with_max_rows(1);
+    for owned in [false, true] {
+        let mut iter = db.scan_with_options(0, b"k0"..b"k9", &options).unwrap();
+        let failure = if owned {
+            iter.consume_next_row_owned::<(), _>(|_, _| {
+                Err(crate::Error::InputError("consumer failed".to_string()))
+            })
+        } else {
+            iter.consume_next_row::<(), _>(|_, _| {
+                Err(crate::Error::InputError("consumer failed".to_string()))
+            })
+        };
+        assert!(failure.is_err());
+        let (key, columns) = iter
+            .consume_next_row_owned(|key, columns| Ok((key.clone(), columns)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.as_ref(), b"k2");
+        assert_eq!(columns[0].as_deref(), Some(b"k2".as_slice()));
+        assert!(
+            iter.consume_next_row_owned(|_, _| Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(iter.next_row_with_bucket().unwrap().is_none());
+    }
+
+    let mut iter = db.scan(0, b"k0"..b"k9").unwrap();
+    iter.remaining_rows = Some(0);
+    assert!(
+        iter.consume_next_row_owned::<(), _>(|_, _| panic!(
+            "zero limit must not call the consumer"
+        ))
+        .unwrap()
+        .is_none()
+    );
+}

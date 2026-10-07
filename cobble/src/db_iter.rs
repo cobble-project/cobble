@@ -18,7 +18,8 @@ use crate::vlog::VlogStore;
 use bytes::Bytes;
 use std::sync::Arc;
 
-pub(crate) type BucketedRow = (u16, Bytes, Vec<Option<Bytes>>);
+/// An owned bucket ID, key, and decoded columns returned by a scan.
+pub type BucketedRow = (u16, Bytes, Vec<Option<Bytes>>);
 type DecodedRow = (Key, Vec<Option<Bytes>>);
 
 pub(crate) struct DbIteratorOptions {
@@ -216,10 +217,20 @@ impl DbIterator {
     where
         F: FnMut(&Bytes, &[Option<Bytes>]) -> Result<T>,
     {
+        self.consume_next_row_owned(|key, columns| consumer(key, &columns))
+    }
+
+    /// Transfers the columns to the consumer; the key is borrowed only for the call.
+    /// As with `consume_next_row`, a failed consumer advances the row without
+    /// consuming the remaining row limit.
+    pub fn consume_next_row_owned<T, F>(&mut self, mut consumer: F) -> Result<Option<T>>
+    where
+        F: FnMut(&Bytes, Vec<Option<Bytes>>) -> Result<T>,
+    {
         let Some((key, columns)) = self.decode_next_row()? else {
             return Ok(None);
         };
-        let consumed = consumer(key.data(), &columns)?;
+        let consumed = consumer(key.data(), columns)?;
         if let Some(remaining_rows) = self.remaining_rows.as_mut() {
             *remaining_rows -= 1;
         }
@@ -237,7 +248,8 @@ impl DbIterator {
         Ok(Some(consumed))
     }
 
-    pub(crate) fn next_row_with_bucket(&mut self) -> Result<Option<BucketedRow>> {
+    /// Returns an owned row, consuming its row limit before handing it to the caller.
+    pub fn next_row_with_bucket(&mut self) -> Result<Option<BucketedRow>> {
         let Some((mut key, columns)) = self.decode_next_row()? else {
             return Ok(None);
         };

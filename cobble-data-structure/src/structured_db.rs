@@ -2226,10 +2226,10 @@ impl StructuredDbIterator {
     where
         F: FnMut(&Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
     {
-        let structured_schema = Arc::clone(&self.structured_schema);
+        let structured_schema = &self.structured_schema;
         let now_seconds = self.now_seconds;
-        self.inner.consume_next_row(|key, columns| {
-            let decoded = decode_row(&structured_schema, now_seconds, columns.to_vec())?;
+        self.inner.consume_next_row_owned(|key, columns| {
+            let decoded = decode_row(structured_schema, now_seconds, columns)?;
             consumer(key, &decoded)
         })
     }
@@ -2238,13 +2238,11 @@ impl StructuredDbIterator {
     where
         F: FnMut(u16, &Bytes, &[Option<StructuredColumnValue>]) -> Result<T>,
     {
-        let structured_schema = Arc::clone(&self.structured_schema);
-        let now_seconds = self.now_seconds;
-        self.inner
-            .consume_next_row_with_bucket(|bucket, key, columns| {
-                let decoded = decode_row(&structured_schema, now_seconds, columns.to_vec())?;
-                consumer(bucket, key, &decoded)
-            })
+        let Some((bucket, key, columns)) = self.inner.next_row_with_bucket()? else {
+            return Ok(None);
+        };
+        let decoded = decode_row(&self.structured_schema, self.now_seconds, columns)?;
+        consumer(bucket, &key, &decoded).map(Some)
     }
 
     #[cfg(feature = "ffi")]
