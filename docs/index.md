@@ -6,6 +6,8 @@ nav_order: 1
 
 # Cobble Project
 
+<p align="center"><img src="{{ '/static/logos/cobble-horizontal-1024.png' | relative_url }}" style="max-width: 60%; height: auto;" alt="Cobble Project logo" /></p>
+
 **Cobble** is a high-performance LSM-based key-value storage engine designed for both embedded and distributed systems.
 It provides a flexible and efficient storage solution for various workloads, from small-scale applications to large distributed services.
 Compared with other embedded key-value stores like [RocksDB](https://github.com/facebook/rocksdb), it offers multiple file formats (SSTable and Parquet), distributed storage support, distributed snapshots, online rescaling between nodes, remote compaction, and more.
