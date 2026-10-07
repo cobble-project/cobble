@@ -1,4 +1,4 @@
-<p align="center"><img src="logo.png" width="60%" alt="Cobble logo" /></p>
+<p align="center"><img src="https://github.com/cobble-project/cobble/raw/HEAD/docs/static/logos/cobble-horizontal-1024.png" width="60%" alt="Cobble Project logo" /></p>
 <p align="center">
   <a href="https://crates.io/crates/cobble"><img alt="crates.io" src="https://img.shields.io/crates/v/cobble?logo=rust" /></a>
   <a href="#"><img alt="GitHub License" src="https://img.shields.io/github/license/cobble-project/cobble" /></a>

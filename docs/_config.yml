@@ -1,7 +1,7 @@
 title: Cobble Docs
 description: Documentation for Cobble — an LSM-based key-value storage engine
 theme: just-the-docs
-logo: false
+logo: /static/logos/cobble-horizontal-512.png
 docs_root_label: latest
 docs_commit_label: ""
 

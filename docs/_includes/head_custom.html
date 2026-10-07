@@ -9,16 +9,27 @@
 {% elsif docs_root != "" %}
   {% assign docs_label = "(" | append: docs_root | append: ")" %}
 {% endif %}
+<link rel="icon" type="image/png" sizes="64x64" href="{{ '/static/logos/cobble-icon-64.png' | relative_url }}">
 <style>
   .site-title {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    padding-top: 0.25rem;
+    padding-bottom: 0.25rem;
     white-space: nowrap;
+  }
+
+  .site-title .site-logo {
+    min-height: 2rem;
   }
 
   .site-title::after {
     content: "{{ docs_label }}";
     display: inline-block;
-    margin-left: 0.35rem;
+    align-self: flex-start;
     font-size: 0.65rem;
+    line-height: 1;
     font-weight: 400;
     letter-spacing: 0.02em;
     opacity: 0.72;
