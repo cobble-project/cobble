@@ -11,11 +11,11 @@ mod merging;
 #[cfg(test)]
 #[path = "../../tests/unit/iterator/mock_iterator.rs"]
 pub(crate) mod mock_iterator;
+mod range_filter;
 mod schema_aware_deduplicating;
 mod schema_evolving;
 mod schema_tagged;
 mod sorted_run;
-mod truncation_filter;
 mod vlog_seq_offset;
 
 // Public API exports for the iterator module.
@@ -30,6 +30,7 @@ pub(crate) use deduplicating::DeduplicatingIterator;
 pub(crate) use factory::{IteratorFactoryOptions, create_iterator, make_iterator_factory};
 #[allow(unused_imports)]
 pub(crate) use merging::MergingIterator;
+pub(crate) use range_filter::RangeFilterIterator;
 pub(crate) use schema_aware_deduplicating::SchemaAwareDeduplicatingIterator;
 #[allow(unused_imports)]
 pub(crate) use schema_evolving::SchemaEvolvingIterator;
@@ -37,8 +38,6 @@ pub(crate) use schema_evolving::SchemaEvolvingIterator;
 pub(crate) use schema_tagged::SchemaTaggedIterator;
 #[allow(unused_imports)]
 pub(crate) use sorted_run::SortedRun;
-#[allow(unused_imports)]
-pub(crate) use truncation_filter::TruncationFilterIterator;
 #[allow(unused_imports)]
 pub(crate) use vlog_seq_offset::VlogSeqOffsetIterator;
 

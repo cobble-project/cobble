@@ -13,6 +13,22 @@ fn cleanup_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
 
+fn empty_snapshot() -> Arc<DbState> {
+    Arc::new(DbState {
+        seq_id: 0,
+        topology_epoch: 0,
+        bucket_ranges: Vec::new(),
+        multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
+        vlog_version: crate::vlog::VlogVersion::new(),
+        active: None,
+        active_schema: None,
+        min_source_schema_by_cf: Vec::new(),
+        immutables: VecDeque::new(),
+        truncation_cursors: crate::db_state::new_truncation_cursors(),
+        suggested_base_snapshot_id: None,
+    })
+}
+
 #[test]
 #[serial(file)]
 fn test_full_projection_preserves_encoded_terminal_memtable_rows() {
@@ -92,20 +108,6 @@ fn test_db_iterator_uses_projected_family_schema_width() {
     let schema = builder.commit();
     let projected_schema = schema.project_in_family(1, &[1]);
 
-    let snapshot = Arc::new(DbState {
-        seq_id: 0,
-        topology_epoch: 0,
-        bucket_ranges: Vec::new(),
-        multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: Vec::new() }),
-        vlog_version: crate::vlog::VlogVersion::new(),
-        active: None,
-        active_schema: None,
-        min_source_schema_by_cf: Vec::new(),
-        immutables: VecDeque::new(),
-        truncation_cursors: crate::db_state::new_truncation_cursors(),
-        suggested_base_snapshot_id: None,
-    });
-
     let iter = DbIterator::new(
         Vec::new(),
         Vec::new(),
@@ -113,7 +115,7 @@ fn test_db_iterator_uses_projected_family_schema_width() {
             end_bound: None,
             lower_bound_exclusive: None,
             max_rows: None,
-            snapshot,
+            snapshot: empty_snapshot(),
             memtable_manager: None,
             access_guard: None,
             vlog_store,
@@ -129,6 +131,114 @@ fn test_db_iterator_uses_projected_family_schema_width() {
 
     assert_eq!(iter.num_columns, 1);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn bounded_scan_stops_before_dedup_value_reads_and_lookahead() {
+    use crate::iterator::SchemaTaggedIterator;
+    use crate::iterator::mock_iterator::CountingMockIterator;
+    use crate::sst::row_codec::{encode_key, encode_value};
+    use crate::r#type::{Column, Value, ValueType};
+    use std::sync::atomic::Ordering;
+
+    let root = tempfile::tempdir().unwrap();
+    let registry = FileSystemRegistry::new();
+    let fs = registry
+        .get_or_register(format!("file://{}", root.path().display()))
+        .unwrap();
+    let file_manager = Arc::new(
+        FileManager::with_defaults(fs, Arc::new(MetricsManager::new("scan-upper-bound"))).unwrap(),
+    );
+    let vlog_store = Arc::new(VlogStore::new(file_manager, 4096, usize::MAX));
+    let schema_manager = Arc::new(SchemaManager::new(1));
+    let schema = schema_manager.latest_schema();
+    let key = |key: &'static [u8]| encode_key(&Key::new(0, Bytes::from_static(key)));
+    let value = |value: &'static [u8]| {
+        encode_value(
+            &Value::new(vec![Some(Column::new(
+                ValueType::Put,
+                Bytes::from_static(value),
+            ))]),
+            1,
+        )
+    };
+    for schema_aware in [false, true] {
+        for (end_key, inclusive, expected_keys, expected_next) in [
+            (b"a".as_slice(), false, vec![], 0),
+            (b"c".as_slice(), false, vec![b"a".as_slice()], 2),
+            (
+                b"c".as_slice(),
+                true,
+                vec![b"a".as_slice(), b"c".as_slice()],
+                4,
+            ),
+        ] {
+            let (input, counts) = CountingMockIterator::new(vec![
+                (key(b"a"), value(b"a-new")),
+                (key(b"a"), value(b"a-old")),
+                (key(b"c"), value(b"c-new")),
+                (key(b"c"), value(b"c-old")),
+                // A value outside every tested range must never be decoded, even by lookahead.
+                (key(b"e"), Bytes::from_static(b"corrupt-value")),
+            ]);
+            let mut iter = DbIterator::new(
+                vec![Box::new(SchemaTaggedIterator::new(input, schema.version()))],
+                Vec::new(),
+                DbIteratorOptions {
+                    end_bound: Some((key(end_key), inclusive)),
+                    lower_bound_exclusive: None,
+                    max_rows: None,
+                    snapshot: empty_snapshot(),
+                    memtable_manager: None,
+                    access_guard: None,
+                    vlog_store: Arc::clone(&vlog_store),
+                    ttl_provider: Arc::new(TTLProvider::disabled()),
+                    schema: Arc::clone(&schema),
+                    schema_aware,
+                    schema_manager: Arc::clone(&schema_manager),
+                    selected_columns: None,
+                    column_family_id: 0,
+                    should_stop_at_block_boundary: false,
+                },
+            );
+            iter.seek(&key(b"a")).unwrap();
+            let actual = iter.by_ref().collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|(key, _)| key.as_ref())
+                    .collect::<Vec<_>>(),
+                expected_keys,
+                "schema_aware={schema_aware}, inclusive={inclusive}"
+            );
+            for (key, columns) in actual {
+                let expected = if key.as_ref() == b"a" {
+                    b"a-new"
+                } else {
+                    b"c-new"
+                };
+                assert_eq!(columns[0].as_deref(), Some(expected.as_slice()));
+            }
+            let value_keys = counts.value_keys.lock().unwrap();
+            assert!(
+                value_keys
+                    .iter()
+                    .all(|read| { expected_keys.iter().any(|expected| *read == key(expected)) })
+            );
+            assert_eq!(
+                value_keys.len(),
+                expected_keys.len() * if schema_aware { 2 } else { 1 }
+            );
+            drop(value_keys);
+            assert_eq!(counts.next.load(Ordering::Relaxed), expected_next);
+            for _ in 0..3 {
+                assert!(iter.next().is_none());
+            }
+            assert_eq!(counts.next.load(Ordering::Relaxed), expected_next);
+            iter.seek(&key(b"a")).unwrap();
+            assert_eq!(iter.next().is_some(), !expected_keys.is_empty());
+        }
+    }
 }
 
 #[test]

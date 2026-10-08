@@ -2630,25 +2630,41 @@ fn test_scan_merges_schema_barriers_before_projection() {
                     );
                 }
             }
-            let bounded = db
-                .scan_with_options_bounds(
-                    0,
-                    Some(&keys[10]),
-                    Some(&keys[30]),
-                    &ScanOptions::default().with_column_family("metrics"),
-                )
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(
-                bounded,
-                expected
-                    .iter()
-                    .filter(|(key, _)| key.as_ref() >= keys[10].as_slice()
-                        && key.as_ref() < keys[30].as_slice())
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            for stop in [false, true] {
+                let mut scan = db
+                    .scan_with_options_bounds(
+                        0,
+                        Some(&keys[10]),
+                        Some(&keys[30]),
+                        &ScanOptions::default()
+                            .with_column_family("metrics")
+                            .with_stop_at_block_boundary(stop),
+                    )
+                    .unwrap();
+                let mut bounded = Vec::new();
+                let mut pauses = 0;
+                loop {
+                    bounded.extend(scan.by_ref().collect::<Result<Vec<_>>>().unwrap());
+                    if !scan.stopped_at_block_boundary() {
+                        break;
+                    }
+                    pauses += 1;
+                    assert!(pauses < 1024, "bounded scan must make progress");
+                    scan.clear_stop_at_block_boundary();
+                }
+                assert_eq!(
+                    bounded,
+                    expected
+                        .iter()
+                        .filter(|(key, _)| key.as_ref() >= keys[10].as_slice()
+                            && key.as_ref() < keys[30].as_slice())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                );
+                scan.clear_stop_at_block_boundary();
+                assert!(scan.next().is_none(), "upper bound must remain exhausted");
+                assert!(!scan.stopped_at_block_boundary());
+            }
             // No write/rotation follows this update: the active memtable is
             // now also an old-schema source. An already-created cursor must
             // retain its target even if another schema is published.
