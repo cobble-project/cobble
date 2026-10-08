@@ -14,6 +14,9 @@ const ACCESS_OPEN: u8 = 0;
 const ACCESS_EXCLUSIVE_REQUESTED: u8 = 1;
 const ACCESS_EXCLUSIVE: u8 = 2;
 
+const ACCESS_WAITERS: usize = 1 << (usize::BITS - 1);
+const ACCESS_COUNT_MASK: usize = ACCESS_WAITERS - 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbLifecycleState {
     Initializing,
@@ -82,11 +85,7 @@ pub(crate) struct ExclusiveDbAccessGuard {
 
 impl Drop for ExclusiveDbAccessGuard {
     fn drop(&mut self) {
-        self.lifecycle
-            .access_mode
-            .store(ACCESS_OPEN, Ordering::Release);
-        self.lifecycle.release_access();
-        self.lifecycle.exclusive_wait_condvar.notify_all();
+        self.lifecycle.release_exclusive_access();
     }
 }
 
@@ -103,7 +102,8 @@ pub(crate) struct DbLifecycle {
     error: ArcSwapOption<Error>,
     /// Condvars to notify when the lifecycle enters an error/closing state.
     error_notifiers: Mutex<Vec<Weak<Condvar>>>,
-    access_wait_mutex: Mutex<()>,
+    /// Number of drain waiters, protected separately from the atomic active-access count.
+    access_wait_mutex: Mutex<usize>,
     access_wait_condvar: Condvar,
     exclusive_wait_mutex: Mutex<()>,
     exclusive_wait_condvar: Condvar,
@@ -117,7 +117,7 @@ impl DbLifecycle {
             active_accesses: AtomicUsize::new(0),
             error: ArcSwapOption::empty(),
             error_notifiers: Mutex::new(Vec::new()),
-            access_wait_mutex: Mutex::new(()),
+            access_wait_mutex: Mutex::new(0),
             access_wait_condvar: Condvar::new(),
             exclusive_wait_mutex: Mutex::new(()),
             exclusive_wait_condvar: Condvar::new(),
@@ -131,7 +131,7 @@ impl DbLifecycle {
             active_accesses: AtomicUsize::new(0),
             error: ArcSwapOption::empty(),
             error_notifiers: Mutex::new(Vec::new()),
-            access_wait_mutex: Mutex::new(()),
+            access_wait_mutex: Mutex::new(0),
             access_wait_condvar: Condvar::new(),
             exclusive_wait_mutex: Mutex::new(()),
             exclusive_wait_condvar: Condvar::new(),
@@ -269,9 +269,7 @@ impl DbLifecycle {
 
         self.wait_for_other_accesses_to_drain();
         if !self.is_open_fast() {
-            self.access_mode.store(ACCESS_OPEN, Ordering::Release);
-            self.release_access();
-            self.exclusive_wait_condvar.notify_all();
+            self.release_exclusive_access();
             return Err(self.error_or_invalid_state());
         }
         self.access_mode.store(ACCESS_EXCLUSIVE, Ordering::Release);
@@ -299,13 +297,18 @@ impl DbLifecycle {
         }
     }
 
+    fn active_access_count(&self) -> usize {
+        self.active_accesses.load(Ordering::Acquire) & ACCESS_COUNT_MASK
+    }
+
     pub(crate) fn wait_for_accesses_to_drain(&self) {
-        if self.active_accesses.load(Ordering::Acquire) == 0 {
+        if self.active_access_count() == 0 {
             return;
         }
         let mut wait_guard = self.access_wait_mutex.lock().unwrap();
+        self.register_access_waiter(&mut wait_guard);
         let mut waited = 0u64;
-        while self.active_accesses.load(Ordering::Acquire) != 0 {
+        while self.active_access_count() != 0 {
             if waited >= 30_000 {
                 warn!(
                     "waited at least 30 seconds to quit, possible block of get/put method or leak of schema or iter objects."
@@ -318,20 +321,53 @@ impl DbLifecycle {
             wait_guard = next_guard;
             waited += 100;
         }
+        self.unregister_access_waiter(&mut wait_guard);
     }
 
     fn wait_for_other_accesses_to_drain(&self) {
-        if self.active_accesses.load(Ordering::Acquire) == 1 {
+        if self.active_access_count() == 1 {
             return;
         }
         let mut wait_guard = self.access_wait_mutex.lock().unwrap();
-        while self.active_accesses.load(Ordering::Acquire) != 1 {
+        self.register_access_waiter(&mut wait_guard);
+        while self.active_access_count() != 1 {
             wait_guard = self.access_wait_condvar.wait(wait_guard).unwrap();
+        }
+        self.unregister_access_waiter(&mut wait_guard);
+    }
+
+    fn register_access_waiter(&self, waiters: &mut usize) {
+        *waiters += 1;
+        // The same atomic orders registration against release: an earlier release is seen by
+        // the predicate recheck, and a later release sees WAITERS in fetch_sub's returned value.
+        self.active_accesses
+            .fetch_or(ACCESS_WAITERS, Ordering::AcqRel);
+    }
+
+    fn unregister_access_waiter(&self, waiters: &mut usize) {
+        *waiters -= 1;
+        if *waiters == 0 {
+            self.active_accesses
+                .fetch_and(ACCESS_COUNT_MASK, Ordering::AcqRel);
         }
     }
 
+    fn release_exclusive_access(&self) {
+        {
+            let _wait_guard = self.exclusive_wait_mutex.lock().unwrap();
+            // Reopen only the access mode; closing/closed lifecycle states remain unchanged.
+            self.access_mode.store(ACCESS_OPEN, Ordering::Release);
+            self.exclusive_wait_condvar.notify_all();
+        }
+        // Release outside the exclusive mutex to avoid nesting the two wait mutexes.
+        self.release_access();
+    }
+
     fn release_access(&self) {
-        if self.active_accesses.fetch_sub(1, Ordering::AcqRel) <= 2 {
+        let previous = self.active_accesses.fetch_sub(1, Ordering::AcqRel);
+        if previous & ACCESS_WAITERS != 0 && previous & ACCESS_COUNT_MASK <= 2 {
+            // Pair with registration/predicate checks so notification cannot precede their wait.
+            let _wait_guard = self.access_wait_mutex.lock().unwrap();
             self.access_wait_condvar.notify_all();
         }
     }
