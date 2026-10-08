@@ -4,8 +4,8 @@ use crate::db_status::OwnedDbAccessGuard;
 use crate::error::Result;
 use crate::iterator::KvIterator;
 use crate::iterator::{
-    DeduplicatingIterator, MergingIterator, SchemaAwareDeduplicatingIterator,
-    TruncationFilterIterator, selects_all_columns,
+    DeduplicatingIterator, MergingIterator, RangeFilterIterator, SchemaAwareDeduplicatingIterator,
+    selects_all_columns,
 };
 use crate::lsm::DynKvIterator;
 use crate::memtable::MemtableManager;
@@ -49,7 +49,6 @@ pub(crate) struct DbIteratorOptions {
 
 pub struct DbIterator {
     inner: DynKvIterator,
-    end_bound: Option<(Bytes, bool)>,
     snapshot: Arc<DbState>,
     _memtable_manager: Option<Arc<MemtableManager>>,
     _access_guard: Option<OwnedDbAccessGuard>,
@@ -81,7 +80,8 @@ impl DbIterator {
             .unwrap_or_else(|| schema.num_columns());
         memtable_iters.append(&mut lsm_iters);
         let merged = MergingIterator::new(memtable_iters);
-        let merged = TruncationFilterIterator::new(merged, options.lower_bound_exclusive);
+        let merged =
+            RangeFilterIterator::new(merged, options.lower_bound_exclusive, options.end_bound);
         let mut inner: DynKvIterator = if options.schema_aware {
             Box::new(SchemaAwareDeduplicatingIterator::new(
                 merged,
@@ -105,7 +105,6 @@ impl DbIterator {
         inner.set_stop_at_block_boundary(options.should_stop_at_block_boundary);
         Self {
             inner,
-            end_bound: options.end_bound,
             snapshot: options.snapshot,
             _memtable_manager: options.memtable_manager,
             _access_guard: options.access_guard,
@@ -144,14 +143,6 @@ impl DbIterator {
         self.stopped_at_block_boundary
     }
 
-    fn is_past_end(&self, encoded_key: &[u8]) -> bool {
-        if let Some((end_key, inclusive)) = &self.end_bound {
-            encoded_key > end_key.as_ref() || (!inclusive && encoded_key == end_key.as_ref())
-        } else {
-            false
-        }
-    }
-
     fn decode_next_row(&mut self) -> Result<Option<DecodedRow>> {
         if self.remaining_rows == Some(0) {
             return Ok(None);
@@ -179,9 +170,6 @@ impl DbIterator {
                 continue;
             };
             self.inner.next()?;
-            if self.is_past_end(encoded_key.as_ref()) {
-                return Ok(None);
-            }
             let key = decode_key(&mut encoded_key)?;
             let value = kv_value.into_decoded(self.num_columns)?;
             let columns = value_to_vec_of_columns_with_vlog(
