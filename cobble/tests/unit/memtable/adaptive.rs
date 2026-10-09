@@ -43,15 +43,20 @@ fn test_vec_exit_on_read_after_enter() {
     let c = controller();
     record_write_and_confirm(&c, WINDOW_SIZE);
     assert_eq!(c.current_type(), MemtableType::Vec);
-    // A single point read on VEC triggers the 16-op sensitive window fast rollback.
-    record_point_read_and_confirm(&c, VEC_READ_SENSITIVE_WINDOW_SIZE);
+    // One point read in the 16-op sensitive window triggers rollback, not Hash entry.
+    assert!(c.record_point_read(1).is_none());
+    record_write_and_confirm(&c, VEC_READ_SENSITIVE_WINDOW_SIZE - 1);
     assert_eq!(c.current_type(), MemtableType::Skiplist);
 }
 
 #[test]
-fn test_hash_enter_on_point_reads() {
+fn test_hash_enter_on_one_point_read_among_writes() {
     let c = controller();
-    record_point_read_and_confirm(&c, WINDOW_SIZE);
+    assert!(c.record_point_read(1).is_none());
+    let decision = c.record_write(WINDOW_SIZE - 1).unwrap();
+    assert_eq!(decision.target, MemtableType::Hash);
+    assert!(!decision.flush_current);
+    c.confirm_switch(&decision);
     assert_eq!(c.current_type(), MemtableType::Hash);
 }
 
@@ -80,7 +85,7 @@ fn test_hash_stays_with_point_reads_and_writes_no_scans() {
 }
 
 #[test]
-fn test_mixed_workload_stays_skiplist() {
+fn test_one_scan_vetoes_hash_entry() {
     let c = controller();
     record_point_read_and_confirm(&c, 1000);
     record_range_scan_and_confirm(&c);
@@ -133,9 +138,6 @@ fn test_scan_blocks_vec_entry() {
     let c = controller();
     record_write_and_confirm(&c, WINDOW_SIZE - 1);
     record_range_scan_and_confirm(&c);
-    // sum = pr(0) + rs(1) + wr(4095) = 4096. pr==0 && rs==0 is false -> not pure writes.
-    // prev=Skiplist, not Vec -> rule 2 doesn't fire. rs > 0 but prev != Hash -> rule 3 doesn't fire.
-    // pr=0, rs > 0 -> rule 4 requires rs==0 -> no. Rule 6: stay Skiplist.
     assert_eq!(c.current_type(), MemtableType::Skiplist);
 }
 
@@ -224,7 +226,7 @@ fn test_pending_decision_blocks_new_evaluation() {
     // cancelled), a second window boundary does NOT produce a new decision. This prevents
     // generation gaps that would permanently stall switching.
     let c = controller();
-    // Window 1: 4096 writes -> decide(Skiplist, 0, 0, 4096) -> Vec.
+    // Window 1: 4096 writes -> decide(Skiplist, 0, 0) -> Vec.
     let d1 = c.record_write(WINDOW_SIZE).unwrap();
     assert_eq!(d1.generation, 1);
     assert_eq!(d1.target, MemtableType::Vec);
@@ -361,59 +363,31 @@ fn test_initial_type_from_constructor() {
 // === Pure decide() function tests ===
 
 #[test]
-fn test_decide_pure_writes_enter_vec() {
-    let d = decide(MemtableType::Skiplist, 0, 0, 4096);
-    assert_eq!(d.target, MemtableType::Vec);
-    assert!(!d.flush_current);
-}
+fn test_decide_access_presence_and_flush_flags() {
+    use MemtableType::{Hash, Skiplist, Vec};
 
-#[test]
-fn test_decide_point_read_dominant_enter_hash() {
-    let d = decide(MemtableType::Skiplist, 4096, 0, 4096);
-    assert_eq!(d.target, MemtableType::Hash);
-    assert!(!d.flush_current);
-}
-
-#[test]
-fn test_decide_vec_exit_on_any_read() {
-    let d = decide(MemtableType::Vec, 1, 0, 4096);
-    assert_eq!(d.target, MemtableType::Skiplist);
-    assert!(d.flush_current);
-}
-
-#[test]
-fn test_decide_vec_exit_on_any_scan() {
-    let d = decide(MemtableType::Vec, 0, 1, 4096);
-    assert_eq!(d.target, MemtableType::Skiplist);
-    assert!(d.flush_current);
-}
-
-#[test]
-fn test_decide_vec_stays_pure_writes() {
-    let d = decide(MemtableType::Vec, 0, 0, 4096);
-    assert_eq!(d.target, MemtableType::Vec);
-    assert!(!d.flush_current);
-}
-
-#[test]
-fn test_decide_hash_exit_on_scan() {
-    let d = decide(MemtableType::Hash, 4090, 1, 4096);
-    assert_eq!(d.target, MemtableType::Skiplist);
-    assert!(d.flush_current);
-}
-
-#[test]
-fn test_decide_hash_stays_no_scans() {
-    let d = decide(MemtableType::Hash, 2000, 0, 4096);
-    assert_eq!(d.target, MemtableType::Hash);
-    assert!(!d.flush_current);
-}
-
-#[test]
-fn test_decide_mixed_stays_skiplist() {
-    let d = decide(MemtableType::Skiplist, 1000, 10, 4096);
-    assert_eq!(d.target, MemtableType::Skiplist);
-    assert!(!d.flush_current);
+    let cases = [
+        (Skiplist, 0, 0, Vec, false),
+        (Skiplist, 1, 0, Hash, false),
+        (Skiplist, 0, 1, Skiplist, false),
+        (Skiplist, 1, 1, Skiplist, false),
+        (Hash, 0, 0, Vec, false),
+        (Hash, 1, 0, Hash, false),
+        (Hash, 0, 1, Skiplist, true),
+        (Hash, 1, 1, Skiplist, true),
+        (Vec, 0, 0, Vec, false),
+        (Vec, 1, 0, Skiplist, true),
+        (Vec, 0, 1, Skiplist, true),
+        (Vec, 1, 1, Skiplist, true),
+    ];
+    for (prev, point_reads, scans, target, flush_current) in cases {
+        let d = decide(prev, point_reads, scans);
+        assert_eq!(
+            (d.target, d.flush_current),
+            (target, flush_current),
+            "prev={prev:?}, point_reads={point_reads}, scans={scans}"
+        );
+    }
 }
 
 // === Multi-thread test: concurrent evaluation does not stall ===
