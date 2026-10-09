@@ -179,10 +179,9 @@ pub enum PrimaryVolumeOffloadPolicyKind {
 /// `Adaptive` is a strategy, not a concrete memtable: when selected, the memtable manager starts
 /// with `Skiplist` and an [`crate::memtable::AdaptiveMemtableController`] that monitors read/write/
 /// scan patterns and switches the concrete type at runtime. The controller transitions toward
-/// `Vec` on pure-write windows and toward `Hash` on point-read-heavy windows (with no scans); it
-/// rolls back to `Skiplist` (flushing the current memtable) when a specialized type encounters an
-/// unsupported pattern (`Vec` under any reads, `Hash` under any scan), and otherwise keeps the
-/// current concrete type.
+/// `Vec` on pure-write windows and toward `Hash` on any point reads without scans, regardless of
+/// write count. Any scan selects `Skiplist`, flushing when leaving `Hash`. `Vec` first rolls back
+/// to `Skiplist` with a flush on any read or scan before a later window can select `Hash`.
 ///
 /// At runtime, [`crate::Db::switch_memtable_type`] accepts both concrete types and `Adaptive`:
 /// switching to a concrete type pins the memtable to that type and **disables** adaptive

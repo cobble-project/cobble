@@ -1,7 +1,7 @@
 //! Adaptive memtable type controller.
 //!
 //! Monitors read/write/scan access patterns and adaptively switches the memtable type to match
-//! the dominant workload. The controller is lock-free on the fast path and has no background
+//! the observed access patterns. The controller is lock-free on the fast path and has no background
 //! thread: every state operation increments a counter and returns an optional
 //! [`SwitchDecision`] when a window boundary is crossed. The memtable manager applies and confirms
 //! the decision after the originating operation releases its active-memtable lock.
@@ -30,10 +30,6 @@ const SENSITIVE_WINDOW_SIZE: u64 = 64;
 /// Extra-sensitive window size, checked only for reads on VEC. VEC is the most performance-
 /// fragile specialized type: any read activity should trigger a rollback as fast as possible.
 const VEC_READ_SENSITIVE_WINDOW_SIZE: u64 = 16;
-
-/// Point-read ratio at or above which (with zero scans) the controller switches to HASH.
-/// 99%: 4051 point reads out of 4096 total ops in a window.
-const READ_RATIO_THRESHOLD: f64 = 0.99;
 
 /// Encodes a concrete [`MemtableType`] (never `Adaptive`) as a `u8` for atomic storage.
 fn type_to_u8(t: MemtableType) -> u8 {
@@ -73,7 +69,7 @@ pub(crate) struct SwitchDecision {
 }
 
 /// Monitors read/write/scan access patterns and adaptively switches the native memtable type to
-/// match the dominant workload.
+/// match the observed access patterns.
 ///
 /// # Switching rules
 ///
@@ -82,22 +78,19 @@ pub(crate) struct SwitchDecision {
 ///
 /// 1. Pure writes (zero reads + zero scans) -> `Vec`, no flush.
 /// 2. On `Vec` with any reads/scans -> `Skiplist`, flush (reads are poison on VEC).
-/// 3. On `Hash` with any scans -> `Skiplist`, flush (scans are poison on HASH).
-/// 4. Point-read ratio >= 99% and zero scans -> `Hash`, no flush.
-/// 5. On `Hash` with no scans -> stay `Hash` (handles point reads + writes well).
-/// 6. Otherwise (Skiplist, mixed) -> stay `Skiplist`.
+/// 3. Any scans -> `Skiplist`, flushing only when leaving `Hash`.
+/// 4. Any point reads and zero scans -> `Hash`, no flush, regardless of write count.
 ///
 /// VEC enters when a full window contains only writes (zero reads/scans). VEC exits on the first
 /// window where any read or scan appears - the extra-sensitive 16-op window on VEC makes this
-/// detection near-instant. HASH stays HASH as long as no scans appear, since HASH handles point
-/// reads and writes well. A read-heavy window on VEC rolls back to SKIPLIST (with flush) rather
+/// detection near-instant. HASH handles point reads mixed with any number of writes. A window
+/// with any reads on VEC rolls back to SKIPLIST (with flush) rather
 /// than "entering" HASH, because the flush is needed to migrate VEC's append-only data.
 ///
 /// # Scans
 ///
 /// Range scans are tracked in a separate `range_scans` counter used only as a boolean signal:
-/// any scan (`rs > 0`) blocks HASH and VEC entry (neither supports efficient range scans). Scans
-/// do not contribute to the point-read ratio denominator.
+/// any scan (`rs > 0`) blocks HASH and VEC entry (neither supports efficient range scans).
 ///
 /// # Fast path vs slow path
 ///
@@ -331,7 +324,7 @@ impl AdaptiveMemtableController {
     /// Records a range scan. Returns a [`SwitchDecision`] if evaluation fires.
     ///
     /// Scans are tracked in a separate counter used only as a boolean signal (`rs > 0` blocks
-    /// HASH/VEC entry). They do not contribute to the point-read counter or the ratio denominator.
+    /// HASH/VEC entry). They do not contribute to the point-read counter.
     pub(crate) fn record_range_scan(&self) -> Option<SwitchDecision> {
         if !self.enabled.load(Ordering::Relaxed) {
             return None;
@@ -385,14 +378,14 @@ impl AdaptiveMemtableController {
         let wr = self.writes.swap(0, Ordering::Relaxed);
         let _total = self.total_ops.swap(0, Ordering::Relaxed);
         // Note: `total` may differ from pr+rs+wr due to concurrent writes between individual
-        // swap calls. This is acceptable - the ratios are approximate by design.
+        // swap calls. This is acceptable - the window statistics are approximate by design.
         let sum = pr + rs + wr;
         if sum == 0 {
             return None;
         }
 
         let prev = self.current_type();
-        let raw_decision = decide(prev, pr, rs, sum);
+        let raw_decision = decide(prev, pr, rs);
 
         if raw_decision.target == prev {
             return None;
@@ -443,18 +436,8 @@ struct RawDecision {
     flush_current: bool,
 }
 
-/// Pure decision function. Extracted for testability without atomic state.
-///
-/// Rules (evaluated in order):
-/// 1. Pure writes (zero reads + zero scans) -> Vec, no flush.
-/// 2. On Vec with any reads/scans -> Skiplist, flush.
-/// 3. On Hash with any scans -> Skiplist, flush.
-/// 4. Point-read ratio >= 99% and zero scans -> Hash, no flush.
-/// 5. On Hash with no scans -> stay Hash (handles point reads + writes well).
-/// 6. Otherwise (Skiplist, mixed) -> stay Skiplist.
-fn decide(prev: MemtableType, pr: u64, rs: u64, sum: u64) -> RawDecision {
-    debug_assert!(sum > 0);
-
+/// Pure decision function for a non-empty window, without atomic state.
+fn decide(prev: MemtableType, pr: u64, rs: u64) -> RawDecision {
     // Rule 1: pure writes -> Vec (non-disruptive).
     if pr == 0 && rs == 0 {
         return RawDecision {
@@ -464,37 +447,26 @@ fn decide(prev: MemtableType, pr: u64, rs: u64, sum: u64) -> RawDecision {
     }
 
     // Rule 2: on Vec, any read or scan is poison -> rollback to Skiplist with flush.
-    // Checked before HASH entry so that a read-heavy window on VEC rolls back to SKIPLIST
+    // Checked before HASH entry so that any reads on VEC roll back to SKIPLIST
     // rather than "entering" HASH (which would skip the flush and leave VEC's data in place).
-    if prev == MemtableType::Vec && (pr + rs) > 0 {
+    if prev == MemtableType::Vec {
         return RawDecision {
             target: MemtableType::Skiplist,
             flush_current: true,
         };
     }
 
-    // Rule 3: on Hash, any scan is poison -> rollback to Skiplist with flush.
-    if prev == MemtableType::Hash && rs > 0 {
+    // Rule 3: any scan requires Skiplist; leaving Hash requires a flush.
+    if rs > 0 {
         return RawDecision {
             target: MemtableType::Skiplist,
-            flush_current: true,
+            flush_current: prev == MemtableType::Hash,
         };
     }
 
-    // Rule 4: point-read-dominant with no scans -> Hash (non-disruptive).
-    // range_scans excluded from denominator (sum = pr + rs + wr, but rs > 0 is already handled
-    // by rules 2-3; reaching here means rs == 0, so sum = pr + wr).
-    if rs == 0 && (pr as f64) / (sum as f64) >= READ_RATIO_THRESHOLD {
-        return RawDecision {
-            target: MemtableType::Hash,
-            flush_current: false,
-        };
-    }
-
-    // Rule 5: on Hash with no scans, HASH handles point reads + writes -> stay.
-    // Rule 6: on Skiplist with mixed workload -> stay (Skiplist handles everything).
+    // Rule 4: point reads without scans -> Hash, regardless of write count.
     RawDecision {
-        target: prev,
+        target: MemtableType::Hash,
         flush_current: false,
     }
 }
