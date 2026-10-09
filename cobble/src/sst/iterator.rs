@@ -41,6 +41,9 @@ pub(crate) struct SSTIteratorOptions {
     pub cache_namespace: u64,
     /// Preload the data block after the current one during scan iteration.
     pub preload_next_data_block: bool,
+    /// Encoded exclusive scan end. Index keys reject whole blocks; the outer range filter
+    /// still enforces the bound within a data block.
+    pub exclusive_upper_bound: Option<Bytes>,
     /// Shared physical-block tracker for cursor-adjacent scan blocks.
     pub hot_block_registry: Option<Arc<ScanHotBlockRegistry>>,
     /// Mark registry hits when this iterator is used as compaction input.
@@ -137,6 +140,7 @@ impl Default for SSTIteratorOptions {
             pin_metadata_partitions: false,
             cache_namespace: 0,
             preload_next_data_block: false,
+            exclusive_upper_bound: None,
             hot_block_registry: None,
             observe_hot_blocks: false,
         }
@@ -435,18 +439,23 @@ impl SSTIterator {
     /// Seek to the first key >= target
     pub fn seek(&mut self, target: &[u8]) -> Result<()> {
         self.boundary_state = BoundaryState::None;
+        if self
+            .options
+            .exclusive_upper_bound
+            .as_ref()
+            .is_some_and(|end| target >= end.as_ref())
+        {
+            self.exhaust();
+            return Ok(());
+        }
         let target = unsafe_bytes(target);
         if self.index_partitions.is_empty() {
-            self.current_data_block = None;
-            self.clear_cached_entry();
-            self.clear_scan_hot_blocks();
+            self.exhaust();
             return Ok(());
         }
         if !self.footer.partitioned_index {
             if self.index_block.is_empty() {
-                self.current_data_block = None;
-                self.clear_cached_entry();
-                self.clear_scan_hot_blocks();
+                self.exhaust();
                 return Ok(());
             }
             self.current_index_partition_idx = 0;
@@ -454,17 +463,25 @@ impl SSTIterator {
             let block_idx = self.index_block.find_lower_or_equal_idx(&target)?;
             self.current_block_idx = block_idx;
             let partition = self.index_block.clone();
-            self.load_data_block_from_partition(&partition, block_idx)?;
+            if !self.load_data_block_from_partition(&partition, block_idx)? {
+                return Ok(());
+            }
             self.seek_in_current_block(&target)?;
             self.finish_seek_positioning()?;
             return Ok(());
         }
 
         let partition_idx = self.index_block.find_lower_or_equal_idx(&target)?;
+        if !self.index_entry_before_upper_bound(&self.index_block, partition_idx)? {
+            self.exhaust();
+            return Ok(());
+        }
         let partition = self.load_index_partition(partition_idx)?;
         let block_idx = partition.find_lower_or_equal_idx(&target)?;
         self.current_block_idx = block_idx;
-        self.load_data_block_from_partition(&partition, block_idx)?;
+        if !self.load_data_block_from_partition(&partition, block_idx)? {
+            return Ok(());
+        }
         self.seek_in_current_block(&target)?;
         self.finish_seek_positioning()?;
         Ok(())
@@ -542,17 +559,48 @@ impl SSTIterator {
         Ok(block)
     }
 
+    fn exhaust(&mut self) {
+        self.current_data_block = None;
+        self.boundary_state = BoundaryState::None;
+        self.clear_cached_entry();
+        self.clear_scan_hot_blocks();
+    }
+
+    fn index_entry_before_upper_bound(&self, index: &Block, entry_idx: usize) -> Result<bool> {
+        let Some(end) = &self.options.exclusive_upper_bound else {
+            return Ok(true);
+        };
+        Ok(index.key(entry_idx)?.as_ref() < end.as_ref())
+    }
+
+    /// The next block index has already been advanced, but no block has been loaded yet.
+    fn next_block_before_upper_bound(&self) -> Result<bool> {
+        if let Some(partition) = &self.current_index_partition
+            && self.current_block_idx < partition.offsets_len()
+        {
+            return self.index_entry_before_upper_bound(partition, self.current_block_idx);
+        }
+        let next_partition_idx = self.current_index_partition_idx + 1;
+        Ok(self.footer.partitioned_index
+            && next_partition_idx < self.index_partitions.len()
+            && self.index_entry_before_upper_bound(&self.index_block, next_partition_idx)?)
+    }
+
     fn load_data_block_from_partition(
         &mut self,
         partition: &Arc<Block>,
         block_idx: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if !self.index_entry_before_upper_bound(partition, block_idx)? {
+            self.exhaust();
+            return Ok(false);
+        }
         let block = self.read_data_block_from_partition(partition, block_idx)?;
         self.current_data_block = Some(block);
         self.current_entry_idx = 0;
         self.clear_cached_entry();
 
-        Ok(())
+        Ok(true)
     }
 
     fn data_block_location(&self, partition: &Block, block_idx: usize) -> Result<(usize, usize)> {
@@ -672,7 +720,9 @@ impl SSTIterator {
         let mut hot_blocks =
             vec![self.data_block_key_from_partition(partition.as_ref(), self.current_block_idx)?];
         let next_block_idx = self.current_block_idx + 1;
-        if next_block_idx < partition.offsets_len() {
+        if next_block_idx < partition.offsets_len()
+            && self.index_entry_before_upper_bound(&partition, next_block_idx)?
+        {
             hot_blocks
                 .push(self.data_block_key_from_partition(partition.as_ref(), next_block_idx)?);
             // The scan path already needs the current block. Pulling the next block
@@ -936,7 +986,7 @@ impl SSTIterator {
         Ok(cached.as_ref().map(|bytes| (bytes.as_ptr(), bytes.len())))
     }
 
-    fn invalidate_current_entry_cache(&self) {
+    fn position_after_sequential_next(&self) {
         self.clear_materialized_entry();
         if self
             .current_data_block
@@ -947,24 +997,8 @@ impl SSTIterator {
         }
     }
 
-    fn position_at_current_entry(&self) {
-        self.invalidate_current_entry_cache();
-    }
-
-    fn position_after_sequential_next(&self) {
-        self.invalidate_current_entry_cache();
-    }
-
-    fn position_after_random_access(&self) {
-        self.clear_cached_entry();
-    }
-
-    fn position_after_block_change(&self) {
-        self.clear_cached_entry();
-    }
-
     fn seek_in_current_block(&mut self, target: &Bytes) -> Result<()> {
-        self.position_after_random_access();
+        self.clear_cached_entry();
         if let Some(block) = &self.current_data_block {
             self.current_entry_idx = if block.is_prefix_compressed() {
                 let idx = block.find_equal_or_greater_idx_prefix_into(
@@ -1003,35 +1037,35 @@ impl SSTIterator {
     pub fn seek_to_first(&mut self) -> Result<()> {
         self.boundary_state = BoundaryState::None;
         if self.index_partitions.is_empty() {
-            self.current_data_block = None;
-            self.clear_cached_entry();
-            self.clear_scan_hot_blocks();
+            self.exhaust();
             return Ok(());
         }
 
         if !self.footer.partitioned_index {
             if self.index_block.is_empty() {
-                self.current_data_block = None;
-                self.clear_cached_entry();
-                self.clear_scan_hot_blocks();
+                self.exhaust();
                 return Ok(());
             }
             self.current_index_partition_idx = 0;
             self.current_index_partition = Some(self.index_block.clone());
             self.current_block_idx = 0;
             let partition = self.index_block.clone();
-            self.load_data_block_from_partition(&partition, 0)?;
-            self.current_entry_idx = 0;
-            self.position_at_current_entry();
+            if !self.load_data_block_from_partition(&partition, 0)? {
+                return Ok(());
+            }
             self.after_data_block_positioned()?;
             return Ok(());
         }
 
+        if !self.index_entry_before_upper_bound(&self.index_block, 0)? {
+            self.exhaust();
+            return Ok(());
+        }
         let partition = self.load_index_partition(0)?;
         self.current_block_idx = 0;
-        self.load_data_block_from_partition(&partition, 0)?;
-        self.current_entry_idx = 0;
-        self.position_at_current_entry();
+        if !self.load_data_block_from_partition(&partition, 0)? {
+            return Ok(());
+        }
         self.after_data_block_positioned()?;
         Ok(())
     }
@@ -1046,31 +1080,31 @@ impl SSTIterator {
                     .unwrap_or(0);
         if reuse_partition {
             let partition = self.current_index_partition.clone().unwrap();
-            self.load_data_block_from_partition(&partition, self.current_block_idx)?;
-            self.current_entry_idx = 0;
-            self.position_after_block_change();
+            if !self.load_data_block_from_partition(&partition, self.current_block_idx)? {
+                return Ok(false);
+            }
             self.after_data_block_positioned()?;
             return Ok(true);
         }
         if !self.footer.partitioned_index {
-            self.current_data_block = None;
-            self.position_after_block_change();
-            self.clear_scan_hot_blocks();
+            self.exhaust();
             return Ok(false);
         }
         let next_partition_idx = self.current_index_partition_idx + 1;
         if next_partition_idx < self.index_partitions.len() {
+            if !self.index_entry_before_upper_bound(&self.index_block, next_partition_idx)? {
+                self.exhaust();
+                return Ok(false);
+            }
             let partition = self.load_index_partition(next_partition_idx)?;
             self.current_block_idx = 0;
-            self.load_data_block_from_partition(&partition, 0)?;
-            self.current_entry_idx = 0;
-            self.position_after_block_change();
+            if !self.load_data_block_from_partition(&partition, 0)? {
+                return Ok(false);
+            }
             self.after_data_block_positioned()?;
             return Ok(true);
         }
-        self.current_data_block = None;
-        self.position_after_block_change();
-        self.clear_scan_hot_blocks();
+        self.exhaust();
         Ok(false)
     }
 
@@ -1117,8 +1151,14 @@ impl SSTIterator {
                 // Move to next block
                 self.current_block_idx += 1;
                 if self.should_stop_at_block_boundary {
+                    if self.options.exclusive_upper_bound.is_some()
+                        && !self.next_block_before_upper_bound()?
+                    {
+                        self.exhaust();
+                        return Ok(false);
+                    }
                     self.current_data_block = None;
-                    self.position_after_block_change();
+                    self.clear_cached_entry();
                     self.clear_scan_hot_blocks();
                     self.boundary_state = BoundaryState::Stopped;
                     return Ok(false);
