@@ -1357,6 +1357,7 @@ impl LSMTree {
                 }
             }
         }
+        let exclusive_upper_bound = encoded_end.map(Bytes::copy_from_slice);
         for run in runs {
             let file_manager = Arc::clone(file_manager);
             let block_cache = self.block_cache.clone();
@@ -1366,6 +1367,7 @@ impl LSMTree {
             let schema_manager = Arc::clone(&schema_manager);
             let selected_columns = selected_columns.clone();
             let scan_hot_blocks = Arc::clone(&self.scan_hot_blocks);
+            let exclusive_upper_bound = exclusive_upper_bound.clone();
             let pin_metadata =
                 pinned_metadata_max_level.is_some_and(|max_level| run.level() <= max_level);
             let run_iter = run.iter(move |file| {
@@ -1395,6 +1397,7 @@ impl LSMTree {
                             pin_metadata_partitions,
                             cache_namespace,
                             preload_next_data_block: preload_scan_cursor_block,
+                            exclusive_upper_bound: exclusive_upper_bound.clone(),
                             hot_block_registry: preload_scan_cursor_block
                                 .then(|| Arc::clone(&scan_hot_blocks)),
                             ..SSTIteratorOptions::default()

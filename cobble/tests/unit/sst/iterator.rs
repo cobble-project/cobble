@@ -123,6 +123,262 @@ fn test_reader(data: Bytes) -> Box<dyn RandomAccessFile> {
     Box::new(BytesRandomAccessFile { data })
 }
 
+#[derive(Default)]
+struct ScanAccessCounts {
+    data: std::sync::atomic::AtomicUsize,
+    index: std::sync::atomic::AtomicUsize,
+    reads: std::sync::Mutex<Vec<usize>>,
+}
+
+struct CountingScanCache {
+    inner: MockCache<BlockCacheKey, CachedBlock>,
+    counts: Arc<ScanAccessCounts>,
+}
+
+impl crate::cache::CacheHandle<BlockCacheKey, CachedBlock> for CountingScanCache {
+    fn get(&self, key: &BlockCacheKey) -> Option<CachedBlock> {
+        use std::sync::atomic::Ordering;
+        match key.kind {
+            BlockCacheKind::Data => {
+                self.counts.data.fetch_add(1, Ordering::Relaxed);
+            }
+            BlockCacheKind::IndexPartition => {
+                self.counts.index.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.inner.get(key)
+    }
+
+    fn insert(&self, key: BlockCacheKey, value: CachedBlock) {
+        self.inner.insert(key, value);
+    }
+    fn remove(&self, key: &BlockCacheKey) {
+        self.inner.remove(key);
+    }
+    fn clear(&self) {
+        self.inner.clear();
+    }
+}
+
+struct CountingScanFile {
+    inner: Box<dyn RandomAccessFile>,
+    counts: Arc<ScanAccessCounts>,
+}
+
+impl File for CountingScanFile {
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+    fn size(&self) -> usize {
+        self.inner.size()
+    }
+}
+
+impl RandomAccessFile for CountingScanFile {
+    fn read_at(&self, offset: usize, size: usize) -> Result<Bytes> {
+        self.counts.reads.lock().unwrap().push(offset);
+        self.inner.read_at(offset, size)
+    }
+}
+
+#[test]
+fn scan_upper_bound_skips_data_blocks_and_index_partitions_including_preload_and_resume() {
+    use crate::iterator::RangeFilterIterator;
+    use std::sync::atomic::Ordering;
+
+    for partitioned_index in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = FileSystemRegistry::new();
+        let fs = registry
+            .get_or_register(dir.path().to_str().unwrap())
+            .unwrap();
+        let mut writer = SSTWriter::new(
+            fs.open_write("bounded.sst").unwrap(),
+            SSTWriterOptions {
+                block_size: 256,
+                data_block_restart_interval: 4,
+                partitioned_index,
+                ..Default::default()
+            },
+        );
+        let keys: Vec<_> = (0..100)
+            .map(|i| encode_key(&Key::new(0, Bytes::from(format!("k{:04}", i * 2)))))
+            .collect();
+        for key in &keys {
+            writer.add(key, &[b'v'; 30]).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut probe =
+            SSTIterator::new(fs.open_read("bounded.sst").unwrap(), Default::default()).unwrap();
+        let mut blocks = Vec::new();
+        for partition_idx in 0..probe.index_partitions.len() {
+            let partition = probe.load_index_partition(partition_idx).unwrap();
+            for idx in 0..partition.offsets_len() {
+                blocks.push((
+                    partition.key(idx).unwrap(),
+                    probe.data_block_location(&partition, idx).unwrap().0,
+                ));
+            }
+        }
+        assert!(blocks.len() > 2);
+        let partition_end = if partitioned_index {
+            assert!(probe.index_partitions.len() > 1);
+            probe.index_block.key(1).unwrap()
+        } else {
+            blocks[2].0.clone()
+        };
+        let data_offsets: Vec<_> = blocks.iter().map(|(_, offset)| *offset).collect();
+        let index_offsets: Vec<_> = probe
+            .index_partitions
+            .iter()
+            .map(|(offset, _)| *offset as usize)
+            .collect();
+        drop(probe);
+
+        for preload in [false, true] {
+            for pause in [false, true] {
+                for end in [&keys[0], &keys[1], &blocks[1].0, &partition_end] {
+                    let mut results = Vec::new();
+                    for pushdown in [false, true] {
+                        let counts = Arc::new(ScanAccessCounts::default());
+                        let cache: BlockCache = Arc::new(CountingScanCache {
+                            inner: MockCache::new(),
+                            counts: Arc::clone(&counts),
+                        });
+                        let hot = Arc::new(ScanHotBlockRegistry::new());
+                        let mut leaf = SSTIterator::with_cache(
+                            Box::new(CountingScanFile {
+                                inner: fs.open_read("bounded.sst").unwrap(),
+                                counts: Arc::clone(&counts),
+                            }),
+                            1,
+                            SSTIteratorOptions {
+                                exclusive_upper_bound: pushdown.then(|| end.clone()),
+                                preload_next_data_block: preload,
+                                hot_block_registry: preload.then(|| Arc::clone(&hot)),
+                                ..Default::default()
+                            },
+                            Some(cache),
+                            None,
+                        )
+                        .unwrap();
+                        leaf.set_stop_at_block_boundary(pause);
+                        let mut iter =
+                            RangeFilterIterator::new(leaf, None, Some((end.clone(), false)));
+                        iter.seek_to_first().unwrap();
+                        let mut actual = Vec::new();
+                        let mut pauses = 0;
+                        loop {
+                            while iter.valid() {
+                                actual.push(iter.take_key().unwrap().unwrap());
+                                iter.next().unwrap();
+                            }
+                            if !iter.stopped_at_block_boundary() {
+                                break;
+                            }
+                            pauses += 1;
+                            assert!(pauses < 100);
+                            iter.clear_stop_at_block_boundary();
+                            iter.next().unwrap();
+                        }
+                        assert_eq!(
+                            actual,
+                            keys.iter()
+                                .filter(|key| *key < end)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        );
+                        let data_accesses = counts.data.load(Ordering::Relaxed);
+                        iter.clear_stop_at_block_boundary();
+                        for _ in 0..3 {
+                            assert!(!iter.next().unwrap());
+                        }
+                        assert_eq!(counts.data.load(Ordering::Relaxed), data_accesses);
+                        let reads = counts.reads.lock().unwrap();
+                        let data_reads = reads
+                            .iter()
+                            .filter(|offset| data_offsets.contains(offset))
+                            .count();
+                        let index_reads = reads
+                            .iter()
+                            .filter(|offset| index_offsets.contains(offset))
+                            .count();
+                        results.push((
+                            data_accesses,
+                            counts.index.load(Ordering::Relaxed),
+                            data_reads,
+                            index_reads,
+                        ));
+                        drop(reads);
+                        drop(iter);
+                        assert!(hot.snapshot_keys().is_empty());
+                    }
+                    let (baseline, bounded) = (results[0], results[1]);
+                    assert!(bounded.0 <= baseline.0 && bounded.2 <= baseline.2);
+                    if end != &keys[1] || preload {
+                        assert!(
+                            bounded.0 < baseline.0 && bounded.2 < baseline.2,
+                            "partitioned={partitioned_index}, preload={preload}, pause={pause}, end={end:?}: {results:?}"
+                        );
+                    }
+                    if partitioned_index && end == &partition_end {
+                        assert!(
+                            bounded.1 < baseline.1 && bounded.3 < baseline.3,
+                            "next index partition must not be read: {results:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // A gap seek selects the preceding data block; it must not fall through to the end block.
+        let end = blocks[1].0.clone();
+        let previous = keys.iter().take_while(|key| **key < end).last().unwrap();
+        let mut gap = previous.to_vec();
+        gap.push(0);
+        assert!(gap.as_slice() < end.as_ref());
+        for preload in [false, true] {
+            let counts = Arc::new(ScanAccessCounts::default());
+            let cache: BlockCache = Arc::new(CountingScanCache {
+                inner: MockCache::new(),
+                counts: Arc::clone(&counts),
+            });
+            let mut iter = SSTIterator::with_cache(
+                Box::new(CountingScanFile {
+                    inner: fs.open_read("bounded.sst").unwrap(),
+                    counts: Arc::clone(&counts),
+                }),
+                2,
+                SSTIteratorOptions {
+                    exclusive_upper_bound: Some(end.clone()),
+                    preload_next_data_block: preload,
+                    ..Default::default()
+                },
+                Some(cache),
+                None,
+            )
+            .unwrap();
+            iter.seek(&gap).unwrap();
+            assert!(!iter.valid());
+            assert_eq!(counts.data.load(Ordering::Relaxed), 1);
+            for _ in 0..3 {
+                assert!(!iter.next().unwrap());
+            }
+            assert_eq!(counts.data.load(Ordering::Relaxed), 1);
+            let indexes = counts.index.load(Ordering::Relaxed);
+            iter.seek(&end).unwrap();
+            iter.seek(b"z").unwrap();
+            assert_eq!(counts.data.load(Ordering::Relaxed), 1);
+            assert_eq!(counts.index.load(Ordering::Relaxed), indexes);
+            iter.seek(&keys[0]).unwrap();
+            assert!(iter.valid(), "seek must reset exhaustion");
+            assert_eq!(iter.key().unwrap().as_ref(), Some(&keys[0]));
+        }
+    }
+}
+
 #[test]
 fn test_data_file_read_metadata_reuses_partitioned_descriptors_and_index_cache() {
     let mut partition = Vec::with_capacity(16);
