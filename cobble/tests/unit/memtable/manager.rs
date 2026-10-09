@@ -140,6 +140,53 @@ fn active_scan_seals_entries_appended_after_iterator_creation() {
 }
 
 #[test]
+fn unlimited_collection_defers_value_decode_and_does_not_update_shadow_allowance() {
+    let filter = MemtableRowFilter {
+        num_columns: 1,
+        selected_columns: Some(vec![0]),
+    };
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        let mut memtable = build_test_memtable(memtable_type, &[]);
+        let key = encode_scan_key(0, 0, b"key");
+        memtable.put(&key, b"").unwrap();
+        let allowance = Arc::new(AtomicUsize::new(3));
+        let entries = collect_limited_entries_from_memtable(
+            &memtable,
+            None,
+            None,
+            Some(&filter),
+            None,
+            Some(&allowance),
+        )
+        .unwrap();
+        assert_eq!(entries, vec![(key, Bytes::new())]);
+        assert_eq!(allowance.load(Ordering::Relaxed), 3);
+        // Collection defers decoding rather than hiding corruption from the normal read path.
+        assert!(
+            KvValue::encoded(entries[0].1.clone())
+                .into_decoded(1)
+                .is_err()
+        );
+        assert!(
+            collect_limited_entries_from_memtable(
+                &memtable,
+                None,
+                None,
+                Some(&filter),
+                Some(1),
+                Some(&allowance),
+            )
+            .is_err(),
+            "a limited scan still evaluates visibility"
+        );
+    }
+}
+
+#[test]
 #[serial_test::serial(file)]
 fn active_snapshot_capture_end_excludes_later_tail_and_restores() {
     let root = "/tmp/memtable_snapshot_capture_end";
@@ -851,50 +898,52 @@ fn test_scan_max_rows_shadow_allowance_disables_deeper_collected_limits_after_sk
 
     let start_key = encode_scan_key(0, 0, b"");
     let end_key = encode_scan_key(0, 0, b"\xff");
-    let memtable_iters = manager
-        .scan_memtable_iterators_with_snapshot(
-            Arc::clone(&snapshot),
-            Arc::clone(&schema),
-            0,
-            Some(&[0]),
-            Some(start_key.clone()),
-            Some(end_key.clone()),
-            Some(1),
-            false,
-        )
-        .unwrap();
-    let active_guard = active.read().unwrap();
-    assert_eq!(
-        active_guard.sealed_data_end,
-        active_guard.readable_memtable().unwrap().data_offset()
-    );
-    drop(active_guard);
-    let mut iter = DbIterator::new(
-        memtable_iters,
-        Vec::new(),
-        DbIteratorOptions {
-            end_bound: Some((end_key.clone(), false)),
-            lower_bound_exclusive: None,
-            max_rows: Some(1),
-            snapshot,
-            memtable_manager: Some(Arc::clone(&manager)),
-            access_guard: None,
-            vlog_store: Arc::clone(&manager.vlog_store),
-            ttl_provider: manager.lsm_tree.ttl_provider(),
-            schema,
-            schema_aware: false,
-            schema_manager: Arc::clone(&manager.schema_manager),
-            selected_columns: None,
-            column_family_id: 0,
-            should_stop_at_block_boundary: false,
-        },
-    );
-    iter.seek(start_key.as_ref()).unwrap();
+    for max_rows in [Some(1), None] {
+        let memtable_iters = manager
+            .scan_memtable_iterators_with_snapshot(
+                Arc::clone(&snapshot),
+                Arc::clone(&schema),
+                0,
+                Some(&[0]),
+                Some(start_key.clone()),
+                Some(end_key.clone()),
+                max_rows,
+                false,
+            )
+            .unwrap();
+        let active_guard = active.read().unwrap();
+        assert_eq!(
+            active_guard.sealed_data_end,
+            active_guard.readable_memtable().unwrap().data_offset()
+        );
+        drop(active_guard);
+        let mut iter = DbIterator::new(
+            memtable_iters,
+            Vec::new(),
+            DbIteratorOptions {
+                end_bound: Some((end_key.clone(), false)),
+                lower_bound_exclusive: None,
+                max_rows,
+                snapshot: Arc::clone(&snapshot),
+                memtable_manager: Some(Arc::clone(&manager)),
+                access_guard: None,
+                vlog_store: Arc::clone(&manager.vlog_store),
+                ttl_provider: manager.lsm_tree.ttl_provider(),
+                schema: Arc::clone(&schema),
+                schema_aware: false,
+                schema_manager: Arc::clone(&manager.schema_manager),
+                selected_columns: None,
+                column_family_id: 0,
+                should_stop_at_block_boundary: false,
+            },
+        );
+        iter.seek(start_key.as_ref()).unwrap();
 
-    let rows: Vec<(Bytes, Vec<Option<Bytes>>)> = iter.collect::<Result<Vec<_>>>().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].0, Bytes::from_static(b"f"));
-    assert_eq!(rows[0].1[0].as_deref(), Some(b"vf".as_slice()));
+        let rows: Vec<(Bytes, Vec<Option<Bytes>>)> = iter.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Bytes::from_static(b"f"));
+        assert_eq!(rows[0].1[0].as_deref(), Some(b"vf".as_slice()));
+    }
 
     cleanup_test_root();
 }
