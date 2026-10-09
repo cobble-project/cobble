@@ -730,19 +730,15 @@ impl MemtableScanIterator {
                     effective_max_rows,
                     self.shadow_allowance.as_ref(),
                 )?
-                .0
             }
-            MemtableScanSource::Immutable(memtable) => {
-                collect_limited_entries_from_memtable(
-                    memtable.as_ref(),
-                    start_bound_inclusive,
-                    end_bound_exclusive,
-                    self.row_filter.as_ref(),
-                    effective_max_rows,
-                    self.shadow_allowance.as_ref(),
-                )?
-                .0
-            }
+            MemtableScanSource::Immutable(memtable) => collect_limited_entries_from_memtable(
+                memtable.as_ref(),
+                start_bound_inclusive,
+                end_bound_exclusive,
+                self.row_filter.as_ref(),
+                effective_max_rows,
+                self.shadow_allowance.as_ref(),
+            )?,
         };
         self.prime_current();
         Ok(())
@@ -835,7 +831,7 @@ fn collect_limited_entries_from_iter<'a, I>(
     row_filter: Option<&MemtableRowFilter>,
     max_rows: Option<usize>,
     shadow_allowance: Option<&Arc<AtomicUsize>>,
-) -> Result<(Vec<(Bytes, Bytes)>, usize)>
+) -> Result<Vec<(Bytes, Bytes)>>
 where
     I: KvIterator<'a>,
 {
@@ -846,7 +842,6 @@ where
     }
     let mut entries = Vec::new();
     let mut visible_rows = 0usize;
-    let mut filtered_shadow_rows = 0usize;
     // The local max_rows budget starts from the caller's requested visible-row cap,
     // then inherits any extra allowance already earned by newer collected memtables.
     // That inherited allowance compensates for newer invisible shadowing rows that can
@@ -862,6 +857,12 @@ where
                 break;
             }
             let encoded_value = kv_value.unwrap_encoded();
+            // Visibility decoding serves only the local row budget. The final iterator still
+            // decodes and filters these values after deduplication.
+            let Some(max_rows) = effective_max_rows else {
+                entries.push((key, encoded_value));
+                continue;
+            };
             let counts_toward_limit = if let Some(row_filter) = row_filter {
                 row_counts_toward_max_rows(&encoded_value, row_filter)?
             } else {
@@ -871,7 +872,6 @@ where
             if counts_toward_limit {
                 visible_rows += 1;
             } else {
-                filtered_shadow_rows += 1;
                 // This row is already provably invisible for the projected read, but it can still
                 // shadow an older same-key value. Propagate one extra slot to lower collected
                 // memtables so they can fetch the next candidate instead of being truncated early.
@@ -879,14 +879,12 @@ where
                     shadow_allowance.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            if let Some(max_rows) = effective_max_rows
-                && visible_rows >= max_rows
-            {
+            if visible_rows >= max_rows {
                 break;
             }
         }
     }
-    Ok((entries, filtered_shadow_rows))
+    Ok(entries)
 }
 
 fn collect_limited_entries_from_memtable(
@@ -896,7 +894,7 @@ fn collect_limited_entries_from_memtable(
     row_filter: Option<&MemtableRowFilter>,
     max_rows: Option<usize>,
     shadow_allowance: Option<&Arc<AtomicUsize>>,
-) -> Result<(Vec<(Bytes, Bytes)>, usize)> {
+) -> Result<Vec<(Bytes, Bytes)>> {
     match memtable {
         MemtableImpl::Hash(hash_memtable) => {
             let mut iter = hash_memtable.iter_with_bounds(seek_target, end_bound_exclusive);
@@ -2183,16 +2181,14 @@ impl MemtableManager {
                 active_guard.seal_read_snapshot_data();
                 Arc::clone(&active_guard.schema)
             };
-            let row_filter = (!schema_aware)
-                .then(|| {
-                    build_memtable_row_filter(
-                        &source_schema,
-                        target_schema.version(),
-                        column_family_id,
-                        selected_columns,
-                    )
-                })
-                .flatten();
+            let row_filter = max_rows.and_then(|_| {
+                build_memtable_row_filter(
+                    &source_schema,
+                    target_schema.version(),
+                    column_family_id,
+                    selected_columns,
+                )
+            });
             if max_rows.is_some() && row_filter.is_none() {
                 deeper_collected_limits_allowed = false;
             }
@@ -2243,7 +2239,7 @@ impl MemtableManager {
             let skiplist_streaming =
                 matches!(immutable.memtable.as_ref(), MemtableImpl::Skiplist(_));
             let row_filter =
-                if !schema_aware && deeper_collected_limits_allowed && !skiplist_streaming {
+                if max_rows.is_some() && deeper_collected_limits_allowed && !skiplist_streaming {
                     build_memtable_row_filter(
                         &immutable.schema,
                         target_schema.version(),
