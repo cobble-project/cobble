@@ -1210,7 +1210,7 @@ impl MemtableManager {
     }
 
     /// Core switch logic: updates `state.memtable_type` and optionally rotates the active
-    /// memtable. Does not interact with the adaptive controller.
+    /// memtable. Does not enable/disable adaptive mode or resolve adaptive decisions.
     fn switch_memtable_type_impl(
         &self,
         concrete_type: MemtableType,
@@ -2508,6 +2508,14 @@ impl MemtableManager {
         }
         drop(guard);
         let job = if let Some(to_flush) = to_flush {
+            // Manual switches lock transition before rotation/state. Never block in reverse
+            // order here; a busy transition or pending fallback leaves the window for later.
+            if let Ok(_transition_guard) = self.transition_lock.try_lock()
+                && let Some(decision) = self.adaptive_controller.evaluate_on_rotation()
+            {
+                state.memtable_type = decision.target;
+                self.adaptive_controller.confirm_switch(&decision);
+            }
             state.hash_bucket_advisor.observe_flush(
                 cause,
                 to_flush.id,

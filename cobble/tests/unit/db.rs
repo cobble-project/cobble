@@ -1180,7 +1180,7 @@ fn test_adaptive_memtable_switches_to_vec_on_pure_writes() {
     let root = "/tmp/db_adaptive_memtable";
     cleanup_test_root(root);
     let db = open_db(Config {
-        memtable_capacity: Size::from_kib(64),
+        memtable_capacity: Size::from_mib(8),
         memtable_buffer_count: 2,
         memtable_type: MemtableType::Adaptive,
         l0_file_limit: 64,
@@ -1195,16 +1195,33 @@ fn test_adaptive_memtable_switches_to_vec_on_pure_writes() {
         MemtableType::Skiplist
     );
 
-    // 4096 writes should trigger the adaptive controller to switch to Vec
-    // (pure writes >= 99.9% with zero reads).
-    for i in 0..4097u32 {
+    // Empty flushes do not evaluate, and a non-empty flush before 4096 does not reset
+    // statistics. Reaching 4096 alone still cannot specialize before the next flush.
+    assert!(db.memtable_manager.flush_active().unwrap().is_none());
+    for i in 0..4095u32 {
         let key = format!("key{i}");
         db.put(0, key.as_bytes(), 0, b"value").unwrap();
     }
-
-    // The controller should have switched the target to Vec (non-disruptive, flush_current=false).
+    assert!(db.memtable_manager.flush_active().unwrap().is_some());
     assert_eq!(
         db.memtable_manager.target_memtable_type(),
+        MemtableType::Skiplist
+    );
+    db.put(0, b"threshold", 0, b"value").unwrap();
+    db.put(0, b"past_threshold", 0, b"value").unwrap();
+    assert_eq!(
+        db.memtable_manager.target_memtable_type(),
+        MemtableType::Skiplist
+    );
+    assert!(db.memtable_manager.flush_active().unwrap().is_some());
+
+    // The normal decision selects the replacement for this rotation, with no extra write/flush.
+    assert_eq!(
+        db.memtable_manager.target_memtable_type(),
+        MemtableType::Vec
+    );
+    assert_eq!(
+        db.memtable_manager.wait_for_active_memtable_type().unwrap(),
         MemtableType::Vec
     );
 
@@ -1234,13 +1251,22 @@ fn test_adaptive_memtable_switches_to_vec_on_pure_writes() {
         db.memtable_manager.target_memtable_type(),
         MemtableType::Skiplist
     );
-    // Now pure writes should trigger a switch to Vec again.
+    // Re-enabling resets operation statistics, but normal evaluation still waits for flush.
     for i in 0..4097u32 {
         let key = format!("resume{i}");
         db.put(0, key.as_bytes(), 0, b"value").unwrap();
     }
     assert_eq!(
         db.memtable_manager.target_memtable_type(),
+        MemtableType::Skiplist
+    );
+    assert!(db.memtable_manager.flush_active().unwrap().is_some());
+    assert_eq!(
+        db.memtable_manager.target_memtable_type(),
+        MemtableType::Vec
+    );
+    assert_eq!(
+        db.memtable_manager.wait_for_active_memtable_type().unwrap(),
         MemtableType::Vec
     );
 
@@ -1270,6 +1296,7 @@ fn test_adaptive_memtable_no_deadlock_on_vec_rollback_during_writes() {
     for i in 0..4097u32 {
         db.put(0, format!("w{i}").as_bytes(), 0, b"value").unwrap();
     }
+    db.memtable_manager.flush_active().unwrap();
     assert_eq!(
         db.memtable_manager.target_memtable_type(),
         MemtableType::Vec
