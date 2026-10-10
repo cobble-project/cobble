@@ -10,7 +10,7 @@ fn inplace_replace_last_entry_can_shrink_but_not_rewrite_an_older_entry() {
     let short = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"x"))]);
     mem.put_ref(&key, &old, 1).unwrap();
     let before = mem.data_offset();
-    assert!(mem.try_replace_latest_ref(&key, &short, 1, 0).unwrap());
+    mem.put_ref_or_replace(&key, &short, 1, 0).unwrap();
     assert!(mem.data_offset() < before);
     let mut encoded_key = vec![0; key.encoded_len()];
     encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
@@ -21,8 +21,9 @@ fn inplace_replace_last_entry_can_shrink_but_not_rewrite_an_older_entry() {
     let other = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"value"))]);
     mem.put_ref(&other_key, &other, 1).unwrap();
     let after_append = mem.data_offset();
-    assert!(!mem.try_replace_latest_ref(&key, &old, 1, 0).unwrap());
-    assert_eq!(mem.data_offset(), after_append);
+    mem.put_ref_or_replace(&key, &old, 1, 0).unwrap();
+    assert!(mem.data_offset() > after_append);
+    assert_eq!(mem.get_all(&encoded_key).count(), 2);
 }
 
 #[test]

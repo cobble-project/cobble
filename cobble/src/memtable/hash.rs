@@ -384,33 +384,33 @@ impl Memtable for HashMemtable {
         Ok(bytes.len())
     }
 
-    fn try_replace_latest_ref(
+    fn put_ref_or_replace(
         &mut self,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
         num_columns: usize,
         sealed_data_end: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let key_len = key.encoded_len();
         let mut encoded_key = vec![0; key_len];
         encode_key_ref_into(key, &mut encoded_key.as_mut_slice());
         let Some(entry_offset) = self.latest_entry_offset(&encoded_key) else {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         };
         if entry_offset < sealed_data_end {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         }
         let mut header = &self.buffer[entry_offset..entry_offset + 8];
         let stored_key_len = header.get_u32() as usize;
         let stored_value_len = header.get_u32() as usize;
         let value_len = value.encoded_len(num_columns);
         if stored_key_len != key_len || stored_value_len != value_len {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         }
         let value_start = entry_offset + 8 + stored_key_len;
         let mut value_buf = &mut self.buffer[value_start..value_start + stored_value_len];
         encode_value_ref_into(value, num_columns, &mut value_buf);
-        Ok(true)
+        Ok(())
     }
 
     /// Returns an iterator over all key-value pairs ordered by key bytes ascending.

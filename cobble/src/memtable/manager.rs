@@ -370,10 +370,8 @@ impl ActiveMemtable {
         let memtable = self
             .writable_memtable()
             .expect("active memtable is writable");
-        if is_full_terminal_ref_value(value, num_columns)
-            && memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)?
-        {
-            Ok(())
+        if is_full_terminal_ref_value(value, num_columns) {
+            memtable.put_ref_or_replace(key, value, num_columns, sealed_data_end)
         } else {
             memtable.put_ref(key, value, num_columns)
         }

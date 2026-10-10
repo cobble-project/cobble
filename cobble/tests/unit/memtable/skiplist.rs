@@ -11,16 +11,185 @@ fn inplace_replace_latest_requires_equal_length_and_unsealed_entry() {
     let shorter = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"x"))]);
     mem.put_ref(&key, &old, 1).unwrap();
     let offset = mem.data_offset();
-    assert!(mem.try_replace_latest_ref(&key, &new, 1, 0).unwrap());
+    mem.put_ref_or_replace(&key, &new, 1, 0).unwrap();
     assert_eq!(mem.data_offset(), offset);
     let mut encoded_key = vec![0; key.encoded_len()];
     encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
     let mut expected_value = vec![0; new.encoded_len(1)];
     encode_value_ref_into(&new, 1, &mut expected_value.as_mut_slice());
     assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
-    assert!(!mem.try_replace_latest_ref(&key, &shorter, 1, 0).unwrap());
+    mem.put_ref_or_replace(&key, &shorter, 1, 0).unwrap();
+    let shorter_offset = mem.data_offset();
+    assert!(shorter_offset > offset);
+    mem.put_ref_or_replace(&key, &new, 1, 0).unwrap();
+    let longer_offset = mem.data_offset();
+    assert!(longer_offset > shorter_offset);
+    mem.put_ref_or_replace(&key, &new, 1, longer_offset)
+        .unwrap();
+    assert!(mem.data_offset() > longer_offset);
+    assert_eq!(mem.get_all(&encoded_key).count(), 4);
+    assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
+}
+
+#[test]
+fn combined_missing_insert_matches_append_order_and_encoding() {
+    let mut combined = SkiplistMemtable::with_capacity(64 * 1024);
+    let mut reference = SkiplistMemtable::with_capacity(64 * 1024);
+    let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"value"))]);
+    for index in 0..257 {
+        let key_bytes = format!("shared-prefix-0123456789-{:03}", index * 73 % 257);
+        let key = RefKey::new((index % 3) as u16, key_bytes.as_bytes());
+        combined.put_ref_or_replace(&key, &value, 1, 0).unwrap();
+        reference.put_ref(&key, &value, 1).unwrap();
+    }
+    assert_eq!(combined.data_end, reference.data_end);
+    assert_eq!(combined.next_ordinal, reference.next_ordinal);
+    assert_eq!(combined.buffer, reference.buffer);
+    let mut combined_iter = combined.iter();
+    let mut reference_iter = reference.iter();
+    combined_iter.seek_to_first().unwrap();
+    reference_iter.seek_to_first().unwrap();
+    while reference_iter.next().unwrap() {
+        assert!(combined_iter.next().unwrap());
+        assert_eq!(combined_iter.key().unwrap(), reference_iter.key().unwrap());
+        assert_eq!(
+            combined_iter
+                .take_value()
+                .unwrap()
+                .unwrap()
+                .unwrap_encoded(),
+            reference_iter
+                .take_value()
+                .unwrap()
+                .unwrap()
+                .unwrap_encoded()
+        );
+    }
+    assert!(!combined_iter.next().unwrap());
+}
+
+#[test]
+fn combined_insert_preserves_sealed_prefix_and_replaces_at_seal_boundary() {
+    let mut mem = SkiplistMemtable::with_capacity(1024);
+    let key = RefKey::new(0, b"key");
+    let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+    let new = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+    let newest = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"end"))]);
+    mem.put_ref_or_replace(&key, &old, 1, 0).unwrap();
+    let seal = mem.data_offset();
+    let sealed_bytes = mem.buffer[..seal].to_vec();
+    mem.put_ref_or_replace(&key, &new, 1, seal).unwrap();
+    let after_append = mem.data_offset();
+    assert!(after_append > seal);
+    assert_eq!(&mem.buffer[..seal], sealed_bytes);
+    mem.put_ref_or_replace(&key, &newest, 1, seal).unwrap();
+    assert_eq!(mem.data_offset(), after_append);
+    assert_eq!(&mem.buffer[..seal], sealed_bytes);
+
+    let mut encoded_key = vec![0; key.encoded_len()];
+    encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
+    let node = mem.lower_bound_node(&encoded_key);
+    assert_eq!(mem.node_entry_offset(node), Some(seal));
+    let values: Vec<_> = mem
+        .get_all(&encoded_key)
+        .map(|bytes| {
+            crate::sst::row_codec::decode_value(&mut Bytes::copy_from_slice(bytes), 1).unwrap()
+        })
+        .collect();
+    assert_eq!(values.len(), 2);
+    assert_eq!(
+        values[0].columns()[0].as_ref().unwrap().data().as_ref(),
+        b"end"
+    );
+    assert_eq!(
+        values[1].columns()[0].as_ref().unwrap().data().as_ref(),
+        b"old"
+    );
+}
+
+#[test]
+fn combined_full_table_replaces_but_failed_insert_leaves_all_state_unchanged() {
+    let key = RefKey::new(0, b"key");
+    let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+    let new = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"new"))]);
+    let capacity = SkiplistMemtable::entry_size(key.encoded_len(), old.encoded_len(1))
+        + SkiplistMemtable::node_size(SkiplistMemtable::choose_height(0));
+    let mut mem = SkiplistMemtable::with_capacity(capacity);
+    mem.put_ref_or_replace(&key, &old, 1, 0).unwrap();
+    assert_eq!(mem.remaining_capacity(), 0);
+    mem.put_ref_or_replace(&key, &new, 1, 0).unwrap();
+    let before = (
+        mem.data_end,
+        mem.arena_cursor,
+        mem.heads,
+        mem.max_height,
+        mem.next_ordinal,
+    );
+    let before_buffer = mem.buffer.clone();
+    for (failed_key, seal) in [(RefKey::new(0, b"missing"), 0), (key, mem.data_offset())] {
+        assert!(matches!(
+            mem.put_ref_or_replace(&failed_key, &new, 1, seal),
+            Err(Error::MemtableFull { .. })
+        ));
+        assert_eq!(
+            (
+                mem.data_end,
+                mem.arena_cursor,
+                mem.heads,
+                mem.max_height,
+                mem.next_ordinal
+            ),
+            before
+        );
+        assert_eq!(mem.buffer, before_buffer);
+    }
+}
+
+#[test]
+fn combined_multi_column_replacement_preserves_ttl_and_encoded_length_rules() {
+    let mut mem = SkiplistMemtable::with_capacity(1024);
+    let key = RefKey::new(0, b"key");
+    let old = RefValue::new_with_expired_at(
+        vec![
+            Some(RefColumn::new(ValueType::Put, b"aa")),
+            Some(RefColumn::new(ValueType::Put, b"bbbb")),
+        ],
+        Some(100),
+    );
+    let new = RefValue::new_with_expired_at(
+        vec![
+            Some(RefColumn::new(ValueType::Put, b"cc")),
+            Some(RefColumn::new(ValueType::Put, b"dddd")),
+        ],
+        Some(200),
+    );
+    mem.put_ref_or_replace(&key, &old, 2, 0).unwrap();
+    let offset = mem.data_offset();
+    mem.put_ref_or_replace(&key, &new, 2, 0).unwrap();
     assert_eq!(mem.data_offset(), offset);
-    assert!(!mem.try_replace_latest_ref(&key, &new, 1, offset).unwrap());
+    let mut encoded_key = vec![0; key.encoded_len()];
+    encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
+    let mut encoded = Bytes::copy_from_slice(mem.get(&encoded_key).unwrap());
+    let decoded = crate::sst::row_codec::decode_value(&mut encoded, 2).unwrap();
+    assert_eq!(decoded.expired_at(), Some(200));
+    assert_eq!(
+        decoded.columns()[0].as_ref().unwrap().data().as_ref(),
+        b"cc"
+    );
+    assert_eq!(
+        decoded.columns()[1].as_ref().unwrap().data().as_ref(),
+        b"dddd"
+    );
+    let longer = RefValue::new_with_expired_at(
+        vec![
+            Some(RefColumn::new(ValueType::Put, b"longer")),
+            Some(RefColumn::new(ValueType::Put, b"dddd")),
+        ],
+        Some(300),
+    );
+    mem.put_ref_or_replace(&key, &longer, 2, 0).unwrap();
+    assert!(mem.data_offset() > offset);
+    assert_eq!(mem.get_all(&encoded_key).count(), 2);
 }
 
 fn assert_compare_matches_full_key_ordering(keys: &[&[u8]]) {

@@ -516,6 +516,40 @@ impl SkiplistMemtable {
         self.data_end = end;
         start
     }
+
+    fn append_ref_with_predecessors(
+        &mut self,
+        encoded_key: &[u8],
+        value: &RefValue<'_>,
+        num_columns: usize,
+        update: &[u32; MAX_HEIGHT],
+    ) -> Result<()> {
+        let key_len = encoded_key.len();
+        let value_len = value.encoded_len(num_columns);
+        let ordinal = self.next_ordinal;
+        let height = Self::choose_height(ordinal);
+        let data_len = Self::entry_size(key_len, value_len);
+        let node_len = Self::node_size(height);
+        self.has_space(data_len + node_len)?;
+        let start = self.data_end;
+        let end = start + data_len;
+        let mut slice = &mut self.buffer[start..end];
+        slice.put_u32_le(key_len as u32);
+        slice.put_u32_le(value_len as u32);
+        slice.put_slice(encoded_key);
+        encode_value_ref_into(value, num_columns, &mut slice);
+        self.data_end = end;
+        let key_start = start
+            .checked_add(8)
+            .ok_or_else(|| Error::InvalidState("key start overflow".to_string()))?;
+        let node = self.alloc_node(start, key_start, key_len, encoded_key, height)?;
+        self.link_node(node, height, update)?;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidState("memtable ordinal overflow".to_string()))?;
+        Ok(())
+    }
 }
 
 impl Memtable for SkiplistMemtable {
@@ -546,34 +580,11 @@ impl Memtable for SkiplistMemtable {
         num_columns: usize,
     ) -> Result<()> {
         let key_len = key.encoded_len();
-        let value_len = value.encoded_len(num_columns);
         let mut encoded_key = vec![0u8; key_len];
         let mut key_slice = encoded_key.as_mut_slice();
         encode_key_ref_into(key, &mut key_slice);
-        let ordinal = self.next_ordinal;
-        let height = Self::choose_height(ordinal);
-        let data_len = Self::entry_size(key_len, value_len);
-        let node_len = Self::node_size(height);
-        self.has_space(data_len + node_len)?;
         let update = self.find_predecessors_for_key(&encoded_key);
-        let start = self.data_end;
-        let end = start + data_len;
-        let mut slice = &mut self.buffer[start..end];
-        slice.put_u32_le(key_len as u32);
-        slice.put_u32_le(value_len as u32);
-        slice.put_slice(&encoded_key);
-        encode_value_ref_into(value, num_columns, &mut slice);
-        self.data_end = end;
-        let key_start = start
-            .checked_add(8)
-            .ok_or_else(|| Error::InvalidState("key start overflow".to_string()))?;
-        let node = self.alloc_node(start, key_start, key_len, &encoded_key, height)?;
-        self.link_node(node, height, &update)?;
-        self.next_ordinal = self
-            .next_ordinal
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidState("memtable ordinal overflow".to_string()))?;
-        Ok(())
+        self.append_ref_with_predecessors(&encoded_key, value, num_columns, &update)
     }
 
     fn get(&self, key: &[u8]) -> Option<&[u8]> {
@@ -622,41 +633,35 @@ impl Memtable for SkiplistMemtable {
         Ok(bytes.len())
     }
 
-    fn try_replace_latest_ref(
+    fn put_ref_or_replace(
         &mut self,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
         num_columns: usize,
         sealed_data_end: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let key_len = key.encoded_len();
         let mut encoded_key = vec![0; key_len];
         encode_key_ref_into(key, &mut encoded_key.as_mut_slice());
-        let node = self.lower_bound_node(&encoded_key);
-        if node == NULL_OFFSET || self.node_key(node) != Some(encoded_key.as_slice()) {
-            return Ok(false);
+        // The predecessor splice and candidate stay inside this exclusive borrow. Appending a
+        // duplicate before the first equal key preserves latest-first ordering.
+        let update = self.find_predecessors_for_key(&encoded_key);
+        let node = self.level_next(update[0], 0);
+        if node != NULL_OFFSET
+            && self.node_key(node) == Some(encoded_key.as_slice())
+            && let Some(entry_offset) = self.node_entry_offset(node)
+            && entry_offset >= sealed_data_end
+            && self.node_key_len(node) == Some(key_len)
+            && let Some(stored_value_len) = self.read_u32_le(entry_offset + 4)
+            && stored_value_len as usize == value.encoded_len(num_columns)
+        {
+            let value_start = entry_offset + 8 + key_len;
+            let mut value_buf =
+                &mut self.buffer[value_start..value_start + stored_value_len as usize];
+            encode_value_ref_into(value, num_columns, &mut value_buf);
+            return Ok(());
         }
-        let Some(entry_offset) = self.node_entry_offset(node) else {
-            return Ok(false);
-        };
-        if entry_offset < sealed_data_end {
-            return Ok(false);
-        }
-        let Some(stored_key_len) = self.node_key_len(node) else {
-            return Ok(false);
-        };
-        let Some(stored_value_len) = self.read_u32_le(entry_offset + 4) else {
-            return Ok(false);
-        };
-        let stored_value_len = stored_value_len as usize;
-        let value_len = value.encoded_len(num_columns);
-        if stored_key_len != key_len || stored_value_len != value_len {
-            return Ok(false);
-        }
-        let value_start = entry_offset + 8 + stored_key_len;
-        let mut value_buf = &mut self.buffer[value_start..value_start + stored_value_len];
-        encode_value_ref_into(value, num_columns, &mut value_buf);
-        Ok(true)
+        self.append_ref_with_predecessors(&encoded_key, value, num_columns, &update)
     }
 
     fn iter(&self) -> Self::KvIter<'_> {
