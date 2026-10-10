@@ -11,16 +11,24 @@ fn inplace_replace_latest_requires_equal_length_and_unsealed_entry() {
     let shorter = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"x"))]);
     mem.put_ref(&key, &old, 1).unwrap();
     let offset = mem.data_offset();
-    assert!(mem.try_replace_latest_ref(&key, &new, 1, 0).unwrap());
+    mem.put_ref_or_replace(&key, &new, 1, 0).unwrap();
     assert_eq!(mem.data_offset(), offset);
     let mut encoded_key = vec![0; key.encoded_len()];
     encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
     let mut expected_value = vec![0; new.encoded_len(1)];
     encode_value_ref_into(&new, 1, &mut expected_value.as_mut_slice());
     assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
-    assert!(!mem.try_replace_latest_ref(&key, &shorter, 1, 0).unwrap());
-    assert_eq!(mem.data_offset(), offset);
-    assert!(!mem.try_replace_latest_ref(&key, &new, 1, offset).unwrap());
+    mem.put_ref_or_replace(&key, &shorter, 1, 0).unwrap();
+    let shorter_offset = mem.data_offset();
+    assert!(shorter_offset > offset);
+    mem.put_ref_or_replace(&key, &new, 1, 0).unwrap();
+    let longer_offset = mem.data_offset();
+    assert!(longer_offset > shorter_offset);
+    mem.put_ref_or_replace(&key, &new, 1, longer_offset)
+        .unwrap();
+    assert!(mem.data_offset() > longer_offset);
+    assert_eq!(mem.get_all(&encoded_key).count(), 4);
+    assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
 }
 
 #[test]

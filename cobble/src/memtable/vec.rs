@@ -254,35 +254,35 @@ impl Memtable for VecMemtable {
         Ok(written)
     }
 
-    fn try_replace_latest_ref(
+    fn put_ref_or_replace(
         &mut self,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
         num_columns: usize,
         sealed_data_end: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let Some((last_key, last_value)) = self.entries.last_mut() else {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         };
         let entry_start = *self
             .entry_data_offsets
             .last()
             .expect("vec memtable entries and offsets must match");
         if entry_start < sealed_data_end {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         }
         let key_len = key.encoded_len();
         if last_key.len() != key_len {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         }
         let mut encoded_key = vec![0; key_len];
         encode_key_ref_into(key, &mut encoded_key.as_mut_slice());
         if last_key.as_ref() != encoded_key {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         }
         let value_len = value.encoded_len(num_columns);
         if value_len > last_value.len() {
-            return Ok(false);
+            return self.put_ref(key, value, num_columns);
         }
         let mut encoded_value = vec![0; value_len];
         encode_value_ref_into(value, num_columns, &mut encoded_value.as_mut_slice());
@@ -291,7 +291,7 @@ impl Memtable for VecMemtable {
         *last_value = Bytes::from(encoded_value);
         self.data_end = self.data_end - old_entry_len + new_entry_len;
         self.used_bytes = self.used_bytes - old_entry_len + new_entry_len;
-        Ok(true)
+        Ok(())
     }
 
     fn iter(&self) -> Self::KvIter<'_> {

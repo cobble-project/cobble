@@ -140,6 +140,81 @@ fn active_scan_seals_entries_appended_after_iterator_creation() {
 }
 
 #[test]
+fn concurrent_combined_skiplist_writes_preserve_keys_and_retained_snapshot_bytes() {
+    let active = Arc::new(RwLock::new(ActiveMemtable {
+        id: Uuid::new_v4(),
+        schema: Arc::new(Schema::new(1, 1, Vec::new())),
+        sealed_data_end: 0,
+        contents: ActiveMemtableContents::Writable(MemtableImpl::Skiplist(
+            SkiplistMemtable::with_capacity(128 * 1024),
+        )),
+    }));
+    let key = RefKey::new(0, b"shared");
+    let old = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, b"old"))]);
+    active
+        .write()
+        .unwrap()
+        .put_ref_or_replace(&key, &old, 1)
+        .unwrap();
+    let mut snapshot =
+        MemtableScanIterator::for_active(Arc::clone(&active), None, None, None, None, None, false);
+    snapshot.seek_to_first().unwrap();
+    let mut retained = snapshot.take_value().unwrap().unwrap().unwrap_encoded();
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut writers = Vec::new();
+    for worker in 0..4 {
+        let active = Arc::clone(&active);
+        let barrier = Arc::clone(&barrier);
+        writers.push(std::thread::spawn(move || {
+            let data = [worker as u8; 3];
+            let value = RefValue::new(vec![Some(RefColumn::new(ValueType::Put, &data))]);
+            barrier.wait();
+            for index in 0..128 {
+                let key_bytes = format!("key-{worker}-{index:03}");
+                let mut guard = active.write().unwrap();
+                guard
+                    .put_ref_or_replace(&RefKey::new(0, key_bytes.as_bytes()), &value, 1)
+                    .unwrap();
+                guard
+                    .put_ref_or_replace(&RefKey::new(0, b"shared"), &value, 1)
+                    .unwrap();
+            }
+        }));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let retained = decode_value(&mut retained, 1).unwrap();
+    assert_eq!(
+        retained.columns()[0].as_ref().unwrap().data().as_ref(),
+        b"old"
+    );
+    let guard = active.read().unwrap();
+    let memtable = guard.readable_memtable().unwrap();
+    for worker in 0..4 {
+        for index in 0..128 {
+            let key_bytes = format!("key-{worker}-{index:03}");
+            let encoded_key = encode_scan_key(0, 0, key_bytes.as_bytes());
+            let mut encoded_value = Bytes::copy_from_slice(memtable.get(&encoded_key).unwrap());
+            let value = decode_value(&mut encoded_value, 1).unwrap();
+            assert_eq!(
+                value.columns()[0].as_ref().unwrap().data().as_ref(),
+                [worker as u8; 3]
+            );
+        }
+    }
+    let shared_key = encode_scan_key(0, 0, b"shared");
+    assert_eq!(memtable.get_all(&shared_key).count(), 2);
+    let mut iter = memtable.iter();
+    iter.seek_to_first().unwrap();
+    let mut count = 0;
+    while iter.next().unwrap() {
+        count += 1;
+    }
+    assert_eq!(count, 4 * 128 + 2);
+}
+
+#[test]
 fn unlimited_collection_defers_value_decode_and_does_not_update_shadow_allowance() {
     let filter = MemtableRowFilter {
         num_columns: 1,
@@ -228,19 +303,10 @@ fn active_snapshot_capture_end_excludes_later_tail_and_restores() {
             .unwrap();
         let capture_end = active.readable_memtable().unwrap().data_offset();
         active.seal_data_end(capture_end);
-        let sealed_data_end = active.sealed_data_end;
-        assert!(
-            !active
-                .writable_memtable()
-                .unwrap()
-                .try_replace_latest_ref(&first_key, &replacement_value, 1, sealed_data_end)
-                .unwrap()
-        );
         active
-            .writable_memtable()
-            .unwrap()
-            .put_ref(&first_key, &replacement_value, 1)
+            .put_ref_or_replace(&first_key, &replacement_value, 1)
             .unwrap();
+        assert!(active.readable_memtable().unwrap().data_offset() > capture_end);
         capture_end
     };
     let snapshot_write = MemtableManager::write_active_memtable_snapshot_data(

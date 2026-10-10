@@ -49,13 +49,15 @@ pub(crate) trait Memtable {
         end_offset: usize,
         writer: &mut dyn crate::file::SequentialWriteFile,
     ) -> Result<usize>;
-    fn try_replace_latest_ref(
+    /// Replaces an unsealed latest value when safe, or appends a new entry otherwise.
+    /// The caller must only use this for full-terminal rows; merges and partial rows must append.
+    fn put_ref_or_replace(
         &mut self,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
         num_columns: usize,
         sealed_data_end: usize,
-    ) -> Result<bool>;
+    ) -> Result<()>;
 
     fn iter(&self) -> Self::KvIter<'_>;
 
@@ -241,22 +243,22 @@ impl Memtable for MemtableImpl {
         }
     }
 
-    fn try_replace_latest_ref(
+    fn put_ref_or_replace(
         &mut self,
         key: &RefKey<'_>,
         value: &RefValue<'_>,
         num_columns: usize,
         sealed_data_end: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         match self {
             Self::Hash(memtable) => {
-                memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)
+                memtable.put_ref_or_replace(key, value, num_columns, sealed_data_end)
             }
             Self::Skiplist(memtable) => {
-                memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)
+                memtable.put_ref_or_replace(key, value, num_columns, sealed_data_end)
             }
             Self::Vec(memtable) => {
-                memtable.try_replace_latest_ref(key, value, num_columns, sealed_data_end)
+                memtable.put_ref_or_replace(key, value, num_columns, sealed_data_end)
             }
         }
     }
