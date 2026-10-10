@@ -2,15 +2,14 @@
 //!
 //! Monitors read/write/scan access patterns and adaptively switches the memtable type to match
 //! the observed access patterns. The controller is lock-free on the fast path and has no background
-//! thread: every state operation increments a counter and returns an optional
-//! [`SwitchDecision`] when a window boundary is crossed. The memtable manager applies and confirms
-//! the decision after the originating operation releases its active-memtable lock.
+//! thread: operations increment counters and return an optional
+//! [`SwitchDecision`] when a fast fallback is detected. Normal evaluation runs at a non-empty
+//! memtable rotation, selecting the replacement type before its allocation. Fast fallback decisions
+//! are applied and confirmed after the originating operation releases its active-memtable lock.
 //!
-//! Statistics are approximate: the window boundary check uses `>=` rather than exact bitmask
-//! equality so that batch operations crossing a boundary (e.g. `record_write(4097)`) are never
-//! missed. A concurrent thread that adds ops between the boundary check and the counter reset
-//! may have those ops discarded by the `swap(0)` - this is acceptable because the next window
-//! will re-evaluate with fresh data.
+//! Statistics are approximate: counters are drained separately, so concurrent operations can land
+//! in different windows for the total and read/scan counts. Threshold checks use `>=` so batches
+//! crossing a threshold are not missed; each completed evaluation starts a fresh window.
 //!
 //! See [`AdaptiveMemtableController`] for the full decision logic.
 
@@ -24,12 +23,14 @@ use crate::config::MemtableType;
 /// Main evaluation window size (operations).
 const WINDOW_SIZE: u64 = 4096;
 
-/// Sensitive (fast rollback) window size, checked only on poison ops (scans on VEC/HASH).
-const SENSITIVE_WINDOW_SIZE: u64 = 64;
+/// Consecutive main windows needed to specialize again after a confirmed rollback.
+const REENTRY_WINDOWS: u8 = 3;
 
-/// Extra-sensitive window size, checked only for reads on VEC. VEC is the most performance-
-/// fragile specialized type: any read activity should trigger a rollback as fast as possible.
-const VEC_READ_SENSITIVE_WINDOW_SIZE: u64 = 16;
+/// Minimum sample size for fast HASH rollback.
+const HASH_FALLBACK_MIN_OPS: u64 = 64;
+
+/// Minimum sample size for fast VEC rollback on any point read or range scan.
+const VEC_FALLBACK_MIN_OPS: u64 = 16;
 
 /// Encodes a concrete [`MemtableType`] (never `Adaptive`) as a `u8` for atomic storage.
 fn type_to_u8(t: MemtableType) -> u8 {
@@ -73,49 +74,38 @@ pub(crate) struct SwitchDecision {
 ///
 /// # Switching rules
 ///
-/// The controller maintains a `current_type` (one of `Skiplist`, `Hash`, `Vec`) and evaluates
-/// a window of operations when a boundary is crossed. The decision rules are evaluated in order:
+/// Normal evaluation runs only at a non-empty memtable rotation after at least 4096 operations.
+/// Operations keep accumulating beyond 4096 until then. Pure writes select `Vec`; otherwise
+/// at least 99% point reads among point reads plus range scans select `Hash`.
+/// Writes do not dilute the scan ratio.
+/// Other mixtures select `Skiplist`.
 ///
-/// 1. Pure writes (zero reads + zero scans) -> `Vec`, no flush.
-/// 2. On `Vec` with any reads/scans -> `Skiplist`, flush (reads are poison on VEC).
-/// 3. Any scans -> `Skiplist`, flushing only when leaving `Hash`.
-/// 4. Any point reads and zero scans -> `Hash`, no flush, regardless of write count.
+/// `Vec` falls back to `Skiplist` with a flush on any read/scan after 16 total operations.
+/// `Hash` falls back with a flush below the 99% point-read ratio after 64 total operations.
+/// Every operation can detect these fallbacks, including writes following a scan. Probes that
+/// do not fall back leave the main window intact; completed normal evaluations drain it.
 ///
-/// VEC enters when a full window contains only writes (zero reads/scans). VEC exits on the first
-/// window where any read or scan appears - the extra-sensitive 16-op window on VEC makes this
-/// detection near-instant. HASH handles point reads mixed with any number of writes. A window
-/// with any reads on VEC rolls back to SKIPLIST (with flush) rather
-/// than "entering" HASH, because the flush is needed to migrate VEC's append-only data.
+/// A confirmed fallback restarts the window after its forced rotation and enables a reentry
+/// bias: specialization then requires three consecutive completed normal windows selecting the
+/// same type. Unsuitable windows clear the run; a different candidate starts a new run. This bias
+/// lasts until adaptive mode is toggled; initial specialization still needs only one full window.
 ///
-/// # Scans
+/// # Fast path
 ///
-/// Range scans are tracked in a separate `range_scans` counter used only as a boolean signal:
-/// any scan (`rs > 0`) blocks HASH and VEC entry (neither supports efficient range scans).
-///
-/// # Fast path vs slow path
-///
-/// - **SKIPLIST (fast path)**: all operations are not sensitive. Only the 4096-op window is
-///   checked.
-/// - **VEC (slow path for reads)**: point reads and range scans are poison. Poison ops
-///   additionally check a smaller sensitive window for fast rollback.
-/// - **HASH (slow path for scans)**: range scans are poison. Scans check the sensitive window.
-///
-/// Writes are never poison, so `record_write()` always uses the fast path (4096-op window only),
-/// except on VEC where writes also check the 16-op window so evaluation fires frequently enough to
-/// detect any read activity.
+/// Recording uses atomics only unless an actual fast-fallback signal is detected. The manager
+/// evaluates full windows while rotating a non-empty table, before creating the next active table.
 pub(crate) struct AdaptiveMemtableController {
     total_ops: AtomicU64,
     point_reads: AtomicU64,
     range_scans: AtomicU64,
-    writes: AtomicU64,
     current_type: AtomicU8,
     /// Whether adaptive evaluation is active. When `false`, all `record_*` calls are no-ops and
     /// `confirm_switch` rejects everything. Toggled by `switch_memtable_type`: enabling on
     /// `Adaptive`, disabling on a concrete type.
     enabled: AtomicBool,
-    /// Serializes mode transitions and evaluation so that a decision is always created from the
-    /// same adaptive session that supplied its statistics.
-    eval_lock: Mutex<()>,
+    /// Serializes mode transitions, evaluation and decision resolution, and protects the
+    /// post-rollback reentry state. A decision belongs to the session supplying its statistics.
+    eval_lock: Mutex<EvaluationState>,
     /// Monotonically increasing **epoch** - incremented on every mode transition (enable/disable).
     /// Never reset. A `SwitchDecision` carries the epoch it was created in; `validate_decision`
     /// rejects decisions from a stale epoch. This prevents ABA when adaptive mode is toggled.
@@ -133,6 +123,12 @@ pub(crate) struct AdaptiveMemtableController {
     /// into that interval.
     #[cfg(test)]
     evaluation_hook: Mutex<Option<EvaluationHook>>,
+}
+
+#[derive(Default)]
+struct EvaluationState {
+    after_fallback: bool,
+    reentry_candidate: Option<(MemtableType, u8)>,
 }
 
 #[cfg(test)]
@@ -157,10 +153,9 @@ impl AdaptiveMemtableController {
             total_ops: AtomicU64::new(0),
             point_reads: AtomicU64::new(0),
             range_scans: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
             current_type: AtomicU8::new(type_to_u8(initial_type)),
             enabled: AtomicBool::new(enabled),
-            eval_lock: Mutex::new(()),
+            eval_lock: Mutex::new(EvaluationState::default()),
             epoch: AtomicU64::new(0),
             decision_generation: AtomicU64::new(0),
             pending_generation: AtomicU64::new(0),
@@ -179,15 +174,16 @@ impl AdaptiveMemtableController {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Enables adaptive evaluation, resetting counters and bumping the epoch so any in-flight
-    /// decision from a previous (disabled) session is invalidated. Called when
+    /// Enables adaptive evaluation, resetting counters/reentry bias and bumping the epoch so
+    /// any in-flight decision from a previous (disabled) session is invalidated. Called when
     /// `switch_memtable_type(Adaptive)` is invoked. Generation is **not** reset - it remains
     /// monotonically increasing across epochs, so the epoch check alone prevents ABA.
     pub(crate) fn enable(&self) {
         // Keep the mode transition in the same critical section as decision creation. In
         // particular, an old evaluation must not drain its window, then acquire this new epoch
         // while publishing its decision.
-        let _guard = self.eval_lock.lock().unwrap();
+        let mut state = self.eval_lock.lock().unwrap();
+        *state = EvaluationState::default();
         self.reset_counters();
         self.pending_generation.store(0, Ordering::Relaxed);
         self.epoch.fetch_add(1, Ordering::Relaxed);
@@ -203,11 +199,12 @@ impl AdaptiveMemtableController {
     /// `switch_memtable_type(concrete)` pins a specific type. The `current_type` is updated to
     /// `pinned_type` so that if adaptive mode is re-enabled later, evaluation resumes from the
     /// pinned type rather than a stale value. The epoch is bumped and any in-flight decision is
-    /// cleared.
+    /// cleared, together with the reentry bias and candidate run.
     pub(crate) fn disable(&self, pinned_type: MemtableType) {
         // See `enable`: mode transitions and evaluation share this lock so a decision's epoch
         // always describes the statistics used to make it.
-        let _guard = self.eval_lock.lock().unwrap();
+        let mut state = self.eval_lock.lock().unwrap();
+        *state = EvaluationState::default();
         self.enabled.store(false, Ordering::Relaxed);
         self.current_type
             .store(type_to_u8(pinned_type), Ordering::Relaxed);
@@ -221,13 +218,11 @@ impl AdaptiveMemtableController {
         );
     }
 
-    /// Clears accumulated statistics (not generations/epoch). Used by `enable` and `disable` so
-    /// transitions don't carry over stale window data.
+    /// Clears statistics on mode transitions and confirmed fallbacks, not generations/epoch.
     fn reset_counters(&self) {
         self.total_ops.store(0, Ordering::Relaxed);
         self.point_reads.store(0, Ordering::Relaxed);
         self.range_scans.store(0, Ordering::Relaxed);
-        self.writes.store(0, Ordering::Relaxed);
     }
 
     /// Validates whether a decision is still applicable **before** any side effects. Returns
@@ -263,11 +258,21 @@ impl AdaptiveMemtableController {
 
     /// Called by the caller after successfully performing the switch described by `decision`.
     /// Updates the controller's tracked type and clears the pending slot so the next window can
-    /// generate a new decision.
+    /// generate a new decision. A confirmed rollback enables the three-window reentry bias.
     pub(crate) fn confirm_switch(&self, decision: &SwitchDecision) {
+        let mut state = self.eval_lock.lock().unwrap();
         if !self.validate_decision(decision) {
             return;
         }
+        if matches!(self.current_type(), MemtableType::Hash | MemtableType::Vec)
+            && decision.target == MemtableType::Skiplist
+        {
+            state.after_fallback = true;
+            // Restart at confirmation so the fallback's forced rotation and operations
+            // collected while it was pending cannot satisfy the new full window.
+            self.reset_counters();
+        }
+        state.reentry_candidate = None;
         self.current_type
             .store(type_to_u8(decision.target), Ordering::Relaxed);
         self.pending_generation.store(0, Ordering::Relaxed);
@@ -275,34 +280,27 @@ impl AdaptiveMemtableController {
 
     /// Cancels a pending decision without updating the type. Called when the physical switch
     /// fails or a decision is rejected. Clears the pending slot so the next window can generate
-    /// a fresh decision and retry.
+    /// a fresh decision and retry. Cancelling reentry also clears its candidate run, not its bias.
     pub(crate) fn cancel_decision(&self, decision: &SwitchDecision) {
+        let mut state = self.eval_lock.lock().unwrap();
         // Only clear if this is still the pending decision (it may have been superseded by a
         // mode toggle, in which case pending is already 0 or belongs to a new epoch).
         let pending = self.pending_generation.load(Ordering::Relaxed);
         if pending == decision.generation && decision.epoch == self.epoch.load(Ordering::Relaxed) {
             self.pending_generation.store(0, Ordering::Relaxed);
+            state.reentry_candidate = None;
         }
     }
 
-    /// Records `count` writes. Returns a [`SwitchDecision`] if a window boundary was crossed and
-    /// the controller decided to switch types; the caller performs the switch and calls
+    /// Records `count` writes. Returns a [`SwitchDecision`] only for a fast fallback;
+    /// the caller performs the switch and calls
     /// [`confirm_switch`](Self::confirm_switch) on success.
     pub(crate) fn record_write(&self, count: u64) -> Option<SwitchDecision> {
         if count == 0 || !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
-        self.writes.fetch_add(count, Ordering::Relaxed);
         let n = self.total_ops.fetch_add(count, Ordering::Relaxed) + count;
-        // Use >= so batch ops crossing a boundary are never missed. On VEC, also check the
-        // 16-op window so reads are detected quickly.
-        let main_window = n >= WINDOW_SIZE;
-        let sensitive =
-            self.current_type() == MemtableType::Vec && n >= VEC_READ_SENSITIVE_WINDOW_SIZE;
-        if main_window || sensitive {
-            return self.evaluate(n);
-        }
-        None
+        self.maybe_fallback(n)
     }
 
     /// Records `count` point reads. Returns a [`SwitchDecision`] if evaluation fires.
@@ -312,37 +310,58 @@ impl AdaptiveMemtableController {
         }
         self.point_reads.fetch_add(count, Ordering::Relaxed);
         let n = self.total_ops.fetch_add(count, Ordering::Relaxed) + count;
-        let main_window = n >= WINDOW_SIZE;
-        let sensitive =
-            self.current_type() == MemtableType::Vec && n >= VEC_READ_SENSITIVE_WINDOW_SIZE;
-        if main_window || sensitive {
-            return self.evaluate(n);
-        }
-        None
+        self.maybe_fallback(n)
     }
 
     /// Records a range scan. Returns a [`SwitchDecision`] if evaluation fires.
     ///
-    /// Scans are tracked in a separate counter used only as a boolean signal (`rs > 0` blocks
-    /// HASH/VEC entry). They do not contribute to the point-read counter.
+    /// Scans are tracked separately from point reads. Writes never dilute their ratio.
     pub(crate) fn record_range_scan(&self) -> Option<SwitchDecision> {
         if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
         self.range_scans.fetch_add(1, Ordering::Relaxed);
         let n = self.total_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        let main_window = n >= WINDOW_SIZE;
-        let sensitive = self.current_type() != MemtableType::Skiplist && n >= SENSITIVE_WINDOW_SIZE;
-        if main_window || sensitive {
-            return self.evaluate(n);
+        self.maybe_fallback(n)
+    }
+
+    fn maybe_fallback(&self, n: u64) -> Option<SwitchDecision> {
+        let prev = self.current_type();
+        // Avoid acquiring eval_lock for every specialized operation past 16/64 when there is
+        // no actual fallback signal. Every operation checks so a scan followed by writes can
+        // still trigger HASH rollback at 64 total operations.
+        if self.fast_fallback(prev, n) {
+            return self.evaluate(false);
         }
         None
     }
 
-    fn evaluate(&self, observed_total: u64) -> Option<SwitchDecision> {
-        // Guard against concurrent evaluation: a failed try_lock means another thread is already
-        // evaluating. That thread will reset the counters, so skipping is safe.
-        let Ok(_guard) = self.eval_lock.try_lock() else {
+    fn fast_fallback(&self, prev: MemtableType, n: u64) -> bool {
+        match prev {
+            MemtableType::Vec if n >= VEC_FALLBACK_MIN_OPS => {
+                self.point_reads.load(Ordering::Relaxed) > 0
+                    || self.range_scans.load(Ordering::Relaxed) > 0
+            }
+            MemtableType::Hash if n >= HASH_FALLBACK_MIN_OPS => {
+                let scans = self.range_scans.load(Ordering::Relaxed);
+                scans != 0 && !hash_read_ratio(self.point_reads.load(Ordering::Relaxed), scans)
+            }
+            _ => false,
+        }
+    }
+
+    /// Evaluates a full normal window at a non-empty rotation. The manager applies and confirms
+    /// any returned decision before creating the replacement table; no additional flush is needed.
+    pub(crate) fn evaluate_on_rotation(&self) -> Option<SwitchDecision> {
+        if self.total_ops.load(Ordering::Relaxed) < WINDOW_SIZE {
+            return None;
+        }
+        self.evaluate(true)
+    }
+
+    fn evaluate(&self, normal_rotation: bool) -> Option<SwitchDecision> {
+        // Another evaluator or mode transition owns the lock; leave statistics for a later call.
+        let Ok(mut state) = self.eval_lock.try_lock() else {
             return None;
         };
 
@@ -363,11 +382,13 @@ impl AdaptiveMemtableController {
             return None;
         }
 
-        // Re-check the threshold after acquiring the lock: another thread may have already
-        // evaluated and reset the counters. If the current total is below the threshold, skip.
+        // Re-check after acquiring the lock: another evaluation may have drained the counters.
         let current_total = self.total_ops.load(Ordering::Relaxed);
-        if current_total < observed_total.min(WINDOW_SIZE) && current_total < WINDOW_SIZE {
-            // Counters were reset by a concurrent evaluation; nothing to do.
+        let prev = self.current_type();
+        let normal = normal_rotation && current_total >= WINDOW_SIZE;
+        let fallback = self.fast_fallback(prev, current_total);
+        // Fast probes never drain a partial main window unless they actually roll back.
+        if !normal && !fallback {
             return None;
         }
 
@@ -375,20 +396,35 @@ impl AdaptiveMemtableController {
         // store(0)) to avoid discarding ops written between the load above and the reset.
         let pr = self.point_reads.swap(0, Ordering::Relaxed);
         let rs = self.range_scans.swap(0, Ordering::Relaxed);
-        let wr = self.writes.swap(0, Ordering::Relaxed);
-        let _total = self.total_ops.swap(0, Ordering::Relaxed);
-        // Note: `total` may differ from pr+rs+wr due to concurrent writes between individual
-        // swap calls. This is acceptable - the window statistics are approximate by design.
-        let sum = pr + rs + wr;
-        if sum == 0 {
-            return None;
-        }
+        let total = self.total_ops.swap(0, Ordering::Relaxed);
+        // Concurrent operations may straddle these separate drains; statistics are approximate.
 
-        let prev = self.current_type();
-        let raw_decision = decide(prev, pr, rs);
+        // Once a fast fallback is detected, keep that decision even if concurrent point reads
+        // change the ratio while draining. An early probe must never drain then specialize.
+        let raw_decision = if fallback {
+            RawDecision {
+                target: MemtableType::Skiplist,
+                flush_current: true,
+            }
+        } else {
+            decide(prev, pr, rs)
+        };
 
         if raw_decision.target == prev {
+            state.reentry_candidate = None;
             return None;
+        }
+        if prev == MemtableType::Skiplist && state.after_fallback {
+            let windows = match state.reentry_candidate {
+                Some((target, windows)) if target == raw_decision.target => windows + 1,
+                _ => 1,
+            };
+            state.reentry_candidate = Some((raw_decision.target, windows));
+            if windows < REENTRY_WINDOWS {
+                return None;
+            }
+        } else {
+            state.reentry_candidate = None;
         }
 
         #[cfg(test)]
@@ -408,8 +444,8 @@ impl AdaptiveMemtableController {
 
         info!(
             "Adaptive memtable switch: {:?} -> {:?} (flush_current={}, gen={}, epoch={}, \
-             window: pointReads={}, rangeScans={}, writes={}, total={})",
-            prev, decision.target, decision.flush_current, generation, epoch, pr, rs, wr, sum
+             window: pointReads={}, rangeScans={}, total={})",
+            prev, decision.target, decision.flush_current, generation, epoch, pr, rs, total
         );
         // Do NOT update current_type here - the caller must confirm after performing the switch.
         Some(decision)
@@ -456,19 +492,24 @@ fn decide(prev: MemtableType, pr: u64, rs: u64) -> RawDecision {
         };
     }
 
-    // Rule 3: any scan requires Skiplist; leaving Hash requires a flush.
-    if rs > 0 {
+    // Rule 3: below 99% point reads requires Skiplist; leaving Hash requires a flush.
+    if !hash_read_ratio(pr, rs) {
         return RawDecision {
             target: MemtableType::Skiplist,
             flush_current: prev == MemtableType::Hash,
         };
     }
 
-    // Rule 4: point reads without scans -> Hash, regardless of write count.
+    // Rule 4: at least 99% point reads among reads/scans -> Hash, regardless of write count.
     RawDecision {
         target: MemtableType::Hash,
         flush_current: false,
     }
+}
+
+/// At least 99% point reads among reads/scans; u128 keeps the comparison exact and overflow-free.
+fn hash_read_ratio(pr: u64, rs: u64) -> bool {
+    (pr as u128) >= 99 * (rs as u128)
 }
 
 #[cfg(test)]
