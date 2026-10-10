@@ -49,8 +49,9 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectBatchWithOptio
         return;
     };
     let encoded = unsafe { std::slice::from_raw_parts(encoded_address, encoded_length) };
-    let default_options = StructuredWriteOptions::default();
+    let default_options;
     let options = if write_options_handle == 0 {
+        default_options = StructuredWriteOptions::default();
         &default_options
     } else {
         let Some(handle) =
@@ -159,8 +160,9 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectChunksWithOpti
         return;
     }
 
-    let default_options = StructuredWriteOptions::default();
+    let default_options;
     let options = if write_options_handle == 0 {
+        default_options = StructuredWriteOptions::default();
         &default_options
     } else {
         let Some(handle) =

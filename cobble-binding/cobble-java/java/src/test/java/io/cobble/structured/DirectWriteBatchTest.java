@@ -12,9 +12,35 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class DirectWriteBatchTest {
+
+    @Test
+    void preservesDefaultAndExplicitColumnFamilyAndTtlOptions() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-direct-batch-options-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        config.ttlEnabled = true;
+        config.timeProvider = Config.TimeProviderKind.MANUAL;
+        DirectWriteBatch batch = new DirectWriteBatch(16);
+
+        try (Db db = Db.open(config);
+                WriteOptions options = WriteOptions.withColumnFamily("timed").ttlSeconds(10)) {
+            db.updateSchema().addBytesColumn("timed", 0).commit();
+            append(batch, "key", "default");
+            db.putDirectBatchWithOptions(0, 0, batch, null);
+            batch.clear();
+            append(batch, "key", "expires");
+            db.putDirectBatchWithOptions(0, 0, batch, options);
+
+            assertArrayEquals(bytes("default"), db.get(0, bytes("key")).getBytes(0));
+            assertArrayEquals(bytes("expires"), db.get(0, bytes("key"), "timed").getBytes(0));
+            db.setTime(11);
+            assertNull(db.get(0, bytes("key"), "timed"));
+            assertArrayEquals(bytes("default"), db.get(0, bytes("key")).getBytes(0));
+        }
+    }
 
     @Test
     void writesAndReusesDirectBatch() throws IOException {

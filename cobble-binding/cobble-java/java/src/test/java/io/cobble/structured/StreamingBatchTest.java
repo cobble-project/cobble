@@ -19,6 +19,37 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class StreamingBatchTest {
 
     @Test
+    void preservesDefaultAndExplicitColumnFamilyAndTtlOptions() throws IOException {
+        Path dataDir = Files.createTempDirectory("cobble-streaming-batch-options-");
+        Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
+        config.ttlEnabled = true;
+        config.timeProvider = Config.TimeProviderKind.MANUAL;
+
+        try (Db db = Db.open(config);
+                WriteOptions options = WriteOptions.withColumnFamily("timed").ttlSeconds(10)) {
+            db.updateSchema().addBytesColumn("timed", 0).commit();
+            try (StreamingWriteBatch batch = db.streamingWriteBatch(0, 0, null, 4)) {
+                batch.output().write(bytes("key"));
+                batch.finishKey();
+                batch.output().write(bytes("default"));
+                batch.finishElement();
+            }
+            try (StreamingWriteBatch batch = db.streamingWriteBatch(0, 0, options, 4)) {
+                batch.output().write(bytes("key"));
+                batch.finishKey();
+                batch.output().write(bytes("expires"));
+                batch.finishElement();
+            }
+
+            assertArrayEquals(bytes("default"), db.get(0, bytes("key")).getBytes(0));
+            assertArrayEquals(bytes("expires"), db.get(0, bytes("key"), "timed").getBytes(0));
+            db.setTime(11);
+            assertNull(db.get(0, bytes("key"), "timed"));
+            assertArrayEquals(bytes("default"), db.get(0, bytes("key")).getBytes(0));
+        }
+    }
+
+    @Test
     void streamsWritesAcrossChunksAndFlushesAtElementBoundaries() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-streaming-write-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(1).totalBuckets(1);
