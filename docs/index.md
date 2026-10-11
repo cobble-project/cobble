@@ -4,8 +4,6 @@ layout: home
 nav_order: 1
 ---
 
-# Cobble Project
-
 <p align="center"><img src="{{ '/static/logos/cobble-horizontal-1024.png' | relative_url }}" style="max-width: 60%; height: auto;" alt="Cobble Project logo" /></p>
 
 **Cobble** is a high-performance LSM-based key-value storage engine designed for both embedded and distributed systems.
