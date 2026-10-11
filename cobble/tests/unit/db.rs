@@ -44,6 +44,381 @@ fn open_db(config: Config) -> Db {
     .unwrap()
 }
 
+#[test]
+fn single_column_memtable_put_preserves_payload_projection_and_owned_results() {
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db = open_db(Config {
+            memtable_capacity: Size::from_mib(1),
+            memtable_type,
+            ..config_with_small_memtable(root.path().to_str().unwrap())
+        });
+        let mut schema = db.update_schema();
+        schema.set_column_family_value_has_ttl(None, false).unwrap();
+        schema.commit();
+        let payload = b"\x00\xffarbitrary-length\x00payload";
+        db.put(0, b"binary", 0, payload).unwrap();
+        db.put(0, b"empty", 0, b"").unwrap();
+        for options in [
+            ReadOptions::default(),
+            ReadOptions::for_column(0),
+            ReadOptions::for_columns(vec![0, 0]),
+            ReadOptions::for_columns(vec![]),
+        ] {
+            let keys = [(0, b"binary".as_slice()), (0, b"empty"), (0, b"missing")];
+            let expected = db.multi_get_with_options(&keys, &options).unwrap();
+            for ((bucket, key), expected) in keys.iter().zip(expected) {
+                assert_eq!(
+                    db.get_with_options(*bucket, key, &options).unwrap(),
+                    expected,
+                    "{memtable_type:?}"
+                );
+            }
+        }
+        assert_eq!(db.get(0, b"empty").unwrap(), Some(vec![Some(Bytes::new())]));
+        let retained = db.get(0, b"binary").unwrap().unwrap();
+        db.put(0, b"binary", 0, b"replacement").unwrap();
+        assert_eq!(retained[0].as_deref(), Some(payload.as_slice()));
+        assert_eq!(
+            db.get(0, b"binary").unwrap().unwrap()[0].as_deref(),
+            Some(b"replacement".as_slice())
+        );
+        db.delete(0, b"empty", 0).unwrap();
+        assert_eq!(db.get(0, b"empty").unwrap(), None);
+        assert!(
+            db.get_with_options(0, b"binary", &ReadOptions::for_column(1))
+                .is_err()
+        );
+        db.advance_truncation_cursor_by_id(0, 0, b"zz").unwrap();
+        assert_eq!(db.get(0, b"binary").unwrap(), None);
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn single_column_memtable_put_falls_back_for_merge_delete_ttl_and_vlog() {
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        for separated in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = open_db(Config {
+                memtable_capacity: Size::from_mib(1),
+                memtable_type,
+                ttl_enabled: true,
+                time_provider: TimeProviderKind::Manual,
+                value_separation_threshold: separated.then(|| Size::from_const(1)),
+                snapshot_on_flush: false,
+                ..config_with_small_memtable(root.path().to_str().unwrap())
+            });
+            db.set_time(100);
+            db.put(0, b"key", 0, b"old").unwrap();
+            db.put_with_options(0, b"ttl", 0, b"older", &WriteOptions::with_ttl(1))
+                .unwrap();
+            db.memtable_manager.flush_active().unwrap();
+            for result in db.memtable_manager.wait_for_flushes() {
+                result.unwrap();
+            }
+            assert_eq!(
+                db.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+                Some(b"old".as_slice())
+            );
+            db.put(0, b"key", 0, b"new").unwrap();
+            assert_eq!(
+                db.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+                Some(b"new".as_slice())
+            );
+            db.merge(0, b"key", 0, b"_operand").unwrap();
+            assert_eq!(
+                db.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+                Some(b"new_operand".as_slice())
+            );
+            db.delete(0, b"key", 0).unwrap();
+            assert_eq!(db.get(0, b"key").unwrap(), None);
+            // Valid expiry ordering: the older row expires before the newer terminal Put.
+            db.put_with_options(0, b"ttl", 0, b"newer", &WriteOptions::with_ttl(2))
+                .unwrap();
+            assert_eq!(
+                db.get(0, b"ttl").unwrap().unwrap()[0].as_deref(),
+                Some(b"newer".as_slice())
+            );
+            db.set_time(103);
+            assert_eq!(db.get(0, b"ttl").unwrap(), None);
+            let large = [0x81; 129];
+            db.put(0, b"large", 0, large).unwrap();
+            assert_eq!(
+                db.get(0, b"large").unwrap().unwrap()[0].as_deref(),
+                Some(large.as_slice())
+            );
+            db.memtable_manager.flush_active().unwrap();
+            for result in db.memtable_manager.wait_for_flushes() {
+                result.unwrap();
+            }
+            assert_eq!(
+                db.get(0, b"large").unwrap().unwrap()[0].as_deref(),
+                Some(large.as_slice())
+            );
+            assert_eq!(db.get(0, b"missing").unwrap(), None);
+            db.close().unwrap();
+        }
+    }
+}
+
+#[test]
+fn single_column_memtable_put_preserves_same_width_schema_transform() {
+    let root = tempfile::tempdir().unwrap();
+    let db = open_db(Config {
+        memtable_capacity: Size::from_mib(1),
+        ..config_with_small_memtable(root.path().to_str().unwrap())
+    });
+    db.put(0, b"key", 0, b"old").unwrap();
+    db.register_schema_transform("suffix", |_spec| {
+        Ok(|value: Option<Bytes>| {
+            Ok(value.map(|value| [value.as_ref(), b"-evolved"].concat().into()))
+        })
+    })
+    .unwrap();
+    let mut schema = db.update_schema();
+    schema
+        .remap_columns(
+            None,
+            vec![ColumnEvolution::Source {
+                source_index: 0,
+                transform: Some(TransformSpec {
+                    transform_type: "suffix".into(),
+                    spec: Bytes::new(),
+                }),
+            }],
+        )
+        .unwrap();
+    schema.commit();
+    assert_eq!(
+        db.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+        Some(b"old-evolved".as_slice())
+    );
+    db.put(0, b"key", 0, b"new").unwrap();
+    assert_eq!(
+        db.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+        Some(b"new".as_slice())
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn full_put_memtable_preserves_multicolumn_projections_and_owned_results() {
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db = open_db(Config {
+            num_columns: 9,
+            memtable_capacity: Size::from_mib(1),
+            memtable_type,
+            ..config_with_small_memtable(root.path().to_str().unwrap())
+        });
+        let mut schema = db.update_schema();
+        schema.set_column_family_value_has_ttl(None, false).unwrap();
+        schema.commit();
+        let payloads: Vec<Vec<u8>> = (0..9)
+            .map(|index| {
+                if index == 4 {
+                    vec![]
+                } else {
+                    vec![0, 255, index]
+                }
+            })
+            .collect();
+        db.put_columns_with_options(0, b"key", &payloads, &WriteOptions::default())
+            .unwrap();
+        let expected: Vec<_> = payloads
+            .iter()
+            .map(|data| Some(Bytes::copy_from_slice(data)))
+            .collect();
+        assert_eq!(db.get(0, b"key").unwrap(), Some(expected));
+        for projection in [
+            None,
+            Some((0..9).collect()),
+            Some((0..9).rev().collect()),
+            Some(vec![0, 0, 8]),
+            Some(vec![4]),
+            Some(vec![]),
+        ] {
+            let options = projection.map(ReadOptions::for_columns).unwrap_or_default();
+            let keys = [(0, b"key".as_slice()), (0, b"missing")];
+            let reference = db.multi_get_with_options(&keys, &options).unwrap();
+            for ((bucket, key), expected) in keys.iter().zip(reference) {
+                assert_eq!(
+                    db.get_with_options(*bucket, key, &options).unwrap(),
+                    expected
+                );
+            }
+        }
+        let retained = db.get(0, b"key").unwrap().unwrap();
+        let first_ptr = retained[0].as_ref().unwrap().as_ptr() as usize;
+        // Full rows retain the canonical inter-column tag/length gaps in one shared buffer.
+        assert_eq!(
+            retained[1].as_ref().unwrap().as_ptr() as usize,
+            first_ptr + payloads[0].len() + 5
+        );
+        let identity = db
+            .get_with_options(0, b"key", &ReadOptions::for_columns((0..9).collect()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity, retained);
+        assert_eq!(
+            identity[1].as_ref().unwrap().as_ptr() as usize,
+            identity[0].as_ref().unwrap().as_ptr() as usize + payloads[0].len() + 5
+        );
+        db.put_columns_with_options(0, b"key", &[b"new"; 9], &WriteOptions::default())
+            .unwrap();
+        for (value, expected) in retained.iter().zip(&payloads) {
+            assert_eq!(value.as_deref(), Some(expected.as_slice()));
+        }
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn full_put_memtable_falls_back_for_partial_merge_delete_ttl_vlog_and_sst() {
+    for memtable_type in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        for separated in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = open_db(Config {
+                num_columns: 3,
+                memtable_capacity: Size::from_mib(1),
+                memtable_type,
+                ttl_enabled: true,
+                time_provider: TimeProviderKind::Manual,
+                value_separation_threshold: separated.then(|| Size::from_const(1)),
+                snapshot_on_flush: false,
+                ..config_with_small_memtable(root.path().to_str().unwrap())
+            });
+            db.set_time(100);
+            let base = [b"base-0".as_slice(), b"base-1", b"base-2"];
+            db.put_columns_with_options(0, b"key", &base, &WriteOptions::default())
+                .unwrap();
+            db.put_columns_with_options(0, b"ttl", &base, &WriteOptions::with_ttl(1))
+                .unwrap();
+            db.memtable_manager.flush_active().unwrap();
+            for result in db.memtable_manager.wait_for_flushes() {
+                result.unwrap();
+            }
+            assert_eq!(
+                db.get(0, b"key").unwrap().unwrap()[2].as_deref(),
+                Some(base[2])
+            );
+            db.put_columns_with_options(0, b"active-merge", &base, &WriteOptions::default())
+                .unwrap();
+            db.merge(0, b"active-merge", 0, b"_operand").unwrap();
+            let merged = db.get(0, b"active-merge").unwrap().unwrap();
+            assert_eq!(merged[0].as_deref(), Some(b"base-0_operand".as_slice()));
+            assert_eq!(merged[1].as_deref(), Some(base[1]));
+            db.put(0, b"key", 1, b"changed").unwrap();
+            let partial = db.get(0, b"key").unwrap().unwrap();
+            assert_eq!(partial[0].as_deref(), Some(base[0]));
+            assert_eq!(partial[1].as_deref(), Some(b"changed".as_slice()));
+            assert_eq!(partial[2].as_deref(), Some(base[2]));
+            db.merge(0, b"key", 0, b"_operand").unwrap();
+            db.delete(0, b"key", 2).unwrap();
+            let expected = vec![
+                Some(Bytes::from_static(b"base-0_operand")),
+                Some(Bytes::from_static(b"changed")),
+                None,
+            ];
+            assert_eq!(db.get(0, b"key").unwrap(), Some(expected.clone()));
+            assert_eq!(db.multi_get(&[(0, b"key")]).unwrap(), vec![Some(expected)]);
+            db.put_columns_with_options(0, b"ttl", &[b"new"; 3], &WriteOptions::with_ttl(2))
+                .unwrap();
+            assert_eq!(
+                db.get(0, b"ttl").unwrap().unwrap()[0].as_deref(),
+                Some(b"new".as_slice())
+            );
+            db.set_time(103);
+            assert_eq!(db.get(0, b"ttl").unwrap(), None);
+            db.put_columns_with_options(0, b"full", &base, &WriteOptions::default())
+                .unwrap();
+            assert_eq!(
+                db.get(0, b"full").unwrap(),
+                db.multi_get(&[(0, b"full")]).unwrap().pop().unwrap()
+            );
+            db.memtable_manager.flush_active().unwrap();
+            for result in db.memtable_manager.wait_for_flushes() {
+                result.unwrap();
+            }
+            assert_eq!(
+                db.get(0, b"full").unwrap().unwrap()[0].as_deref(),
+                Some(base[0])
+            );
+            db.close().unwrap();
+        }
+    }
+}
+
+#[test]
+fn full_put_memtable_preserves_multicolumn_schema_remapping() {
+    let root = tempfile::tempdir().unwrap();
+    let db = open_db(Config {
+        num_columns: 2,
+        memtable_capacity: Size::from_mib(1),
+        ..config_with_small_memtable(root.path().to_str().unwrap())
+    });
+    db.put_columns_with_options(
+        0,
+        b"key",
+        &[b"left".as_slice(), b"right"],
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    let mut schema = db.update_schema();
+    schema
+        .remap_columns(
+            None,
+            vec![
+                ColumnEvolution::Source {
+                    source_index: 1,
+                    transform: None,
+                },
+                ColumnEvolution::Source {
+                    source_index: 0,
+                    transform: None,
+                },
+            ],
+        )
+        .unwrap();
+    schema.commit();
+    assert_eq!(
+        db.get(0, b"key").unwrap(),
+        Some(vec![
+            Some(Bytes::from_static(b"right")),
+            Some(Bytes::from_static(b"left"))
+        ])
+    );
+    db.put_columns_with_options(
+        0,
+        b"key",
+        &[b"new-left".as_slice(), b"new-right"],
+        &WriteOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+        Some(b"new-left".as_slice())
+    );
+    db.close().unwrap();
+}
+
 fn runtime_manifest_store(db: &Db) -> crate::runtime_manifest::RuntimeManifestStore {
     crate::runtime_manifest::RuntimeManifestStore::new(Arc::clone(&db.file_manager))
 }

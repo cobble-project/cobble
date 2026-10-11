@@ -1,5 +1,280 @@
 use super::*;
 
+fn decode_memtable_row(data: &[u8], num_columns: usize) -> Result<DecodedValue> {
+    decode_memtable_value(
+        &mut Bytes::copy_from_slice(data),
+        num_columns,
+        &vec![u8::MAX; bitmap_size(num_columns).max(1)],
+        true,
+    )
+}
+
+fn direct_columns(decoded: DecodedValue) -> Vec<Option<Bytes>> {
+    match decoded {
+        DecodedValue::FullPut(columns) => columns,
+        DecodedValue::Value(_) => panic!("expected a direct Put result"),
+    }
+}
+
+fn assert_generic_matches_reference(data: &[u8], num_columns: usize) {
+    let DecodedValue::Value(value) = decode_memtable_row(data, num_columns).unwrap() else {
+        panic!("expected a generic Value result");
+    };
+    let reference = decode_value(&mut Bytes::copy_from_slice(data), num_columns).unwrap();
+    assert_eq!(value.expired_at(), reference.expired_at());
+    assert_eq!(
+        encode_value(&value, num_columns),
+        encode_value(&reference, num_columns)
+    );
+}
+
+#[test]
+fn full_put_columns_preserves_single_column_arbitrary_and_empty_bytes() {
+    for payload in [b"".as_slice(), b"\x00\xffarbitrary\x00bytes", &[0x42; 257]] {
+        let value = Value::new(vec![Some(Column::new(
+            ValueType::Put,
+            Bytes::copy_from_slice(payload),
+        ))]);
+        let encoded = encode_value(&value, 1);
+        let extracted = direct_columns(decode_memtable_row(&encoded, 1).unwrap());
+        assert_eq!(extracted[0].as_deref(), Some(payload));
+        if !payload.is_empty() {
+            assert_ne!(
+                extracted[0].as_ref().unwrap().as_ptr(),
+                encoded[5..].as_ptr()
+            );
+        }
+    }
+}
+
+#[test]
+fn full_put_columns_rejects_ttl_and_non_put_rows() {
+    for value_type in [
+        ValueType::Put,
+        ValueType::Delete,
+        ValueType::Merge,
+        ValueType::PutSeparated,
+        ValueType::MergeSeparated,
+        ValueType::PutSeparatedArray,
+        ValueType::MergeSeparatedArray,
+    ] {
+        for expired_at in [None, Some(123)] {
+            let value = Value::new_with_expired_at(
+                vec![Some(Column::new(
+                    value_type,
+                    Bytes::from_static(b"payload"),
+                ))],
+                expired_at,
+            );
+            let encoded = encode_value(&value, 1);
+            if value_type == ValueType::Put && expired_at.is_none() {
+                assert_eq!(
+                    direct_columns(decode_memtable_row(&encoded, 1).unwrap())[0].as_deref(),
+                    Some(b"payload".as_slice())
+                );
+            } else {
+                assert_generic_matches_reference(&encoded, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn full_put_columns_reports_truncated_headers_and_invalid_tags() {
+    for len in 0..5 {
+        assert!(decode_memtable_row(&vec![0; len], 1).is_err());
+    }
+    for expired_at in [0u32, 123] {
+        let mut encoded = expired_at.to_le_bytes().to_vec();
+        encoded.push(0xff);
+        assert!(matches!(
+            decode_memtable_row(&encoded, 1),
+            Err(Error::IoError(_))
+        ));
+    }
+}
+
+#[test]
+fn full_put_columns_shares_one_buffer_across_bitmap_tail_and_empty_payloads() {
+    for num_columns in [2, 8, 9, 17] {
+        let payloads: Vec<_> = (0..num_columns)
+            .map(|index| match index % 3 {
+                0 => vec![0, 255, index as u8],
+                1 => vec![],
+                _ => vec![index as u8; 257],
+            })
+            .collect();
+        let value = Value::new(
+            payloads
+                .iter()
+                .map(|payload| Some(Column::new(ValueType::Put, Bytes::copy_from_slice(payload))))
+                .collect(),
+        );
+        let encoded = encode_value(&value, num_columns);
+        let extracted = direct_columns(decode_memtable_row(&encoded, num_columns).unwrap());
+        let base = extracted[0].as_ref().unwrap().as_ptr() as usize;
+        let mut offset = 0;
+        for (index, (column, payload)) in extracted.iter().zip(&payloads).enumerate() {
+            let column = column.as_ref().unwrap();
+            assert_eq!(column.as_ref(), payload);
+            if !payload.is_empty() {
+                assert_eq!(column.as_ptr() as usize, base + offset);
+            }
+            offset += payload.len() + if index + 2 == num_columns { 1 } else { 5 };
+        }
+        // Unused bitmap tail bits do not describe schema columns and match the general decoder.
+        if num_columns % 8 != 0 {
+            let mut tail_bits = encoded.to_vec();
+            tail_bits[4 + bitmap_size(num_columns) - 1] |= !column_mask_last_byte(num_columns);
+            assert_eq!(
+                direct_columns(decode_memtable_row(&tail_bits, num_columns).unwrap()),
+                extracted
+            );
+        }
+    }
+    assert_generic_matches_reference(&[0; 4], 0);
+}
+
+#[test]
+fn full_put_columns_falls_back_for_missing_or_non_put_columns() {
+    for num_columns in [2, 9] {
+        for index in 0..num_columns {
+            for value_type in [
+                None,
+                Some(ValueType::Merge),
+                Some(ValueType::Delete),
+                Some(ValueType::PutSeparated),
+            ] {
+                let mut columns =
+                    vec![
+                        Some(Column::new(ValueType::Put, Bytes::from_static(b"payload")));
+                        num_columns
+                    ];
+                columns[index] =
+                    value_type.map(|kind| Column::new(kind, Bytes::from_static(b"other")));
+                let encoded = encode_value(&Value::new(columns), num_columns);
+                assert_generic_matches_reference(&encoded, num_columns);
+            }
+        }
+        let value = Value::new_with_expired_at(
+            vec![Some(Column::new(ValueType::Put, Bytes::new())); num_columns],
+            Some(123),
+        );
+        assert_generic_matches_reference(&encode_value(&value, num_columns), num_columns);
+    }
+}
+
+#[test]
+fn full_put_columns_validates_multicolumn_headers_lengths_and_tags() {
+    let put = encode_value_type(&ValueType::Put);
+    for data in [
+        vec![0, 0, 0, 0],
+        vec![0, 0, 0, 0, 3],
+        vec![0, 0, 0, 0, 3, put, 0, 0, 0],
+        vec![0, 0, 0, 0, 3, put, 10, 0, 0, 0],
+        vec![0, 0, 0, 0, 3, put, 255, 255, 255, 255],
+        vec![0, 0, 0, 0, 3, put, 0, 0, 0, 0],
+        vec![0, 0, 0, 0, 3, put, 0, 0, 0, 0, 255],
+    ] {
+        assert!(matches!(
+            decode_memtable_row(&data, 2),
+            Err(Error::IoError(_))
+        ));
+    }
+    // Generic results report corruption in the same traversal, including TTL and missing rows.
+    for data in [vec![0, 0, 0, 0, 1, 255], vec![1, 0, 0, 0, 3, 255]] {
+        assert!(decode_memtable_row(&data, 2).is_err());
+        assert!(decode_value(&mut Bytes::from(data), 2).is_err());
+    }
+}
+
+#[test]
+fn memtable_decoder_promotes_late_non_put_and_keeps_shared_payloads() {
+    for kind in [
+        ValueType::Merge,
+        ValueType::Delete,
+        ValueType::PutSeparated,
+        ValueType::MergeSeparatedArray,
+    ] {
+        for index in [1, 8] {
+            let mut columns =
+                vec![Some(Column::new(ValueType::Put, Bytes::from_static(b"payload"))); 9];
+            columns[index] = Some(Column::new(kind, Bytes::from_static(b"tail")));
+            let encoded = encode_value(&Value::new(columns), 9);
+            assert_generic_matches_reference(&encoded, 9);
+            let DecodedValue::Value(value) = decode_memtable_row(&encoded, 9).unwrap() else {
+                panic!("expected generic row");
+            };
+            let prefix = value.columns()[0].as_ref().unwrap().data();
+            let next = value.columns()[1].as_ref().unwrap().data();
+            assert_eq!(
+                next.as_ptr() as usize,
+                prefix.as_ptr() as usize + prefix.len() + 5
+            );
+        }
+    }
+}
+
+#[test]
+fn memtable_decoder_disabled_direct_and_masked_terminal_semantics() {
+    let value = Value::new(vec![
+        Some(Column::new(ValueType::Put, Bytes::from_static(b"first"))),
+        Some(Column::new(ValueType::Delete, Bytes::new())),
+        Some(Column::new(ValueType::Merge, Bytes::from_static(b"merge"))),
+    ]);
+    let encoded = encode_value(&value, 3);
+    let mut terminal_mask = [0u8];
+    let masked =
+        decode_value_masked(&mut encoded.clone(), 3, &[0b100], Some(&mut terminal_mask)).unwrap();
+    assert_eq!(terminal_mask, [0b011]);
+    assert!(masked.columns()[0].is_none());
+    assert!(masked.columns()[1].is_none());
+    assert_eq!(
+        masked.columns()[2].as_ref().unwrap().data().as_ref(),
+        b"merge"
+    );
+    let all_put = encode_value(
+        &Value::new(vec![
+            Some(Column::new(
+                ValueType::Put,
+                Bytes::from_static(b"payload")
+            ));
+            3
+        ]),
+        3,
+    );
+    assert!(matches!(
+        decode_memtable_value(&mut all_put.clone(), 3, &[0b111], false).unwrap(),
+        DecodedValue::Value(_)
+    ));
+    assert!(matches!(
+        decode_memtable_value(&mut all_put.clone(), 3, &[0b101], true).unwrap(),
+        DecodedValue::Value(_)
+    ));
+    let no_ttl = all_put.slice(4..);
+    let decoded =
+        decode_value_masked_with_ttl(&mut no_ttl.clone(), 3, &[0b111], None, false).unwrap();
+    assert_eq!(decoded.columns().len(), 3);
+    assert!(decoded.expired_at().is_none());
+}
+
+#[test]
+fn memtable_decoder_detects_corruption_after_late_promotion() {
+    let put = encode_value_type(&ValueType::Put);
+    let merge = encode_value_type(&ValueType::Merge);
+    for data in [
+        vec![0, 0, 0, 0, 7, put, 0, 0, 0, 0, merge],
+        vec![0, 0, 0, 0, 7, put, 0, 0, 0, 0, merge, 255, 255, 255, 255],
+        vec![0, 0, 0, 0, 7, put, 0, 0, 0, 0, merge, 0, 0, 0, 0, 255],
+    ] {
+        assert!(matches!(
+            decode_memtable_row(&data, 3),
+            Err(Error::IoError(_))
+        ));
+        assert!(decode_value(&mut Bytes::from(data), 3).is_err());
+    }
+}
+
 #[test]
 fn test_encode_decode_key() {
     let key = Key::new(42, b"hello world".to_vec());
