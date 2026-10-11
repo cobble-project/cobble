@@ -14,6 +14,7 @@ use crate::iterator::KvIterator;
 use crate::r#type::{KvValue, RefKey, RefValue};
 pub(crate) use hash::HashMemtable;
 pub(crate) use skiplist::SkiplistMemtable;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 pub(crate) use vec::{
     VecMemtable, decode_vec_entry_stream, encode_vec_entry_stream_entry,
@@ -37,7 +38,10 @@ pub(crate) trait Memtable {
     fn put_ref(&mut self, key: &RefKey<'_>, value: &RefValue<'_>, num_columns: usize)
     -> Result<()>;
     fn get(&self, key: &[u8]) -> Option<&[u8]>;
-    fn get_all(&self, key: &[u8]) -> Self::ValueIter<'_>;
+    /// Visits matching versions newest-first, stopping immediately on Break or an error.
+    fn visit_values_until<F>(&self, key: &[u8], visitor: F) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>>;
     fn remaining_capacity(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn data_offset(&self) -> usize;
@@ -61,10 +65,6 @@ pub(crate) trait Memtable {
 
     fn iter(&self) -> Self::KvIter<'_>;
 
-    type ValueIter<'a>: Iterator<Item = &'a [u8]>
-    where
-        Self: 'a;
-
     type KvIter<'a>: KvIterator<'a>
     where
         Self: 'a;
@@ -82,24 +82,6 @@ impl MemtableImpl {
             Self::Hash(_) => MemtableType::Hash,
             Self::Skiplist(_) => MemtableType::Skiplist,
             Self::Vec(_) => MemtableType::Vec,
-        }
-    }
-}
-
-pub(crate) enum MemtableValueIter<'a> {
-    Hash(hash::MemtableValueIter<'a>),
-    Skiplist(skiplist::MemtableValueIter<'a>),
-    Vec(vec::MemtableValueIter<'a>),
-}
-
-impl<'a> Iterator for MemtableValueIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Hash(iter) => iter.next(),
-            Self::Skiplist(iter) => iter.next(),
-            Self::Vec(iter) => iter.next(),
         }
     }
 }
@@ -198,11 +180,14 @@ impl Memtable for MemtableImpl {
         }
     }
 
-    fn get_all(&self, key: &[u8]) -> Self::ValueIter<'_> {
+    fn visit_values_until<F>(&self, key: &[u8], visitor: F) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    {
         match self {
-            Self::Hash(memtable) => MemtableValueIter::Hash(memtable.get_all(key)),
-            Self::Skiplist(memtable) => MemtableValueIter::Skiplist(memtable.get_all(key)),
-            Self::Vec(memtable) => MemtableValueIter::Vec(memtable.get_all(key)),
+            Self::Hash(memtable) => memtable.visit_values_until(key, visitor),
+            Self::Skiplist(memtable) => memtable.visit_values_until(key, visitor),
+            Self::Vec(memtable) => memtable.visit_values_until(key, visitor),
         }
     }
 
@@ -270,11 +255,6 @@ impl Memtable for MemtableImpl {
             Self::Vec(memtable) => MemtableKvIter::Vec(memtable.iter()),
         }
     }
-
-    type ValueIter<'a>
-        = MemtableValueIter<'a>
-    where
-        Self: 'a;
 
     type KvIter<'a>
         = MemtableKvIter<'a>

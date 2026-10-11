@@ -5,6 +5,7 @@ use crate::memtable::{Memtable, MemtableReclaimer};
 use crate::sst::row_codec::{encode_key_ref_into, encode_value_ref_into};
 use crate::r#type::{RefKey, RefValue};
 use bytes::Bytes;
+use std::ops::ControlFlow;
 
 pub(crate) type MemtableKvIterator<'a> = OrderedMemtableKvIterator<'a>;
 
@@ -17,7 +18,7 @@ pub(crate) struct VecMemtable {
     reclaimer: Option<MemtableReclaimer>,
 }
 
-pub(crate) struct MemtableValueIter<'a> {
+struct MemtableValueIter<'a> {
     mem: &'a VecMemtable,
     key: Vec<u8>,
     next_idx: usize,
@@ -136,6 +137,14 @@ impl VecMemtable {
         }
         Ok(())
     }
+
+    fn get_all(&self, key: &[u8]) -> MemtableValueIter<'_> {
+        MemtableValueIter {
+            mem: self,
+            key: key.to_vec(),
+            next_idx: self.entries.len(),
+        }
+    }
 }
 
 impl Memtable for VecMemtable {
@@ -182,12 +191,16 @@ impl Memtable for VecMemtable {
             .map(|(_, value)| value.as_ref())
     }
 
-    fn get_all(&self, key: &[u8]) -> Self::ValueIter<'_> {
-        MemtableValueIter {
-            mem: self,
-            key: key.to_vec(),
-            next_idx: self.entries.len(),
+    fn visit_values_until<F>(&self, key: &[u8], mut visitor: F) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    {
+        for value in self.get_all(key) {
+            if visitor(value)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
         }
+        Ok(ControlFlow::Continue(()))
     }
 
     fn remaining_capacity(&self) -> usize {
@@ -304,10 +317,6 @@ impl Memtable for VecMemtable {
         MemtableKvIterator::new(entries)
     }
 
-    type ValueIter<'a>
-        = MemtableValueIter<'a>
-    where
-        Self: 'a;
     type KvIter<'a>
         = MemtableKvIterator<'a>
     where
