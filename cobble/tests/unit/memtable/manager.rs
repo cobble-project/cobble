@@ -23,6 +23,57 @@ fn default_options_use_skiplist_memtable() {
     );
 }
 
+#[test]
+fn visitor_dispatch_preserves_versions_and_stop_for_all_memtable_types() {
+    for kind in [
+        MemtableType::Hash,
+        MemtableType::Skiplist,
+        MemtableType::Vec,
+    ] {
+        let table = build_test_memtable(
+            kind,
+            &[
+                (b"key", ValueType::Put, b"base"),
+                (b"key", ValueType::Merge, b"operand"),
+                (b"neighbor", ValueType::Put, b"other"),
+            ],
+        );
+        let mut key = Vec::new();
+        crate::sst::row_codec::encode_key_ref_into(&RefKey::new(0, b"key"), &mut key);
+        let mut visited = Vec::new();
+        assert!(
+            table
+                .visit_values_until(&key, |value| {
+                    let decoded = decode_value(&mut Bytes::copy_from_slice(value), 1)?;
+                    let column = decoded.columns()[0].as_ref().unwrap();
+                    visited.push((*column.value_type(), column.data().to_vec()));
+                    Ok(ControlFlow::Continue(()))
+                })
+                .unwrap()
+                .is_continue()
+        );
+        assert_eq!(
+            visited,
+            vec![
+                (ValueType::Merge, b"operand".to_vec()),
+                (ValueType::Put, b"base".to_vec()),
+            ],
+            "{kind:?}"
+        );
+        let mut visits = 0;
+        assert!(
+            table
+                .visit_values_until(&key, |_| {
+                    visits += 1;
+                    Ok(ControlFlow::Break(()))
+                })
+                .unwrap()
+                .is_break()
+        );
+        assert_eq!(visits, 1, "{kind:?}");
+    }
+}
+
 fn cleanup_test_root() {
     let _ = std::fs::remove_dir_all("/tmp/memtable_manager_test");
 }
@@ -204,7 +255,17 @@ fn concurrent_combined_skiplist_writes_preserve_keys_and_retained_snapshot_bytes
         }
     }
     let shared_key = encode_scan_key(0, 0, b"shared");
-    assert_eq!(memtable.get_all(&shared_key).count(), 2);
+    let mut versions = 0;
+    assert!(
+        memtable
+            .visit_values_until(&shared_key, |_| {
+                versions += 1;
+                Ok(ControlFlow::Continue(()))
+            })
+            .unwrap()
+            .is_continue()
+    );
+    assert_eq!(versions, 2);
     let mut iter = memtable.iter();
     iter.seek_to_first().unwrap();
     let mut count = 0;

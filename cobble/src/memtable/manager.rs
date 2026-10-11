@@ -2134,19 +2134,21 @@ impl MemtableManager {
     {
         if let Some(active) = &snapshot.active {
             let active = active.read().unwrap();
-            if let Some(memtable) = active.readable_memtable() {
-                for value in memtable.get_all(key) {
-                    if f(value, active.schema.as_ref())?.is_break() {
-                        return Ok(());
-                    }
-                }
+            if let Some(memtable) = active.readable_memtable()
+                && memtable
+                    .visit_values_until(key, |value| f(value, active.schema.as_ref()))?
+                    .is_break()
+            {
+                return Ok(());
             }
         }
         for immutable in snapshot.immutables.iter().rev() {
-            for value in immutable.memtable.get_all(key) {
-                if f(value, immutable.schema.as_ref())?.is_break() {
-                    return Ok(());
-                }
+            if immutable
+                .memtable
+                .visit_values_until(key, |value| f(value, immutable.schema.as_ref()))?
+                .is_break()
+            {
+                return Ok(());
             }
         }
         Ok(())

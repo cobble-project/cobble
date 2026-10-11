@@ -2,6 +2,66 @@ use super::*;
 use crate::iterator::KvIterator;
 use crate::r#type::{RefColumn, ValueType};
 
+fn collect_values(mem: &SkiplistMemtable, key: &[u8]) -> Vec<Vec<u8>> {
+    let mut values = Vec::new();
+    assert!(
+        mem.visit_values_until(key, |value| {
+            values.push(value.to_vec());
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap()
+        .is_continue()
+    );
+    values
+}
+
+#[test]
+fn visitor_matches_version_order_and_stops_at_key_boundary() {
+    let mut mem = SkiplistMemtable::with_capacity(4096);
+    mem.put(b"a", b"neighbor-before").unwrap();
+    mem.put(b"key", b"base").unwrap();
+    mem.put(b"key", b"merge-one").unwrap();
+    mem.put(b"key", b"merge-two").unwrap();
+    mem.put(b"z", b"neighbor-after").unwrap();
+    for (key, expected) in [
+        (
+            b"key".as_slice(),
+            vec![b"merge-two".as_slice(), b"merge-one", b"base"],
+        ),
+        (b"a", vec![b"neighbor-before".as_slice()]),
+        (b"z", vec![b"neighbor-after".as_slice()]),
+        (b"missing", vec![]),
+        (b"", vec![]),
+        (b"zz", vec![]),
+    ] {
+        assert_eq!(collect_values(&mem, key), expected);
+    }
+}
+
+#[test]
+fn visitor_break_and_error_do_not_visit_older_versions() {
+    let mut mem = SkiplistMemtable::with_capacity(4096);
+    mem.put(b"key", b"old").unwrap();
+    mem.put(b"key", b"new").unwrap();
+    let mut visits = 0;
+    assert!(
+        mem.visit_values_until(b"key", |value| {
+            visits += 1;
+            assert_eq!(value, b"new");
+            Ok(std::ops::ControlFlow::Break(()))
+        })
+        .unwrap()
+        .is_break()
+    );
+    assert_eq!(visits, 1);
+    let result = mem.visit_values_until(b"key", |_| {
+        visits += 1;
+        Err(Error::InvalidState("visitor failed".into()))
+    });
+    assert!(matches!(result, Err(Error::InvalidState(message)) if message == "visitor failed"));
+    assert_eq!(visits, 2);
+}
+
 #[test]
 fn inplace_replace_latest_requires_equal_length_and_unsealed_entry() {
     let mut mem = SkiplistMemtable::with_capacity(1024);
@@ -27,7 +87,7 @@ fn inplace_replace_latest_requires_equal_length_and_unsealed_entry() {
     mem.put_ref_or_replace(&key, &new, 1, longer_offset)
         .unwrap();
     assert!(mem.data_offset() > longer_offset);
-    assert_eq!(mem.get_all(&encoded_key).count(), 4);
+    assert_eq!(collect_values(&mem, &encoded_key).len(), 4);
     assert_eq!(mem.get(&encoded_key), Some(expected_value.as_slice()));
 }
 
@@ -90,8 +150,8 @@ fn combined_insert_preserves_sealed_prefix_and_replaces_at_seal_boundary() {
     encode_key_ref_into(&key, &mut encoded_key.as_mut_slice());
     let node = mem.lower_bound_node(&encoded_key);
     assert_eq!(mem.node_entry_offset(node), Some(seal));
-    let values: Vec<_> = mem
-        .get_all(&encoded_key)
+    let values: Vec<_> = collect_values(&mem, &encoded_key)
+        .iter()
         .map(|bytes| {
             crate::sst::row_codec::decode_value(&mut Bytes::copy_from_slice(bytes), 1).unwrap()
         })
@@ -189,7 +249,7 @@ fn combined_multi_column_replacement_preserves_ttl_and_encoded_length_rules() {
     );
     mem.put_ref_or_replace(&key, &longer, 2, 0).unwrap();
     assert!(mem.data_offset() > offset);
-    assert_eq!(mem.get_all(&encoded_key).count(), 2);
+    assert_eq!(collect_values(&mem, &encoded_key).len(), 2);
 }
 
 fn assert_compare_matches_full_key_ordering(keys: &[&[u8]]) {
@@ -225,12 +285,12 @@ fn put_and_get() {
 }
 
 #[test]
-fn get_all_returns_latest_first() {
+fn visitor_returns_latest_first() {
     let mut mem = SkiplistMemtable::with_capacity(2048);
     mem.put(b"key", b"v1").unwrap();
     mem.put(b"key", b"v2").unwrap();
     mem.put(b"key", b"v3").unwrap();
-    let mut iter = mem.get_all(b"key");
+    let mut iter = collect_values(&mem, b"key").into_iter();
     assert_eq!(iter.next().unwrap(), b"v3");
     assert_eq!(iter.next().unwrap(), b"v2");
     assert_eq!(iter.next().unwrap(), b"v1");
@@ -480,9 +540,9 @@ fn large_scale_overwrite_keeps_latest_and_full_history() {
         let latest = format!("v{:02}-{:05}", VERSIONS_PER_KEY - 1, key_id);
         assert_eq!(mem.get(key.as_bytes()).unwrap(), latest.as_bytes());
 
-        let collected = mem
-            .get_all(key.as_bytes())
-            .map(|v| String::from_utf8(v.to_vec()).unwrap())
+        let collected = collect_values(&mem, key.as_bytes())
+            .into_iter()
+            .map(|v| String::from_utf8(v).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(collected.len(), VERSIONS_PER_KEY);
         for (idx, value) in collected.iter().enumerate() {

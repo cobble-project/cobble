@@ -12,7 +12,7 @@ use crate::r#type::{RefKey, RefValue};
 use crate::util::unsafe_bytes;
 use bytes::Bytes;
 use std::cmp::Ordering;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 const NULL_OFFSET: u32 = u32::MAX;
 const MAX_HEIGHT: usize = 12;
@@ -42,12 +42,6 @@ pub(crate) struct SkiplistMemtable {
     max_height: usize,
     next_ordinal: u32,
     reclaimer: Option<MemtableReclaimer>,
-}
-
-pub(crate) struct MemtableValueIter<'a> {
-    mem: &'a SkiplistMemtable,
-    key: Vec<u8>,
-    next_node: u32,
 }
 
 impl<'a> SkiplistMemtableIter<'a> {
@@ -596,12 +590,26 @@ impl Memtable for SkiplistMemtable {
         if entry_key == key { Some(value) } else { None }
     }
 
-    fn get_all(&self, key: &[u8]) -> Self::ValueIter<'_> {
-        MemtableValueIter {
-            mem: self,
-            key: key.to_vec(),
-            next_node: self.lower_bound_node(key),
+    fn visit_values_until<F>(&self, key: &[u8], mut visitor: F) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    {
+        let mut node = self.lower_bound_node(key);
+        while node != NULL_OFFSET {
+            let Some((entry_key, value)) = self.node_key_value(node) else {
+                break;
+            };
+            if entry_key == key {
+                // Borrow the lookup key and defer the successor read until the visitor continues.
+                if visitor(value)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            } else if entry_key > key {
+                break;
+            }
+            node = self.node_next(node, 0).unwrap_or(NULL_OFFSET);
         }
+        Ok(ControlFlow::Continue(()))
     }
 
     fn remaining_capacity(&self) -> usize {
@@ -668,34 +676,10 @@ impl Memtable for SkiplistMemtable {
         MemtableKvIterator::new(self)
     }
 
-    type ValueIter<'a>
-        = MemtableValueIter<'a>
-    where
-        Self: 'a;
     type KvIter<'a>
         = MemtableKvIterator<'a>
     where
         Self: 'a;
-}
-
-impl<'a> Iterator for MemtableValueIter<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.next_node != NULL_OFFSET {
-            let node = self.next_node;
-            self.next_node = self.mem.node_next(node, 0).unwrap_or(NULL_OFFSET);
-            let (entry_key, value) = self.mem.node_key_value(node)?;
-            if entry_key == self.key {
-                return Some(value);
-            }
-            if entry_key > self.key.as_slice() {
-                self.next_node = NULL_OFFSET;
-                return None;
-            }
-        }
-        None
-    }
 }
 
 impl Drop for SkiplistMemtable {

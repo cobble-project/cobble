@@ -1,6 +1,7 @@
 //! Hash-indexed memtable implementation.
 //! This memtable organizes entries in a single buffer with a hash index for efficient lookups.
 use bytes::{Buf, BufMut};
+use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
 use crate::memtable::iter::OrderedMemtableKvIterator;
@@ -26,7 +27,7 @@ pub(crate) struct HashMemtable {
     reclaimer: Option<MemtableReclaimer>,
 }
 
-pub(crate) struct MemtableValueIter<'a> {
+struct MemtableValueIter<'a> {
     mem: &'a HashMemtable,
     key: Vec<u8>,
     hash: u64,
@@ -284,6 +285,18 @@ impl HashMemtable {
         }
         MemtableKvIterator::new(entries)
     }
+
+    fn get_all(&self, key: &[u8]) -> MemtableValueIter<'_> {
+        let hash = Self::hash_key(key);
+        let hash_bucket = self.bucket_index_from_hash(hash);
+        let head = self.bucket_head(hash_bucket);
+        MemtableValueIter {
+            mem: self,
+            key: key.to_vec(),
+            hash,
+            next_node: head,
+        }
+    }
 }
 
 impl Memtable for HashMemtable {
@@ -343,16 +356,16 @@ impl Memtable for HashMemtable {
         None
     }
 
-    fn get_all(&self, key: &[u8]) -> MemtableValueIter<'_> {
-        let hash = Self::hash_key(key);
-        let hash_bucket = self.bucket_index_from_hash(hash);
-        let head = self.bucket_head(hash_bucket);
-        MemtableValueIter {
-            mem: self,
-            key: key.to_vec(),
-            hash,
-            next_node: head,
+    fn visit_values_until<F>(&self, key: &[u8], mut visitor: F) -> Result<ControlFlow<()>>
+    where
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    {
+        for value in self.get_all(key) {
+            if visitor(value)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
         }
+        Ok(ControlFlow::Continue(()))
     }
 
     fn remaining_capacity(&self) -> usize {
@@ -418,11 +431,6 @@ impl Memtable for HashMemtable {
     fn iter(&self) -> MemtableKvIterator<'_> {
         self.iter_with_bounds(None, None)
     }
-
-    type ValueIter<'a>
-        = MemtableValueIter<'a>
-    where
-        Self: 'a;
 
     type KvIter<'a> = MemtableKvIterator<'a>;
 }
