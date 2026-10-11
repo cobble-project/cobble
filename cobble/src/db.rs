@@ -5,6 +5,7 @@ use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};
 use crate::db_status::{CloseTransition, DbAccessGuard, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
+use crate::iterator::selects_all_columns;
 use crate::key_codec::{
     encode_key, encode_next_column_family_scan_key, encode_scan_key, encode_scan_key_after,
 };
@@ -17,7 +18,9 @@ use crate::snapshot::{
     ActiveMemtableSnapshotData, LoadedManifest, SnapshotCallback, SnapshotManager,
     SnapshotManifestInfo, load_manifest_for_snapshot, snapshot_manifest_name,
 };
-use crate::sst::row_codec::{decode_key, decode_value, decode_value_masked};
+use crate::sst::row_codec::{
+    DecodedValue, decode_key, decode_memtable_value, decode_value, decode_value_masked,
+};
 use crate::r#type::{Column, RefColumn, RefKey, RefValue, Value, ValueType};
 use crate::vlog::VlogStore;
 use crate::wal::{WalCompletion, WalId, WalSegment, WalStore, WalWriter};
@@ -2097,29 +2100,42 @@ impl Db {
                 Some(vec![0u8; mask_size])
             };
             let mut values: Vec<SchemaValue> = Vec::new();
+            let has_full_projection = num_columns != 0
+                && selected_columns.is_none_or(|columns| selects_all_columns(columns, num_columns));
+            let mut direct_put_columns = None;
             let mut stopped_by_memtable_terminal = false;
             self.memtable_manager.get_all_with_snapshot_until(
                 Arc::clone(&snapshot),
                 encoded_key.as_ref(),
                 |raw, source_schema| {
-                    let mut raw_value = Bytes::copy_from_slice(raw);
                     let is_target_schema = source_schema.version() == schema.version();
-                    let value = if is_target_schema {
-                        decode_value_masked(
+                    // Own the row before releasing the memtable read guard; column slices share it.
+                    let mut raw_value = Bytes::copy_from_slice(raw);
+                    let decoded = if is_target_schema {
+                        // Only the first row with a complete, ordered projection can return
+                        // directly. A previously collected Merge still needs this row as input.
+                        decode_memtable_value(
                             &mut raw_value,
                             source_schema
                                 .num_columns_in_family(column_family_id)
                                 .unwrap_or(0),
                             decode_mask,
-                            None,
+                            has_full_projection && values.is_empty(),
                         )?
                     } else {
-                        decode_value(
+                        DecodedValue::Value(decode_value(
                             &mut raw_value,
                             source_schema
                                 .num_columns_in_family(column_family_id)
                                 .unwrap_or(0),
-                        )?
+                        )?)
+                    };
+                    let value = match decoded {
+                        DecodedValue::FullPut(columns) => {
+                            direct_put_columns = Some(columns);
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        DecodedValue::Value(value) => value,
                     };
                     // Keep the established multi-column terminal-mask behavior unchanged.
                     if is_target_schema && let Some(mask) = terminal_mask.as_mut() {
@@ -2152,8 +2168,10 @@ impl Db {
                     }
                 },
             )?;
-            // A single-column terminal cuts off the rest of the lookup before older layers are read.
-            // Multi-column reads continue through the LSM mask path.
+            if let Some(columns) = direct_put_columns {
+                return Ok(Some(columns));
+            }
+            // Terminal memtable rows cut off older layers; otherwise continue through the LSM mask path.
             let mut should_stop = stopped_by_memtable_terminal;
             let lsm_values = if should_stop {
                 Vec::new()

@@ -403,9 +403,49 @@ pub(crate) fn decode_value_masked_with_ttl(
     data: &mut Bytes,
     num_columns: usize,
     decode_mask: &[u8],
-    mut terminal_mask: Option<&mut [u8]>,
+    terminal_mask: Option<&mut [u8]>,
     has_ttl: bool,
 ) -> Result<Value> {
+    match decode_value_masked_inner(
+        data,
+        num_columns,
+        decode_mask,
+        terminal_mask,
+        has_ttl,
+        false,
+    )? {
+        DecodedValue::Value(value) => Ok(value),
+        // This wrapper always disables the direct result.
+        DecodedValue::FullPut(_) => unreachable!("direct Put decoding is disabled"),
+    }
+}
+
+pub(crate) enum DecodedValue {
+    /// Complete, non-expiring Put payloads, ready to return without merging history.
+    FullPut(Vec<Option<Bytes>>),
+    /// Typed columns that still need the usual TTL, schema, or merge processing.
+    Value(Value),
+}
+
+/// Decodes a memtable row once, optionally returning complete non-expiring Put columns directly.
+/// Memtable rows always carry the canonical TTL header, even for no-TTL column families.
+pub(crate) fn decode_memtable_value(
+    data: &mut Bytes,
+    num_columns: usize,
+    decode_mask: &[u8],
+    allow_full_put: bool,
+) -> Result<DecodedValue> {
+    decode_value_masked_inner(data, num_columns, decode_mask, None, true, allow_full_put)
+}
+
+fn decode_value_masked_inner(
+    data: &mut Bytes,
+    num_columns: usize,
+    decode_mask: &[u8],
+    mut terminal_mask: Option<&mut [u8]>,
+    has_ttl: bool,
+    allow_full_put: bool,
+) -> Result<DecodedValue> {
     let expired_at = read_expired_at(data, has_ttl)?;
 
     let mask_size = bitmap_size(num_columns).max(1);
@@ -448,7 +488,26 @@ pub(crate) fn decode_value_masked_with_ttl(
         }
     }
 
-    let mut columns = Vec::with_capacity(num_columns);
+    // Headers establish eligibility; each column tag must still confirm a plain Put.
+    let can_try_full_put = allow_full_put
+        && expired_at == 0
+        && num_columns != 0
+        && (0..mask_size).all(|index| {
+            let mask = if index + 1 == mask_size {
+                column_mask_last_byte(num_columns)
+            } else {
+                u8::MAX
+            };
+            (num_columns == 1 || bitmap[index] & mask == mask) && decode_mask[index] & mask == mask
+        });
+    // Some holds the Put prefix. The first non-Put converts it to typed columns below.
+    let mut put_prefix: Option<Vec<Option<Bytes>>> =
+        can_try_full_put.then(|| Vec::with_capacity(num_columns));
+    let mut columns = if can_try_full_put {
+        Vec::new()
+    } else {
+        Vec::with_capacity(num_columns)
+    };
     for i in 0..num_columns {
         let is_presence = if num_columns == 1 {
             true
@@ -464,20 +523,26 @@ pub(crate) fn decode_value_masked_with_ttl(
                 )));
             }
             let value_type = decode_value_type(data.get_u8())?;
+            if value_type != ValueType::Put
+                && let Some(prefix) = put_prefix.take()
+            {
+                // Switch once to the generic result, moving the prefix without copying payloads
+                // or restarting the parser. Subsequent columns continue into the same result.
+                columns.reserve(num_columns);
+                columns.extend(
+                    prefix
+                        .into_iter()
+                        .map(|payload| payload.map(|payload| Column::new(ValueType::Put, payload))),
+                );
+            }
             if let Some(ref mut mask) = terminal_mask
                 && value_type.is_terminal()
                 && let Some(byte) = mask.get_mut(i / 8)
             {
                 *byte |= 1 << (i % 8);
             }
-            if is_last {
-                if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
-                    let col_data = data.split_to(data.len());
-                    columns.push(Some(Column::new(value_type, col_data)));
-                } else {
-                    data.advance(data.len());
-                    columns.push(None);
-                }
+            let data_len = if is_last {
+                data.len()
             } else {
                 if data.remaining() < 4 {
                     return Err(Error::IoError(format!(
@@ -494,25 +559,35 @@ pub(crate) fn decode_value_masked_with_ttl(
                         data.remaining()
                     )));
                 }
-                if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
-                    let col_data = data.split_to(data_len);
-                    columns.push(Some(Column::new(value_type, col_data)));
+                data_len
+            };
+            if decode_mask[i / 8] & (1 << (i % 8)) != 0 {
+                let col_data = data.split_to(data_len);
+                if let Some(prefix) = put_prefix.as_mut() {
+                    prefix.push(Some(col_data));
                 } else {
-                    data.advance(data_len);
-                    columns.push(None);
+                    columns.push(Some(Column::new(value_type, col_data)));
                 }
+            } else {
+                data.advance(data_len);
+                columns.push(None);
             }
         } else {
             columns.push(None);
         }
     }
 
+    if let Some(columns) = put_prefix {
+        return Ok(DecodedValue::FullPut(columns));
+    }
     let expired_at = if expired_at == 0 {
         None
     } else {
         Some(expired_at)
     };
-    Ok(Value::new_with_expired_at(columns, expired_at))
+    Ok(DecodedValue::Value(Value::new_with_expired_at(
+        columns, expired_at,
+    )))
 }
 
 /// Returns the encoded size of a Value in bytes.
