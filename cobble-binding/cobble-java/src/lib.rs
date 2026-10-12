@@ -1,5 +1,9 @@
 //! JNI bridge crate for Cobble Java binding.
 //!
+//! Address-based direct-buffer entry points also receive their Java owners. These
+//! otherwise unused JNI object arguments keep the buffers reachable until native
+//! return, including on Java 8, without re-resolving addresses or acquiring locks.
+//!
 //! This crate is internal to Java binding packaging and exports JNI symbols
 //! consumed by `cobble-binding/cobble-java/java` classes.
 //! End users should use the Java APIs under `io.cobble.*` instead of calling

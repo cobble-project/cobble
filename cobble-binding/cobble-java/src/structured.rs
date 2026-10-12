@@ -17,8 +17,8 @@ use crate::util::{
     decode_java_string, decode_multi_get_keys, decode_optional_java_string,
     decode_packed_multi_get_keys, decode_recovery_mode, decode_u16, decode_u64_from_jlong,
     expand_storage_mode, new_object_array, object_array_class, object_class, parse_config_json,
-    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
-    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
+    take_last_overflow_direct_buffer, take_owned_overflow_direct_buffer, throw_illegal_argument,
+    throw_illegal_state, to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use bytes::Bytes;
 use cobble_binding::structured::ffi as structured_ffi;
@@ -498,9 +498,13 @@ pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueOffe
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _value_owner: JObject,
     value_address: jlong,
     value_capacity: jint,
     value_length: jint,
@@ -600,6 +604,8 @@ pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueueAdva
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
@@ -813,6 +819,8 @@ pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePeek
     handle: jlong,
     bucket: jint,
     batch_size: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
 ) -> jint {
@@ -865,6 +873,8 @@ pub extern "system" fn Java_io_cobble_structured_PriorityQueue_priorityQueuePoll
     handle: jlong,
     bucket: jint,
     batch_size: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
 ) -> jint {
@@ -1649,10 +1659,14 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectWithOptions<'l
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _value_owner: JObject,
     value_address: jlong,
     value_capacity: jint,
     value_length: jint,
@@ -1846,10 +1860,14 @@ pub extern "system" fn Java_io_cobble_structured_Db_mergeBytesDirectWithOptions<
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _value_owner: JObject,
     value_address: jlong,
     value_capacity: jint,
     value_length: jint,
@@ -2098,10 +2116,14 @@ pub extern "system" fn Java_io_cobble_structured_Db_putEncodedListDirectWithOpti
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _encoded_list_owner: JObject,
     encoded_list_address: jlong,
     encoded_list_capacity: jint,
     encoded_list_length: jint,
@@ -2129,10 +2151,14 @@ pub extern "system" fn Java_io_cobble_structured_Db_mergeEncodedListDirectWithOp
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _encoded_list_owner: JObject,
     encoded_list_address: jlong,
     encoded_list_capacity: jint,
     encoded_list_length: jint,
@@ -2353,6 +2379,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_getEncodedDirectWithOptions<
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
     key_length: jint,
@@ -2420,6 +2448,20 @@ pub extern "system" fn Java_io_cobble_structured_Db_getEncodedDirectWithOptions<
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_takeOwnedOverflowNative(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    match take_owned_overflow_direct_buffer(&mut env) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            throw_illegal_state(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_structured_Db_getLastDirectOverflowBuffer(
     mut env: JNIEnv,
     _class: JClass,
@@ -2438,6 +2480,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_multiGetEncodedDirectWithOpt
     mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
     read_options_handle: jlong,
@@ -2876,8 +2920,12 @@ pub extern "system" fn Java_io_cobble_structured_Db_openStructuredDirectScanCurs
     _class: JClass,
     handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _start_key_owner: JObject,
     start_key_address: jlong,
     start_key_length: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _end_key_owner: JObject,
     end_key_address: jlong,
     end_key_length: jint,
     scan_options_handle: jlong,
@@ -3696,6 +3744,8 @@ pub extern "system" fn Java_io_cobble_structured_ScanCursor_nextRowDirectInterna
     env: JNIEnv,
     class: JClass,
     native_handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
 ) -> jint {
@@ -3703,6 +3753,7 @@ pub extern "system" fn Java_io_cobble_structured_ScanCursor_nextRowDirectInterna
         env,
         class,
         native_handle,
+        _io_owner,
         io_address,
         io_capacity,
     )
@@ -3713,6 +3764,8 @@ pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextRowDirectI
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
 ) -> jint {
@@ -3741,6 +3794,8 @@ pub extern "system" fn Java_io_cobble_structured_DirectScanCursor_nextBatchDirec
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
     max_rows: jint,

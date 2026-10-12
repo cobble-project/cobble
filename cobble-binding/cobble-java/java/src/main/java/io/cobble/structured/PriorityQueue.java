@@ -90,9 +90,11 @@ public final class PriorityQueue extends NativeObject {
         priorityQueueOfferDirect(
                 nativeHandle,
                 bucket,
+                keyBuffer,
                 DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength,
+                valueBuffer,
                 DirectIoUtils.directAddress(valueBuffer),
                 valueBuffer.capacity(),
                 valueLength);
@@ -303,6 +305,7 @@ public final class PriorityQueue extends NativeObject {
         priorityQueueAdvanceDirect(
                 nativeHandle,
                 bucket,
+                keyBuffer,
                 DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength);
@@ -349,12 +352,14 @@ public final class PriorityQueue extends NativeObject {
                                     nativeHandle,
                                     bucket,
                                     batchSize,
+                                    pooled,
                                     DirectIoUtils.directAddress(pooled),
                                     pooled.capacity())
                             : priorityQueuePollBatchDirect(
                                     nativeHandle,
                                     bucket,
                                     batchSize,
+                                    pooled,
                                     DirectIoUtils.directAddress(pooled),
                                     pooled.capacity());
             if (encodedLength == 0) {
@@ -415,9 +420,11 @@ public final class PriorityQueue extends NativeObject {
     private static native void priorityQueueOfferDirect(
             long nativeHandle,
             int bucket,
+            ByteBuffer keyOwner,
             long keyAddress,
             int keyCapacity,
             int keyLength,
+            ByteBuffer valueOwner,
             long valueAddress,
             int valueCapacity,
             int valueLength);
@@ -427,7 +434,12 @@ public final class PriorityQueue extends NativeObject {
     private static native void priorityQueueAdvance(long nativeHandle, int bucket, byte[] key);
 
     private static native void priorityQueueAdvanceDirect(
-            long nativeHandle, int bucket, long keyAddress, int keyCapacity, int keyLength);
+            long nativeHandle,
+            int bucket,
+            ByteBuffer keyOwner,
+            long keyAddress,
+            int keyCapacity,
+            int keyLength);
 
     private static native byte[] priorityQueueCursor(long nativeHandle, int bucket);
 
@@ -442,10 +454,20 @@ public final class PriorityQueue extends NativeObject {
             long nativeHandle, int bucket, int batchSize);
 
     private static native int priorityQueuePeekBatchDirect(
-            long nativeHandle, int bucket, int batchSize, long ioAddress, int ioCapacity);
+            long nativeHandle,
+            int bucket,
+            int batchSize,
+            ByteBuffer ioOwner,
+            long ioAddress,
+            int ioCapacity);
 
     private static native int priorityQueuePollBatchDirect(
-            long nativeHandle, int bucket, int batchSize, long ioAddress, int ioCapacity);
+            long nativeHandle,
+            int bucket,
+            int batchSize,
+            ByteBuffer ioOwner,
+            long ioAddress,
+            int ioCapacity);
 
     static native ByteBuffer getLastDirectOverflowBuffer();
 

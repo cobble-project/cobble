@@ -6,9 +6,9 @@ use crate::util::{
     decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_multi_get_keys,
     decode_packed_multi_get_keys, decode_recovery_mode, decode_u16, decode_u32,
     decode_u64_from_jlong, expand_storage_mode, parse_config_json,
-    take_last_overflow_direct_buffer, throw_illegal_argument, throw_illegal_state,
-    to_java_optional_bytes_2d, to_java_optional_bytes_3d, to_java_string_or_throw,
-    write_payload_to_io_or_cached_overflow,
+    take_last_overflow_direct_buffer, take_owned_overflow_direct_buffer, throw_illegal_argument,
+    throw_illegal_state, to_java_optional_bytes_2d, to_java_optional_bytes_3d,
+    to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
 };
 use crate::write_options::write_options_from_handle_or_throw;
 use cobble_binding::ffi as cobble_ffi;
@@ -894,10 +894,14 @@ pub extern "system" fn Java_io_cobble_Db_putDirectWithOptions<'local>(
     _class: JClass,
     native_handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _value_owner: JObject,
     value_address: jlong,
     value_capacity: jint,
     value_length: jint,
@@ -1122,10 +1126,14 @@ pub extern "system" fn Java_io_cobble_Db_mergeDirectWithOptions<'local>(
     _class: JClass,
     native_handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _key_owner: JObject,
     key_address: jlong,
     key_capacity: jint,
     key_length: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _value_owner: JObject,
     value_address: jlong,
     value_capacity: jint,
     value_length: jint,
@@ -1295,6 +1303,8 @@ pub extern "system" fn Java_io_cobble_Db_getEncodedDirectWithOptions<'local>(
     _class: JClass,
     native_handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
     key_length: jint,
@@ -1359,6 +1369,20 @@ pub extern "system" fn Java_io_cobble_Db_getEncodedDirectWithOptions<'local>(
         }
     };
     encode_optional_columns_to_direct_buffer(&mut env, values, direct_addr, io_capacity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_takeOwnedOverflowNative(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    match take_owned_overflow_direct_buffer(&mut env) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            throw_illegal_state(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1531,6 +1555,8 @@ pub extern "system" fn Java_io_cobble_Db_multiGetEncodedDirectWithOptions<'local
     mut env: JNIEnv<'local>,
     _class: JClass,
     native_handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
     read_options_handle: jlong,

@@ -2820,6 +2820,90 @@ class DbBindingTest {
     }
 
     @Test
+    void rawDirectRowsKeepOwnersAndOverflowResultsIndependent() throws Exception {
+        Config config =
+                new Config()
+                        .addVolume(Files.createTempDirectory("cobble-raw-direct-owner-").toString())
+                        .numColumns(2)
+                        .totalBuckets(1);
+        byte[] otherKey = new byte[] {2};
+        byte[] otherValue = new byte[8192];
+        Arrays.fill(otherValue, (byte) 9);
+        Field ownerField = DirectEncodedRow.class.getDeclaredField("owner");
+        ownerField.setAccessible(true);
+        try (Db db = Db.open(config);
+                ReadOptions options = ReadOptions.forColumns(0, 1)) {
+            db.put(0, otherKey, 0, otherValue);
+            byte[] smallKey = new byte[] {3};
+            db.put(0, smallKey, 0, new byte[] {4});
+            DirectEncodedRow closed = db.getDirectEncodedRowWithOptions(0, smallKey, options);
+            closed.close();
+            closed.close();
+            try (DirectEncodedRow first = db.getDirectEncodedRowWithOptions(0, smallKey, options);
+                    DirectEncodedRow second =
+                            db.getDirectEncodedRowWithOptions(0, smallKey, options)) {
+                assertNotSame(
+                        ownerField.get(first),
+                        ownerField.get(second),
+                        "repeated close must not return the same buffer to the pool twice");
+            }
+            // Cover both JNI overflow and the temporary buffer allocated for a large key.
+            for (int keyLength : new int[] {1, 8192}) {
+                byte[] key = new byte[keyLength];
+                Arrays.fill(key, (byte) 1);
+                byte[] value = new byte[4096];
+                Arrays.fill(value, (byte) 3);
+                db.put(0, key, 0, value);
+                ByteBuffer directKey = directBufferOf(key).asReadOnlyBuffer();
+                ((Buffer) directKey).position(key.length);
+                for (int overload = 0; overload < 3; overload++) {
+                    try (DirectEncodedRow row =
+                                    overload == 0
+                                            ? db.getDirectEncodedRowWithOptions(0, key, options)
+                                            : overload == 1
+                                                    ? db.getDirectEncodedRowWithOptions(
+                                                            0, directKey, options)
+                                                    : db.getDirectEncodedRowWithOptions(
+                                                            0, directKey, key.length, options);
+                            DirectColumns columns =
+                                    db.getDirectColumnsWithOptions(0, key, options);
+                            DirectEncodedRow other =
+                                    db.getDirectEncodedRowWithOptions(0, otherKey, options)) {
+                        assertEquals(2, row.size());
+                        assertTrue(row.isNull(1));
+                        ByteBuffer owner = (ByteBuffer) ownerField.get(row);
+                        assertNotNull(owner);
+                        assertArrayEquals(
+                                otherValue,
+                                other.decodeColumn(0, DbBindingTest::readInputStreamBytes));
+                        assertArrayEquals(value, readDirectBytes(columns.get(0)));
+                        assertArrayEquals(
+                                value,
+                                row.decodeColumn(
+                                        0,
+                                        input -> {
+                                            assertTrue(Thread.holdsLock(owner));
+                                            System.gc();
+                                            return readInputStreamBytes(input);
+                                        }));
+                        assertFalse(Thread.holdsLock(owner));
+                    }
+                    assertEquals(key.length, directKey.position());
+                    assertEquals(key.length, directKey.limit());
+                }
+                ByteBuffer io = directBufferOf(key);
+                ByteBuffer encoded = db.getEncodedDirectWithOptions(0, io, key.length, options);
+                try (DirectColumns other = db.getDirectColumnsWithOptions(0, otherKey, options);
+                        DirectColumns columns =
+                                DirectColumns.decode(encoded, encoded.remaining(), null)) {
+                    assertArrayEquals(otherValue, readDirectBytes(other.get(0)));
+                    assertArrayEquals(value, readDirectBytes(columns.get(0)));
+                }
+            }
+        }
+    }
+
+    @Test
     void dbDirectColumnViewsHandleFitAndOverflow() throws IOException {
         Path dataDir = Files.createTempDirectory("cobble-java-direct-raw-view-");
         Config config = new Config().addVolume(dataDir.toString()).numColumns(2).totalBuckets(1);
@@ -3219,6 +3303,13 @@ class DbBindingTest {
         byte[] bytes = new byte[copy.remaining()];
         copy.get(bytes);
         return bytes;
+    }
+
+    private static ByteBuffer directBufferOf(byte[] bytes) {
+        ByteBuffer buffer = ByteBuffer.allocateDirect(bytes.length);
+        buffer.put(bytes);
+        ((Buffer) buffer).flip();
+        return buffer;
     }
 
     private static byte[] readInputStreamBytes(InputStream input) throws IOException {

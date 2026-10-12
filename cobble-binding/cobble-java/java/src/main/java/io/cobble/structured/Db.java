@@ -15,7 +15,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A structured database with typed column support (Bytes and List).
@@ -578,10 +577,12 @@ public final class Db extends NativeObject {
         putBytesDirectWithOptions(
                 nativeHandle,
                 bucket,
+                keyBuffer,
                 DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength,
                 column,
+                valueBuffer,
                 DirectIoUtils.directAddress(valueBuffer),
                 valueBuffer.capacity(),
                 valueLength,
@@ -603,6 +604,7 @@ public final class Db extends NativeObject {
                 nativeHandle,
                 bucket,
                 column,
+                encoded,
                 DirectIoUtils.directAddress(encoded),
                 encoded.capacity(),
                 batch.encodedLength(),
@@ -622,6 +624,7 @@ public final class Db extends NativeObject {
     void putStreamingBatchWithOptions(
             int bucket,
             int column,
+            DirectChunkedOutputStream chunksOwner,
             long[] chunkAddresses,
             int[] chunkLengths,
             int[] keyLengths,
@@ -633,6 +636,7 @@ public final class Db extends NativeObject {
                 nativeHandle,
                 bucket,
                 column,
+                chunksOwner,
                 chunkAddresses,
                 chunkLengths,
                 keyLengths,
@@ -670,10 +674,12 @@ public final class Db extends NativeObject {
         mergeBytesDirectWithOptions(
                 nativeHandle,
                 bucket,
+                keyBuffer,
                 DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength,
                 column,
+                valueBuffer,
                 DirectIoUtils.directAddress(valueBuffer),
                 valueBuffer.capacity(),
                 valueLength,
@@ -711,10 +717,12 @@ public final class Db extends NativeObject {
         putEncodedListDirectWithOptions(
                 nativeHandle,
                 bucket,
+                keyBuffer,
                 DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength,
                 column,
+                encodedListBuffer,
                 DirectIoUtils.directAddress(encodedListBuffer),
                 encodedListBuffer.capacity(),
                 encodedListLength,
@@ -795,10 +803,12 @@ public final class Db extends NativeObject {
         mergeEncodedListDirectWithOptions(
                 nativeHandle,
                 bucket,
+                keyBuffer,
                 DirectIoUtils.directAddress(keyBuffer),
                 keyBuffer.capacity(),
                 keyLength,
                 column,
+                encodedListBuffer,
                 DirectIoUtils.directAddress(encodedListBuffer),
                 encodedListBuffer.capacity(),
                 encodedListLength,
@@ -893,7 +903,8 @@ public final class Db extends NativeObject {
         EncodedDirectResult encoded = readEncodedDirectResult(bucket, key, options);
         return encoded == null
                 ? null
-                : new DirectEncodedRow(encoded.address, encoded.length, encoded.releaser);
+                : new DirectEncodedRow(
+                        encoded.buffer, encoded.address, encoded.length, encoded.releaser);
     }
 
     /**
@@ -949,7 +960,8 @@ public final class Db extends NativeObject {
                 readEncodedDirectResult(bucket, keyBuffer, keyLength, options);
         return encoded == null
                 ? null
-                : new DirectEncodedRow(encoded.address, encoded.length, encoded.releaser);
+                : new DirectEncodedRow(
+                        encoded.buffer, encoded.address, encoded.length, encoded.releaser);
     }
 
     /**
@@ -1042,8 +1054,10 @@ public final class Db extends NativeObject {
                 openStructuredDirectScanCursor(
                         nativeHandle,
                         bucket,
+                        startKeyInclusive,
                         directAddressOrMissing(startKeyInclusive),
                         startKeyLength,
+                        endKeyExclusive,
                         directAddressOrMissing(endKeyExclusive),
                         endKeyLength,
                         soh);
@@ -1094,6 +1108,7 @@ public final class Db extends NativeObject {
                     getEncodedDirectWithOptions(
                             nativeHandle,
                             bucket,
+                            ioBuffer,
                             DirectIoUtils.directAddress(ioBuffer),
                             ioBuffer.capacity(),
                             key.length,
@@ -1108,18 +1123,11 @@ public final class Db extends NativeObject {
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 usingPooledForResult = true;
-                AtomicBoolean released = new AtomicBoolean(false);
-                Runnable releaser =
-                        () -> {
-                            if (released.compareAndSet(false, true)) {
-                                pool.release(pooled);
-                            }
-                        };
                 return new EncodedDirectResult(
                         resultBuffer,
                         DirectIoUtils.directAddress(resultBuffer),
                         decodedLength,
-                        releaser);
+                        () -> pool.release(pooled));
             }
             // JNI overflow buffers are thread-local scratch space. Copy before returning a
             // close-scoped Java view that may outlive the next JNI call on this thread.
@@ -1164,6 +1172,7 @@ public final class Db extends NativeObject {
                     getEncodedDirectWithOptions(
                             nativeHandle,
                             bucket,
+                            ioBuffer,
                             DirectIoUtils.directAddress(ioBuffer),
                             ioBuffer.capacity(),
                             keyLength,
@@ -1178,18 +1187,11 @@ public final class Db extends NativeObject {
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
                 usingPooledForResult = true;
-                AtomicBoolean released = new AtomicBoolean(false);
-                Runnable releaser =
-                        () -> {
-                            if (released.compareAndSet(false, true)) {
-                                pool.release(pooled);
-                            }
-                        };
                 return new EncodedDirectResult(
                         resultBuffer,
                         DirectIoUtils.directAddress(resultBuffer),
                         decodedLength,
-                        releaser);
+                        () -> pool.release(pooled));
             }
             // JNI overflow buffers are thread-local scratch space. Copy before returning a
             // close-scoped Java view that may outlive the next JNI call on this thread.
@@ -1211,6 +1213,8 @@ public final class Db extends NativeObject {
         }
     }
 
+    // Transfers one lease to one row. DirectRow/DirectEncodedRow already guard close, and
+    // DirectRow.decode releases on failure, so the releaser needs no second atomic guard.
     private static final class EncodedDirectResult {
         private final ByteBuffer buffer;
         private final long address;
@@ -1244,6 +1248,7 @@ public final class Db extends NativeObject {
         long roh = options == null ? 0L : options.getNativeHandle();
         return multiGetEncodedDirectWithOptions(
                 nativeHandle,
+                ioBuffer,
                 io.cobble.DirectIoUtils.directAddress(ioBuffer),
                 ioBuffer.capacity(),
                 roh);
@@ -1255,6 +1260,7 @@ public final class Db extends NativeObject {
     }
 
     int executeStreamingMultiGet(
+            DirectChunkedOutputStream chunksOwner,
             long[] chunkAddresses,
             int[] chunkLengths,
             int[] buckets,
@@ -1265,11 +1271,13 @@ public final class Db extends NativeObject {
         long roh = options == null ? 0L : options.getNativeHandle();
         return multiGetBytesDirectChunksWithOptions(
                 nativeHandle,
+                chunksOwner,
                 chunkAddresses,
                 chunkLengths,
                 buckets,
                 keyLengths,
                 keyCount,
+                resultBuffer,
                 DirectIoUtils.directAddress(resultBuffer),
                 resultBuffer.capacity(),
                 roh);
@@ -1473,10 +1481,12 @@ public final class Db extends NativeObject {
     private static native void putBytesDirectWithOptions(
             long nativeHandle,
             int bucket,
+            ByteBuffer keyOwner,
             long keyAddress,
             int keyCapacity,
             int keyLength,
             int column,
+            ByteBuffer valueOwner,
             long valueAddress,
             int valueCapacity,
             int valueLength,
@@ -1486,6 +1496,7 @@ public final class Db extends NativeObject {
             long nativeHandle,
             int bucket,
             int column,
+            ByteBuffer encodedOwner,
             long encodedAddress,
             int encodedCapacity,
             int encodedLength,
@@ -1496,6 +1507,7 @@ public final class Db extends NativeObject {
             long nativeHandle,
             int bucket,
             int column,
+            DirectChunkedOutputStream chunksOwner,
             long[] chunkAddresses,
             int[] chunkLengths,
             int[] keyLengths,
@@ -1517,10 +1529,12 @@ public final class Db extends NativeObject {
     private static native void mergeBytesDirectWithOptions(
             long nativeHandle,
             int bucket,
+            ByteBuffer keyOwner,
             long keyAddress,
             int keyCapacity,
             int keyLength,
             int column,
+            ByteBuffer valueOwner,
             long valueAddress,
             int valueCapacity,
             int valueLength,
@@ -1541,10 +1555,12 @@ public final class Db extends NativeObject {
     private static native void putEncodedListDirectWithOptions(
             long nativeHandle,
             int bucket,
+            ByteBuffer keyOwner,
             long keyAddress,
             int keyCapacity,
             int keyLength,
             int column,
+            ByteBuffer encodedListOwner,
             long encodedListAddress,
             int encodedListCapacity,
             int encodedListLength,
@@ -1564,10 +1580,12 @@ public final class Db extends NativeObject {
     private static native void mergeEncodedListDirectWithOptions(
             long nativeHandle,
             int bucket,
+            ByteBuffer keyOwner,
             long keyAddress,
             int keyCapacity,
             int keyLength,
             int column,
+            ByteBuffer encodedListOwner,
             long encodedListAddress,
             int encodedListCapacity,
             int encodedListLength,
@@ -1588,21 +1606,28 @@ public final class Db extends NativeObject {
     private static native int getEncodedDirectWithOptions(
             long nativeHandle,
             int bucket,
+            ByteBuffer ioOwner,
             long ioAddress,
             int ioCapacity,
             int keyLength,
             long readOptionsHandle);
 
     private static native int multiGetEncodedDirectWithOptions(
-            long nativeHandle, long ioAddress, int ioCapacity, long readOptionsHandle);
+            long nativeHandle,
+            ByteBuffer ioOwner,
+            long ioAddress,
+            int ioCapacity,
+            long readOptionsHandle);
 
     private static native int multiGetBytesDirectChunksWithOptions(
             long nativeHandle,
+            DirectChunkedOutputStream chunksOwner,
             long[] chunkAddresses,
             int[] chunkLengths,
             int[] buckets,
             int[] keyLengths,
             int keyCount,
+            ByteBuffer resultOwner,
             long resultAddress,
             int resultCapacity,
             long readOptionsHandle);
@@ -1620,8 +1645,10 @@ public final class Db extends NativeObject {
     private static native long openStructuredDirectScanCursor(
             long nativeHandle,
             int bucket,
+            ByteBuffer startKeyOwner,
             long startKeyAddress,
             int startKeyLength,
+            ByteBuffer endKeyOwner,
             long endKeyAddress,
             int endKeyLength,
             long scanOptionsHandle);

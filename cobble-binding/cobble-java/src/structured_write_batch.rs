@@ -5,7 +5,7 @@ use crate::util::{decode_u16, throw_illegal_argument, throw_illegal_state};
 use cobble_binding::structured::ffi as structured_ffi;
 use cobble_binding::structured::{StructuredColumnValue, StructuredWriteOptions};
 use jni::JNIEnv;
-use jni::objects::{JClass, JIntArray, JLongArray};
+use jni::objects::{JClass, JIntArray, JLongArray, JObject};
 use jni::sys::{jint, jlong};
 use std::borrow::Cow;
 
@@ -16,6 +16,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectBatchWithOptio
     handle: jlong,
     bucket: jint,
     column: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _encoded_owner: JObject,
     encoded_address: jlong,
     encoded_capacity: jint,
     encoded_length: jint,
@@ -74,6 +76,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_putBytesDirectChunksWithOpti
     handle: jlong,
     bucket: jint,
     column: jint,
+    // Keeps chunk buffers alive during JNI; numeric addresses are not GC roots.
+    _chunks_owner: JObject,
     chunk_addresses: JLongArray,
     chunk_lengths: JIntArray,
     key_lengths: JIntArray,
@@ -187,11 +191,15 @@ pub extern "system" fn Java_io_cobble_structured_Db_multiGetBytesDirectChunksWit
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
+    // Keeps chunk buffers alive during JNI; numeric addresses are not GC roots.
+    _chunks_owner: JObject,
     chunk_addresses: JLongArray,
     chunk_lengths: JIntArray,
     buckets: JIntArray,
     key_lengths: JIntArray,
     key_count: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _result_owner: JObject,
     result_address: jlong,
     result_capacity: jint,
     read_options_handle: jlong,

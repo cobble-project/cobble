@@ -16,14 +16,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class DirectScanCursor extends NativeObject implements Iterable<DirectScanRow> {
     private final DirectBufferPool pool;
-    private final ByteBuffer ioBuffer;
+    private final ByteBuffer pooledBuffer;
+    private ByteBuffer ioBuffer;
     private final AtomicBoolean ioBufferReleased = new AtomicBoolean(false);
     private boolean iteratorCreated = false;
 
     DirectScanCursor(long nativeHandle, DirectBufferPool pool) {
         super(nativeHandle);
         this.pool = pool;
-        this.ioBuffer = pool.acquire();
+        this.pooledBuffer = pool.acquire();
+        this.ioBuffer = pooledBuffer;
     }
 
     /**
@@ -37,13 +39,14 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         }
         int encodedLength =
                 nextRowDirectInternal(
-                        nativeHandle, DirectIoUtils.directAddress(ioBuffer), ioBuffer.capacity());
+                        nativeHandle,
+                        ioBuffer,
+                        DirectIoUtils.directAddress(ioBuffer),
+                        ioBuffer.capacity());
         if (encodedLength == 0) {
             return null;
         }
-        ByteBuffer resultBuffer =
-                DirectIoUtils.resolveEncodedBuffer(
-                        ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
+        ByteBuffer resultBuffer = resultBuffer(encodedLength);
         return DirectScanRow.decode(resultBuffer, Math.abs(encodedLength));
     }
 
@@ -62,16 +65,27 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         int encodedLength =
                 nextBatchDirectInternal(
                         nativeHandle,
+                        ioBuffer,
                         DirectIoUtils.directAddress(ioBuffer),
                         ioBuffer.capacity(),
                         maxRows);
         if (encodedLength == 0) {
             return DirectScanBatch.empty();
         }
-        ByteBuffer resultBuffer =
-                DirectIoUtils.resolveEncodedBuffer(
-                        ioBuffer, encodedLength, Db::getLastDirectOverflowBuffer);
+        ByteBuffer resultBuffer = resultBuffer(encodedLength);
         return DirectScanBatch.decode(resultBuffer, Math.abs(encodedLength));
+    }
+
+    private ByteBuffer resultBuffer(int encodedLength) {
+        if (encodedLength < 0) {
+            ByteBuffer overflow = takeOwnedOverflowNative();
+            if (overflow == null) {
+                throw new IllegalStateException("missing owned overflow direct buffer from JNI");
+            }
+            ioBuffer = overflow;
+            releasePooledBuffer();
+        }
+        return ioBuffer;
     }
 
     @Override
@@ -111,18 +125,25 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         try {
             super.close();
         } finally {
-            if (ioBufferReleased.compareAndSet(false, true)) {
-                pool.release(ioBuffer);
-            }
+            releasePooledBuffer();
+            ioBuffer = null;
+        }
+    }
+
+    private void releasePooledBuffer() {
+        if (ioBufferReleased.compareAndSet(false, true)) {
+            pool.release(pooledBuffer);
         }
     }
 
     @Override
     protected native void disposeInternal(long nativeHandle);
 
+    private static native ByteBuffer takeOwnedOverflowNative();
+
     private static native int nextRowDirectInternal(
-            long nativeHandle, long ioAddress, int ioCapacity);
+            long nativeHandle, ByteBuffer ioOwner, long ioAddress, int ioCapacity);
 
     private static native int nextBatchDirectInternal(
-            long nativeHandle, long ioAddress, int ioCapacity, int maxRows);
+            long nativeHandle, ByteBuffer ioOwner, long ioAddress, int ioCapacity, int maxRows);
 }

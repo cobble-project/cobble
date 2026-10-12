@@ -36,7 +36,10 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         }
         int encodedLength =
                 nextEntryDirectInternal(
-                        nativeHandle, DirectIoUtils.directAddress(ioBuffer), ioBuffer.capacity());
+                        nativeHandle,
+                        ioBuffer,
+                        DirectIoUtils.directAddress(ioBuffer),
+                        ioBuffer.capacity());
         if (encodedLength == 0) {
             return null;
         }
@@ -102,7 +105,7 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
     protected native void disposeInternal(long nativeHandle);
 
     private static native int nextEntryDirectInternal(
-            long nativeHandle, long ioAddress, int ioCapacity);
+            long nativeHandle, ByteBuffer ioOwner, long ioAddress, int ioCapacity);
 
     private static native ByteBuffer takeOwnedOverflowNative();
 }
