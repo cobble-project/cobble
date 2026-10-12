@@ -44,6 +44,7 @@ public final class DirectColumns implements AutoCloseable {
         if (needed > Integer.MAX_VALUE) throw new IllegalArgumentException("packed keys too large");
         DirectBufferPool pool = Db.directBufferPool();
         ByteBuffer pooled = pool.acquire();
+        ByteBuffer payload = null;
         try {
             ByteBuffer io =
                     needed <= pooled.capacity() ? pooled : ByteBuffer.allocateDirect((int) needed);
@@ -57,7 +58,7 @@ public final class DirectColumns implements AutoCloseable {
             int length = reader.read(io);
             if (length == 0 || length == Integer.MIN_VALUE)
                 throw new IllegalStateException("invalid direct multi-get length");
-            ByteBuffer payload =
+            payload =
                     length > 0
                             ? io
                             : DirectIoUtils.resolveEncodedBuffer(
@@ -84,6 +85,7 @@ public final class DirectColumns implements AutoCloseable {
             return Collections.unmodifiableList(rows);
         } finally {
             pool.release(pooled);
+            if (payload != pooled) DirectIoUtils.returnOverflowBuffer(payload);
         }
     }
 
@@ -97,26 +99,34 @@ public final class DirectColumns implements AutoCloseable {
         DirectBufferPool pool = Db.directBufferPool();
         ByteBuffer pooled = pool.acquire();
         boolean retained = false;
+        ByteBuffer result = null;
         try {
             ByteBuffer io =
                     keyLength <= pooled.capacity() ? pooled : ByteBuffer.allocateDirect(keyLength);
             DirectIoUtils.copyKey(io, keyBuffer, keyLength);
             int length = reader.read(bucket, io, keyLength);
             if (length == 0) return null;
-            ByteBuffer result =
+            result =
                     length > 0
                             ? io
                             : DirectIoUtils.resolveEncodedBuffer(
                                     io, length, reader::takeOverflowBuffer);
+            ByteBuffer leasedBuffer = result;
             DirectColumns columns =
                     decode(
                             result,
                             Math.abs(length),
-                            result == pooled ? () -> pool.release(pooled) : null);
-            retained = result == pooled;
+                            result == pooled
+                                    ? () -> pool.release(pooled)
+                                    : () -> DirectIoUtils.returnOverflowBuffer(leasedBuffer));
+            retained = true;
+            if (result != pooled) pool.release(pooled);
             return columns;
         } finally {
-            if (!retained) pool.release(pooled);
+            if (!retained) {
+                pool.release(pooled);
+                if (result != pooled) DirectIoUtils.returnOverflowBuffer(result);
+            }
         }
     }
 
@@ -126,6 +136,7 @@ public final class DirectColumns implements AutoCloseable {
         DirectBufferPool pool = Db.directBufferPool();
         ByteBuffer pooled = pool.acquire();
         boolean retained = false;
+        ByteBuffer result = null;
         try {
             ByteBuffer io =
                     key.length <= pooled.capacity()
@@ -135,20 +146,27 @@ public final class DirectColumns implements AutoCloseable {
             io.put(key);
             int length = reader.read(bucket, io, key.length);
             if (length == 0) return null;
-            ByteBuffer result =
+            result =
                     length > 0
                             ? io
                             : DirectIoUtils.resolveEncodedBuffer(
                                     io, length, reader::takeOverflowBuffer);
+            ByteBuffer leasedBuffer = result;
             DirectColumns columns =
                     decode(
                             result,
                             Math.abs(length),
-                            result == pooled ? () -> pool.release(pooled) : null);
-            retained = result == pooled;
+                            result == pooled
+                                    ? () -> pool.release(pooled)
+                                    : () -> DirectIoUtils.returnOverflowBuffer(leasedBuffer));
+            retained = true;
+            if (result != pooled) pool.release(pooled);
             return columns;
         } finally {
-            if (!retained) pool.release(pooled);
+            if (!retained) {
+                pool.release(pooled);
+                if (result != pooled) DirectIoUtils.returnOverflowBuffer(result);
+            }
         }
     }
 

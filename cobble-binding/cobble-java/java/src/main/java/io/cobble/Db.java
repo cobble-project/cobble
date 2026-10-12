@@ -950,8 +950,8 @@ public final class Db extends NativeObject {
         DirectBufferPool pool = directBufferPool;
         ByteBuffer pooled = pool.acquire();
         ByteBuffer ioBuffer = pooled;
-        boolean pooledReleased = false;
-        boolean usingPooledForResult = false;
+        boolean retained = false;
+        ByteBuffer ownedResult = null;
         try {
             if (key.length > ioBuffer.capacity()) {
                 ioBuffer = ByteBuffer.allocateDirect(key.length);
@@ -967,33 +967,38 @@ public final class Db extends NativeObject {
                             key.length,
                             readOptionsHandle);
             if (encodedLength == 0) {
-                pool.release(pooled);
                 return null;
             }
             ByteBuffer resultBuffer =
                     DirectIoUtils.resolveEncodedBuffer(
                             ioBuffer, encodedLength, Db::takeOwnedOverflowNative);
+            if (resultBuffer != pooled) ownedResult = resultBuffer;
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
-                usingPooledForResult = true;
-                return new EncodedDirectResult(
-                        resultBuffer,
-                        DirectIoUtils.directAddress(resultBuffer),
-                        decodedLength,
-                        () -> pool.release(pooled));
+                EncodedDirectResult result =
+                        new EncodedDirectResult(
+                                resultBuffer,
+                                DirectIoUtils.directAddress(resultBuffer),
+                                decodedLength,
+                                () -> pool.release(pooled));
+                retained = true;
+                return result;
             }
+            ByteBuffer leasedBuffer = resultBuffer;
+            EncodedDirectResult result =
+                    new EncodedDirectResult(
+                            resultBuffer,
+                            DirectIoUtils.directAddress(resultBuffer),
+                            decodedLength,
+                            () -> DirectIoUtils.returnOverflowBuffer(leasedBuffer));
             pool.release(pooled);
-            pooledReleased = true;
-            return new EncodedDirectResult(
-                    resultBuffer,
-                    DirectIoUtils.directAddress(resultBuffer),
-                    decodedLength,
-                    () -> {});
-        } catch (RuntimeException e) {
-            if (!pooledReleased && !usingPooledForResult) {
+            retained = true;
+            return result;
+        } finally {
+            if (!retained) {
                 pool.release(pooled);
+                DirectIoUtils.returnOverflowBuffer(ownedResult);
             }
-            throw e;
         }
     }
 
@@ -1009,8 +1014,8 @@ public final class Db extends NativeObject {
         DirectBufferPool pool = directBufferPool;
         ByteBuffer pooled = pool.acquire();
         ByteBuffer ioBuffer = pooled;
-        boolean pooledReleased = false;
-        boolean usingPooledForResult = false;
+        boolean retained = false;
+        ByteBuffer ownedResult = null;
         try {
             if (keyLength > ioBuffer.capacity()) {
                 ioBuffer = ByteBuffer.allocateDirect(keyLength);
@@ -1026,33 +1031,38 @@ public final class Db extends NativeObject {
                             keyLength,
                             readOptionsHandle);
             if (encodedLength == 0) {
-                pool.release(pooled);
                 return null;
             }
             ByteBuffer resultBuffer =
                     DirectIoUtils.resolveEncodedBuffer(
                             ioBuffer, encodedLength, Db::takeOwnedOverflowNative);
+            if (resultBuffer != pooled) ownedResult = resultBuffer;
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
-                usingPooledForResult = true;
-                return new EncodedDirectResult(
-                        resultBuffer,
-                        DirectIoUtils.directAddress(resultBuffer),
-                        decodedLength,
-                        () -> pool.release(pooled));
+                EncodedDirectResult result =
+                        new EncodedDirectResult(
+                                resultBuffer,
+                                DirectIoUtils.directAddress(resultBuffer),
+                                decodedLength,
+                                () -> pool.release(pooled));
+                retained = true;
+                return result;
             }
+            ByteBuffer leasedBuffer = resultBuffer;
+            EncodedDirectResult result =
+                    new EncodedDirectResult(
+                            resultBuffer,
+                            DirectIoUtils.directAddress(resultBuffer),
+                            decodedLength,
+                            () -> DirectIoUtils.returnOverflowBuffer(leasedBuffer));
             pool.release(pooled);
-            pooledReleased = true;
-            return new EncodedDirectResult(
-                    resultBuffer,
-                    DirectIoUtils.directAddress(resultBuffer),
-                    decodedLength,
-                    () -> {});
-        } catch (RuntimeException e) {
-            if (!pooledReleased && !usingPooledForResult) {
+            retained = true;
+            return result;
+        } finally {
+            if (!retained) {
                 pool.release(pooled);
+                DirectIoUtils.returnOverflowBuffer(ownedResult);
             }
-            throw e;
         }
     }
 

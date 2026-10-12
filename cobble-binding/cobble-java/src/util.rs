@@ -495,8 +495,8 @@ pub(crate) fn take_last_overflow_direct_buffer<'local>(
     })
 }
 
-/// Transfers the cached overflow buffer to a Java-owned read lease. The next read allocates a
-/// fresh overflow slot, so reentrant reads cannot overwrite a still-live table row.
+/// Transfers the cached overflow buffer to a Java-owned read lease, leaving the single slot
+/// empty so reentrant reads cannot overwrite a still-live row.
 pub(crate) fn take_owned_overflow_direct_buffer<'local>(
     env: &mut JNIEnv<'local>,
 ) -> Result<jobject, String> {
@@ -513,6 +513,29 @@ pub(crate) fn take_owned_overflow_direct_buffer<'local>(
 
 thread_local! {
     static LAST_OVERFLOW_DIRECT_BUFFER: RefCell<Option<GlobalRef>> = const { RefCell::new(None) };
+}
+
+/// Returns a completed Java lease to the closing thread's single overflow slot. A full slot
+/// keeps its existing scratch buffer; the returned buffer is then left to Java's Cleaner.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DirectIoUtils_returnOverflowBufferNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    buffer: JByteBuffer,
+) {
+    let result = LAST_OVERFLOW_DIRECT_BUFFER.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(env.new_global_ref(&buffer)?);
+        }
+        Ok::<_, jni::errors::Error>(())
+    });
+    if let Err(err) = result {
+        throw_illegal_state(
+            &mut env,
+            format!("failed to retain overflow direct buffer: {err}"),
+        );
+    }
 }
 
 fn get_or_grow_overflow_direct_buffer<'local>(

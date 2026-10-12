@@ -2,6 +2,7 @@ package io.cobble;
 
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.function.Supplier;
 
 /** Shared helpers for direct-memory Cobble Java APIs. */
@@ -52,6 +53,19 @@ public final class DirectIoUtils {
         ((Buffer) copy).clear();
         return copy;
     }
+
+    /**
+     * Returns an exclusively owned, completed lease to the closing thread's single overflow slot.
+     * Internal use only: caller-owned buffers and live views must never be returned.
+     */
+    public static void returnOverflowBuffer(ByteBuffer buffer) {
+        if (buffer == null) return;
+        ((Buffer) buffer).clear();
+        buffer.order(ByteOrder.BIG_ENDIAN);
+        returnOverflowBufferNative(buffer);
+    }
+
+    private static native void returnOverflowBufferNative(ByteBuffer buffer);
 
     // Bulk ByteBuffer copies retain both owners without locking two caller-provided buffers.
     // A prefix needs only a duplicate, not the extra slice required for an arbitrary offset.
