@@ -625,6 +625,8 @@ pub extern "system" fn Java_io_cobble_ScanCursor_nextEntryDirectInternal(
     env: JNIEnv,
     class: JClass,
     native_handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
 ) -> jint {
@@ -632,6 +634,7 @@ pub extern "system" fn Java_io_cobble_ScanCursor_nextEntryDirectInternal(
         env,
         class,
         native_handle,
+        _io_owner,
         io_address,
         io_capacity,
     )
@@ -642,6 +645,8 @@ pub extern "system" fn Java_io_cobble_DirectScanCursor_nextEntryDirectInternal(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _io_owner: JObject,
     io_address: jlong,
     io_capacity: jint,
 ) -> jint {
@@ -685,8 +690,12 @@ pub extern "system" fn Java_io_cobble_Db_openDirectScanCursor(
     _class: JClass,
     native_handle: jlong,
     bucket: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _start_key_owner: JObject,
     start_key_address: jlong,
     start_key_length: jint,
+    // Keeps the buffer alive during JNI; its numeric address is not a GC root.
+    _end_key_owner: JObject,
     end_key_address: jlong,
     end_key_length: jint,
     scan_options_handle: jlong,

@@ -37,7 +37,10 @@ public final class ScanCursor extends NativeObject implements Iterable<Row> {
         }
         int encodedLength =
                 nextRowDirectInternal(
-                        nativeHandle, DirectIoUtils.directAddress(ioBuffer), ioBuffer.capacity());
+                        nativeHandle,
+                        ioBuffer,
+                        DirectIoUtils.directAddress(ioBuffer),
+                        ioBuffer.capacity());
         if (encodedLength == 0) {
             return null;
         }
@@ -147,5 +150,5 @@ public final class ScanCursor extends NativeObject implements Iterable<Row> {
     }
 
     private static native int nextRowDirectInternal(
-            long nativeHandle, long ioAddress, int ioCapacity);
+            long nativeHandle, ByteBuffer ioOwner, long ioAddress, int ioCapacity);
 }

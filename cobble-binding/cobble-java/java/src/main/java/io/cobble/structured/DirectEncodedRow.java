@@ -5,6 +5,7 @@ import io.cobble.UnsafeAccess;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,18 +29,23 @@ public final class DirectEncodedRow implements AutoCloseable {
                 public void run() {}
             };
 
+    private final ByteBuffer owner;
     private final long address;
     private final int length;
     private final Runnable releaser;
     private final AtomicBoolean closed;
 
-    DirectEncodedRow(long address, int length, Runnable releaser) {
+    DirectEncodedRow(ByteBuffer owner, long address, int length, Runnable releaser) {
+        if (owner == null) {
+            throw new NullPointerException("owner");
+        }
         if (address == 0L) {
             throw new IllegalArgumentException("address must not be 0");
         }
         if (length < 0) {
             throw new IllegalArgumentException("length must be >= 0");
         }
+        this.owner = owner;
         this.address = address;
         this.length = length;
         this.releaser = releaser == null ? NO_OP : releaser;
@@ -53,7 +59,9 @@ public final class DirectEncodedRow implements AutoCloseable {
 
     /** Returns the number of columns encoded in this row. */
     public int columnCount() {
-        return DirectIoUtils.readLength(address, length, 0, "column count", PAYLOAD_NAME);
+        synchronized (owner) {
+            return DirectIoUtils.readLength(address, length, 0, "column count", PAYLOAD_NAME);
+        }
     }
 
     /** Returns whether the target column is NULL. */
@@ -62,6 +70,12 @@ public final class DirectEncodedRow implements AutoCloseable {
     }
 
     byte columnTag(int column) {
+        synchronized (owner) {
+            return columnTagWithOwner(column);
+        }
+    }
+
+    private byte columnTagWithOwner(int column) {
         int offset = 0;
         int columnCount =
                 DirectIoUtils.readLength(address, length, offset, "column count", PAYLOAD_NAME);
@@ -109,6 +123,16 @@ public final class DirectEncodedRow implements AutoCloseable {
      * @return mapped value, or {@code null} if the target column is NULL
      */
     public <T> T decodeBytesColumn(int column, ColumnDecoder<T> decoder) throws IOException {
+        // Keep the buffer alive for all Unsafe reads, including decoder callbacks and exceptions.
+        // An owner monitor provides Java 8-compatible liveness without a fence on every byte.
+        // This does not make concurrent close or pooled-buffer reuse safe.
+        synchronized (owner) {
+            return decodeBytesColumnWithOwner(column, decoder);
+        }
+    }
+
+    private <T> T decodeBytesColumnWithOwner(int column, ColumnDecoder<T> decoder)
+            throws IOException {
         if (decoder == null) {
             throw new NullPointerException("decoder");
         }
@@ -166,6 +190,13 @@ public final class DirectEncodedRow implements AutoCloseable {
      * @return decoded list, or {@code null} if the target column is NULL
      */
     public <T> List<T> decodeListColumn(int column, ColumnDecoder<T> decoder) throws IOException {
+        synchronized (owner) {
+            return decodeListColumnWithOwner(column, decoder);
+        }
+    }
+
+    private <T> List<T> decodeListColumnWithOwner(int column, ColumnDecoder<T> decoder)
+            throws IOException {
         if (decoder == null) {
             throw new NullPointerException("decoder");
         }
@@ -227,13 +258,6 @@ public final class DirectEncodedRow implements AutoCloseable {
         throw new IllegalStateException("missing column in encoded direct row: " + column);
     }
 
-    Runnable takeReleaser() {
-        if (closed.compareAndSet(false, true)) {
-            return releaser;
-        }
-        return NO_OP;
-    }
-
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
@@ -264,7 +288,11 @@ public final class DirectEncodedRow implements AutoCloseable {
         }
     }
 
-    /** Decoder function that maps one column payload stream to a value. */
+    /**
+     * Decoder function that maps one column payload stream to a value.
+     *
+     * <p>The stream is borrowed only for the callback and must not be retained or used afterwards.
+     */
     @FunctionalInterface
     public interface ColumnDecoder<T> {
         T decode(InputStream input) throws IOException;

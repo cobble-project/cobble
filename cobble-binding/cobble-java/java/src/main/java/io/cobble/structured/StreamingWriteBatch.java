@@ -83,6 +83,7 @@ public final class StreamingWriteBatch implements AutoCloseable {
         db.putStreamingBatchWithOptions(
                 bucket,
                 column,
+                chunks,
                 chunks.addresses(),
                 chunks.lengths(),
                 keyLengths,

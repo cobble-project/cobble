@@ -61,6 +61,7 @@ public final class StreamingMultiGet implements AutoCloseable {
         int[] chunkLengths = chunks.lengths();
         int encodedLength =
                 db.executeStreamingMultiGet(
+                        chunks,
                         addresses,
                         chunkLengths,
                         buckets,
@@ -72,6 +73,7 @@ public final class StreamingMultiGet implements AutoCloseable {
             resultBuffer = ByteBuffer.allocateDirect(Math.negateExact(encodedLength));
             encodedLength =
                     db.executeStreamingMultiGet(
+                            chunks,
                             addresses,
                             chunkLengths,
                             buckets,

@@ -28,11 +28,15 @@ public final class DirectIoUtils {
     }
 
     public static void copyKey(ByteBuffer target, byte[] key) {
-        UnsafeAccess.copyMemory(key, 0, directAddress(target), key.length);
+        synchronized (target) {
+            UnsafeAccess.copyMemory(key, 0, directAddress(target), key.length);
+        }
     }
 
     public static void copyKey(ByteBuffer target, ByteBuffer keyBuffer, int keyLength) {
-        UnsafeAccess.copyMemory(directAddress(keyBuffer), directAddress(target), keyLength);
+        ByteBuffer source = prefixView(keyBuffer, keyLength);
+        ByteBuffer destination = prefixView(target, keyLength);
+        destination.put(source);
     }
 
     /** Returns a stable direct copy of {@code source[0..length)}. */
@@ -44,8 +48,18 @@ public final class DirectIoUtils {
             throw new IllegalArgumentException("length out of range: " + length);
         }
         ByteBuffer copy = ByteBuffer.allocateDirect(length);
-        UnsafeAccess.copyMemory(directAddress(source), directAddress(copy), length);
+        copy.put(prefixView(source, length));
+        ((Buffer) copy).clear();
         return copy;
+    }
+
+    // Bulk ByteBuffer copies retain both owners without locking two caller-provided buffers.
+    // A prefix needs only a duplicate, not the extra slice required for an arbitrary offset.
+    private static ByteBuffer prefixView(ByteBuffer source, int length) {
+        ByteBuffer view = source.duplicate();
+        ((Buffer) view).clear();
+        ((Buffer) view).limit(length);
+        return view;
     }
 
     public static void ensureRemaining(int totalLength, int offset, int size, String payloadName) {
@@ -111,7 +125,9 @@ public final class DirectIoUtils {
             offset += Integer.BYTES;
             ensureRemaining(encodedLength, offset, length, "direct payload");
             ByteBuffer column = ByteBuffer.allocateDirect(length);
-            UnsafeAccess.copyMemory(address + offset, directAddress(column), length);
+            synchronized (column) {
+                UnsafeAccess.copyMemory(address + offset, directAddress(column), length);
+            }
             columns[i] = column;
             offset += length;
         }

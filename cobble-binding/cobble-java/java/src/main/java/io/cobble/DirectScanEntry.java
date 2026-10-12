@@ -49,7 +49,7 @@ public final class DirectScanEntry {
         return new DirectScanEntry(
                 bucket,
                 DirectIoUtils.slice(encoded, keyOffset, keyLength, "direct scan row"),
-                new DirectEncodedRow(address + rowOffset, rowLength, null),
+                new DirectEncodedRow(encoded, address + rowOffset, rowLength, null),
                 encoded,
                 rowOffset,
                 rowLength);

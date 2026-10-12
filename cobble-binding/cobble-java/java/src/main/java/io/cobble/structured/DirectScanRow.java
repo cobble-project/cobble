@@ -47,7 +47,7 @@ public final class DirectScanRow {
         return new DirectScanRow(
                 bucket,
                 DirectIoUtils.slice(encoded, keyOffset, keyLength, PAYLOAD_NAME),
-                new DirectEncodedRow(address + rowOffset, rowLength, null));
+                new DirectEncodedRow(encoded, address + rowOffset, rowLength, null));
     }
 
     /** Returns the scanned bucket id, or {@code -1} when unavailable. */
