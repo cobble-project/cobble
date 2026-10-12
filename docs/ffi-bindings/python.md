@@ -16,7 +16,7 @@ not currently exposed in Python.
 Requires CPython 3.11 or newer:
 
 ```bash
-pip install pycobble==0.5.1
+pip install pycobble==0.5.2
 ```
 
 Import public APIs from `pycobble`.
