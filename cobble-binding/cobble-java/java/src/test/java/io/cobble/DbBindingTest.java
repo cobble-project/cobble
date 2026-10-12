@@ -40,6 +40,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -50,6 +51,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -2900,6 +2903,210 @@ class DbBindingTest {
                     assertArrayEquals(value, readDirectBytes(columns.get(0)));
                 }
             }
+        }
+    }
+
+    @Test
+    void overflowLeasesReuseOneSlotOnlyAfterCloseOnTheClosingThread() throws Exception {
+        Config config =
+                new Config()
+                        .addVolume(Files.createTempDirectory("cobble-overflow-pool-").toString())
+                        .numColumns(1)
+                        .totalBuckets(1);
+        Field owner = DirectEncodedRow.class.getDeclaredField("owner");
+        owner.setAccessible(true);
+        ExecutorService firstThread = Executors.newSingleThreadExecutor();
+        ExecutorService secondThread = Executors.newSingleThreadExecutor();
+        try (Db db = Db.open(config)) {
+            byte[] key = new byte[] {1};
+            byte[] value = new byte[8192];
+            Arrays.fill(value, (byte) 7);
+            db.put(0, key, 0, value);
+            firstThread
+                    .submit(
+                            () -> {
+                                DirectEncodedRow first =
+                                        db.getDirectEncodedRowWithOptions(0, key, null);
+                                ByteBuffer firstBuffer = (ByteBuffer) owner.get(first);
+                                ((Buffer) firstBuffer).limit(1);
+                                firstBuffer.order(ByteOrder.LITTLE_ENDIAN);
+                                first.close();
+                                try (DirectEncodedRow reused =
+                                                db.getDirectEncodedRowWithOptions(0, key, null);
+                                        DirectEncodedRow nested =
+                                                db.getDirectEncodedRowWithOptions(0, key, null)) {
+                                    assertSame(firstBuffer, owner.get(reused));
+                                    assertEquals(ByteOrder.BIG_ENDIAN, firstBuffer.order());
+                                    assertEquals(firstBuffer.capacity(), firstBuffer.limit());
+                                    assertNotSame(owner.get(reused), owner.get(nested));
+                                    first.close(); // Must not return the live reused lease again.
+                                    assertArrayEquals(
+                                            value,
+                                            reused.decodeColumn(
+                                                    0, DbBindingTest::readInputStreamBytes));
+                                    ByteBuffer nestedBuffer = (ByteBuffer) owner.get(nested);
+                                    nested.close();
+                                    reused.close(); // Full slot must keep nestedBuffer, not reused.
+                                    try (DirectEncodedRow next =
+                                            db.getDirectEncodedRowWithOptions(0, key, null)) {
+                                        assertSame(nestedBuffer, owner.get(next));
+                                    }
+                                }
+                                DirectEncodedRow migrating =
+                                        db.getDirectEncodedRowWithOptions(0, key, null);
+                                ByteBuffer migratingBuffer = (ByteBuffer) owner.get(migrating);
+                                secondThread
+                                        .submit(
+                                                () -> {
+                                                    migrating.close();
+                                                    try (DirectEncodedRow next =
+                                                            db.getDirectEncodedRowWithOptions(
+                                                                    0, key, null)) {
+                                                        assertSame(
+                                                                migratingBuffer, owner.get(next));
+                                                    }
+                                                    return null;
+                                                })
+                                        .get();
+                                try (DirectEncodedRow isolated =
+                                        db.getDirectEncodedRowWithOptions(0, key, null)) {
+                                    assertNotSame(migratingBuffer, owner.get(isolated));
+                                }
+                                return null;
+                            })
+                    .get();
+        } finally {
+            firstThread.shutdownNow();
+            secondThread.shutdownNow();
+        }
+    }
+
+    @Test
+    void rawCursorReturnsReplacedOverflowAndRetainsCurrentUntilClose() throws Exception {
+        Config config =
+                new Config()
+                        .addVolume(Files.createTempDirectory("cobble-overflow-cursor-").toString())
+                        .numColumns(1)
+                        .totalBuckets(1);
+        Field io = DirectScanCursor.class.getDeclaredField("ioBuffer");
+        io.setAccessible(true);
+        Field owner = DirectEncodedRow.class.getDeclaredField("owner");
+        owner.setAccessible(true);
+        ExecutorService thread = Executors.newSingleThreadExecutor();
+        try (Db db = Db.open(config)) {
+            db.put(0, new byte[] {1}, 0, new byte[4096]);
+            db.put(0, new byte[] {2}, 0, new byte[8192]);
+            thread.submit(
+                            () -> {
+                                DirectScanCursor cursor =
+                                        db.scanDirectWithOptions(0, null, 0, null, 0, null);
+                                assertNotNull(cursor.nextEntry());
+                                ByteBuffer replaced = (ByteBuffer) io.get(cursor);
+                                assertNotNull(cursor.nextEntry());
+                                ByteBuffer current = (ByteBuffer) io.get(cursor);
+                                assertNotSame(replaced, current);
+                                try (DirectEncodedRow point =
+                                        db.getDirectEncodedRowWithOptions(
+                                                0, new byte[] {1}, null)) {
+                                    assertSame(replaced, owner.get(point));
+                                    assertNull(cursor.nextEntry());
+                                    assertNull(cursor.nextEntry());
+                                    cursor.close();
+                                    cursor.close();
+                                    try (DirectEncodedRow after =
+                                            db.getDirectEncodedRowWithOptions(
+                                                    0, new byte[] {2}, null)) {
+                                        assertSame(current, owner.get(after));
+                                        assertNotSame(owner.get(point), owner.get(after));
+                                    }
+                                }
+                                return null;
+                            })
+                    .get();
+        } finally {
+            thread.shutdownNow();
+        }
+    }
+
+    @Test
+    void directColumnsReturnOverflowOnPointAndBatchDecodeFailure() throws Exception {
+        Config config =
+                new Config()
+                        .addVolume(Files.createTempDirectory("cobble-overflow-decode-").toString())
+                        .numColumns(1)
+                        .totalBuckets(1);
+        Field owner = DirectEncodedRow.class.getDeclaredField("owner");
+        owner.setAccessible(true);
+        ExecutorService thread = Executors.newSingleThreadExecutor();
+        try (Db db = Db.open(config)) {
+            byte[] key = new byte[] {1};
+            db.put(0, key, 0, new byte[8192]);
+            thread.submit(
+                            () -> {
+                                ByteBuffer malformed = ByteBuffer.allocateDirect(16384);
+                                DirectColumns.Reader reader =
+                                        new DirectColumns.Reader() {
+                                            public int read(int bucket, ByteBuffer io, int length) {
+                                                return -8;
+                                            }
+
+                                            public ByteBuffer takeOverflowBuffer() {
+                                                return malformed;
+                                            }
+                                        };
+                                assertThrows(
+                                        IllegalStateException.class,
+                                        () -> DirectColumns.read(reader, 0, key));
+                                try (DirectEncodedRow held =
+                                        db.getDirectEncodedRowWithOptions(0, key, null)) {
+                                    assertSame(malformed, owner.get(held));
+                                    ByteBuffer batch = ByteBuffer.allocateDirect(16384);
+                                    batch.putInt(1)
+                                            .putInt(10)
+                                            .putInt(1)
+                                            .put((byte) 1)
+                                            .putInt(1)
+                                            .put((byte) 4);
+                                    DirectColumns.BatchReader batchReader =
+                                            new DirectColumns.BatchReader() {
+                                                public int read(ByteBuffer io) {
+                                                    return -18;
+                                                }
+
+                                                public ByteBuffer takeOverflowBuffer() {
+                                                    return batch;
+                                                }
+                                            };
+                                    RuntimeException failure =
+                                            new RuntimeException("decoder failure");
+                                    assertSame(
+                                            failure,
+                                            assertThrows(
+                                                    RuntimeException.class,
+                                                    () ->
+                                                            DirectColumns.readBatch(
+                                                                    batchReader,
+                                                                    new int[] {0},
+                                                                    new byte[][] {key},
+                                                                    (index, columns) -> {
+                                                                        assertArrayEquals(
+                                                                                new byte[] {4},
+                                                                                readDirectBytes(
+                                                                                        columns.get(
+                                                                                                0)));
+                                                                        throw failure;
+                                                                    })));
+                                    try (DirectEncodedRow next =
+                                            db.getDirectEncodedRowWithOptions(0, key, null)) {
+                                        assertSame(batch, owner.get(next));
+                                        assertNotSame(owner.get(held), owner.get(next));
+                                    }
+                                }
+                                return null;
+                            })
+                    .get();
+        } finally {
+            thread.shutdownNow();
         }
     }
 

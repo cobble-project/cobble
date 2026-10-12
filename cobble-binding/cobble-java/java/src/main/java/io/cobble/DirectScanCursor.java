@@ -49,8 +49,10 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
             if (resultBuffer == null) {
                 throw new IllegalStateException("missing owned overflow direct buffer from JNI");
             }
+            ByteBuffer previous = ioBuffer;
             ioBuffer = resultBuffer;
             releasePooledBuffer();
+            if (previous != pooledBuffer) DirectIoUtils.returnOverflowBuffer(previous);
         }
         return DirectScanEntry.decode(resultBuffer, Math.abs(encodedLength));
     }
@@ -92,8 +94,10 @@ public final class DirectScanCursor extends NativeObject implements Iterable<Dir
         try {
             super.close();
         } finally {
-            releasePooledBuffer();
+            ByteBuffer previous = ioBuffer;
             ioBuffer = null;
+            releasePooledBuffer();
+            if (previous != pooledBuffer) DirectIoUtils.returnOverflowBuffer(previous);
         }
     }
 

@@ -92,6 +92,14 @@ class DirectEncodedRowOwnershipTest {
                                                         })));
                         assertFalse(Thread.holdsLock(owner.get()));
                         assertArrayEquals(bytes, row.decodeBytesColumn(0, this::readAll));
+                        ByteBuffer scratch = Db.getLastDirectOverflowBuffer();
+                        assertNotSame(scratch, owner.get(), "structured rows keep stable copies");
+                        row.close();
+                        row.close();
+                        assertSame(
+                                scratch,
+                                Db.getLastDirectOverflowBuffer(),
+                                "closing a copy must not replace the occupied native scratch slot");
                     }
                 }
             }

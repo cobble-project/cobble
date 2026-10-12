@@ -8,7 +8,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Column-family-scoped priority queue for structured Java bindings.
@@ -343,8 +342,8 @@ public final class PriorityQueue extends NativeObject {
     private EncodedDirectResult readPriorityQueueDirectResult(
             int bucket, int batchSize, boolean peek) {
         ByteBuffer pooled = directBufferPool.acquire();
-        boolean pooledReleased = false;
-        boolean usingPooledForResult = false;
+        boolean retained = false;
+        ByteBuffer ownedResult = null;
         try {
             int encodedLength =
                     peek
@@ -363,7 +362,6 @@ public final class PriorityQueue extends NativeObject {
                                     DirectIoUtils.directAddress(pooled),
                                     pooled.capacity());
             if (encodedLength == 0) {
-                directBufferPool.release(pooled);
                 return null;
             }
             ByteBuffer resultBuffer =
@@ -371,27 +369,32 @@ public final class PriorityQueue extends NativeObject {
                             pooled, encodedLength, PriorityQueue::getLastDirectOverflowBuffer);
             int decodedLength = Math.abs(encodedLength);
             if (resultBuffer == pooled) {
-                usingPooledForResult = true;
-                AtomicBoolean released = new AtomicBoolean(false);
-                Runnable releaser =
-                        () -> {
-                            if (released.compareAndSet(false, true)) {
-                                directBufferPool.release(pooled);
-                            }
-                        };
-                return new EncodedDirectResult(resultBuffer, decodedLength, releaser);
+                EncodedDirectResult result =
+                        new EncodedDirectResult(
+                                resultBuffer,
+                                decodedLength,
+                                () -> directBufferPool.release(pooled));
+                retained = true;
+                return result;
             }
             // JNI overflow buffers are thread-local scratch space. Copy before returning a
             // close-scoped Java view that may outlive the next JNI call on this thread.
             resultBuffer = DirectIoUtils.copyDirectPrefix(resultBuffer, decodedLength);
+            ownedResult = resultBuffer;
+            ByteBuffer leasedBuffer = resultBuffer;
+            EncodedDirectResult result =
+                    new EncodedDirectResult(
+                            resultBuffer,
+                            decodedLength,
+                            () -> DirectIoUtils.returnOverflowBuffer(leasedBuffer));
             directBufferPool.release(pooled);
-            pooledReleased = true;
-            return new EncodedDirectResult(resultBuffer, decodedLength, () -> {});
-        } catch (RuntimeException e) {
-            if (!pooledReleased && !usingPooledForResult) {
+            retained = true;
+            return result;
+        } finally {
+            if (!retained) {
                 directBufferPool.release(pooled);
+                DirectIoUtils.returnOverflowBuffer(ownedResult);
             }
-            throw e;
         }
     }
 
