@@ -195,10 +195,9 @@ fn validate_runtime_manifest_version(version: u32) -> Result<()> {
 
 /// Runtime-manifest metadata I/O.
 ///
-/// Both the generation file and `CURRENT` are written through
-/// `FileManager::create_metadata_file`, which writes a checksum-protected temp
-/// file and atomically renames it on close. The generation is published before
-/// `CURRENT`, so readers never observe a pointer to a partial manifest.
+/// Generation files use checksum-protected temporary publication. Mutable `CURRENT` uses
+/// explicit atomic replacement, falling back to immutable commits where needed. The generation
+/// is published first, so readers never observe a pointer to a partial manifest.
 pub(crate) struct RuntimeManifestStore {
     file_manager: Arc<FileManager>,
 }
@@ -248,11 +247,8 @@ impl RuntimeManifestStore {
             &manifest_name,
             &encode_runtime_manifest(envelope)?,
         )?;
-        write_metadata_file(
-            &self.file_manager,
-            RUNTIME_CURRENT_NAME,
-            format!("{generation}\n").as_bytes(),
-        )
+        self.file_manager
+            .replace_metadata_file(RUNTIME_CURRENT_NAME, format!("{generation}\n").as_bytes())
     }
 
     /// Returns a generation that has never been used in this runtime-manifest namespace.
@@ -366,11 +362,14 @@ impl RuntimeManifestStore {
     fn current_generation(&self) -> Result<Option<u64>> {
         if !self
             .file_manager
-            .metadata_file_exists_untracked(RUNTIME_CURRENT_NAME)?
+            .replaced_metadata_file_exists(RUNTIME_CURRENT_NAME)?
         {
             return Ok(None);
         }
-        let bytes = read_metadata_file(&self.file_manager, RUNTIME_CURRENT_NAME)?;
+        let reader = self
+            .file_manager
+            .open_replaced_metadata_file(RUNTIME_CURRENT_NAME)?;
+        let bytes = MetadataReader::new(reader).read_all()?;
         let text = std::str::from_utf8(&bytes).map_err(|err| {
             Error::InvalidState(format!("Runtime CURRENT is not valid UTF-8: {err}"))
         })?;

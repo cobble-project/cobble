@@ -25,6 +25,10 @@ impl PosixFileSystem {
 }
 
 impl FileSystem for PosixFileSystem {
+    fn supports_atomic_replace(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

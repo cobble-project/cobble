@@ -1,9 +1,59 @@
 use super::*;
 use crate::config::{VolumeDescriptor, VolumeUsageKind};
 use crate::file::FileManager;
+use crate::file::{FileSystem, FileSystemRegistry};
 use crate::metrics_manager::MetricsManager;
 use size::Size;
 use std::sync::Arc;
+
+#[test]
+fn properties_rewrite_without_atomic_rename_stays_flat() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = format!("file://{}", dir.path().display());
+    let inner = FileSystemRegistry::new().get_or_register(&root).unwrap();
+    let fs = Arc::new(crate::file::atomic_replace::tests::TestFileSystem::new(
+        inner,
+    ));
+    let manager = FileManager::with_defaults(
+        fs.clone(),
+        Arc::new(MetricsManager::new("non-atomic-properties")),
+    )
+    .unwrap();
+    let mut config = Config {
+        volumes: VolumeDescriptor::single_volume(root),
+        ..Config::default()
+    };
+    persist_db_properties(&manager, "shard", &config).unwrap();
+    config.l0_file_limit += 1;
+    assert!(refresh_db_properties(&manager, "shard", &config).unwrap());
+    assert_eq!(
+        load_db_properties(&manager, "shard")
+            .unwrap()
+            .config
+            .l0_file_limit,
+        config.l0_file_limit
+    );
+    assert!(!refresh_db_properties(&manager, "shard", &config).unwrap());
+    assert!(fs.exists(DB_PROPERTIES_NAME).unwrap());
+    assert!(!fs.exists(&format!("{DB_PROPERTIES_NAME}-ATOMIC/")).unwrap());
+    *fs.fail_rename_to.lock().unwrap() = Some(DB_PROPERTIES_NAME.to_string());
+    config.l0_file_limit += 1;
+    assert!(refresh_db_properties(&manager, "shard", &config).is_err());
+    assert!(!fs.exists(DB_PROPERTIES_NAME).unwrap());
+    assert!(matches!(
+        load_db_properties(&manager, "shard"),
+        Err(Error::IoError(_))
+    ));
+    *fs.fail_rename_to.lock().unwrap() = None;
+    assert!(refresh_db_properties(&manager, "shard", &config).unwrap());
+    assert_eq!(
+        load_db_properties(&manager, "shard")
+            .unwrap()
+            .config
+            .l0_file_limit,
+        config.l0_file_limit
+    );
+}
 
 #[test]
 fn properties_are_plain_toml_without_volume_credentials() {
@@ -47,8 +97,10 @@ fn properties_are_plain_toml_without_volume_credentials() {
     let file_manager = FileManager::from_config(&storage_config, "shard-7", metrics).unwrap();
 
     persist_db_properties(&file_manager, "shard-7", &config).unwrap();
-    let path = dir.path().join("shard-7").join(DB_PROPERTIES_NAME);
-    let contents = std::fs::read_to_string(path).unwrap();
+    let reader = file_manager
+        .open_metadata_file_reader_untracked(DB_PROPERTIES_NAME)
+        .unwrap();
+    let contents = String::from_utf8(reader.read_all().unwrap().to_vec()).unwrap();
     let decoded: DbProperties = toml::from_str(&contents).unwrap();
     let route = config.volumes[0].without_credentials();
     assert_eq!(
@@ -187,9 +239,24 @@ fn startup_replaces_malformed_properties() {
     };
     let metrics = Arc::new(MetricsManager::new("properties-malformed-test"));
     let file_manager = FileManager::from_config(&storage_config, "shard-12", metrics).unwrap();
+    assert!(matches!(
+        load_db_properties(&file_manager, "shard-12"),
+        Err(Error::IoError(_))
+    ));
     file_manager
-        .write_plain_metadata_file_atomic(DB_PROPERTIES_NAME, b"not = [valid")
+        .rewrite_plain_metadata_file(DB_PROPERTIES_NAME, b"not = [valid")
         .unwrap();
+    assert!(matches!(
+        load_db_properties(&file_manager, "shard-12"),
+        Err(Error::IoError(_))
+    ));
+    file_manager
+        .rewrite_plain_metadata_file(DB_PROPERTIES_NAME, &[0xff])
+        .unwrap();
+    assert!(matches!(
+        load_db_properties(&file_manager, "shard-12"),
+        Err(Error::IoError(_))
+    ));
     let writer_config = Config {
         volumes: VolumeDescriptor::single_volume("s3://bucket/data"),
         ..Config::default()
@@ -197,4 +264,40 @@ fn startup_replaces_malformed_properties() {
 
     assert!(refresh_db_properties(&file_manager, "shard-12", &writer_config).unwrap());
     load_db_properties(&file_manager, "shard-12").unwrap();
+    let mut invalid = DbProperties::from_writer("shard-12", &writer_config);
+    invalid.version += 1;
+    file_manager
+        .rewrite_plain_metadata_file(
+            DB_PROPERTIES_NAME,
+            serialize_db_properties(&invalid).unwrap().as_bytes(),
+        )
+        .unwrap();
+    assert!(matches!(
+        load_db_properties(&file_manager, "shard-12"),
+        Err(Error::InvalidState(_))
+    ));
+    invalid.version = DB_PROPERTIES_VERSION_CURRENT;
+    invalid.db_id = "another-shard".to_string();
+    file_manager
+        .rewrite_plain_metadata_file(
+            DB_PROPERTIES_NAME,
+            serialize_db_properties(&invalid).unwrap().as_bytes(),
+        )
+        .unwrap();
+    assert!(matches!(
+        load_db_properties(&file_manager, "shard-12"),
+        Err(Error::InvalidState(_))
+    ));
+    invalid.db_id = "shard-12".to_string();
+    invalid.config.volumes.clear();
+    file_manager
+        .rewrite_plain_metadata_file(
+            DB_PROPERTIES_NAME,
+            serialize_db_properties(&invalid).unwrap().as_bytes(),
+        )
+        .unwrap();
+    assert!(matches!(
+        load_db_properties(&file_manager, "shard-12"),
+        Err(Error::InvalidState(_))
+    ));
 }

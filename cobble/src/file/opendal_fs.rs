@@ -181,6 +181,11 @@ fn resolve_goosefs_master_addr_root(
 }
 
 impl FileSystem for OpendalFileSystem {
+    fn supports_atomic_replace(&self) -> bool {
+        // Only local Unix rename is guaranteed to atomically replace its destination.
+        cfg!(unix) && self.op.info().scheme() == "fs"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

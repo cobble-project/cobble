@@ -455,7 +455,11 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         path.components()
             .any(|component| component.as_os_str() == "shards")
     }));
-    assert!(files.iter().any(|path| path.ends_with("CURRENT")));
+    let metadata_url = url::Url::from_directory_path(&metadata_root).unwrap();
+    let metadata_fs = cobble::FileSystemRegistry::new()
+        .get_or_register(metadata_url.as_str())
+        .unwrap();
+    assert!(cobble::atomic_replace::exists(metadata_fs.as_ref(), "CURRENT").unwrap());
     assert!(files.iter().any(|path| {
         path.file_name()
             .and_then(|name| name.to_str())

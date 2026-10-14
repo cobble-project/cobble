@@ -213,7 +213,8 @@ impl FileCatalog {
 
     fn load_namespace(&self, entry: &NamespaceEntry) -> CatalogResult<NamespaceManifest> {
         let prefix = namespace_prefix(entry.namespace_id);
-        let current: CurrentPointer = read_json(&self.store, &format!("{prefix}/CURRENT"))?;
+        let current: CurrentPointer =
+            read_replaced_json(&self.store, &format!("{prefix}/CURRENT"))?;
         validate_header(&current.format, current.version)?;
         let manifest: NamespaceManifest = read_json(
             &self.store,
@@ -264,7 +265,7 @@ impl FileCatalog {
         next: CatalogManifest,
     ) -> CatalogResult<()> {
         write_json(&self.store, &format!("CATALOG-{}", next.generation), &next)?;
-        write_json(
+        replace_json(
             &self.store,
             "CURRENT",
             &CurrentPointer {
@@ -288,7 +289,7 @@ impl FileCatalog {
             &format!("{prefix}/NAMESPACE-{}", manifest.generation),
             manifest,
         )?;
-        write_json(
+        replace_json(
             &self.store,
             &format!("{prefix}/CURRENT"),
             &CurrentPointer {
@@ -608,10 +609,10 @@ impl Catalog for FileCatalog {
 }
 
 fn load_catalog_manifest(store: &CatalogStore) -> CatalogResult<CatalogManifest> {
-    if !store.exists("CURRENT")? {
+    if !store.replaced_exists("CURRENT")? {
         return Ok(CatalogManifest::empty());
     }
-    let current: CurrentPointer = read_json(store, "CURRENT")?;
+    let current: CurrentPointer = read_replaced_json(store, "CURRENT")?;
     validate_header(&current.format, current.version)?;
     let manifest: CatalogManifest = read_json(store, &format!("CATALOG-{}", current.generation))?;
     validate_header(&manifest.format, manifest.version)?;
@@ -673,6 +674,18 @@ fn write_json<T: Serialize>(store: &CatalogStore, path: &str, value: &T) -> Cata
     let bytes = serde_json::to_vec(value)
         .map_err(|error| CatalogError::InvalidMetadata(error.to_string()))?;
     store.write(path, &bytes)?;
+    Ok(())
+}
+
+fn read_replaced_json<T: DeserializeOwned>(store: &CatalogStore, path: &str) -> CatalogResult<T> {
+    let bytes = store.read_replaced(path)?;
+    serde_json::from_slice(&bytes).map_err(|error| CatalogError::InvalidMetadata(error.to_string()))
+}
+
+fn replace_json<T: Serialize>(store: &CatalogStore, path: &str, value: &T) -> CatalogResult<()> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| CatalogError::InvalidMetadata(error.to_string()))?;
+    store.replace(path, &bytes)?;
     Ok(())
 }
 

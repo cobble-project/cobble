@@ -2,6 +2,11 @@ package io.cobble;
 
 /** Java-side filesystem contract bridged into Cobble core through JNI. */
 public interface CustomFileSystem extends AutoCloseable {
+    /** Whether rename atomically replaces an existing destination. */
+    default boolean supportsAtomicReplace() {
+        return false;
+    }
+
     /** Creates a directory recursively relative to this filesystem root. */
     void createDir(String path);
 

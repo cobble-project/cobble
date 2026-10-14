@@ -1,7 +1,7 @@
 use super::*;
 use crate::MergeOperator;
 use crate::db_state::full_bucket_range;
-use crate::file::{File, SequentialWriteFile};
+use crate::file::File;
 use crate::paths::{GOVERNANCE_MANIFEST_POINTER_NAME, snapshot_active_data_relative_path};
 use crate::row_merge::resolve_column_with_vlog;
 use crate::snapshot::SnapshotLifecycleState;
@@ -610,8 +610,17 @@ fn writer_persists_plain_db_properties_without_volume_credentials() {
         .db_id("properties-shard")
         .open()
         .unwrap();
-    let properties_path = format!("{root}/properties-shard/PROPERTIES");
-    let contents = std::fs::read_to_string(&properties_path).unwrap();
+    let properties_reader = db
+        .file_manager
+        .open_metadata_file_reader_untracked("PROPERTIES")
+        .unwrap();
+    let contents = String::from_utf8(
+        properties_reader
+            .read_at(0, properties_reader.size())
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     let parsed: toml::Value = toml::from_str(&contents).unwrap();
 
     assert_eq!(parsed["db_id"].as_str(), Some("properties-shard"));
@@ -632,7 +641,17 @@ fn writer_persists_plain_db_properties_without_volume_credentials() {
         .db_id("properties-shard")
         .open()
         .unwrap();
-    let refreshed_contents = std::fs::read_to_string(&properties_path).unwrap();
+    let properties_reader = restarted
+        .file_manager
+        .open_metadata_file_reader_untracked("PROPERTIES")
+        .unwrap();
+    let refreshed_contents = String::from_utf8(
+        properties_reader
+            .read_at(0, properties_reader.size())
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     let refreshed: toml::Value = toml::from_str(&refreshed_contents).unwrap();
 
     assert_eq!(refreshed["config"]["l0_file_limit"].as_integer(), Some(15));
@@ -1900,10 +1919,12 @@ fn test_db_uses_noop_governance_when_explicitly_configured() {
     let db = open_db(config);
     db.close().unwrap();
 
+    let fs = crate::file::FileSystemRegistry::new()
+        .get_or_register(format!("file://{root}"))
+        .unwrap();
     assert!(
-        !std::path::Path::new(root)
-            .join(GOVERNANCE_MANIFEST_POINTER_NAME)
-            .exists()
+        !crate::file::atomic_replace::exists(fs.as_ref(), GOVERNANCE_MANIFEST_POINTER_NAME)
+            .unwrap()
     );
     cleanup_test_root(root);
 }
@@ -2339,11 +2360,9 @@ fn runtime_manifest_enabled_open_rejects_corrupt_current_without_overwriting_it(
         .unwrap();
     let file_manager = Arc::clone(&db.file_manager);
     db.close().unwrap();
-    let mut writer = file_manager
-        .create_metadata_file("runtime/CURRENT")
+    file_manager
+        .replace_metadata_file("runtime/CURRENT", b"not-a-generation\n")
         .unwrap();
-    writer.write(b"not-a-generation\n").unwrap();
-    writer.close().unwrap();
 
     let error = match DbBuilder::new(config)
         .bucket_ranges(ranges)

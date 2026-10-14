@@ -11,8 +11,9 @@ use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::{schema_file_relative_path, snapshot_manifest_relative_path};
 use crate::rescale_protocol::{
-    ExportLease, ImportRecord, export_lease_name, has_import_records, import_record_name,
-    load_import_records, write_export_lease, write_import_record,
+    ExportLease, IMPORT_RECORD_DIR, ImportEnd, ImportStart, export_lease_name, has_import_starts,
+    import_end_name, import_start_name, load_import_end, load_import_starts, write_export_lease,
+    write_import_end, write_import_start,
 };
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
@@ -164,16 +165,6 @@ fn copy_db_state(state: &DbState) -> DbState {
     }
 }
 
-fn shared_adoption_barrier_id(records: &[ImportRecord]) -> Option<u64> {
-    let snapshot_id = records
-        .first()
-        .and_then(|record| record.adoption_barrier_snapshot_id)?;
-    records
-        .iter()
-        .all(|record| record.adoption_barrier_snapshot_id == Some(snapshot_id))
-        .then_some(snapshot_id)
-}
-
 pub(crate) struct AdoptionCoordinator {
     db_id: String,
     config: crate::Config,
@@ -243,7 +234,21 @@ impl AdoptionCoordinator {
     }
 
     pub(crate) fn tick(self: &Arc<Self>) -> Result<()> {
-        let records = load_import_records(&self.file_manager)?;
+        if self.finalizing.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = self.tick_once();
+        if !matches!(result, Ok(true)) {
+            self.finalizing.store(false, Ordering::Release);
+        }
+        result.map(|_| ())
+    }
+
+    /// Returns true when a materialization callback owns finalization.
+    fn tick_once(self: &Arc<Self>) -> Result<bool> {
+        let _access = self.db_lifecycle.begin_owned_access()?;
+        let records = load_import_starts(&self.file_manager)?;
+        self.cleanup_orphan_ends()?;
         if records
             .iter()
             .any(|record| record.target_db_id != self.db_id)
@@ -253,7 +258,20 @@ impl AdoptionCoordinator {
             ));
         }
         if records.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        let mut pending = Vec::new();
+        let mut completed = Vec::new();
+        for record in records {
+            if load_import_end(&self.file_manager, &record.export_id)?.is_some() {
+                completed.push(record);
+            } else {
+                pending.push(record);
+            }
+        }
+        self.finish_adoption(&completed)?;
+        if pending.is_empty() {
+            return Ok(false);
         }
         self.file_manager
             .schedule_referenced_adoptions(&self.db_state)?;
@@ -261,74 +279,50 @@ impl AdoptionCoordinator {
             || self
                 .file_manager
                 .has_referenced_adoption_jobs(&self.db_state)
-            || self.finalizing.swap(true, Ordering::AcqRel)
         {
-            return Ok(());
+            return Ok(false);
         }
-        let committed_barrier = match self.adoption_barrier_is_committed(&records) {
-            Ok(committed) => committed,
-            Err(err) => {
-                self.finalizing.store(false, Ordering::Release);
-                return Err(err);
-            }
-        };
-        if let Some(barrier_id) = committed_barrier {
-            let result = self.finish_adoption(barrier_id);
-            self.finalizing.store(false, Ordering::Release);
-            return result;
-        }
-        let _access = match self.db_lifecycle.begin_owned_access() {
-            Ok(access) => access,
-            Err(err) => {
-                self.finalizing.store(false, Ordering::Release);
-                return Err(err);
-            }
-        };
         if let Some(base) = self.db_state.load().suggested_base_snapshot_id {
             self.db_state.rebase_suggested_snapshot(base, None);
         }
         let coordinator = Arc::clone(self);
         let callback = Arc::new(
             move |result: Result<crate::snapshot::SnapshotManifestInfo>| {
-                if let Ok(info) = result
-                    && let Err(err) = coordinator.finish_adoption(info.id)
-                {
+                if let Err(err) = coordinator.complete_adoption(&pending, result) {
                     log::warn!("expand adoption finalization failed: {err}");
                 }
                 coordinator.finalizing.store(false, Ordering::Release);
             },
         );
-        if let Err(err) = self.memtable_manager.create_snapshot_with_before_flush(
-            self.snapshot_manager.clone(),
-            Some(callback),
-            |snapshot_id| self.write_adoption_barrier(snapshot_id),
-        ) {
-            self.finalizing.store(false, Ordering::Release);
-            return Err(err);
+        self.memtable_manager
+            .create_snapshot(self.snapshot_manager.clone(), Some(callback))?;
+        Ok(true)
+    }
+
+    fn complete_adoption(
+        &self,
+        records: &[ImportStart],
+        result: Result<crate::snapshot::SnapshotManifestInfo>,
+    ) -> Result<()> {
+        let snapshot_id = result?.id;
+        for record in records {
+            write_import_end(
+                &self.file_manager,
+                &ImportEnd {
+                    version: 1,
+                    export_id: record.export_id.clone(),
+                    snapshot_id,
+                },
+            )?;
         }
-        Ok(())
+        self.finish_adoption(records)
     }
 
-    /// A barrier is committed exactly when its manifest exists. A missing manifest represents a
-    /// failed or interrupted pre-commit attempt and may be replaced by a new barrier.
-    fn adoption_barrier_is_committed(&self, records: &[ImportRecord]) -> Result<Option<u64>> {
-        let Some(snapshot_id) = shared_adoption_barrier_id(records) else {
-            return Ok(None);
-        };
-        Ok(list_snapshot_manifest_ids(&self.file_manager)?
-            .contains(&snapshot_id)
-            .then_some(snapshot_id))
-    }
-
-    fn write_adoption_barrier(&self, snapshot_id: u64) -> Result<()> {
-        for mut record in load_import_records(&self.file_manager)? {
-            record.adoption_barrier_snapshot_id = Some(snapshot_id);
-            write_import_record(&self.file_manager, &record)?;
+    /// Callers pass only records whose immutable END has already been published.
+    fn finish_adoption(&self, records: &[ImportStart]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    fn finish_adoption(&self, barrier_id: u64) -> Result<()> {
         if let Some(publisher) = &self.runtime_manifest_publisher {
             publisher.publish_at_least(self.db_state.load().seq_id)?;
         }
@@ -337,14 +331,11 @@ impl AdoptionCoordinator {
         {
             return Ok(());
         }
-        for record in load_import_records(&self.file_manager)? {
-            if record.adoption_barrier_snapshot_id != Some(barrier_id) {
-                continue;
-            }
-            if let Some(snapshot_id) = record.import_snapshot_id
-                && !self.snapshot_manager.is_retained(snapshot_id)
-            {
-                let _ = self.snapshot_manager.expire_snapshot(snapshot_id)?;
+        for record in records {
+            if !self.snapshot_manager.is_retained(record.import_snapshot_id) {
+                let _ = self
+                    .snapshot_manager
+                    .expire_snapshot(record.import_snapshot_id)?;
             }
             if self
                 .snapshot_manager
@@ -359,13 +350,34 @@ impl AdoptionCoordinator {
             )?;
             source.remove_metadata_file(&export_lease_name(&record.export_id))?;
             self.file_manager
-                .remove_metadata_file(&import_record_name(&record.export_id))?;
+                .remove_metadata_file(&import_start_name(&record.export_id))?;
+            self.file_manager
+                .remove_metadata_file(&import_end_name(&record.export_id))?;
         }
         Ok(())
     }
 
     pub(crate) fn is_complete(&self) -> Result<bool> {
-        Ok(!has_import_records(&self.file_manager)?)
+        Ok(!self.finalizing.load(Ordering::Acquire) && !has_import_starts(&self.file_manager)?)
+    }
+
+    fn cleanup_orphan_ends(&self) -> Result<()> {
+        for name in self.file_manager.list_metadata_names(IMPORT_RECORD_DIR)? {
+            let Some(export_id) = name
+                .strip_prefix("IMPORT-")
+                .and_then(|name| name.strip_suffix(".END"))
+            else {
+                continue;
+            };
+            if !self
+                .file_manager
+                .metadata_file_exists_untracked(&import_start_name(export_id))?
+            {
+                self.file_manager
+                    .remove_metadata_file(&format!("{IMPORT_RECORD_DIR}/{name}"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -574,21 +586,6 @@ impl Db {
                 ranges: expand_ranges.clone(),
             };
             write_export_lease(&source_file_manager, &lease)?;
-            let record = ImportRecord {
-                version: 1,
-                export_id: export_id.clone(),
-                source_db_id: source_db_id.clone(),
-                source_manifest_path: source_manifest_path.clone(),
-                snapshot_id: source_snapshot_id,
-                target_db_id: self.id.clone(),
-                ranges: expand_ranges.clone(),
-                import_snapshot_id: None,
-                adoption_barrier_snapshot_id: None,
-            };
-            if let Err(err) = write_import_record(&self.file_manager, &record) {
-                let _ = source_file_manager.remove_metadata_file(&export_lease_name(export_id));
-                return Err(err);
-            }
         }
         let mut original_state = None;
         let mut original_ranges = None;
@@ -840,9 +837,9 @@ impl Db {
             )?;
             if let Some(export_id) = &export_id {
                 self.create_snapshot_and_wait_with_before_flush("bucket expand", |snapshot_id| {
-                    write_import_record(
+                    write_import_start(
                         &self.file_manager,
-                        &ImportRecord {
+                        &ImportStart {
                             version: 1,
                             export_id: export_id.clone(),
                             source_db_id: source_db_id.clone(),
@@ -850,8 +847,7 @@ impl Db {
                             snapshot_id: source_snapshot_id,
                             target_db_id: self.id.clone(),
                             ranges: expand_ranges.clone(),
-                            import_snapshot_id: Some(snapshot_id),
-                            adoption_barrier_snapshot_id: None,
+                            import_snapshot_id: snapshot_id,
                         },
                     )
                 })?
@@ -885,7 +881,7 @@ impl Db {
             if !snapshot_committed && let Some(export_id) = &export_id {
                 let _ = self
                     .file_manager
-                    .remove_metadata_file(&import_record_name(export_id));
+                    .remove_metadata_file(&import_start_name(export_id));
                 let _ = source_file_manager.remove_metadata_file(&export_lease_name(export_id));
             }
             return Err(err);

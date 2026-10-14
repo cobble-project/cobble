@@ -40,6 +40,12 @@ pub trait FileSystem: Send + Sync {
         false
     }
 
+    /// Whether rename atomically replaces an existing destination. Unknown and custom
+    /// filesystems use immutable metadata commits unless they explicitly opt in.
+    fn supports_atomic_replace(&self) -> bool {
+        false
+    }
+
     /// Returns the size of a regular file without opening it for reads.
     fn file_size(&self, _path: &str) -> Result<Option<u64>> {
         Ok(None)

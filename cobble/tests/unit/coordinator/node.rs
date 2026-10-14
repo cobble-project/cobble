@@ -27,6 +27,51 @@ fn default_column_family_ids() -> BTreeMap<String, u8> {
     BTreeMap::from([("default".to_string(), 0)])
 }
 
+#[test]
+fn non_atomic_current_replacement_keeps_global_snapshots_flat() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = CoordinatorConfig {
+        volumes: crate::config::VolumeDescriptor::single_volume(format!(
+            "file://{}",
+            dir.path().display()
+        )),
+        snapshot_retention: None,
+    };
+    let mut node = DbCoordinator::open(config).unwrap();
+    let fs = Arc::new(crate::file::atomic_replace::tests::TestFileSystem::new(
+        node.fs.clone(),
+    ));
+    node.fs = fs.clone();
+    let node = Arc::new(node);
+    let threads = [1, 2].map(|id| {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let snapshot = GlobalSnapshotManifest {
+                version: GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT,
+                id,
+                total_buckets: 1,
+                column_family_ids: default_column_family_ids(),
+                shard_snapshots: Vec::new(),
+                watermark_seconds: 0,
+            };
+            node.materialize_global_snapshot(&snapshot).unwrap();
+        })
+    });
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(node.list_global_snapshots().unwrap().len(), 2);
+    assert!(node.load_current_global_snapshot().unwrap().is_some());
+    for id in [1, 2] {
+        assert!(fs.exists(&global_snapshot_manifest_path(id)).unwrap());
+    }
+    assert!(!fs.exists(&global_snapshot_current_path()).unwrap());
+    assert!(
+        fs.exists(&format!("{}-ATOMIC/", global_snapshot_current_path()))
+            .unwrap()
+    );
+}
+
 fn default_column_families() -> BTreeMap<String, SnapshotColumnFamily> {
     column_families(default_column_family_ids())
 }
@@ -356,7 +401,7 @@ fn test_global_snapshot_retain_expire() {
 
 #[test]
 #[serial_test::serial(file)]
-fn test_load_latest_snapshot_id_ignores_checksum_mismatch_pointer() {
+fn test_load_latest_snapshot_id_rejects_checksum_mismatch_pointer() {
     let root = "/tmp/coordinator_pointer_checksum";
     cleanup_root(root);
     let registry = FileSystemRegistry::new();
@@ -369,8 +414,10 @@ fn test_load_latest_snapshot_id_ignores_checksum_mismatch_pointer() {
     writer.write(b"SNAPSHOT-123").unwrap();
     writer.close().unwrap();
 
-    let latest = load_latest_snapshot_id(&fs).unwrap();
-    assert!(latest.is_none());
+    assert!(matches!(
+        load_latest_snapshot_id(&fs),
+        Err(Error::ChecksumMismatch(_))
+    ));
 
     cleanup_root(root);
 }

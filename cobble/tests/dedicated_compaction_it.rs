@@ -164,52 +164,63 @@ fn count_snapshots(root: &str) -> usize {
 
 /// Returns whether the writer published a runtime CURRENT pointer.
 fn runtime_current_exists(root: &str) -> bool {
-    fn walk(dir: &std::path::Path) -> bool {
+    runtime_current_path(root).is_some()
+}
+
+fn runtime_current_path(root: &str) -> Option<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
+            return None;
         };
-        entries.flatten().any(|entry| {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path)
-            } else {
-                path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
-                    && path
-                        .parent()
-                        .and_then(|parent| parent.file_name())
-                        .and_then(|name| name.to_str())
-                        == Some("runtime")
+        if dir.file_name().and_then(|name| name.to_str()) == Some("runtime") {
+            let url = url::Url::from_directory_path(dir).ok()?;
+            let fs = cobble::FileSystemRegistry::new()
+                .get_or_register(url.as_str())
+                .ok()?;
+            if cobble::atomic_replace::exists(fs.as_ref(), "CURRENT").ok()? {
+                return Some(dir.join("CURRENT"));
             }
-        })
+        }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && let Some(found) = walk(&path)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
     walk(std::path::Path::new(root))
 }
 
 fn runtime_generation(root: &str) -> Option<u64> {
-    fn walk(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        let entries = std::fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = walk(&path) {
-                    return Some(found);
-                }
-            } else if path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
-                && path
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .and_then(|name| name.to_str())
-                    == Some("runtime")
-            {
-                return Some(path);
-            }
-        }
-        None
-    }
+    let payload =
+        cobble::test_utils::read_metadata_payload_from_path_for_test(runtime_current_path(root)?)
+            .ok()?;
+    std::str::from_utf8(&payload).ok()?.trim().parse().ok()
+}
 
-    let bytes = std::fs::read(walk(std::path::Path::new(root))?).ok()?;
-    let payload = bytes.get(..bytes.len().checked_sub(8)?)?;
-    std::str::from_utf8(payload).ok()?.trim().parse().ok()
+fn runtime_current_payload_path(root: &str) -> std::path::PathBuf {
+    let logical = runtime_current_path(root).expect("runtime CURRENT exists");
+    let url = url::Url::from_directory_path(logical.parent().unwrap()).unwrap();
+    let fs = cobble::FileSystemRegistry::new()
+        .get_or_register(url.as_str())
+        .unwrap();
+    if fs.supports_atomic_replace() && logical.is_file() {
+        return logical;
+    }
+    let directory = logical.with_file_name("CURRENT-ATOMIC");
+    let sequence = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter_map(|name| {
+            name.split_once(".complete-")
+                .map(|(sequence, _)| sequence.to_string())
+        })
+        .max()
+        .unwrap();
+    directory.join(format!("{sequence}.data"))
 }
 
 fn wait_for_plan(planner: &DedicatedCompactionPlanner) -> DedicatedCompactionPlan {
@@ -801,14 +812,7 @@ fn dedicated_runtime_publish_failure_preserves_result_until_retry() {
         .expect("baseline snapshot callback")
         .expect("materialize baseline snapshot");
 
-    let current = find_file(root, |path| {
-        path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
-            && path
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                == Some("runtime")
-    });
+    let current = runtime_current_payload_path(root);
     let valid_current = std::fs::read(&current).unwrap();
     let (stop, handle) = spawn_compactor(config, db_id);
     assert!(
@@ -999,17 +1003,13 @@ fn dedicated_compactor_runtime_missing_corrupt_and_inaccessible_fail_loud() {
 
     // The writer publishes PROPERTIES before runtime observations. A direct per-DB compactor
     // cannot open until that volume contract exists; the multi-DB service retries discovery.
-    assert!(DedicatedCompactor::open(config.clone(), db_id.clone()).is_err());
+    assert!(matches!(
+        DedicatedCompactor::open(config.clone(), db_id.clone()),
+        Err(cobble::Error::IoError(_))
+    ));
 
     let db = open_db_with_id(config.clone(), &db_id);
-    let current = find_file(root, |path| {
-        path.file_name().and_then(|name| name.to_str()) == Some("CURRENT")
-            && path
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                == Some("runtime")
-    });
+    let current = runtime_current_payload_path(root);
     let valid_current = std::fs::read(&current).unwrap();
     db.close().unwrap();
 

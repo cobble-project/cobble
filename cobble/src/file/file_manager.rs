@@ -2471,12 +2471,27 @@ impl FileManager {
         ))
     }
 
-    /// Atomically writes a plain, untracked metadata file without the checksum envelope used by
-    /// manifests. Use this for human-readable metadata formats such as TOML.
+    /// Publishes plain, untracked metadata at an immutable name after closing its temporary file.
+    /// No checksum envelope is added; callers must not reuse the destination for updates.
     pub(crate) fn write_plain_metadata_file_atomic(
         &self,
         name: &str,
         content: &[u8],
+    ) -> Result<()> {
+        self.publish_plain_metadata_file(name, content, false)
+    }
+
+    /// Closes the temporary file, then deletes and republishes rebuildable single-owner metadata
+    /// such as PROPERTIES. Readers may briefly observe absence; replacement is not atomic.
+    pub(crate) fn rewrite_plain_metadata_file(&self, name: &str, content: &[u8]) -> Result<()> {
+        self.publish_plain_metadata_file(name, content, true)
+    }
+
+    fn publish_plain_metadata_file(
+        &self,
+        name: &str,
+        content: &[u8],
+        remove_existing: bool,
     ) -> Result<()> {
         let final_path = self.metadata_file_path(name);
         let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
@@ -2493,6 +2508,9 @@ impl FileManager {
                 written += count;
             }
             writer.close()?;
+            if remove_existing && self.meta_volume.fs().exists(&final_path)? {
+                self.meta_volume.fs().delete(&final_path)?;
+            }
             self.meta_volume.fs().rename(&temp_path, &final_path)
         })();
         drop(writer);
@@ -2500,6 +2518,34 @@ impl FileManager {
             let _ = self.meta_volume.fs().delete(&temp_path);
         }
         write_result
+    }
+
+    /// Replaces a mutable checksum-bearing metadata file.
+    pub(crate) fn replace_metadata_file(&self, name: &str, content: &[u8]) -> Result<()> {
+        let writer = super::atomic_replace::ReplaceWriter::new(
+            Arc::clone(self.meta_volume.fs()),
+            &self.metadata_file_path(name),
+        )?;
+        let mut writer = MetadataWriter::new(writer);
+        writer.write(content)?;
+        writer.close()
+    }
+
+    pub(crate) fn open_replaced_metadata_file(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn RandomAccessFile>> {
+        super::atomic_replace::open_read(
+            self.meta_volume.fs().as_ref(),
+            &self.metadata_file_path(name),
+        )
+    }
+
+    pub(crate) fn replaced_metadata_file_exists(&self, name: &str) -> Result<bool> {
+        super::atomic_replace::exists(
+            self.meta_volume.fs().as_ref(),
+            &self.metadata_file_path(name),
+        )
     }
 
     /// Registers an existing metadata file with the FileManager.

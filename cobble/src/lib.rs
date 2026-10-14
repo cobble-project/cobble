@@ -161,6 +161,7 @@ pub use db::{Db, ExpandStorageMode, RecoveryMode};
 pub use db_builder::DbBuilder;
 pub use db_iter::{BucketedRow, DbIterator};
 pub use error::{Error, Result};
+pub use file::atomic_replace;
 pub use file::{
     FastCopyDestination, File, FileSystem, FileSystemRegistry, ProcessFileSystemRegistry,
     ProcessFileSystemRequest, RandomAccessFile, SequentialWriteFile,
