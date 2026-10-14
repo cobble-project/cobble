@@ -180,6 +180,18 @@ fn resolve_goosefs_master_addr_root(
     (master_addr, root)
 }
 
+fn hdfs_url_options(url: &Url) -> HashMap<String, String> {
+    let mut options = HashMap::from([("root".to_string(), normalize_root(url.path()))]);
+    if url.host_str().is_some() {
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        options.insert("name_node".to_string(), format!("hdfs://{authority}"));
+    }
+    if !url.username().is_empty() {
+        options.insert("user".to_string(), url.username().to_string());
+    }
+    options
+}
+
 impl FileSystem for OpendalFileSystem {
     fn supports_atomic_replace(&self) -> bool {
         // Only local Unix rename is guaranteed to atomically replace its destination.
@@ -327,6 +339,12 @@ impl FileSystem for OpendalFileSystem {
                 let auth_username = access_id.or_else(|| query_options.remove("auth_username"));
                 if let Some(auth_username) = auth_username.filter(|name| !name.is_empty()) {
                     options.insert("auth_username".to_string(), auth_username);
+                }
+            }
+            "hdfs" => {
+                options.extend(hdfs_url_options(url));
+                if let Some(user) = access_id.filter(|user| !user.is_empty()) {
+                    options.insert("user".to_string(), user);
                 }
             }
             _ => {

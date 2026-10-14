@@ -127,6 +127,15 @@ fn test_opendal_fs_list() {
 }
 
 #[test]
+fn test_hdfs_url_options_preserve_authority_root_and_user() {
+    let url = Url::parse("hdfs://alice@[::1]:19000/data/prefix/").unwrap();
+    let options = hdfs_url_options(&url);
+    assert_eq!(options.get("name_node").unwrap(), "hdfs://[::1]:19000");
+    assert_eq!(options.get("root").unwrap(), "/data/prefix");
+    assert_eq!(options.get("user").unwrap(), "alice");
+}
+
+#[test]
 fn test_resolve_s3_bucket_root_endpoint_aws_style() {
     let url = Url::parse("s3://my-bucket/data/prefix").unwrap();
     let mut query = HashMap::new();
