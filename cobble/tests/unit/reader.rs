@@ -13,6 +13,56 @@ fn cleanup_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
 
+#[test]
+fn current_pointer_reads_both_formats_and_reports_committed_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = FileSystemRegistry::new()
+        .get_or_register(url::Url::from_directory_path(dir.path()).unwrap().as_str())
+        .unwrap();
+    inner.create_dir(SNAPSHOT_DIR).unwrap();
+    let path = global_snapshot_current_path();
+    let mut legacy = inner.open_write(&path).unwrap();
+    legacy
+        .write(&encode_metadata_payload_for_test(b"SNAPSHOT-1"))
+        .unwrap();
+    legacy.close().unwrap();
+
+    let fs: Arc<dyn FileSystem> = Arc::new(
+        crate::file::atomic_replace::tests::TestFileSystem::new(Arc::clone(&inner)),
+    );
+    assert_eq!(
+        read_manifest_pointer(&fs, None).unwrap().unwrap().0,
+        "SNAPSHOT-1"
+    );
+    for id in [2, 3] {
+        atomic_replace::write(
+            Arc::clone(&fs),
+            &path,
+            &encode_metadata_payload_for_test(format!("SNAPSHOT-{id}").as_bytes()),
+        )
+        .unwrap();
+        // Directory timestamps must not suppress a refresh when commits share an mtime.
+        assert_eq!(
+            read_manifest_pointer(&fs, Some(1)).unwrap().unwrap(),
+            (format!("SNAPSHOT-{id}"), None)
+        );
+    }
+    let directory = format!("{path}-ATOMIC");
+    let payload = inner
+        .list(&directory)
+        .unwrap()
+        .into_iter()
+        .find(|name| name.ends_with(".data"))
+        .unwrap();
+    let mut corrupt = inner.open_write(&format!("{directory}/{payload}")).unwrap();
+    corrupt.write(b"corrupt").unwrap();
+    corrupt.close().unwrap();
+    assert!(matches!(
+        read_manifest_pointer(&fs, None),
+        Err(Error::ChecksumMismatch(_))
+    ));
+}
+
 fn wait_for_manifest_in_db(root: &str, db_id: &str, snapshot_id: u64) -> String {
     let full_path = format!(
         "{}/{}",

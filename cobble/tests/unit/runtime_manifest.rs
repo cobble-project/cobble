@@ -1,5 +1,5 @@
 use super::*;
-use crate::file::FileSystemRegistry;
+use crate::file::{FileSystem, FileSystemRegistry};
 use crate::metrics_manager::MetricsManager;
 use tempfile::TempDir;
 
@@ -101,6 +101,47 @@ fn full_round_trip_and_atomic_current_publication() {
     let loaded = store.load_current().unwrap().unwrap();
     assert_eq!(loaded.chain_depth, 1);
     assert_eq!(loaded.manifest, current);
+}
+
+#[test]
+fn non_atomic_current_replacement_keeps_generation_files_flat() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = FileSystemRegistry::new()
+        .get_or_register(format!("file://{}", dir.path().display()))
+        .unwrap();
+    let fs = Arc::new(crate::file::atomic_replace::tests::TestFileSystem::new(
+        inner,
+    ));
+    let manager = Arc::new(
+        FileManager::with_defaults(
+            fs.clone(),
+            Arc::new(MetricsManager::new("non-atomic-runtime")),
+        )
+        .unwrap(),
+    );
+    let store = RuntimeManifestStore::new(manager);
+    for generation in [1, 2] {
+        store
+            .publish(&RuntimeManifestEnvelope::full(manifest(
+                generation,
+                vec![levels(&[], &[])],
+            )))
+            .unwrap();
+        assert_eq!(
+            store.load_current().unwrap().unwrap().generation,
+            generation
+        );
+        assert!(fs.exists(&runtime_manifest_name(generation)).unwrap());
+        assert!(
+            !fs.exists(&format!("{}-ATOMIC", runtime_manifest_name(generation)))
+                .unwrap()
+        );
+    }
+    assert!(!fs.exists(RUNTIME_CURRENT_NAME).unwrap());
+    assert!(
+        fs.exists(&format!("{RUNTIME_CURRENT_NAME}-ATOMIC/"))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -529,12 +570,10 @@ fn load_rejects_missing_base_cycle_duplicate_ids_and_corrupt_current() {
             .contains("duplicate file id 9")
     );
 
-    write_metadata_file(
-        &store.file_manager,
-        RUNTIME_CURRENT_NAME,
-        b"not-a-generation",
-    )
-    .unwrap();
+    store
+        .file_manager
+        .replace_metadata_file(RUNTIME_CURRENT_NAME, b"not-a-generation")
+        .unwrap();
     assert!(
         store
             .load_current()

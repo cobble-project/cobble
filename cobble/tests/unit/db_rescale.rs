@@ -13,6 +13,79 @@ fn cleanup_test_root(path: &str) {
     let _ = std::fs::remove_dir_all(path);
 }
 
+#[test]
+fn non_atomic_import_start_end_are_immutable_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = crate::file::FileSystemRegistry::new()
+        .get_or_register(format!("file://{}", dir.path().display()))
+        .unwrap();
+    let fs = Arc::new(crate::file::atomic_replace::tests::TestFileSystem::new(
+        inner,
+    ));
+    let manager = FileManager::with_defaults(
+        fs.clone(),
+        Arc::new(MetricsManager::new("non-atomic-import")),
+    )
+    .unwrap();
+    let mut record = ImportStart {
+        version: 1,
+        export_id: "export".to_string(),
+        source_db_id: "source".to_string(),
+        source_manifest_path: "file:///source/snapshot/SNAPSHOT-1".to_string(),
+        snapshot_id: 1,
+        target_db_id: "target".to_string(),
+        ranges: vec![0..=0],
+        import_snapshot_id: 2,
+    };
+    write_import_start(&manager, &record).unwrap();
+    write_import_start(&manager, &record).unwrap();
+    record.import_snapshot_id = 3;
+    assert!(write_import_start(&manager, &record).is_err());
+    let records = load_import_starts(&manager).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].import_snapshot_id, 2);
+    assert!(fs.inner.exists(&import_start_name("export")).unwrap());
+    assert!(
+        !fs.inner
+            .exists(&format!("{}-ATOMIC/", import_start_name("export")))
+            .unwrap()
+    );
+    assert!(has_import_starts(&manager).unwrap());
+    assert!(load_import_end(&manager, "export").unwrap().is_none());
+    let mut end = ImportEnd {
+        version: 1,
+        export_id: "export".to_string(),
+        snapshot_id: 4,
+    };
+    write_import_end(&manager, &end).unwrap();
+    end.snapshot_id = 5;
+    write_import_end(&manager, &end).unwrap();
+    assert_eq!(
+        load_import_end(&manager, "export")
+            .unwrap()
+            .unwrap()
+            .snapshot_id,
+        4
+    );
+    manager
+        .remove_metadata_file(&import_start_name("export"))
+        .unwrap();
+    assert!(!has_import_starts(&manager).unwrap());
+    manager
+        .remove_metadata_file(&import_end_name("export"))
+        .unwrap();
+    manager
+        .write_plain_metadata_file_atomic("imports/IMPORT-legacy.json", b"{}")
+        .unwrap();
+    assert!(load_import_starts(&manager).unwrap().is_empty());
+    assert!(!has_import_starts(&manager).unwrap());
+    assert!(
+        manager
+            .metadata_file_exists_untracked("imports/IMPORT-legacy.json")
+            .unwrap()
+    );
+}
+
 fn snapshot_for_rescale_test(db: &Db) -> crate::ShardSnapshotMetadata {
     let (tx, rx) = mpsc::channel();
     db.snapshot_with_callback(move |result| {
@@ -227,47 +300,174 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
             ),
             VolumeDescriptor::new(&source_root, vec![crate::VolumeUsageKind::Readonly]),
         ],
+        snapshot_disable_incremental_base_link: true,
         ..Config::default()
     };
     let target = Db::open(target_config.clone(), vec![0..=3]).unwrap();
-    let barrier = snapshot_for_rescale_test(&target);
+    if let Some(worker) = &target.primary_tiering_worker {
+        worker.stop();
+        worker.join();
+    }
+    let imported = snapshot_for_rescale_test(&target);
     let target_id = target.id().to_string();
     let target_manager = Arc::clone(&target.file_manager);
-    drop(target);
     let (source_manager, _) =
         snapshot_source_file_manager(&target_config, source.id(), &source_snapshot.manifest_path)
             .unwrap();
-    let export_id = "restart-cleanup".to_string();
-    write_export_lease(
-        &source_manager,
-        &ExportLease {
+    let inner = crate::file::FileSystemRegistry::new()
+        .get_or_register(format!("{target_root}/{target_id}"))
+        .unwrap();
+    let fs = Arc::new(crate::file::atomic_replace::tests::TestFileSystem::new(
+        inner,
+    ));
+    let import_manager = Arc::new(
+        FileManager::with_defaults(
+            fs.clone(),
+            Arc::new(MetricsManager::new("import-end-retry")),
+        )
+        .unwrap(),
+    );
+    let coordinator = AdoptionCoordinator::new(
+        (target_id.clone(), target_config.clone()),
+        (import_manager.clone(), target.lsm_tree.clone()),
+        target.db_state.clone(),
+        target.db_lifecycle.clone(),
+        target.memtable_manager.clone(),
+        target.snapshot_manager.clone(),
+        None,
+    );
+    let publish_start = |export_id: &str| {
+        write_export_lease(
+            &source_manager,
+            &ExportLease {
+                version: 1,
+                export_id: export_id.to_string(),
+                source_db_id: source.id().to_string(),
+                snapshot_id: source_snapshot.snapshot_id,
+                target_db_id: target_id.clone(),
+                ranges: vec![4..=7],
+            },
+        )
+        .unwrap();
+        let record = ImportStart {
             version: 1,
-            export_id: export_id.clone(),
+            export_id: export_id.to_string(),
             source_db_id: source.id().to_string(),
+            source_manifest_path: source_snapshot.manifest_path.clone(),
             snapshot_id: source_snapshot.snapshot_id,
             target_db_id: target_id.clone(),
             ranges: vec![4..=7],
-        },
-    )
-    .unwrap();
-    // Persist the post-barrier/pre-cleanup crash cut, then let normal startup finish adoption.
-    write_import_record(
-        &target_manager,
-        &ImportRecord {
-            version: 1,
-            export_id,
-            source_db_id: source.id().to_string(),
-            source_manifest_path: source_snapshot.manifest_path,
-            snapshot_id: source_snapshot.snapshot_id,
-            target_db_id: target_id.clone(),
-            ranges: vec![4..=7],
-            import_snapshot_id: None,
-            adoption_barrier_snapshot_id: Some(barrier.snapshot_id),
-        },
-    )
-    .unwrap();
+            import_snapshot_id: imported.snapshot_id,
+        };
+        write_import_start(&import_manager, &record).unwrap();
+        record
+    };
+    let captured = vec![publish_start("first"), publish_start("second")];
+    // A later import must never receive the older callback's completion fact.
+    let later = publish_start("later");
+    assert!(
+        coordinator
+            .complete_adoption(
+                &captured,
+                Err(Error::IoError("snapshot failed".to_string()))
+            )
+            .is_err()
+    );
+    for record in captured.iter().chain(std::iter::once(&later)) {
+        assert!(
+            load_import_end(&import_manager, &record.export_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let info = |snapshot: &crate::ShardSnapshotMetadata| crate::snapshot::SnapshotManifestInfo {
+        id: snapshot.snapshot_id,
+        timestamp_seconds: snapshot.timestamp_seconds,
+        manifest_path: snapshot.manifest_path.clone(),
+        bucket_ranges: snapshot.ranges.clone(),
+        latest_schema_id: snapshot.schema_id,
+        data_size_bytes: snapshot.data_size_bytes,
+        incremental_data_size_bytes: snapshot.incremental_data_size_bytes,
+    };
+    let owned = snapshot_for_rescale_test(&target);
+    *fs.fail_rename_to.lock().unwrap() = Some(import_end_name("second"));
+    assert!(
+        coordinator
+            .complete_adoption(&captured, Ok(info(&owned)))
+            .is_err()
+    );
+    assert_eq!(
+        load_import_end(&import_manager, "first")
+            .unwrap()
+            .unwrap()
+            .snapshot_id,
+        owned.snapshot_id
+    );
+    assert!(
+        load_import_end(&import_manager, "second")
+            .unwrap()
+            .is_none()
+    );
+    assert!(load_import_end(&import_manager, "later").unwrap().is_none());
+    for record in captured.iter().chain(std::iter::once(&later)) {
+        assert!(
+            source_manager
+                .metadata_file_exists_untracked(&export_lease_name(&record.export_id))
+                .unwrap()
+        );
+        assert!(
+            import_manager
+                .metadata_file_exists_untracked(&import_start_name(&record.export_id))
+                .unwrap()
+        );
+    }
     assert!(!source.expire_snapshot(source_snapshot.snapshot_id).unwrap());
-    let reopened = Db::open_from_snapshot(target_config, barrier.snapshot_id, target_id).unwrap();
+    *fs.fail_rename_to.lock().unwrap() = None;
+    let retry = snapshot_for_rescale_test(&target);
+    coordinator
+        .complete_adoption(&captured, Ok(info(&retry)))
+        .unwrap();
+    assert!(load_import_end(&import_manager, "later").unwrap().is_none());
+    assert!(
+        import_manager
+            .metadata_file_exists_untracked(&import_start_name("later"))
+            .unwrap()
+    );
+    assert!(
+        !source_manager
+            .metadata_file_exists_untracked(&export_lease_name("first"))
+            .unwrap()
+    );
+    assert!(
+        !source_manager
+            .metadata_file_exists_untracked(&export_lease_name("second"))
+            .unwrap()
+    );
+    // Independently completed imports do not require a shared snapshot id. END remains a fact
+    // even when that historical completion snapshot is no longer retained.
+    assert!(target.expire_snapshot(owned.snapshot_id).unwrap());
+    publish_start("already-ended");
+    write_import_end(
+        &import_manager,
+        &ImportEnd {
+            version: 1,
+            export_id: "already-ended".to_string(),
+            snapshot_id: owned.snapshot_id,
+        },
+    )
+    .unwrap();
+    write_import_end(
+        &import_manager,
+        &ImportEnd {
+            version: 1,
+            export_id: "orphan".to_string(),
+            snapshot_id: owned.snapshot_id,
+        },
+    )
+    .unwrap();
+    drop(coordinator);
+    drop(target);
+    let reopened = Db::open_from_snapshot(target_config, retry.snapshot_id, target_id).unwrap();
     reopened
         .wait_for_expand_adoption(Duration::from_secs(10))
         .unwrap();
@@ -284,29 +484,6 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
             .is_empty()
     );
     assert!(!root.path().join("target").join(source.id()).exists());
-}
-
-#[test]
-fn adoption_barrier_requires_every_live_import() {
-    let record = |barrier| ImportRecord {
-        version: 1,
-        export_id: "export".to_string(),
-        source_db_id: "source".to_string(),
-        source_manifest_path: "file:///source/source/snapshot/SNAPSHOT-1".to_string(),
-        snapshot_id: 1,
-        target_db_id: "target".to_string(),
-        ranges: vec![0..=0],
-        import_snapshot_id: Some(2),
-        adoption_barrier_snapshot_id: barrier,
-    };
-    assert_eq!(
-        shared_adoption_barrier_id(&[record(Some(3)), record(Some(3))]),
-        Some(3)
-    );
-    assert_eq!(
-        shared_adoption_barrier_id(&[record(Some(3)), record(None)]),
-        None
-    );
 }
 
 #[test]

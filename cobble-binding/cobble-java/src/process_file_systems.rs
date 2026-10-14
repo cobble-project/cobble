@@ -87,9 +87,18 @@ impl ProcessFileSystemRegistry for JniProcessFileSystemRegistry {
         let global = env.new_global_ref(&resolved).map_err(|err| {
             Error::IoError(format!("failed to pin resolved custom filesystem: {err}"))
         })?;
+        let supports_atomic_replace = env
+            .call_method(&resolved, "supportsAtomicReplace", "()Z", &[])
+            .and_then(|value| value.z())
+            .map_err(|err| {
+                Error::IoError(format!(
+                    "custom filesystem supportsAtomicReplace failed: {err}"
+                ))
+            })?;
         Ok(Some(Arc::new(JniCustomFileSystem {
             vm: self.vm.clone(),
             object: global,
+            supports_atomic_replace,
         })))
     }
 }
@@ -97,6 +106,7 @@ impl ProcessFileSystemRegistry for JniProcessFileSystemRegistry {
 struct JniCustomFileSystem {
     vm: Arc<JavaVM>,
     object: GlobalRef,
+    supports_atomic_replace: bool,
 }
 
 impl Drop for JniCustomFileSystem {
@@ -106,6 +116,10 @@ impl Drop for JniCustomFileSystem {
 }
 
 impl FileSystem for JniCustomFileSystem {
+    fn supports_atomic_replace(&self) -> bool {
+        self.supports_atomic_replace
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

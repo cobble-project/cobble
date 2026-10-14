@@ -3,7 +3,7 @@ use crate::config::VolumeUsageKind;
 use crate::coordinator::GlobalSnapshotManifest;
 use crate::db_state::{bucket_range_fits_total, bucket_range_last, bucket_slots_for_total};
 use crate::error::{Error, Result};
-use crate::file::{FileSystem, FileSystemRegistry, MetadataReader};
+use crate::file::{FileSystem, FileSystemRegistry, MetadataReader, atomic_replace};
 use crate::lru::LruCache;
 use crate::merge_operator::MergeOperatorResolver;
 use crate::metrics_manager::MetricsManager;
@@ -721,29 +721,31 @@ fn read_manifest_pointer(
     let pointer_path = global_snapshot_current_path();
     let mut last_err = None;
     for _ in 0..5 {
-        if !fs.exists(&pointer_path)? {
+        if !atomic_replace::exists(fs.as_ref(), &pointer_path)? {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        let modified = fs.last_modified(&pointer_path)?;
+        // Only the flat primary has a stable timestamp; version directories use the pointer itself.
+        let modified = if fs.supports_atomic_replace() && fs.exists(&pointer_path)? {
+            fs.last_modified(&pointer_path)?
+        } else {
+            None
+        };
         if let (Some(previous), Some(current)) = (last_modified, modified)
             && previous == current
         {
             return Ok(None);
         }
-        let reader = match fs.open_read(&pointer_path) {
+        let reader = match atomic_replace::open_read(fs.as_ref(), &pointer_path) {
             Ok(reader) => reader,
+            Err(err @ Error::ChecksumMismatch(_)) => return Err(err),
             Err(err) => {
                 last_err = Some(err);
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
         };
-        let payload = match MetadataReader::new(reader).read_all() {
-            Ok(payload) => payload,
-            Err(Error::ChecksumMismatch(_)) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+        let payload = MetadataReader::new(reader).read_all()?;
         let pointer = String::from_utf8(payload.to_vec())
             .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;
         let pointer = pointer.trim().to_string();

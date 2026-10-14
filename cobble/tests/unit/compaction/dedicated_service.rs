@@ -56,12 +56,22 @@ fn exact_discovery_does_not_scan_siblings_or_children() {
     };
     let shards = discover_exact_shards(
         &config,
-        &[CompactionScanPath::Local(selected)],
+        &[CompactionScanPath::Local(selected.clone())],
         &FileSystemRegistry::new(),
     );
 
     assert_eq!(shards.len(), 1);
     assert_eq!(shards[0].db_id, "selected");
+    std::fs::remove_file(selected.join(DB_PROPERTIES_NAME)).unwrap();
+    std::fs::create_dir(selected.join("PROPERTIES-ATOMIC")).unwrap();
+    assert!(
+        discover_exact_shards(
+            &config,
+            &[CompactionScanPath::Local(selected)],
+            &FileSystemRegistry::new()
+        )
+        .is_empty()
+    );
 }
 
 #[test]

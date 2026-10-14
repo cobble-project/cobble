@@ -7,9 +7,44 @@ use cobble_table::{
     LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableScanPlan, TableScanSplit,
     TableSchema, Value, ValueCodec, register_schema_transforms,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type TableTransform = Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
+
+fn local_metadata_fs(path: &Path) -> (Arc<dyn cobble::FileSystem>, String) {
+    let url = url::Url::from_directory_path(path.parent().unwrap()).unwrap();
+    let fs = cobble::FileSystemRegistry::new()
+        .get_or_register(url.as_str())
+        .unwrap();
+    (fs, path.file_name().unwrap().to_str().unwrap().to_string())
+}
+
+fn metadata_exists(path: &Path) -> bool {
+    let (fs, name) = local_metadata_fs(path);
+    cobble::atomic_replace::exists(fs.as_ref(), &name).unwrap()
+}
+
+fn physical_metadata_path(path: &Path) -> PathBuf {
+    let (fs, _) = local_metadata_fs(path);
+    if fs.supports_atomic_replace() && path.is_file() {
+        return path.to_path_buf();
+    }
+    let directory = path.with_file_name(format!(
+        "{}-ATOMIC",
+        path.file_name().unwrap().to_str().unwrap()
+    ));
+    let sequence = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter_map(|name| {
+            name.split_once(".complete-")
+                .map(|(sequence, _)| sequence.to_string())
+        })
+        .max()
+        .unwrap();
+    directory.join(format!("{sequence}.data"))
+}
 
 fn string_to_binary_factory(spec: &[u8]) -> cobble::Result<TableTransform> {
     if spec != b"string-to-binary" {
@@ -196,16 +231,12 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         "warehouse/tables/TABLE-{}",
         events.table_id().as_u32()
     ));
-    assert!(user_root.join("snapshot/CURRENT").is_file());
-    assert!(event_root.join("snapshot/CURRENT").is_file());
-    assert!(
-        !local
-            .join(format!(
-                "warehouse/tables/TABLE-{}/snapshot/CURRENT",
-                users.table_id()
-            ))
-            .exists()
-    );
+    assert!(metadata_exists(&user_root.join("snapshot/CURRENT")));
+    assert!(metadata_exists(&event_root.join("snapshot/CURRENT")));
+    assert!(!metadata_exists(&local.join(format!(
+        "warehouse/tables/TABLE-{}/snapshot/CURRENT",
+        users.table_id()
+    ))));
     let properties = std::fs::read_to_string(user_root.join("bucket-0/PROPERTIES")).unwrap();
     assert!(properties.contains(&format!("file://{}", external.display())));
     // A combined source/cache volume retains the source root but scopes its writable cache.
@@ -589,7 +620,7 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         old_reader.get(&keys[left_index]).unwrap(),
         Some(rows[left_index].clone())
     );
-    let current_path = user_root.join("snapshot/CURRENT");
+    let current_path = physical_metadata_path(&user_root.join("snapshot/CURRENT"));
     let valid_current = std::fs::read(&current_path).unwrap();
     std::fs::write(&current_path, b"corrupt global current\n").unwrap();
     assert!(reader.refresh().is_err());

@@ -3,6 +3,7 @@ use crate::coordinator::CoordinatorConfig;
 use crate::coordinator::file::MetadataWriter;
 use crate::error::Error::IoError;
 use crate::error::{Error, Result};
+use crate::file::atomic_replace::{self, ReplaceWriter};
 use crate::file::{
     BufferedWriter, File, FileSystem, FileSystemRegistry, MetadataReader, SequentialWriteFile,
 };
@@ -17,8 +18,8 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Global manifests version 2 reference shard snapshots with big-endian bucket prefixes.
 pub(crate) const GLOBAL_SNAPSHOT_MANIFEST_VERSION_CURRENT: u32 = 2;
@@ -67,6 +68,7 @@ pub struct DbCoordinator {
     fs: Arc<dyn FileSystem>,
     next_id: AtomicU64,
     retained: DashSet<u64>,
+    publication: Mutex<()>,
 }
 
 impl DbCoordinator {
@@ -104,6 +106,7 @@ impl DbCoordinator {
             fs,
             next_id: AtomicU64::new(next_id),
             retained: DashSet::new(),
+            publication: Mutex::new(()),
         })
     }
 
@@ -179,6 +182,7 @@ impl DbCoordinator {
 
     /// Materialize a global snapshot manifest and update the pointer.
     pub fn materialize_global_snapshot(&self, snapshot: &GlobalSnapshotManifest) -> Result<()> {
+        let _publication = self.publication.lock().unwrap();
         let manifest_path = global_snapshot_manifest_path(snapshot.id);
         let writer = MetadataWriter::new(&manifest_path, &self.fs)?;
         let mut buffered = BufferedWriter::new(writer, 8192);
@@ -262,7 +266,8 @@ impl DbCoordinator {
 
     fn publish_manifest_pointer(&self, manifest_name: &str) -> Result<()> {
         let pointer_path = global_snapshot_current_path();
-        let mut writer = MetadataWriter::new(&pointer_path, &self.fs)?;
+        let writer = ReplaceWriter::new(Arc::clone(&self.fs), &pointer_path)?;
+        let mut writer = crate::file::MetadataWriter::new(writer);
         writer.write(manifest_name.as_bytes())?;
         writer.close()?;
         Ok(())
@@ -365,15 +370,11 @@ fn decode_global_manifest(bytes: &[u8]) -> Result<GlobalSnapshotManifest> {
 
 fn load_latest_snapshot_id(fs: &Arc<dyn FileSystem>) -> Result<Option<u64>> {
     let pointer_path = global_snapshot_current_path();
-    if !fs.exists(&pointer_path)? {
+    if !atomic_replace::exists(fs.as_ref(), &pointer_path)? {
         return Ok(None);
     }
-    let reader = fs.open_read(&pointer_path)?;
-    let payload = match MetadataReader::new(reader).read_all() {
-        Ok(payload) => payload,
-        Err(Error::ChecksumMismatch(_)) => return Ok(None),
-        Err(err) => return Err(err),
-    };
+    let reader = atomic_replace::open_read(fs.as_ref(), &pointer_path)?;
+    let payload = MetadataReader::new(reader).read_all()?;
     let manifest_name = String::from_utf8(payload.to_vec())
         .map(|s| s.trim().to_string())
         .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;

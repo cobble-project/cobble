@@ -1,3 +1,4 @@
+pub mod atomic_replace;
 mod file_manager;
 mod file_system;
 mod files;

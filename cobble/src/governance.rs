@@ -6,6 +6,7 @@ use crate::db_state::{bucket_range_fits_total, bucket_range_last};
 use crate::error::{Error, Result};
 use crate::file::{
     File, FileSystem, FileSystemRegistry, MetadataReader, MetadataWriter, SequentialWriteFile,
+    atomic_replace::{self, ReplaceWriter},
 };
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
@@ -317,23 +318,21 @@ impl GovernanceManager {
         manifest_writer.write(&manifest_bytes)?;
         manifest_writer.close()?;
 
-        let mut pointer_writer =
-            MetadataWriter::new(self.fs.open_write(GOVERNANCE_MANIFEST_POINTER_NAME)?);
+        let mut pointer_writer = MetadataWriter::new(ReplaceWriter::new(
+            Arc::clone(&self.fs),
+            GOVERNANCE_MANIFEST_POINTER_NAME,
+        )?);
         pointer_writer.write(manifest_name.as_bytes())?;
         pointer_writer.close()?;
         Ok(manifest_name)
     }
 
     fn load_current(&self) -> Result<Option<GovernanceManifest>> {
-        if !self.fs.exists(GOVERNANCE_MANIFEST_POINTER_NAME)? {
+        if !atomic_replace::exists(self.fs.as_ref(), GOVERNANCE_MANIFEST_POINTER_NAME)? {
             return Ok(None);
         }
-        let reader = self.fs.open_read(GOVERNANCE_MANIFEST_POINTER_NAME)?;
-        let pointer_payload = match MetadataReader::new(reader).read_all() {
-            Ok(payload) => payload,
-            Err(Error::ChecksumMismatch(_)) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+        let reader = atomic_replace::open_read(self.fs.as_ref(), GOVERNANCE_MANIFEST_POINTER_NAME)?;
+        let pointer_payload = MetadataReader::new(reader).read_all()?;
         let manifest_name = String::from_utf8(pointer_payload.to_vec())
             .map_err(|err| Error::IoError(format!("Invalid manifest pointer: {}", err)))?;
         let manifest_name = manifest_name.trim();

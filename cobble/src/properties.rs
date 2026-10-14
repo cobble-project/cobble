@@ -56,6 +56,7 @@ impl DbProperties {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn persist_db_properties(
     file_manager: &FileManager,
     db_id: &str,
@@ -63,13 +64,13 @@ pub(crate) fn persist_db_properties(
 ) -> Result<()> {
     let properties = DbProperties::from_writer(db_id, config);
     let toml = serialize_db_properties(&properties)?;
-    file_manager.write_plain_metadata_file_atomic(DB_PROPERTIES_NAME, toml.as_bytes())
+    file_manager.rewrite_plain_metadata_file(DB_PROPERTIES_NAME, toml.as_bytes())
 }
 
 /// Publishes the writer's current sanitized configuration at startup.
 ///
 /// An existing semantically equivalent TOML file is left untouched. Missing, malformed, stale,
-/// or differently configured properties are atomically replaced.
+/// or differently configured properties are rewritten. A reader may briefly observe absence.
 pub(crate) fn refresh_db_properties(
     file_manager: &FileManager,
     db_id: &str,
@@ -94,7 +95,7 @@ pub(crate) fn refresh_db_properties(
         }
     }
 
-    file_manager.write_plain_metadata_file_atomic(DB_PROPERTIES_NAME, desired_toml.as_bytes())?;
+    file_manager.rewrite_plain_metadata_file(DB_PROPERTIES_NAME, desired_toml.as_bytes())?;
     Ok(true)
 }
 
@@ -121,13 +122,14 @@ pub(crate) fn load_db_properties(
         )));
     }
     let bytes = reader.read_all()?;
+    // Decode failures can be transient while the writer republishes PROPERTIES.
     let contents = std::str::from_utf8(bytes.as_ref()).map_err(|err| {
-        Error::InvalidState(format!(
+        Error::IoError(format!(
             "DB PROPERTIES for {expected_db_id} is not UTF-8: {err}"
         ))
     })?;
     let properties: DbProperties = toml::from_str(contents).map_err(|err| {
-        Error::InvalidState(format!(
+        Error::IoError(format!(
             "Failed to parse DB PROPERTIES for {expected_db_id}: {err}"
         ))
     })?;

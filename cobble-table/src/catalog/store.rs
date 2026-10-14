@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use cobble::atomic_replace;
 use cobble::{
     Config, Error, File, FileSystem, FileSystemRegistry, Result, SequentialWriteFile,
     VolumeUsageKind,
@@ -8,8 +9,9 @@ use uuid::Uuid;
 
 /// File storage used exclusively by the table catalog.
 ///
-/// Catalog paths are relative to `<storage-id>/catalog` on the first Meta volume. Files are
-/// published with a temporary write followed by an atomic rename.
+/// Catalog paths are relative to `<storage-id>/catalog` on the first Meta volume.
+/// Immutable files use temporary publication; mutable pointers explicitly use
+/// replacement, which can fall back to immutable commits when rename is not atomic.
 #[derive(Clone)]
 pub(super) struct CatalogStore {
     file_system: Arc<dyn FileSystem>,
@@ -57,8 +59,21 @@ impl CatalogStore {
         file.read_at(0, file.size())
     }
 
-    pub(super) fn exists(&self, relative_path: &str) -> Result<bool> {
-        self.file_system.exists(&self.path(relative_path))
+    pub(super) fn replace(&self, relative_path: &str, payload: &[u8]) -> Result<()> {
+        let path = self.path(relative_path);
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            self.ensure_dir(parent)?;
+        }
+        atomic_replace::write(Arc::clone(&self.file_system), &path, payload)
+    }
+
+    pub(super) fn read_replaced(&self, relative_path: &str) -> Result<Bytes> {
+        let file = atomic_replace::open_read(self.file_system.as_ref(), &self.path(relative_path))?;
+        file.read_at(0, file.size())
+    }
+
+    pub(super) fn replaced_exists(&self, relative_path: &str) -> Result<bool> {
+        atomic_replace::exists(self.file_system.as_ref(), &self.path(relative_path))
     }
 
     fn path(&self, relative_path: &str) -> String {
@@ -104,3 +119,7 @@ fn validate_segment(label: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/catalog_store.rs"]
+mod tests;
