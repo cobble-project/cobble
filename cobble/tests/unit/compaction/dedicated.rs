@@ -268,6 +268,41 @@ fn test_orphan_sweep_preserves_active_and_committed() {
         .unwrap(),
         "metadata-only crashed lease should be swept"
     );
+
+    // OpenDAL deletes directories non-recursively. A shared metadata/data volume must remove
+    // LEASE before its parent, and cleaning one job must not touch another job's output.
+    use crate::file::FileSystemRegistry;
+    let shared = tempfile::tempdir().unwrap();
+    let volume = crate::VolumeDescriptor {
+        base_dir: "fs:///".into(),
+        custom_options: Some(std::collections::HashMap::from([(
+            "root".into(),
+            shared.path().to_string_lossy().into_owned(),
+        )])),
+        ..crate::VolumeDescriptor::default()
+    };
+    let fs = FileSystemRegistry::new()
+        .get_or_register_volume(&volume)
+        .unwrap();
+    let shared_fm = Arc::new(
+        FileManager::with_defaults(
+            fs.clone(),
+            Arc::new(crate::metrics_manager::MetricsManager::new(
+                "shared-cleanup",
+            )),
+        )
+        .unwrap(),
+    );
+    for job in ["remove", "preserve"] {
+        write_job_lease(&shared_fm, job).unwrap();
+        let (_, mut writer) = shared_fm
+            .create_data_file_with_prefix(&dedicated_compaction_job_output_prefix(job))
+            .unwrap();
+        writer.close().unwrap();
+    }
+    cleanup_job_dir(&shared_fm, "remove").unwrap();
+    assert!(!fs.exists("compaction/jobs/remove").unwrap());
+    assert!(fs.exists("compaction/jobs/preserve/data").unwrap());
 }
 
 #[test]

@@ -462,13 +462,13 @@ pub(crate) fn cleanup_job_dir(file_manager: &Arc<FileManager>, job_id: &str) -> 
         let path = format!("{}/{}", data_prefix, file_name);
         let _ = file_manager.remove_data_volume_path(&path);
     }
-    // Remove the data subdir and the job dir itself on data volumes.
-    let _ = file_manager.remove_data_volume_path(&data_prefix);
+    // Remove the lease before its parent: metadata and data may share the same directory.
     let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
-    let _ = file_manager.remove_data_volume_path(&job_dir);
-    // Remove the lease file and job directory from the metadata volume.
     let lease_path = format!("{}/{}", job_dir, DEDICATED_COMPACTION_LEASE_FILE);
     let _ = file_manager.remove_metadata_volume_path(&lease_path);
+    // Remove the now-empty data and job directories after their contents.
+    let _ = file_manager.remove_data_volume_path(&data_prefix);
+    let _ = file_manager.remove_data_volume_path(&job_dir);
     let _ = file_manager.remove_metadata_volume_path(&job_dir);
     Ok(())
 }
@@ -623,20 +623,8 @@ pub(crate) fn sweep_orphan_job_dirs(
         if referenced {
             continue;
         }
-        // Delete all files in the job directory, then the directory itself. Output files live
-        // on data volumes; the lease file lives on the metadata volume.
         debug!("sweeping orphan job directory {}", job_id);
-        for file_name in &job_files {
-            let path = format!("{}/{}", job_data_prefix, file_name);
-            let _ = file_manager.remove_data_volume_path(&path);
-        }
-        let _ = file_manager.remove_data_volume_path(&job_data_prefix);
-        let job_dir = format!("{}/{}", DEDICATED_COMPACTION_JOBS_DIR, job_id);
-        let _ = file_manager.remove_data_volume_path(&job_dir);
-        // Also clean up the lease file and job directory on the metadata volume.
-        let lease_path = format!("{}/{}", job_dir, DEDICATED_COMPACTION_LEASE_FILE);
-        let _ = file_manager.remove_metadata_volume_path(&lease_path);
-        let _ = file_manager.remove_metadata_volume_path(&job_dir);
+        cleanup_job_dir(file_manager, job_id)?;
         swept += 1;
     }
     Ok(swept)
