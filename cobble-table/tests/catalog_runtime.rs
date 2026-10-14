@@ -7,8 +7,6 @@ use cobble_table::{
     LogicalType, SchemaChange, TableKey, TableKeyBuilder, TableScanPlan, TableScanSplit,
     TableSchema, Value, ValueCodec, register_schema_transforms,
 };
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type TableTransform = Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
@@ -362,22 +360,22 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .bucket_ranges(vec![0..=0]);
     register_schema_transforms(&replay_builder).unwrap();
     let replay_db = Arc::new(replay_builder.open().unwrap());
-    let mapping_builder = DbBuilder::new(materialization_runtime)
-        .db_id("mapping-retry")
+    let refresh_builder = DbBuilder::new(materialization_runtime)
+        .db_id("refresh-shard")
         .bucket_ranges(vec![1..=1]);
-    register_schema_transforms(&mapping_builder).unwrap();
-    let mapping_db = Arc::new(mapping_builder.open().unwrap());
+    register_schema_transforms(&refresh_builder).unwrap();
+    let refresh_db = Arc::new(refresh_builder.open().unwrap());
     let replay_initial = catalog
         .materialize_table(Arc::clone(&replay_db), &accounts_id)
         .unwrap();
     drop(replay_initial);
-    let mut mapping_initial = catalog
-        .materialize_table(Arc::clone(&mapping_db), &accounts_id)
+    let mut refresh_initial = catalog
+        .materialize_table(Arc::clone(&refresh_db), &accounts_id)
         .unwrap();
-    mapping_initial.put(&rows[right_index]).unwrap();
-    mapping_initial.snapshot_and_wait().unwrap();
-    let stale_projection = mapping_initial.project_by_names(&["score"]).unwrap();
-    let mut stale_scan = mapping_initial.scan(keys[right_index].bucket()).unwrap();
+    refresh_initial.put(&rows[right_index]).unwrap();
+    refresh_initial.snapshot_and_wait().unwrap();
+    let stale_projection = refresh_initial.project_by_names(&["score"]).unwrap();
+    let mut stale_scan = refresh_initial.scan(keys[right_index].bucket()).unwrap();
     catalog
         .evolve_schema(
             &accounts_id,
@@ -436,38 +434,34 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
     assert_eq!(replayed.schema(), evolved.schema());
     drop(replayed);
 
-    let failed_mapping =
-        catalog_schema_mapping_path(&warehouse, users.table_id().as_u32(), "mapping-retry", 1);
-    std::fs::create_dir_all(&failed_mapping).unwrap();
+    let materialized = catalog
+        .materialize_table(Arc::clone(&refresh_db), &accounts_id)
+        .unwrap();
+    assert_eq!(materialized.schema(), evolved.schema());
+    drop(materialized);
+    assert!(refresh_initial.get(&keys[right_index]).is_err());
     assert!(
-        catalog
-            .materialize_table(Arc::clone(&mapping_db), &accounts_id)
-            .is_err()
-    );
-    std::fs::remove_dir(&failed_mapping).unwrap();
-    assert!(mapping_initial.get(&keys[right_index]).is_err());
-    assert!(
-        mapping_initial
+        refresh_initial
             .multi_get(&[keys[right_index].clone()])
             .is_err()
     );
-    assert!(mapping_initial.put(&rows[right_index]).is_err());
+    assert!(refresh_initial.put(&rows[right_index]).is_err());
     assert!(
-        mapping_initial
+        refresh_initial
             .put_with_options(&rows[right_index], &cobble::WriteOptions::with_ttl(1))
             .is_err()
     );
-    assert!(mapping_initial.delete(&keys[right_index]).is_err());
-    assert!(mapping_initial.scan(keys[right_index].bucket()).is_err());
+    assert!(refresh_initial.delete(&keys[right_index]).is_err());
+    assert!(refresh_initial.scan(keys[right_index].bucket()).is_err());
     assert!(stale_projection.get(&keys[right_index]).is_err());
     assert_eq!(stale_scan.next().unwrap().unwrap(), rows[right_index]);
     assert!(stale_scan.next().is_none());
     drop(stale_scan);
 
-    assert!(evolved.refresh_writer(&mut mapping_initial).unwrap());
-    assert!(!evolved.refresh_writer(&mut mapping_initial).unwrap());
-    assert!(events.refresh_writer(&mut mapping_initial).is_err());
-    assert_eq!(mapping_initial.schema(), evolved.schema());
+    assert!(evolved.refresh_writer(&mut refresh_initial).unwrap());
+    assert!(!evolved.refresh_writer(&mut refresh_initial).unwrap());
+    assert!(events.refresh_writer(&mut refresh_initial).is_err());
+    assert_eq!(refresh_initial.schema(), evolved.schema());
     let Value::Int8(score) = rows[right_index][2] else {
         panic!("catalog schema score starts as int8");
     };
@@ -478,29 +472,29 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         Value::Null,
     ];
     assert_eq!(
-        mapping_initial.get(&keys[right_index]).unwrap(),
+        refresh_initial.get(&keys[right_index]).unwrap(),
         Some(refreshed_row.clone())
     );
-    mapping_initial
+    refresh_initial
         .put_with_options(&refreshed_row, &cobble::WriteOptions::with_ttl(1))
         .unwrap();
     assert_eq!(
-        mapping_initial.get(&keys[right_index]).unwrap(),
+        refresh_initial.get(&keys[right_index]).unwrap(),
         Some(refreshed_row)
     );
     assert_eq!(
-        mapping_initial
+        refresh_initial
             .project_by_names(&["score"])
             .unwrap()
             .get(&keys[right_index])
             .unwrap(),
         Some(vec![Value::Int64(i64::from(score))])
     );
-    let mut unrelated = mapping_db.update_schema();
+    let mut unrelated = refresh_db.update_schema();
     unrelated.ensure_column_family_exists("unrelated").unwrap();
     unrelated.commit();
-    assert!(mapping_initial.get(&keys[right_index]).unwrap().is_some());
-    drop(mapping_initial);
+    assert!(refresh_initial.get(&keys[right_index]).unwrap().is_some());
+    drop(refresh_initial);
     drop(catalog);
 
     // The worker supplies fresh local primary/cache roots; the plan never appends catalog paths.
@@ -775,20 +769,4 @@ fn table_field_count(snapshot: &ShardSnapshotMetadata) -> usize {
         .as_array()
         .unwrap()
         .len()
-}
-
-fn catalog_schema_mapping_path(
-    warehouse: &Path,
-    table_id: u32,
-    db_id: &str,
-    catalog_schema_id: u32,
-) -> PathBuf {
-    let digest = Sha256::digest(db_id.as_bytes());
-    let shard = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    warehouse.join(format!(
-        "warehouse/catalog/tables/TABLE-{table_id}/shards/{shard}/SCHEMA-{catalog_schema_id}"
-    ))
 }

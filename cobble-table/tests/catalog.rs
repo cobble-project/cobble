@@ -120,15 +120,10 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         table_one.put(&deleted_row).unwrap();
         table_one.delete(&deleted_key).unwrap();
         table_two.put(&row).unwrap();
-        let mapping_one = catalog
-            .load_shard_schema_mapping(&accounts, shard_one.id(), CatalogSchemaId::from(0))
-            .unwrap();
-        let mapping_two = catalog
-            .load_shard_schema_mapping(&accounts, shard_two.id(), CatalogSchemaId::from(0))
-            .unwrap();
-        assert_ne!(mapping_one.core_schema_id(), mapping_two.core_schema_id());
-        assert_eq!(mapping_one.db_id(), shard_one.id());
-        assert_eq!(mapping_one.table_id(), accounts_table.table_id());
+        assert_ne!(
+            shard_one.current_schema().version(),
+            shard_two.current_schema().version()
+        );
         assert_eq!(table_one.get(&key_one).unwrap(), Some(row.clone()));
         assert_eq!(table_two.get(&key_two).unwrap(), Some(row.clone()));
 
@@ -159,13 +154,7 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         assert_eq!(table_one.get(&key_one).unwrap(), Some(expected));
         let deleted_key = build_key(&table_one, &deleted_row[..2]);
         assert_eq!(table_one.get(&deleted_key).unwrap(), None);
-        assert_eq!(
-            catalog
-                .load_shard_schema_mapping(&accounts, shard_one.id(), CatalogSchemaId::from(1))
-                .unwrap()
-                .catalog_schema_id(),
-            CatalogSchemaId::from(1)
-        );
+        assert_eq!(table_one.schema(), &schema_one);
         let evolved = second
             .evolve_schema(
                 &accounts,
@@ -208,10 +197,6 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         assert_eq!(table_one.get(&key_one).unwrap(), Some(expected));
         let deleted_key = build_key(&table_one, &deleted_row[..2]);
         assert_eq!(table_one.get(&deleted_key).unwrap(), None);
-        let stable_mapping = second
-            .load_shard_schema_mapping(&accounts, shard_one.id(), CatalogSchemaId::from(2))
-            .unwrap()
-            .core_schema_id();
         let mut unrelated = shard_one.update_schema();
         unrelated
             .ensure_column_family_exists("after-materialize")
@@ -232,21 +217,11 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
             ])
         );
         assert_eq!(shard_one.current_schema().version(), applied_version);
-        assert_eq!(
-            second
-                .load_shard_schema_mapping(&accounts, shard_one.id(), CatalogSchemaId::from(2))
-                .unwrap()
-                .core_schema_id(),
-            stable_mapping
-        );
 
         second
             .materialize_table(Arc::clone(&shard_two), &accounts)
             .unwrap();
-        let pre_rollback_mapping = second
-            .load_shard_schema_mapping(&accounts, shard_two.id(), CatalogSchemaId::from(2))
-            .unwrap()
-            .core_schema_id();
+        let pre_rollback_version = shard_two.current_schema().version();
         let rolled_back_shard = Arc::new(
             DbBuilder::new(shard_config("shard-two-rollback"))
                 .bucket_ranges(vec![0..=7])
@@ -254,14 +229,11 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
                 .open()
                 .unwrap(),
         );
-        second
+        let repaired = second
             .materialize_table(Arc::clone(&rolled_back_shard), &accounts)
             .unwrap();
-        let repaired_mapping = second
-            .load_shard_schema_mapping(&accounts, shard_two.id(), CatalogSchemaId::from(2))
-            .unwrap()
-            .core_schema_id();
-        assert!(repaired_mapping < pre_rollback_mapping);
+        assert_eq!(repaired.schema(), &schema_two);
+        assert!(rolled_back_shard.current_schema().version() < pre_rollback_version);
 
         let event_row = vec![
             Value::String("tenant-b".to_string()),
@@ -394,17 +366,12 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
         assert_eq!(loaded.table_id(), accounts_id);
         assert_eq!(loaded.catalog_schema_id().as_u32(), 2);
         assert_eq!(loaded.schema(), &schema_two);
-        let schema_zero_mapping = catalog
-            .load_shard_schema_mapping(&customers, shard_one.id(), CatalogSchemaId::from(0))
+        let current_version = shard_one.current_schema().version();
+        let materialized = catalog
+            .materialize_table(Arc::clone(&shard_one), &customers)
             .unwrap();
-        let schema_two_mapping = catalog
-            .load_shard_schema_mapping(&customers, shard_one.id(), CatalogSchemaId::from(2))
-            .unwrap();
-        assert_eq!(
-            schema_zero_mapping.catalog_schema_id(),
-            CatalogSchemaId::from(0)
-        );
-        assert!(schema_two_mapping.core_schema_id() > schema_zero_mapping.core_schema_id());
+        assert_eq!(materialized.schema(), &schema_two);
+        assert_eq!(shard_one.current_schema().version(), current_version);
         assert_eq!(
             catalog
                 .load_table_schema(&customers, CatalogSchemaId::from(0))
@@ -484,6 +451,10 @@ fn file_catalog_namespace_and_table_lifecycle_survives_restart() {
     assert!(catalog.list_namespaces().unwrap().is_empty());
     let metadata_root = root.path().join(storage_id).join("catalog");
     let files = all_files(&metadata_root);
+    assert!(!files.iter().any(|path| {
+        path.components()
+            .any(|component| component.as_os_str() == "shards")
+    }));
     assert!(files.iter().any(|path| path.ends_with("CURRENT")));
     assert!(files.iter().any(|path| {
         path.file_name()
