@@ -493,6 +493,7 @@ impl FileSystem for OpendalFileSystem {
             .map_err(|e| Error::IoError(format!("Failed to list {}: {}", path, e)))?;
         Ok(entries
             .into_iter()
+            .filter(|entry| entry.path().trim_matches('/') != path.trim_matches('/'))
             .filter_map(|entry: Entry| {
                 let name = entry.name().trim_end_matches('/');
                 (!name.is_empty()).then(|| name.to_string())
@@ -552,7 +553,13 @@ impl FileSystem for OpendalFileSystem {
                 meta.last_modified()
                     .map(|ts| ts.into_inner().as_second() as u64)
             })
-            .map_err(|e| Error::IoError(format!("Failed to stat {}: {}", path, e)))
+            .or_else(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(Error::IoError(format!("Failed to stat {}: {}", path, e)))
+                }
+            })
     }
 }
 

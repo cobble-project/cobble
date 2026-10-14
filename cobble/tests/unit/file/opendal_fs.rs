@@ -63,6 +63,7 @@ fn test_opendal_fs_basic() {
     let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None);
     assert!(fs.is_ok());
     let fs = fs.unwrap();
+    assert_eq!(fs.last_modified("absent").unwrap(), None);
     assert!(!fs.exists("example").unwrap());
     assert!(fs.create_dir("example").is_ok());
     assert!(fs.exists("example").unwrap());
@@ -101,6 +102,7 @@ fn test_opendal_fs_list() {
     cleanup_test_root();
     let fs = OpendalFileSystem::init(&Url::parse(TEST_ROOT).unwrap(), None, None, None).unwrap();
     fs.create_dir("list/subdir").unwrap();
+    fs.create_dir("list/list").unwrap();
     assert_eq!(fs.file_size("list/subdir").unwrap(), None);
     {
         let mut writer = fs.open_write("list/a.txt").unwrap();
@@ -123,6 +125,7 @@ fn test_opendal_fs_list() {
     assert!(listed.contains(&"a.txt".to_string()));
     assert!(listed.contains(&"b.txt".to_string()));
     assert!(listed.contains(&"subdir".to_string()));
+    assert_eq!(listed.iter().filter(|name| *name == "list").count(), 1);
     cleanup_test_root();
 }
 
