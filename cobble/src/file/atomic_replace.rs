@@ -9,7 +9,6 @@ use crate::file::{File, FileSystem, RandomAccessFile, SequentialWriteFile};
 use bytes::Bytes;
 use crc32fast::Hasher;
 use std::sync::Arc;
-use uuid::Uuid;
 
 const SUFFIX: &str = "-ATOMIC";
 
@@ -150,7 +149,7 @@ pub struct ReplaceWriter {
 impl ReplaceWriter {
     pub fn new(fs: Arc<dyn FileSystem>, path: &str) -> Result<Self> {
         let (payload_path, sequence) = if fs.supports_atomic_replace() {
-            (format!("{path}.tmp-{}", Uuid::new_v4()), None)
+            (crate::paths::metadata_temporary_path(path), None)
         } else {
             let dir = directory(path);
             fs.create_dir(&dir)?;

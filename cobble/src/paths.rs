@@ -1,5 +1,14 @@
 use crate::error::{Error, Result};
 
+/// An unpublished metadata file beside its destination, outside the destination's name prefix.
+pub fn metadata_temporary_path(path: &str) -> String {
+    let suffix = uuid::Uuid::new_v4();
+    match path.rsplit_once('/') {
+        Some((parent, name)) => format!("{parent}/_{name}.tmp-{suffix}"),
+        None => format!("_{path}.tmp-{suffix}"),
+    }
+}
+
 pub(crate) const SNAPSHOT_DIR: &str = "snapshot";
 pub(crate) const SCHEMA_DIR: &str = "schema";
 pub(crate) const GLOBAL_SNAPSHOT_POINTER_NAME: &str = "CURRENT";

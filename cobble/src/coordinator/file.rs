@@ -5,7 +5,6 @@ use crate::file::{
     File, FileSystem, MetadataWriter as ChecksumMetadataWriter, SequentialWriteFile,
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
 pub(crate) struct MetadataWriter {
     temp_path: String,
@@ -16,7 +15,7 @@ pub(crate) struct MetadataWriter {
 
 impl MetadataWriter {
     pub(crate) fn new(path: &str, fs: &Arc<dyn FileSystem>) -> Result<Self> {
-        let temp_path = format!("{}.tmp-{}", path, Uuid::new_v4());
+        let temp_path = crate::paths::metadata_temporary_path(path);
         let writer = fs.open_write(&temp_path)?;
         Ok(Self {
             temp_path,

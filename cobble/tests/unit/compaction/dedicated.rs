@@ -72,9 +72,25 @@ fn test_parse_job_id() {
     assert_eq!(parse_dedicated_compaction_job_id("COMPACTION-"), None);
     assert_eq!(parse_dedicated_compaction_job_id("SNAPSHOT-5"), None);
     assert_eq!(
+        parse_dedicated_compaction_job_id("COMPACTION-abc-123.tmp-01234567"),
+        None
+    );
+    assert_eq!(
         parse_dedicated_compaction_job_id("compaction/results/COMPACTION-xyz"),
         Some("xyz".to_string())
     );
+    for (path, prefix) in [
+        ("COMPACTION-abc", "_COMPACTION-abc.tmp-"),
+        ("/COMPACTION-abc", "/_COMPACTION-abc.tmp-"),
+        (
+            "compaction/results/COMPACTION-abc",
+            "compaction/results/_COMPACTION-abc.tmp-",
+        ),
+    ] {
+        let temporary = crate::paths::metadata_temporary_path(path);
+        assert!(temporary.starts_with(prefix));
+        assert_eq!(parse_dedicated_compaction_job_id(&temporary), None);
+    }
 }
 
 #[test]

@@ -54,8 +54,8 @@ pub(crate) fn dedicated_compaction_job_output_prefix(job_id: &str) -> String {
 pub(crate) fn parse_dedicated_compaction_job_id(name: &str) -> Option<String> {
     let name = name.rsplit('/').next().unwrap_or(name);
     name.strip_prefix(DEDICATED_COMPACTION_RESULT_PREFIX)
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.contains(".tmp-"))
+        .map(str::to_owned)
 }
 
 /// Complete immutable descriptor for a data file, covering the same fields as `ManifestFile`.

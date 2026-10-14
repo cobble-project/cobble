@@ -5,7 +5,6 @@ use cobble::{
     VolumeUsageKind,
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// File storage used exclusively by the table catalog.
 ///
@@ -41,7 +40,7 @@ impl CatalogStore {
             self.ensure_dir(parent)?;
         }
 
-        let temp_path = format!("{path}.tmp-{}", Uuid::new_v4());
+        let temp_path = cobble::paths::metadata_temporary_path(&path);
         let mut writer = self.file_system.open_write(&temp_path)?;
         let result = (|| {
             write_all(&mut writer, payload, relative_path)?;

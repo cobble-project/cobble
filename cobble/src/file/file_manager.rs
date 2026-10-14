@@ -2450,7 +2450,7 @@ impl FileManager {
     /// Metadata files are identified by their name rather than a numeric ID.
     pub fn create_metadata_file(&self, name: &str) -> Result<AtomicMetadataWriter> {
         let final_path = self.metadata_file_path(name);
-        let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
+        let temp_path = crate::paths::metadata_temporary_path(&final_path);
         let writer = self.meta_volume.fs().open_write(&temp_path)?;
 
         let tracked = Arc::new(TrackedFile::managed(
@@ -2494,7 +2494,7 @@ impl FileManager {
         remove_existing: bool,
     ) -> Result<()> {
         let final_path = self.metadata_file_path(name);
-        let temp_path = format!("{}.tmp-{}", final_path, Uuid::new_v4());
+        let temp_path = crate::paths::metadata_temporary_path(&final_path);
         let mut writer = self.meta_volume.fs().open_write(&temp_path)?;
         let write_result = (|| {
             let mut written = 0;
