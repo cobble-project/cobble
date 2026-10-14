@@ -75,11 +75,12 @@ pub trait Catalog: Send + Sync {
     fn drop_table(&self, identifier: &TableIdentifier) -> CatalogResult<()>;
 }
 
-/// Schema history and shard-mapping persistence required by a connected catalog table.
+/// Schema history and shard-mapping reporting required by a connected catalog table.
 ///
 /// Implementations own their metadata storage and commit coordination; runtime data locations
 /// are configured separately in [`super::CatalogRuntimeContext`]. Published schema versions must
 /// be immutable, and recording a shard mapping must be idempotent so a failed caller can retry.
+/// Implementations may keep reported shard mappings in memory.
 /// Detached worker plans contain their own history and do not report shard mappings.
 pub trait CatalogSchemaStore: Send + Sync {
     fn load_schema_version(

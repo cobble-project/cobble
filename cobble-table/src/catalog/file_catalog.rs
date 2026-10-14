@@ -10,9 +10,7 @@ use crate::evolution::schema_field_ids;
 use crate::{Table, TableSchema};
 use cobble::{Config, Db};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use uuid::Uuid;
 
@@ -116,16 +114,6 @@ impl TableSchemaRecord {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShardSchemaMappingFile {
-    format: String,
-    version: u32,
-    table_id: TableId,
-    db_id: String,
-    catalog_schema_id: CatalogSchemaId,
-    core_schema_id: u64,
-}
-
 /// File-backed table catalog.
 ///
 /// Operations are serialized across handles in this process and refresh CURRENT before every
@@ -140,6 +128,8 @@ pub struct FileCatalog {
 
 struct FileCatalogSchemaStore {
     store: CatalogStore,
+    /// Runtime-only reports; materialization and recovery use the shard's DB schema.
+    schema_mappings: Mutex<HashMap<(TableId, String, CatalogSchemaId), u64>>,
 }
 
 impl CatalogSchemaStore for FileCatalogSchemaStore {
@@ -152,20 +142,12 @@ impl CatalogSchemaStore for FileCatalogSchemaStore {
     }
 
     fn record_shard_schema_mapping(&self, mapping: ShardSchemaMapping) -> CatalogResult<()> {
-        write_schema_mapping(&self.store, ShardSchemaMappingFile::from(mapping))
-    }
-}
-
-impl From<ShardSchemaMapping> for ShardSchemaMappingFile {
-    fn from(mapping: ShardSchemaMapping) -> Self {
-        Self {
-            format: CATALOG_FORMAT.to_string(),
-            version: CATALOG_VERSION,
-            table_id: mapping.table_id,
-            db_id: mapping.db_id,
-            catalog_schema_id: mapping.catalog_schema_id,
-            core_schema_id: mapping.core_schema_id,
-        }
+        let mut mappings = lock(&self.schema_mappings)?;
+        let core_schema_id = mappings
+            .entry((mapping.table_id, mapping.db_id, mapping.catalog_schema_id))
+            .or_insert(mapping.core_schema_id);
+        *core_schema_id = (*core_schema_id).min(mapping.core_schema_id);
+        Ok(())
     }
 }
 
@@ -179,6 +161,7 @@ impl FileCatalog {
             catalog_config.storage_id(),
             Arc::new(FileCatalogSchemaStore {
                 store: store.clone(),
+                schema_mappings: Mutex::new(HashMap::new()),
             }),
         )?);
         Ok(Self {
@@ -317,27 +300,6 @@ impl FileCatalog {
     }
 }
 
-fn write_schema_mapping(
-    store: &CatalogStore,
-    mapping: ShardSchemaMappingFile,
-) -> CatalogResult<()> {
-    let path = schema_mapping_path(mapping.table_id, &mapping.db_id, mapping.catalog_schema_id);
-    if store.exists(&path)? {
-        let existing: ShardSchemaMappingFile = read_json(store, &path)?;
-        validate_header(&existing.format, existing.version)?;
-        validate_schema_mapping_key(
-            &existing,
-            mapping.table_id,
-            &mapping.db_id,
-            mapping.catalog_schema_id,
-        )?;
-        if existing.core_schema_id <= mapping.core_schema_id {
-            return Ok(());
-        }
-    }
-    write_json(store, &path, &mapping)
-}
-
 fn load_table_schema_record(
     store: &CatalogStore,
     table_id: TableId,
@@ -374,36 +336,6 @@ fn load_table_schema_record(
         );
     }
     Ok(record)
-}
-
-impl FileCatalog {
-    /// Load the core schema id used for one table schema on a shard.
-    pub fn load_shard_schema_mapping(
-        &self,
-        identifier: &TableIdentifier,
-        db_id: &str,
-        catalog_schema_id: CatalogSchemaId,
-    ) -> CatalogResult<ShardSchemaMapping> {
-        let table = self.load_table(identifier)?;
-        if catalog_schema_id > table.catalog_schema_id() {
-            return Err(CatalogError::SchemaNotFound {
-                table: identifier.clone(),
-                catalog_schema_id,
-            });
-        }
-        let mapping: ShardSchemaMappingFile = read_json(
-            &self.store,
-            &schema_mapping_path(table.table_id(), db_id, catalog_schema_id),
-        )?;
-        validate_header(&mapping.format, mapping.version)?;
-        validate_schema_mapping_key(&mapping, table.table_id(), db_id, catalog_schema_id)?;
-        Ok(ShardSchemaMapping {
-            table_id: mapping.table_id,
-            db_id: mapping.db_id,
-            catalog_schema_id: mapping.catalog_schema_id,
-            core_schema_id: mapping.core_schema_id,
-        })
-    }
 }
 
 impl Catalog for FileCatalog {
@@ -732,39 +664,6 @@ fn table_schema_path(table_id: TableId, schema_id: CatalogSchemaId) -> String {
     )
 }
 
-fn schema_mapping_path(
-    table_id: TableId,
-    db_id: &str,
-    catalog_schema_id: CatalogSchemaId,
-) -> String {
-    let digest = Sha256::digest(db_id.as_bytes());
-    let mut shard = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut shard, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    format!(
-        "tables/TABLE-{table_id}/shards/{shard}/SCHEMA-{}",
-        catalog_schema_id.as_u32()
-    )
-}
-
-fn validate_schema_mapping_key(
-    mapping: &ShardSchemaMappingFile,
-    table_id: TableId,
-    db_id: &str,
-    catalog_schema_id: CatalogSchemaId,
-) -> CatalogResult<()> {
-    if mapping.table_id != table_id
-        || mapping.db_id != db_id
-        || mapping.catalog_schema_id != catalog_schema_id
-    {
-        return Err(CatalogError::InvalidMetadata(
-            "shard schema mapping does not match its lookup key".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn read_json<T: DeserializeOwned>(store: &CatalogStore, path: &str) -> CatalogResult<T> {
     let bytes = store.read(path)?;
     serde_json::from_slice(&bytes).map_err(|error| CatalogError::InvalidMetadata(error.to_string()))
@@ -776,3 +675,7 @@ fn write_json<T: Serialize>(store: &CatalogStore, path: &str, value: &T) -> Cata
     store.write(path, &bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/file_catalog.rs"]
+mod tests;
