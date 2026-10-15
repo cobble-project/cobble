@@ -8,7 +8,6 @@ publish = false
 [features]
 default = []
 storage-all = [
-    "storage-alluxio",
     "storage-cos",
     "storage-ftp",
     "storage-goosefs",
@@ -17,7 +16,6 @@ storage-all = [
     "storage-s3",
     "storage-sftp",
 ]
-storage-alluxio = ["cobble/storage-alluxio"]
 storage-cos = ["cobble/storage-cos"]
 storage-ftp = ["cobble/storage-ftp"]
 storage-goosefs = ["cobble/storage-goosefs"]

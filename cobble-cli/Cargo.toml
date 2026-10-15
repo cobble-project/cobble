@@ -12,7 +12,6 @@ categories = ["command-line-utilities", "database-implementations"]
 [features]
 default = []
 storage-all = [
-    "storage-alluxio",
     "storage-cos",
     "storage-ftp",
     "storage-goosefs",
@@ -21,7 +20,6 @@ storage-all = [
     "storage-s3",
     "storage-sftp",
 ]
-storage-alluxio = ["cobble/storage-alluxio", "cobble-web-monitor/storage-alluxio"]
 storage-cos = ["cobble/storage-cos", "cobble-web-monitor/storage-cos"]
 storage-ftp = ["cobble/storage-ftp", "cobble-web-monitor/storage-ftp"]
 storage-goosefs = ["cobble/storage-goosefs", "cobble-web-monitor/storage-goosefs"]

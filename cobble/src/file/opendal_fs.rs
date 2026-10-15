@@ -379,7 +379,7 @@ impl FileSystem for OpendalFileSystem {
         };
         let op = Operator::via_iter(&scheme, options).map_err(|e| {
             Error::FileSystemError(format!(
-                "Failed to create opendal operator for scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-alluxio, storage-goosefs).",
+                "Failed to create opendal operator for scheme '{}': {}. Enable the matching cobble storage feature (for example: storage-s3, storage-oss, storage-cos, storage-goosefs).",
                 scheme,
                 e
             ))

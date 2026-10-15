@@ -28,7 +28,6 @@ Optional feature mapping:
 
 | Cobble Feature | OpenDAL Service |
 |---|---|
-| `storage-alluxio` | `services-alluxio` |
 | `storage-cos` | `services-cos` |
 | `storage-ftp` | `services-ftp` |
 | `storage-goosefs` | `services-goosefs` |

@@ -44,7 +44,7 @@ jobs:
             features: storage-all
           - runner: windows-2025-vs2026
             name: windows-x64
-            features: storage-alluxio,storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
+            features: storage-cos,storage-ftp,storage-goosefs,storage-oss,storage-s3
         profile:
           - cmake: Release
             name: release

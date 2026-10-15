@@ -22,7 +22,6 @@ Cobble uses Apache OpenDAL for volume backends.
 The local `file://` backend is always enabled by default and does not require any Cargo feature.
 Optional remote/storage-service features exposed by Cobble are:
 
-- `storage-alluxio`
 - `storage-cos`
 - `storage-oss`
 - `storage-s3`
