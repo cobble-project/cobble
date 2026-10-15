@@ -14,7 +14,6 @@ crate-type = ["staticlib", "rlib"]
 [features]
 default = []
 storage-all = [
-    "storage-alluxio",
     "storage-cos",
     "storage-ftp",
     "storage-goosefs",
@@ -23,7 +22,6 @@ storage-all = [
     "storage-s3",
     "storage-sftp",
 ]
-storage-alluxio = ["cobble-binding/storage-alluxio"]
 storage-cos = ["cobble-binding/storage-cos"]
 storage-ftp = ["cobble-binding/storage-ftp"]
 storage-goosefs = ["cobble-binding/storage-goosefs"]

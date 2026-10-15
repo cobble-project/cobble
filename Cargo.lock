@@ -2686,7 +2686,6 @@ dependencies = [
  "opendal-http-transport-reqwest",
  "opendal-layer-retry",
  "opendal-layer-timeout",
- "opendal-service-alluxio",
  "opendal-service-cos",
  "opendal-service-fs",
  "opendal-service-ftp",
@@ -2756,20 +2755,6 @@ checksum = "a704141924500f3803c05ed871b53305d2a2f11cb5ef20160c3ee688a1857f66"
 dependencies = [
  "opendal-core",
  "tokio",
-]
-
-[[package]]
-name = "opendal-service-alluxio"
-version = "0.58.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8516234efd2a091bb75316f015f8769c4745ef7f16c2819c7a0b0e548d620069"
-dependencies = [
- "bytes",
- "http",
- "log",
- "opendal-core",
- "serde",
- "serde_json",
 ]
 
 [[package]]
