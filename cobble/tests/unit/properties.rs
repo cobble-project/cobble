@@ -83,8 +83,24 @@ fn properties_are_plain_toml_without_volume_credentials() {
         ("access_key_id".to_string(), "oss-option-ak".to_string()),
         ("access_key_secret".to_string(), "oss-option-sk".to_string()),
     ]));
+    let mut cos_volume = VolumeDescriptor::new(
+        "cos://example-bucket/data?secret_id=cos-query-id&security_token=cos-query-token",
+        vec![VolumeUsageKind::Snapshot],
+    );
+    cos_volume.custom_options = Some(HashMap::from([
+        ("secret_id".to_string(), "cos-option-id".to_string()),
+        ("security_token".to_string(), "cos-option-token".to_string()),
+    ]));
+    let mut ftp_volume = VolumeDescriptor::new(
+        "ftp://example.com/data?user=ftp-query-user&password=ftp-query-password",
+        vec![VolumeUsageKind::Snapshot],
+    );
+    ftp_volume.custom_options = Some(HashMap::from([
+        ("user".to_string(), "ftp-option-user".to_string()),
+        ("password".to_string(), "ftp-option-password".to_string()),
+    ]));
     let config = Config {
-        volumes: vec![volume, oss_volume],
+        volumes: vec![volume, oss_volume, cos_volume, ftp_volume],
         l0_file_limit: 17,
         wal_enabled: true,
         ..Config::default()
@@ -115,6 +131,11 @@ fn properties_are_plain_toml_without_volume_credentials() {
     let oss_route = decoded.config.volumes[1].with_credentials_from(&config);
     assert_eq!(oss_route.base_dir, config.volumes[1].base_dir);
     assert_eq!(oss_route.custom_options, config.volumes[1].custom_options);
+    for index in [2, 3] {
+        let rebound = decoded.config.volumes[index].with_credentials_from(&config);
+        assert_eq!(rebound.base_dir, config.volumes[index].base_dir);
+        assert_eq!(rebound.custom_options, config.volumes[index].custom_options);
+    }
 
     assert_eq!(decoded.version, DB_PROPERTIES_VERSION_CURRENT);
     assert_eq!(decoded.db_id, "shard-7");
@@ -145,6 +166,14 @@ fn properties_are_plain_toml_without_volume_credentials() {
         "oss-query-sk",
         "oss-option-ak",
         "oss-option-sk",
+        "cos-query-id",
+        "cos-query-token",
+        "cos-option-id",
+        "cos-option-token",
+        "ftp-query-user",
+        "ftp-query-password",
+        "ftp-option-user",
+        "ftp-option-password",
     ] {
         assert!(!contents.contains(secret), "PROPERTIES leaked {secret}");
     }

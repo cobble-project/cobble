@@ -607,6 +607,7 @@ dependencies = [
  "metrics",
  "opendal",
  "parquet",
+ "percent-encoding",
  "positioned-io",
  "rand 0.8.5",
  "serde",

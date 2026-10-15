@@ -100,7 +100,8 @@ fn split_bucket_and_root_from_path(path: &str) -> Option<(String, String)> {
 }
 
 fn host_looks_like_endpoint(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok()
+    host.eq_ignore_ascii_case("localhost")
+        || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
 }
 
 fn resolve_s3_bucket_root_endpoint(
@@ -190,6 +191,151 @@ fn hdfs_url_options(url: &Url) -> HashMap<String, String> {
         options.insert("user".to_string(), url.username().to_string());
     }
     options
+}
+
+fn url_credential(value: &str) -> Result<String> {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| Error::ConfigError("URL credential is not valid UTF-8".to_string()))
+}
+
+/// Translate volume URLs into each service's actual OpenDAL configuration keys.
+/// Explicit options override URL defaults; custom options override query options.
+fn opendal_options(
+    url: &Url,
+    access_id: Option<String>,
+    access_key: Option<String>,
+    custom_options: Option<HashMap<String, String>>,
+) -> Result<(String, HashMap<String, String>)> {
+    let scheme = match url.scheme() {
+        "file" => "fs",
+        scheme => scheme,
+    }
+    .to_ascii_lowercase();
+    let mut query_options: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    if let Some(custom_options) = custom_options {
+        query_options.extend(custom_options);
+    }
+    let mut options = HashMap::new();
+    match scheme.as_str() {
+        "fs" => {
+            // File URL paths need native conversion, especially for Windows drive letters.
+            let root = if url.scheme() == "file" {
+                local_fs_root(url)?
+            } else {
+                url.path().to_string()
+            };
+            options.insert("root".to_string(), root);
+        }
+        "s3" => {
+            let (bucket, root, endpoint) =
+                resolve_s3_bucket_root_endpoint(url, &mut query_options)?;
+            options.insert("bucket".to_string(), bucket);
+            options.insert("root".to_string(), root);
+            if let Some(endpoint) = endpoint {
+                options.insert("endpoint".to_string(), endpoint);
+                options.insert("enable_virtual_host_style".to_string(), "false".to_string());
+            }
+            let access_key_id = query_options
+                .remove("access_key_id")
+                .or(access_id)
+                .or_else(|| query_options.remove("access_id"));
+            let secret_access_key = query_options
+                .remove("secret_access_key")
+                .or(access_key)
+                .or_else(|| query_options.remove("access_key"));
+            if let Some(value) = access_key_id.filter(|value| !value.is_empty()) {
+                options.insert("access_key_id".to_string(), value);
+            }
+            if let Some(value) = secret_access_key.filter(|value| !value.is_empty()) {
+                options.insert("secret_access_key".to_string(), value);
+            }
+        }
+        "goosefs" => {
+            let (master_addr, root) = resolve_goosefs_master_addr_root(url, &mut query_options);
+            if let Some(master_addr) = master_addr {
+                options.insert("master_addr".to_string(), master_addr);
+            }
+            options.insert("root".to_string(), root);
+            if let Some(user) = access_id.filter(|user| !user.is_empty()) {
+                options.insert("auth_username".to_string(), user);
+            }
+        }
+        "hdfs" => {
+            options.extend(hdfs_url_options(url));
+            if let Some(user) = access_id.filter(|user| !user.is_empty()) {
+                options.insert("user".to_string(), user);
+            }
+        }
+        "oss" | "cos" => {
+            // Object-store authorities are buckets, not service endpoints.
+            if let Some(bucket) = url.host_str() {
+                options.insert("bucket".to_string(), bucket.to_string());
+            }
+            options.insert("root".to_string(), normalize_root(url.path()));
+            let (id_key, secret_key) = if scheme == "oss" {
+                ("access_key_id", "access_key_secret")
+            } else {
+                ("secret_id", "secret_key")
+            };
+            let id = match access_id {
+                Some(id) => id,
+                None => url_credential(url.username())?,
+            };
+            let secret = match access_key {
+                Some(secret) => secret,
+                None => url_credential(url.password().unwrap_or(""))?,
+            };
+            if !id.is_empty() {
+                options.insert(id_key.to_string(), id);
+            }
+            if !secret.is_empty() {
+                options.insert(secret_key.to_string(), secret);
+            }
+        }
+        "ftp" | "sftp" => {
+            if url.host_str().is_some() {
+                let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+                let endpoint_scheme = match scheme.as_str() {
+                    "ftp" => "ftp",
+                    // OpenSSH requires the URI form to recognize an explicit port.
+                    _ => "ssh",
+                };
+                options.insert(
+                    "endpoint".to_string(),
+                    format!("{endpoint_scheme}://{authority}"),
+                );
+            }
+            options.insert("root".to_string(), normalize_root(url.path()));
+            let user = match access_id {
+                Some(user) => user,
+                None => url_credential(url.username())?,
+            };
+            if !user.is_empty() {
+                options.insert("user".to_string(), user);
+            }
+            if scheme == "ftp" {
+                let password = match access_key {
+                    Some(password) => password,
+                    None => url_credential(url.password().unwrap_or(""))?,
+                };
+                if !password.is_empty() {
+                    options.insert("password".to_string(), password);
+                }
+            } else if url.password().is_some()
+                || access_key.is_some_and(|secret| !secret.is_empty())
+                || query_options.contains_key("password")
+            {
+                return Err(Error::ConfigError(
+                        "SFTP password authentication is unsupported; use an SSH agent or the key option with a private-key file path".to_string(),
+                    ));
+            }
+        }
+        _ => {}
+    }
+    options.extend(query_options);
+    Ok((scheme, options))
 }
 
 impl FileSystem for OpendalFileSystem {
@@ -283,94 +429,7 @@ impl FileSystem for OpendalFileSystem {
         access_key: Option<String>,
         custom_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let mut scheme = url.scheme().to_ascii_lowercase();
-        if scheme == "file" {
-            scheme = "fs".to_string();
-        }
-        let mut query_options: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        let mut options: HashMap<String, String> = HashMap::new();
-        match scheme.as_str() {
-            "fs" => {
-                // URL paths are not native filesystem paths on Windows: for example,
-                // `file:///D:/data` has a URL path of `/D:/data` but an fs root of `D:\data`.
-                let root = if url.scheme().eq_ignore_ascii_case("file") {
-                    local_fs_root(url)?
-                } else {
-                    url.path().to_string()
-                };
-                options.insert("root".to_string(), root);
-            }
-            "s3" => {
-                let (bucket, root, endpoint) =
-                    resolve_s3_bucket_root_endpoint(url, &mut query_options)?;
-                options.insert("bucket".to_string(), bucket);
-                options.insert("root".to_string(), root);
-                if let Some(endpoint) = endpoint {
-                    options.insert("endpoint".to_string(), endpoint);
-                    if !query_options.contains_key("enable_virtual_host_style") {
-                        options
-                            .insert("enable_virtual_host_style".to_string(), "false".to_string());
-                    }
-                }
-
-                let access_key_id = access_id
-                    .or_else(|| query_options.remove("access_key_id"))
-                    .or_else(|| query_options.remove("access_id"));
-                let secret_access_key = access_key
-                    .or_else(|| query_options.remove("secret_access_key"))
-                    .or_else(|| query_options.remove("access_key"));
-                if let Some(access_key_id) = access_key_id
-                    && !access_key_id.is_empty()
-                {
-                    options.insert("access_key_id".to_string(), access_key_id);
-                }
-                if let Some(secret_access_key) = secret_access_key
-                    && !secret_access_key.is_empty()
-                {
-                    options.insert("secret_access_key".to_string(), secret_access_key);
-                }
-            }
-            "goosefs" => {
-                let (master_addr, root) = resolve_goosefs_master_addr_root(url, &mut query_options);
-                if let Some(master_addr) = master_addr {
-                    options.insert("master_addr".to_string(), master_addr);
-                }
-                options.insert("root".to_string(), root);
-                let auth_username = access_id.or_else(|| query_options.remove("auth_username"));
-                if let Some(auth_username) = auth_username.filter(|name| !name.is_empty()) {
-                    options.insert("auth_username".to_string(), auth_username);
-                }
-            }
-            "hdfs" => {
-                options.extend(hdfs_url_options(url));
-                if let Some(user) = access_id.filter(|user| !user.is_empty()) {
-                    options.insert("user".to_string(), user);
-                }
-            }
-            _ => {
-                // Other schemes: preserve previous host/path-based behavior.
-                let host = url.host_str().unwrap_or("");
-                let access_id = access_id.unwrap_or_else(|| url.username().to_string());
-                let access_key =
-                    access_key.unwrap_or_else(|| url.password().unwrap_or("").to_string());
-                let bucket = url.path().trim_start_matches('/');
-                options.insert("host".to_string(), host.to_string());
-                if !access_id.is_empty() {
-                    options.insert("access_key_id".to_string(), access_id);
-                }
-                if !access_key.is_empty() {
-                    options.insert("secret_access_key".to_string(), access_key);
-                }
-                if !bucket.is_empty() {
-                    options.insert("bucket".to_string(), bucket.to_string());
-                }
-                options.insert("root".to_string(), normalize_root(url.path()));
-            }
-        }
-        options.extend(query_options);
-        if let Some(custom_options) = custom_options {
-            options.extend(custom_options);
-        }
+        let (scheme, options) = opendal_options(url, access_id, access_key, custom_options)?;
         #[cfg(windows)]
         let local_root = if scheme == "fs" {
             options.get("root").map(PathBuf::from)
