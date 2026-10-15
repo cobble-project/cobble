@@ -423,6 +423,11 @@ fn is_sensitive_volume_option(key: &str) -> bool {
             | "aws_secret_access_key"
             | "session_token"
             | "aws_session_token"
+            | "secret_id"
+            | "security_token"
+            | "password"
+            | "user"
+            | "auth_username"
     )
 }
 
