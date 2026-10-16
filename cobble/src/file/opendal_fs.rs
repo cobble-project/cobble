@@ -340,8 +340,8 @@ fn opendal_options(
 
 impl FileSystem for OpendalFileSystem {
     fn supports_atomic_replace(&self) -> bool {
-        // Only local Unix rename is guaranteed to atomically replace its destination.
-        cfg!(unix) && self.op.info().scheme() == "fs"
+        // Local FS uses native rename on Unix and MoveFileExW replacement on Windows.
+        self.op.info().scheme() == "fs"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -510,7 +510,10 @@ impl FileSystem for OpendalFileSystem {
             match rename_result {
                 Ok(()) => Ok(()),
                 Err(rename_err) => {
-                    if rename_err.kind() == ErrorKind::Unsupported {
+                    // Never weaken an advertised atomic replacement into copy + delete.
+                    if rename_err.kind() == ErrorKind::Unsupported
+                        && !self.supports_atomic_replace()
+                    {
                         let copy_result: opendal::Result<Metadata> = self.op.copy(from, to).await;
                         copy_result.map_err(|copy_err| {
                             Error::IoError(format!(
