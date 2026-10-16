@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 900" role="img" aria-labelledby="rescale-handoff-title rescale-handoff-desc">
+  <title id="rescale-handoff-title">Rescale changes ownership, not the key range</title>
+  <desc id="rescale-handoff-desc">Read from top to bottom: A initially owns buckets 0–511 and B owns 512–1023; after preparing C from B and shrinking all shards, A owns 0–341, 342–511 is in handoff, B owns 512–683 and C owns 684–1023; expanding B gives it 342–683, then a new global snapshot is published before traffic resumes.</desc>
+  <defs>
+    <pattern id="rescale-handoff-hatch" width="12" height="12" patternUnits="userSpaceOnUse">
+      <rect width="12" height="12" fill="#ffffff"/>
+      <path d="M-4 4 L4 -4 M0 12 L12 0 M8 16 L16 8" fill="none" stroke="#ded6cb" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #302d28; }
+    .title { font-family: Georgia, serif; font-size: 32px; }
+    .body { font-size: 20px; fill: #655f55; }
+    .label { font-size: 24px; font-weight: 600; }
+    .range { font-size: 20px; }
+    .step { font-size: 20px; font-weight: 600; }
+    .border { fill: none; stroke: #aaa396; stroke-width: 1.2; }
+    .divider { fill: none; stroke: #faf8f3; stroke-width: 2.5; }
+    .handoff-edge { fill: none; stroke: #b2a28d; stroke-width: 1.2; }
+    .river-edge { fill: none; stroke: #a9a293; stroke-width: 1.2; }
+  </style>
+  <rect width="1120" height="900" fill="#faf8f3"/>
+  <text x="40" y="60" class="title">Rescale changes ownership, not the key range</text>
+  <text x="40" y="100" class="body">Start from a materialized global snapshot. Keep reads and writes paused.</text>
+  <text x="40" y="144" class="body">Prepare C from B’s snapshot with a fresh identity before shrinking.</text>
+
+  <text x="208" y="208" class="body">Key range · fixed bucket space</text>
+  <text x="1072" y="208" class="body" text-anchor="end">0–1023</text>
+
+  <!-- Fixed horizontal scale: x = 208 + bucket boundary × 864 / 1024.
+       Curves interpolate ownership boundaries, not movements of keys.
+       Each range bar is partitioned in proportion to the bucket counts. -->
+  <g id="rescale-handoff-shrink-bands">
+    <path d="M208 316 H640 C640 396 496.5625 396 496.5625 476 H208 Z" fill="#e9e4da" fill-opacity="0.72"/>
+    <path d="M640 316 V476 H496.5625 C496.5625 396 640 396 640 316 Z" fill="url(#rescale-handoff-hatch)"/>
+    <path d="M640 316 H1072 C1072 396 785.125 396 785.125 476 H640 Z" fill="#dbe6ea" fill-opacity="0.72"/>
+    <path d="M1072 316 V476 H785.125 C785.125 396 1072 396 1072 316 Z" fill="#d1c7b7" fill-opacity="0.72"/>
+    <path d="M640 476 V316 C640 396 496.5625 396 496.5625 476" class="handoff-edge"/>
+    <path d="M1072 316 C1072 396 785.125 396 785.125 476" class="river-edge"/>
+  </g>
+  <g id="rescale-handoff-expand-bands">
+    <path d="M208 556 H496.5625 V716 H208 Z" fill="#e9e4da" fill-opacity="0.72"/>
+    <path d="M496.5625 556 H640 C640 636 496.5625 636 496.5625 716 Z" fill="url(#rescale-handoff-hatch)"/>
+    <path d="M640 556 H785.125 V716 H496.5625 C496.5625 636 640 636 640 556 Z" fill="#dbe6ea" fill-opacity="0.72"/>
+    <path d="M785.125 556 H1072 V716 H785.125 Z" fill="#d1c7b7" fill-opacity="0.72"/>
+    <path d="M496.5625 556 V716 C496.5625 636 640 636 640 556" class="handoff-edge"/>
+    <path d="M785.125 556 V716" class="river-edge"/>
+  </g>
+
+  <text x="40" y="268" class="step">1 · Initial</text>
+  <text x="40" y="300" class="body">2 shards</text>
+  <g id="rescale-handoff-initial">
+    <rect x="208" y="236" width="432" height="80" fill="#e9e4da"/>
+    <rect x="640" y="236" width="432" height="80" fill="#dbe6ea"/>
+    <rect x="208" y="236" width="864" height="80" class="border"/>
+    <path d="M640 236 V316" class="divider"/>
+    <text x="424" y="268" class="label" text-anchor="middle">Shard A</text>
+    <text x="424" y="300" class="range" text-anchor="middle">0–511</text>
+    <text x="856" y="268" class="label" text-anchor="middle">Shard B</text>
+    <text x="856" y="300" class="range" text-anchor="middle">512–1023</text>
+  </g>
+
+  <text x="40" y="508" class="step">2 · Shrink all</text>
+  <text x="40" y="540" class="body">A, B and C</text>
+  <g id="rescale-handoff-shrunk">
+    <rect x="208" y="476" width="288.5625" height="80" fill="#e9e4da"/>
+    <rect x="496.5625" y="476" width="143.4375" height="80" fill="url(#rescale-handoff-hatch)"/>
+    <rect x="640" y="476" width="145.125" height="80" fill="#dbe6ea"/>
+    <rect x="785.125" y="476" width="286.875" height="80" fill="#d1c7b7"/>
+    <rect x="208" y="476" width="864" height="80" class="border"/>
+    <path d="M496.5625 476 V556 M640 476 V556 M785.125 476 V556" class="divider"/>
+    <text x="352.28125" y="508" class="label" text-anchor="middle">Shard A</text>
+    <text x="352.28125" y="540" class="range" text-anchor="middle">0–341</text>
+    <text x="568.28125" y="508" class="step" text-anchor="middle">In handoff</text>
+    <text x="568.28125" y="540" class="range" text-anchor="middle">342–511</text>
+    <text x="712.5625" y="508" class="label" text-anchor="middle">Shard B</text>
+    <text x="712.5625" y="540" class="range" text-anchor="middle">512–683</text>
+    <text x="928.5625" y="508" class="label" text-anchor="middle">Shard C</text>
+    <text x="928.5625" y="540" class="range" text-anchor="middle">684–1023</text>
+  </g>
+
+  <text x="40" y="748" class="step">3 · Expand B</text>
+  <text x="40" y="780" class="body">3 shards</text>
+  <g id="rescale-handoff-target">
+    <rect x="208" y="716" width="288.5625" height="80" fill="#e9e4da"/>
+    <rect x="496.5625" y="716" width="288.5625" height="80" fill="#dbe6ea"/>
+    <rect x="785.125" y="716" width="286.875" height="80" fill="#d1c7b7"/>
+    <rect x="208" y="716" width="864" height="80" class="border"/>
+    <path d="M496.5625 716 V796 M785.125 716 V796" class="divider"/>
+    <text x="352.28125" y="748" class="label" text-anchor="middle">Shard A</text>
+    <text x="352.28125" y="780" class="range" text-anchor="middle">0–341</text>
+    <text x="640.84375" y="748" class="label" text-anchor="middle">Shard B</text>
+    <text x="640.84375" y="780" class="range" text-anchor="middle">342–683</text>
+    <text x="928.5625" y="748" class="label" text-anchor="middle">Shard C</text>
+    <text x="928.5625" y="780" class="range" text-anchor="middle">684–1023</text>
+  </g>
+  <text x="208" y="852" class="step">Publish a new global snapshot, then resume traffic.</text>
+</svg>
