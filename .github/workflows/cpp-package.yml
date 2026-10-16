@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing GitHub release tag to receive the C++ binaries (for example, v0.5.2)
+        description: Existing GitHub release tag to receive the C++ binaries (for example, v0.5.3)
         required: true
         type: string
   release:

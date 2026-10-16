@@ -134,7 +134,7 @@ pytest cobble-binding/cobble-python/tests
 Publishing a GitHub Release runs `python-package.yml`: it builds and smoke-tests
 the platform wheels, builds the source distribution, then uploads them to PyPI
 as `pycobble` and attaches them to the GitHub Release. The release tag must match
-the workspace version (for example, `v0.5.2`). Manual workflow runs only build
+the workspace version (for example, `v0.5.3`). Manual workflow runs only build
 artifacts and do not publish. Pre-release GitHub Releases also trigger publishing;
 use a pre-release package version and matching tag for those.
 

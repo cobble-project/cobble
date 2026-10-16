@@ -14,7 +14,7 @@ Add `cobble` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cobble = "0.5.2"
+cobble = "0.5.3"
 ```
 
 Cobble uses Apache OpenDAL for volume backends.
@@ -34,7 +34,7 @@ Optional remote/storage-service features exposed by Cobble are:
 
 ```toml
 [dependencies]
-cobble = { version = "0.5.2", default-features = false, features = ["storage-s3"] }
+cobble = { version = "0.5.3", default-features = false, features = ["storage-s3"] }
 ```
 
 - Enable all optional remote/storage-service backends: `storage-all`
