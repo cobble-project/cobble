@@ -4,6 +4,7 @@
 // Typed get returns Object[] where each element is null | byte[] | byte[][].
 // Typed scan cursor yields structured batches with mixed column types.
 
+use crate::db::{complete_snapshot_json_future, shard_snapshot_json};
 use crate::metrics::metrics_json;
 use crate::structured_read_options::structured_read_options_from_handle_or_throw;
 use crate::structured_scan_options::{
@@ -12,8 +13,7 @@ use crate::structured_scan_options::{
 };
 use crate::structured_write_options::structured_write_options_from_handle_or_throw;
 use crate::util::{
-    FrameError, byte_array_class, complete_future_exceptionally, complete_future_with_cobble_error,
-    complete_future_with_string, decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref,
+    FrameError, byte_array_class, decode_bucket_ranges, decode_java_bytes, decode_java_bytes_ref,
     decode_java_string, decode_multi_get_keys, decode_optional_java_string,
     decode_packed_multi_get_keys, decode_recovery_mode, decode_u16, decode_u64_from_jlong,
     expand_storage_mode, new_object_array, object_array_class, object_class, parse_config_json,
@@ -28,8 +28,7 @@ use cobble_binding::structured::{
 };
 use cobble_binding::{Config, RecoveryMode};
 use jni::JNIEnv;
-use jni::JavaVM;
-use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
 
 pub(crate) enum StructuredSchemaBuilderHandle {
@@ -4400,33 +4399,4 @@ fn build_shard_snapshot_payload(
         .shard_snapshot_metadata(snapshot_id)
         .map_err(|err| err.to_string())?;
     Ok(shard_snapshot_json(&input))
-}
-
-fn shard_snapshot_json(input: &cobble_binding::ShardSnapshotMetadata) -> String {
-    serde_json::to_string(input).expect("snapshot metadata is serializable")
-}
-
-fn complete_snapshot_json_future(
-    vm: &JavaVM,
-    future: &GlobalRef,
-    result: cobble_binding::Result<String>,
-) {
-    let mut env = match vm.attach_current_thread() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    match result {
-        Ok(json) => {
-            let _ = complete_future_with_string(&mut env, future.as_obj(), &json).or_else(|_| {
-                complete_future_exceptionally(
-                    &mut env,
-                    future.as_obj(),
-                    "failed to allocate json string",
-                )
-            });
-        }
-        Err(err) => {
-            let _ = complete_future_with_cobble_error(&mut env, future.as_obj(), &err);
-        }
-    }
 }

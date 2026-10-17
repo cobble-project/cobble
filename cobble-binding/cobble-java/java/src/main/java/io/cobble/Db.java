@@ -1260,6 +1260,12 @@ public final class Db extends NativeObject {
                 snapshotId, snapshotJsonFuture.thenApply(ShardSnapshot::fromJson));
     }
 
+    /** Export a completed snapshot into independent destination storage. */
+    public ExportSnapshotHandle exportSnapshot(
+            long snapshotId, Config.VolumeDescriptor destination) {
+        return ExportSnapshotHandle.start(nativeHandle, snapshotId, destination, false);
+    }
+
     /**
      * Trigger snapshot creation and block until snapshot manifest is materialized.
      *

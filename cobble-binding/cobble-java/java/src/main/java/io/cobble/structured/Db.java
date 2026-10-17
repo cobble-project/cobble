@@ -1365,6 +1365,12 @@ public final class Db extends NativeObject {
                 snapshotId, snapshotJsonFuture.thenApply(ShardSnapshot::fromJson));
     }
 
+    /** Export a completed snapshot into independent destination storage. */
+    public io.cobble.ExportSnapshotHandle exportSnapshot(
+            long snapshotId, Config.VolumeDescriptor destination) {
+        return io.cobble.ExportSnapshotHandle.start(nativeHandle, snapshotId, destination, true);
+    }
+
     /** Trigger snapshot creation and block until manifest is materialized. */
     public ShardSnapshot snapshot() {
         try {

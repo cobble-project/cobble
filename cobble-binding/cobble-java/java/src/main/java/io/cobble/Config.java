@@ -259,6 +259,11 @@ public final class Config {
     }
 
     public static final class VolumeDescriptor {
+        /** Serialize this destination with the same storage field mapping as Config. */
+        String toJson() {
+            return GSON.toJson(this);
+        }
+
         /** Volume base directory URL/path. */
         public String baseDir;
 

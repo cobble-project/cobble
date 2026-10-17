@@ -23,6 +23,7 @@ mod reader;
 mod scan;
 mod schema;
 mod single_db;
+mod snapshot_export;
 mod snapshot_tools;
 mod structured;
 mod structured_read_options;
