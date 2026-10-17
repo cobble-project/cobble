@@ -1,5 +1,5 @@
 use crate::error::Error;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,70 @@ impl<T: RandomAccessFile + ?Sized> ReadAllFile for T {
 
 pub trait SequentialWriteFile: File + Send {
     fn write(&mut self, data: &[u8]) -> Result<usize, Error>;
+}
+
+const COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) fn write_all<W: SequentialWriteFile + ?Sized>(
+    writer: &mut W,
+    data: &[u8],
+) -> Result<(), Error> {
+    write_all_with(writer, data, &mut || Ok(()), &mut |_| {})
+}
+
+fn write_all_with<W: SequentialWriteFile + ?Sized>(
+    writer: &mut W,
+    mut data: &[u8],
+    check_cancelled: &mut impl FnMut() -> Result<(), Error>,
+    progress: &mut impl FnMut(u64),
+) -> Result<(), Error> {
+    while !data.is_empty() {
+        check_cancelled()?;
+        let written = writer.write(data)?;
+        if written == 0 || written > data.len() {
+            return Err(Error::IoError(
+                "File write returned an invalid byte count".into(),
+            ));
+        }
+        progress(written as u64);
+        data = &data[written..];
+    }
+    Ok(())
+}
+
+/// Copy bounded chunks and stop the writer before the caller can clean up its destination.
+/// Ownership, cancellation policy, and physical cleanup remain with the caller.
+pub(crate) fn copy_file_contents_and_close<R, W>(
+    source: &R,
+    writer: &mut W,
+    mut check_cancelled: impl FnMut() -> Result<(), Error>,
+    mut progress: impl FnMut(u64),
+) -> Result<(), Error>
+where
+    R: RandomAccessFile + ?Sized,
+    W: SequentialWriteFile + ?Sized,
+{
+    let result = (|| {
+        let source_size = source.size();
+        let mut offset = 0;
+        while offset < source_size {
+            check_cancelled()?;
+            let chunk = COPY_CHUNK_BYTES.min(source_size - offset);
+            let bytes = source.read_at(offset, chunk)?;
+            if bytes.is_empty() || bytes.len() > chunk {
+                return Err(Error::IoError(
+                    "File read returned an invalid byte count".into(),
+                ));
+            }
+            write_all_with(writer, &bytes, &mut check_cancelled, &mut progress)?;
+            offset += bytes.len();
+        }
+        check_cancelled()
+    })();
+    let close_result = writer.close();
+    result?;
+    close_result?;
+    check_cancelled()
 }
 
 // Implement File for Box<dyn RandomAccessFile>
@@ -382,11 +446,22 @@ impl<W: SequentialWriteFile> BufferedWriter<W> {
             return Ok(());
         }
 
-        let data = self.buffer.split();
-        let len = data.len();
-        self.inner.write(&data)?;
-        self.offset += len;
-        Ok(())
+        let mut written = 0;
+        let result = write_all_with(
+            &mut self.inner,
+            &self.buffer,
+            &mut || Ok(()),
+            &mut |count| {
+                written += count as usize;
+            },
+        );
+        if result.is_ok() {
+            self.buffer.clear();
+        } else {
+            self.buffer.advance(written);
+        }
+        self.offset += written;
+        result
     }
 
     pub fn offset(&self) -> usize {
@@ -396,13 +471,9 @@ impl<W: SequentialWriteFile> BufferedWriter<W> {
 
 impl<W: SequentialWriteFile> File for BufferedWriter<W> {
     fn close(&mut self) -> Result<(), Error> {
-        if !self.buffer.is_empty() {
-            let data = self.buffer.split();
-            let len = data.len();
-            self.inner.write(&data)?;
-            self.offset += len;
-        }
-        self.inner.close()
+        let flush_result = self.flush();
+        let close_result = self.inner.close();
+        flush_result.and(close_result)
     }
 
     fn size(&self) -> usize {

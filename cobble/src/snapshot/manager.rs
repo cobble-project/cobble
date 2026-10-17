@@ -23,7 +23,7 @@ use crate::time::TimeProvider;
 use crate::vlog::VlogVersion;
 use log::warn;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::RangeInclusive;
+use std::ops::{Deref, RangeInclusive};
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
@@ -33,6 +33,29 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinSet;
 
 const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) struct SnapshotUploadRuntime(Option<Runtime>);
+
+impl Deref for SnapshotUploadRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        self.0.as_ref().expect("snapshot runtime is alive")
+    }
+}
+
+impl Drop for SnapshotUploadRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            // A protected export can outlive a forced DB close and release the last owner here.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                runtime.shutdown_background();
+            } else {
+                drop(runtime);
+            }
+        }
+    }
+}
 
 type SnapshotSourceFile = (
     u64,
@@ -55,7 +78,7 @@ pub(crate) struct SnapshotManager {
     materialize_tx: Arc<Mutex<Option<mpsc::Sender<u64>>>>,
     materialize_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     materialize_done: Arc<Condvar>,
-    upload_runtime: Arc<Runtime>,
+    upload_runtime: Arc<SnapshotUploadRuntime>,
     time_provider: Arc<dyn TimeProvider>,
 }
 
@@ -88,11 +111,84 @@ struct SnapshotManagerState {
     // Includes self-reference while the snapshot retains itself.
     incremental_references: HashMap<u64, HashSet<u64>>,
     // Map<snapshot_id, number_of_references_pointing_to_it>.
-    // Counts self-reference and incoming references from incremental children.
+    // Counts self-reference, incoming incremental children, and temporary export pins.
     incremental_ref_counts: HashMap<u64, usize>,
     // Reference counts for schema files used by live snapshots.
     schema_ref_counts: HashMap<u64, usize>,
     in_flight: usize,
+}
+
+pub(crate) struct SnapshotExportGuard {
+    manager: SnapshotManager,
+    snapshot_id: u64,
+}
+
+impl Drop for SnapshotExportGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.manager.release_export_pin(self.snapshot_id) {
+            warn!(
+                "failed to release snapshot export pin {}: {}",
+                self.snapshot_id, error
+            );
+        }
+    }
+}
+
+impl SnapshotManagerState {
+    fn collect_unreferenced_snapshots(
+        &mut self,
+        mut pending: Vec<u64>,
+    ) -> (Vec<Arc<DbSnapshot>>, HashSet<String>) {
+        let mut removed = Vec::new();
+        while let Some(snapshot_id) = pending.pop() {
+            if self
+                .incremental_ref_counts
+                .get(&snapshot_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
+                continue;
+            }
+            self.incremental_ref_counts.remove(&snapshot_id);
+            let referenced = self
+                .incremental_references
+                .remove(&snapshot_id)
+                .unwrap_or_default();
+            self.completed.remove(&snapshot_id);
+            self.retained.remove(&snapshot_id);
+            let Some(snapshot) = self.snapshots.remove(&snapshot_id) else {
+                continue;
+            };
+            decrement_schema_ref_counts(
+                &mut self.schema_ref_counts,
+                &snapshot.referenced_schema_ids,
+            );
+            for referenced_id in referenced {
+                if referenced_id == snapshot_id {
+                    continue;
+                }
+                if let Some(count) = self.incremental_ref_counts.get_mut(&referenced_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        pending.push(referenced_id);
+                    }
+                }
+            }
+            removed.push(snapshot);
+        }
+        let live_active_paths = self
+            .snapshots
+            .values()
+            .flat_map(|snapshot| {
+                snapshot
+                    .active_memtable_data
+                    .iter()
+                    .map(|segment| segment.path.clone())
+            })
+            .collect();
+        (removed, live_active_paths)
+    }
 }
 
 fn suggested_base_fallback_id(
@@ -328,7 +424,7 @@ impl SnapshotManager {
             materialize_tx: Arc::new(Mutex::new(None)),
             materialize_worker: Arc::new(Mutex::new(None)),
             materialize_done: Arc::new(Condvar::new()),
-            upload_runtime: Arc::new(upload_runtime),
+            upload_runtime: Arc::new(SnapshotUploadRuntime(Some(upload_runtime))),
             time_provider,
         }
     }
@@ -553,6 +649,54 @@ impl SnapshotManager {
         }
         state.retained.insert(id);
         true
+    }
+
+    pub(crate) fn upload_runtime(&self) -> Arc<SnapshotUploadRuntime> {
+        Arc::clone(&self.upload_runtime)
+    }
+
+    /// Protect the complete dependency chain without changing the caller's retention policy.
+    pub(crate) fn pin_completed_snapshot(&self, id: u64) -> Result<SnapshotExportGuard> {
+        let mut state = self.state.lock().unwrap();
+        if !state.completed.contains(&id)
+            || !state
+                .snapshots
+                .get(&id)
+                .is_some_and(|snapshot| snapshot.is_published())
+        {
+            return Err(Error::InvalidState(format!(
+                "Snapshot {id} is not published"
+            )));
+        }
+        let count = state.incremental_ref_counts.entry(id).or_default();
+        *count = count.checked_add(1).ok_or_else(|| {
+            Error::InvalidState(format!("Snapshot {id} reference count exhausted"))
+        })?;
+        Ok(SnapshotExportGuard {
+            manager: self.clone(),
+            snapshot_id: id,
+        })
+    }
+
+    fn release_export_pin(&self, id: u64) -> Result<()> {
+        let (removed, live_active_paths) = {
+            let mut state = self.state.lock().unwrap();
+            let count = state.incremental_ref_counts.get_mut(&id).ok_or_else(|| {
+                Error::InvalidState(format!("Snapshot {id} export reference disappeared"))
+            })?;
+            *count = count.checked_sub(1).ok_or_else(|| {
+                Error::InvalidState(format!("Snapshot {id} export reference underflow"))
+            })?;
+            if *count > 0 {
+                return Ok(());
+            }
+            state.collect_unreferenced_snapshots(vec![id])
+        };
+        if removed.is_empty() {
+            Ok(())
+        } else {
+            self.cleanup_removed_snapshots(removed, live_active_paths)
+        }
     }
 
     pub(crate) fn has_live_external_lease(&self, export_id: &str) -> bool {
@@ -1119,60 +1263,18 @@ impl SnapshotManager {
                     pending.push(id);
                 }
             }
-            let mut removed_snapshots = Vec::new();
-            // recursively remove snapshots that no longer have incoming references
-            while let Some(snapshot_id) = pending.pop() {
-                if state
-                    .incremental_ref_counts
-                    .get(&snapshot_id)
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-                {
-                    continue;
-                }
-                state.incremental_ref_counts.remove(&snapshot_id);
-                let referenced = state
-                    .incremental_references
-                    .remove(&snapshot_id)
-                    .unwrap_or_default();
-                state.completed.remove(&snapshot_id);
-                state.retained.remove(&snapshot_id);
-                let Some(snapshot) = state.snapshots.remove(&snapshot_id) else {
-                    continue;
-                };
-                decrement_schema_ref_counts(
-                    &mut state.schema_ref_counts,
-                    &snapshot.referenced_schema_ids,
-                );
-                for referenced_id in referenced {
-                    if referenced_id == snapshot_id {
-                        continue;
-                    }
-                    if let Some(ref_count) = state.incremental_ref_counts.get_mut(&referenced_id) {
-                        *ref_count = ref_count.saturating_sub(1);
-                        if *ref_count == 0 {
-                            pending.push(referenced_id);
-                        }
-                    }
-                }
-                removed_snapshots.push(snapshot);
-            }
-            (
-                removed_snapshots,
-                removed_requested_snapshot,
-                state
-                    .snapshots
-                    .values()
-                    .flat_map(|snapshot| {
-                        snapshot
-                            .active_memtable_data
-                            .iter()
-                            .map(|segment| segment.path.clone())
-                    })
-                    .collect::<HashSet<_>>(),
-            )
+            let (removed, live_active_paths) = state.collect_unreferenced_snapshots(pending);
+            (removed, removed_requested_snapshot, live_active_paths)
         };
+        self.cleanup_removed_snapshots(removed_snapshots, live_active_data_paths)?;
+        Ok(removed_requested_snapshot)
+    }
+
+    fn cleanup_removed_snapshots(
+        &self,
+        removed_snapshots: Vec<Arc<DbSnapshot>>,
+        live_active_data_paths: HashSet<String>,
+    ) -> Result<()> {
         let mut removed_active_data_paths = HashSet::new();
         for snapshot in &removed_snapshots {
             self.file_manager
@@ -1192,7 +1294,7 @@ impl SnapshotManager {
                 .for_each(|file| file.dereference());
         }
         self.cleanup_expired_schema_files()?;
-        Ok(removed_requested_snapshot)
+        Ok(())
     }
 
     fn cleanup_expired_schema_files(&self) -> Result<()> {

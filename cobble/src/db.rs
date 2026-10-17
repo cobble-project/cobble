@@ -45,7 +45,10 @@ use crate::util::{build_commit_short_id, build_version_string, init_logging};
 mod rescale;
 #[path = "db_restore.rs"]
 mod restore;
+#[path = "db_snapshot_export.rs"]
+mod snapshot_export;
 pub use restore::RecoveryMode;
+pub use snapshot_export::ExportSnapshotHandle;
 
 #[derive(Clone)]
 struct RecoveredWalCheckpoint {

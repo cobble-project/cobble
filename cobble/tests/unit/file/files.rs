@@ -306,3 +306,216 @@ fn test_read_ahead_from_tokio_context() {
         assert_eq!(&reader.read_at(8, 2).unwrap()[..], b"89");
     });
 }
+
+struct ShortReader {
+    data: Bytes,
+    limit: usize,
+}
+
+impl File for ShortReader {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl RandomAccessFile for ShortReader {
+    fn read_at(&self, offset: usize, size: usize) -> Result<Bytes, Error> {
+        assert!(size <= COPY_CHUNK_BYTES);
+        Ok(self.data.slice(offset..offset + size.min(self.limit)))
+    }
+}
+
+#[derive(Default)]
+struct ShortWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    fail_after: Option<usize>,
+    fail_close: bool,
+    close_calls: usize,
+}
+
+impl File for ShortWriter {
+    fn close(&mut self) -> Result<(), Error> {
+        self.close_calls += 1;
+        if self.fail_close {
+            Err(Error::IoError("injected close error".into()))
+        } else {
+            Ok(())
+        }
+    }
+    fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl SequentialWriteFile for ShortWriter {
+    fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        if self
+            .fail_after
+            .is_some_and(|limit| self.bytes.len() >= limit)
+        {
+            return Err(Error::IoError("injected write error".into()));
+        }
+        let count = data.len().min(self.limit).min(
+            self.fail_after
+                .map_or(usize::MAX, |limit| limit - self.bytes.len()),
+        );
+        self.bytes.extend_from_slice(&data[..count]);
+        Ok(count)
+    }
+}
+
+#[test]
+fn copy_file_handles_short_reads_writes_and_actual_progress() {
+    let source = ShortReader {
+        data: Bytes::from_static(b"0123456789"),
+        limit: 3,
+    };
+    let mut writer = ShortWriter {
+        limit: 2,
+        ..Default::default()
+    };
+    let mut progress = Vec::new();
+    copy_file_contents_and_close(
+        &source,
+        &mut writer,
+        || Ok(()),
+        |count| progress.push(count),
+    )
+    .unwrap();
+    assert_eq!(writer.bytes, source.data);
+    assert_eq!(progress, [2, 1, 2, 1, 2, 1, 1]);
+    assert_eq!(writer.close_calls, 1);
+}
+
+#[test]
+fn copy_file_zero_progress_preserves_primary_error_and_closes() {
+    for (read_limit, write_limit) in [(0, 2), (2, 0)] {
+        let source = ShortReader {
+            data: Bytes::from_static(b"data"),
+            limit: read_limit,
+        };
+        let mut writer = ShortWriter {
+            limit: write_limit,
+            fail_close: true,
+            ..Default::default()
+        };
+        let error =
+            copy_file_contents_and_close(&source, &mut writer, || Ok(()), |_| {}).unwrap_err();
+        assert!(error.to_string().contains("invalid byte count"));
+        assert_eq!(writer.close_calls, 1);
+    }
+}
+
+#[test]
+fn copy_file_checks_cancellation_between_partial_writes_and_after_close() {
+    let source = ShortReader {
+        data: Bytes::from_static(b"data"),
+        limit: 4,
+    };
+    let mut writer = ShortWriter {
+        limit: 2,
+        ..Default::default()
+    };
+    let cancelled = AtomicBool::new(false);
+    let error = copy_file_contents_and_close(
+        &source,
+        &mut writer,
+        || {
+            if cancelled.load(Ordering::SeqCst) {
+                Err(Error::CancelledError("cancelled".into()))
+            } else {
+                Ok(())
+            }
+        },
+        |_| cancelled.store(true, Ordering::SeqCst),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::CancelledError(_)));
+    assert_eq!(writer.bytes, b"da");
+    assert_eq!(writer.close_calls, 1);
+
+    let empty = ShortReader {
+        data: Bytes::new(),
+        limit: 1,
+    };
+    let mut checks = 0;
+    let error = copy_file_contents_and_close(
+        &empty,
+        &mut writer,
+        || {
+            checks += 1;
+            if checks == 2 {
+                Err(Error::CancelledError("cancelled after close".into()))
+            } else {
+                Ok(())
+            }
+        },
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::CancelledError(_)));
+    assert_eq!(writer.close_calls, 2);
+}
+
+#[test]
+fn buffered_writer_partial_failure_retry_does_not_duplicate_written_prefix() {
+    let inner = ShortWriter {
+        limit: 2,
+        fail_after: Some(3),
+        ..Default::default()
+    };
+    let mut writer = BufferedWriter::new(inner, 8);
+    writer.write(b"abcdef").unwrap();
+    assert!(writer.flush().is_err());
+    assert_eq!(writer.inner.bytes, b"abc");
+    assert_eq!(writer.offset(), 6);
+    writer.inner.fail_after = None;
+    writer.close().unwrap();
+    assert_eq!(writer.inner.bytes, b"abcdef");
+    assert_eq!(writer.inner.close_calls, 1);
+}
+
+#[test]
+fn buffered_writer_full_flush_retains_buffer_capacity() {
+    let inner = ShortWriter {
+        limit: 2,
+        ..Default::default()
+    };
+    let mut writer = BufferedWriter::new(inner, 8);
+    let capacity = writer.buffer.capacity();
+    for _ in 0..2 {
+        writer.write(b"abcdefgh").unwrap();
+        writer.flush().unwrap();
+        assert!(writer.buffer.is_empty());
+        assert_eq!(writer.buffer.capacity(), capacity);
+    }
+    assert_eq!(writer.inner.bytes, b"abcdefghabcdefgh");
+    writer.close().unwrap();
+}
+
+#[test]
+fn buffered_writer_closes_after_flush_failure_and_preserves_primary_error() {
+    let inner = ShortWriter {
+        limit: 2,
+        fail_after: Some(3),
+        fail_close: true,
+        ..Default::default()
+    };
+    let mut writer = BufferedWriter::new(inner, 8);
+    writer.write(b"abcdef").unwrap();
+    assert!(
+        writer
+            .close()
+            .unwrap_err()
+            .to_string()
+            .contains("injected write error")
+    );
+    assert_eq!(writer.inner.close_calls, 1);
+    assert_eq!(writer.inner.bytes, b"abc");
+    assert!(writer.close().is_err());
+    assert_eq!(writer.inner.bytes, b"abc");
+}

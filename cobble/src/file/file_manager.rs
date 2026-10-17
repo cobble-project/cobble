@@ -14,7 +14,9 @@ use crate::Config;
 use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
 use crate::file::file_system::{FastCopyDestination, FileSystem, FileSystemRegistry};
-use crate::file::files::{File, RandomAccessFile, SequentialWriteFile};
+use crate::file::files::{
+    File, RandomAccessFile, SequentialWriteFile, copy_file_contents_and_close,
+};
 use crate::file::logical_file::{
     FileCommitState, LogicalFile, ReplicaId, ReplicaLifecycle, ReplicaOrigin,
 };
@@ -37,7 +39,6 @@ const SNAPSHOT_DIR: &str = "snapshot";
 const SCHEMA_DIR: &str = "schema";
 const DEFAULT_BASE_FILE_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_READER_CACHE_CAPACITY: usize = 512;
-const SNAPSHOT_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const VLOG_FILE_PRIORITY: u8 = 10;
 const DEFAULT_TRACKED_FILE_PRIORITY: u8 = u8::MAX;
 
@@ -1618,20 +1619,6 @@ impl FileManager {
         }
     }
 
-    pub(crate) fn copy_reader_to_tracked_writer_with_cancel(
-        &self,
-        source: &dyn RandomAccessFile,
-        writer: &mut TrackedWriter,
-        lifecycle_state: Option<&AtomicU8>,
-    ) -> Result<()> {
-        self.copy_reader_to_tracked_writer_with_cancel_and_progress(
-            source,
-            writer,
-            lifecycle_state,
-            &mut |_| {},
-        )
-    }
-
     fn copy_reader_to_tracked_writer_with_cancel_and_progress(
         &self,
         source: &dyn RandomAccessFile,
@@ -1639,27 +1626,20 @@ impl FileManager {
         lifecycle_state: Option<&AtomicU8>,
         progress: &mut dyn FnMut(u64),
     ) -> Result<()> {
-        let source_size = source.size();
-        let mut offset = 0usize;
-        while offset < source_size {
-            if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
-                return Err(Error::CancelledError(
-                    "Snapshot upload cancelled while copying data files".to_string(),
-                ));
-            }
-            let chunk = SNAPSHOT_COPY_CHUNK_BYTES.min(source_size - offset);
-            let bytes = source.read_at(offset, chunk)?;
-            let written = writer.write(bytes.as_ref())?;
-            progress(written as u64);
-            offset += bytes.len();
-        }
-        if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
-            return Err(Error::CancelledError(
-                "Snapshot upload cancelled while copying data files".to_string(),
-            ));
-        }
-        writer.close()?;
-        Ok(())
+        copy_file_contents_and_close(
+            source,
+            writer,
+            || {
+                if lifecycle_state.is_some_and(SnapshotLifecycleState::is_cancelled_raw) {
+                    Err(Error::CancelledError(
+                        "Snapshot upload cancelled while copying data files".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            progress,
+        )
     }
 
     pub(crate) fn transfer_data_file_to_volume(
@@ -1719,6 +1699,44 @@ impl FileManager {
             progress,
         )?;
         Ok(target)
+    }
+
+    /// Copies immutable bytes without registering a destination replica in this manager.
+    pub(crate) fn copy_file_to_external(
+        &self,
+        source_path: &str,
+        destination_fs: &dyn FileSystem,
+        destination_path: &str,
+        mut check_cancelled: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        check_cancelled()?;
+        let (source_volume, source_relative) = self.resolve_volume_path(source_path)?;
+        let source = source_volume.fs().open_read(&source_relative)?;
+        let destination = FastCopyDestination::new(destination_fs, destination_path);
+        if source_volume
+            .fs()
+            .can_fast_copy_to(&source_relative, &destination)
+        {
+            if source_volume
+                .fs()
+                .fast_copy_to(&source_relative, &destination)
+                .is_ok()
+            {
+                let copied = destination_fs.open_read(destination_path)?;
+                if copied.size() != source.size() {
+                    return Err(Error::IoError(
+                        "Snapshot export fast-copy size mismatch".into(),
+                    ));
+                }
+                return check_cancelled();
+            }
+            // The path belongs exclusively to the export, including a failed fast-copy attempt.
+            if destination_fs.exists(destination_path)? {
+                destination_fs.delete(destination_path)?;
+            }
+        }
+        let mut writer = destination_fs.open_write(destination_path)?;
+        copy_file_contents_and_close(source.as_ref(), writer.as_mut(), check_cancelled, |_| {})
     }
 
     /// Registers an existing data file for restore operations.

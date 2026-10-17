@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::file::files::{File, ReadAllFile, SequentialWriteFile};
+use crate::file::files::{File, ReadAllFile, SequentialWriteFile, write_all};
 use bytes::Bytes;
 use crc32fast::Hasher;
 
@@ -75,55 +75,49 @@ impl<R: ReadAllFile> MetadataReader<R> {
 }
 
 pub(crate) struct MetadataWriter<W: SequentialWriteFile> {
-    inner: Option<W>,
+    inner: W,
     checksum_hasher: Hasher,
-    closed: bool,
+    close_result: Option<Result<()>>,
 }
 
 impl<W: SequentialWriteFile> MetadataWriter<W> {
     pub(crate) fn new(inner: W) -> Self {
         Self {
-            inner: Some(inner),
+            inner,
             checksum_hasher: Hasher::new(),
-            closed: false,
+            close_result: None,
         }
     }
 }
 
 impl<W: SequentialWriteFile> SequentialWriteFile for MetadataWriter<W> {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
-        if self.closed {
+        if self.close_result.is_some() {
             return Err(Error::IoError("Metadata writer already closed".to_string()));
         }
-        match self.inner.as_mut() {
-            Some(inner) => {
-                let written = inner.write(data)?;
-                self.checksum_hasher.update(&data[..written]);
-                Ok(written)
-            }
-            None => Err(Error::IoError("Metadata writer already closed".to_string())),
-        }
+        let written = self.inner.write(data)?;
+        self.checksum_hasher.update(&data[..written]);
+        Ok(written)
     }
 }
 
 impl<W: SequentialWriteFile> File for MetadataWriter<W> {
     fn close(&mut self) -> Result<()> {
-        if self.closed {
-            return Ok(());
+        if let Some(result) = &self.close_result {
+            return result.clone();
         }
-        let Some(inner) = self.inner.as_mut() else {
-            return Ok(());
-        };
         let checksum = std::mem::replace(&mut self.checksum_hasher, Hasher::new()).finalize();
         let trailer = trailer_for_checksum(checksum);
-        inner.write(&trailer)?;
-        inner.close()?;
-        self.closed = true;
-        Ok(())
+        let write_result = write_all(&mut self.inner, &trailer);
+        let close_result = self.inner.close();
+        let result = write_result.and(close_result);
+        // A close attempt is terminal, even if only part of the trailer was written.
+        self.close_result = Some(result.clone());
+        result
     }
 
     fn size(&self) -> usize {
-        self.inner.as_ref().map(|inner| inner.size()).unwrap_or(0)
+        self.inner.size()
     }
 }
 

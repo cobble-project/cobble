@@ -469,6 +469,15 @@ pub(crate) struct ManifestEncodeResult {
     pub(crate) active_memtable_total_size_bytes: u64,
 }
 
+pub(crate) fn encode_manifest_payload<W: SequentialWriteFile>(
+    writer: &mut W,
+    manifest: &ManifestPayload,
+) -> Result<()> {
+    let json = serde_json::to_vec(manifest)
+        .map_err(|err| Error::IoError(format!("Failed to encode manifest: {err}")))?;
+    crate::file::write_all(writer, &json)
+}
+
 pub(crate) fn encode_manifest<W: SequentialWriteFile>(
     writer: &mut BufferedWriter<W>,
     snapshot: &DbSnapshot,
@@ -561,9 +570,7 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
             truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
         })
     };
-    let json = serde_json::to_vec(&manifest)
-        .map_err(|err| Error::IoError(format!("Failed to encode manifest: {}", err)))?;
-    writer.write(&json)?;
+    encode_manifest_payload(writer, &manifest)?;
     let (incremental_base_id, data_size_bytes, active_memtable_total_size_bytes) = match &manifest {
         ManifestPayload::Snapshot(snapshot_manifest) => (
             None,

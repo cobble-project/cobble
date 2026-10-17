@@ -607,7 +607,7 @@ fn test_copy_writer(
 
 #[test]
 #[serial_test::serial(file)]
-fn test_copy_reader_cancels_after_last_write_before_close() {
+fn test_copy_reader_reports_cancellation_after_last_write_and_closes() {
     let (fs, fm) = create_test_file_manager();
     let lifecycle_state = Arc::new(AtomicU8::new(0));
     let (mut writer, data, close_called) =
@@ -616,15 +616,16 @@ fn test_copy_reader_cancels_after_last_write_before_close() {
         data: Bytes::from_static(b"copy-me"),
     };
 
-    let result = fm.copy_reader_to_tracked_writer_with_cancel(
+    let result = fm.copy_reader_to_tracked_writer_with_cancel_and_progress(
         &source,
         &mut writer,
         Some(lifecycle_state.as_ref()),
+        &mut |_| {},
     );
 
     assert!(matches!(result, Err(Error::CancelledError(_))));
     assert_eq!(data.lock().unwrap().as_slice(), b"copy-me");
-    assert!(!close_called.load(Ordering::SeqCst));
+    assert!(close_called.load(Ordering::SeqCst));
     cleanup_test_root();
 }
 
@@ -654,8 +655,13 @@ fn test_copy_reader_closes_after_last_write_without_cancellation() {
         data: Bytes::from_static(b"copy-me"),
     };
 
-    fm.copy_reader_to_tracked_writer_with_cancel(&source, &mut writer, None)
-        .unwrap();
+    fm.copy_reader_to_tracked_writer_with_cancel_and_progress(
+        &source,
+        &mut writer,
+        None,
+        &mut |_| {},
+    )
+    .unwrap();
 
     assert_eq!(data.lock().unwrap().as_slice(), b"copy-me");
     assert!(close_called.load(Ordering::SeqCst));
