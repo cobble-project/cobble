@@ -26,10 +26,18 @@ const FINISHED: u8 = 3;
 
 struct ExportState {
     phase: AtomicU8,
-    result: Mutex<Option<Result<ShardSnapshotMetadata>>>,
+    completion: Mutex<ExportCompletion>,
     completed: Condvar,
     completed_async: Notify,
     cancelled: Notify,
+}
+
+type ExportCallback = Box<dyn FnOnce(Result<ShardSnapshotMetadata>) + Send>;
+
+#[derive(Default)]
+struct ExportCompletion {
+    result: Option<Result<ShardSnapshotMetadata>>,
+    callbacks: Vec<ExportCallback>,
 }
 
 impl ExportState {
@@ -64,11 +72,17 @@ impl ExportState {
     }
 
     fn finish(&self, result: Result<ShardSnapshotMetadata>) {
-        let mut stored = self.result.lock().unwrap();
-        *stored = Some(result);
-        self.phase.store(FINISHED, Ordering::Release);
+        let callbacks = {
+            let mut stored = self.completion.lock().unwrap();
+            stored.result = Some(result.clone());
+            self.phase.store(FINISHED, Ordering::Release);
+            std::mem::take(&mut stored.callbacks)
+        };
         self.completed.notify_all();
         self.completed_async.notify_waiters();
+        for callback in callbacks {
+            callback(result.clone());
+        }
     }
 }
 
@@ -92,12 +106,12 @@ impl ExportSnapshotHandle {
 
     /// Block for the cached result. Do not call on an async runtime worker; use `result` instead.
     pub fn wait(&self) -> Result<ShardSnapshotMetadata> {
-        let mut result = self.state.result.lock().unwrap();
+        let mut completion = self.state.completion.lock().unwrap();
         loop {
-            if let Some(result) = &*result {
+            if let Some(result) = &completion.result {
                 return result.clone();
             }
-            result = self.state.completed.wait(result).unwrap();
+            completion = self.state.completed.wait(completion).unwrap();
         }
     }
 
@@ -107,11 +121,30 @@ impl ExportSnapshotHandle {
             let notified = self.state.completed_async.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(result) = self.state.result.lock().unwrap().clone() {
+            if let Some(result) = self.state.completion.lock().unwrap().result.clone() {
                 return result;
             }
             notified.await;
         }
+    }
+
+    /// Register completion without a waiter thread. Pending callbacks run on the upload blocking
+    /// pool after database access is released; an already-completed result invokes inline.
+    /// Callbacks must not panic.
+    pub fn on_complete(
+        &self,
+        callback: impl FnOnce(Result<ShardSnapshotMetadata>) + Send + 'static,
+    ) {
+        let result = {
+            let mut completion = self.state.completion.lock().unwrap();
+            if let Some(result) = &completion.result {
+                result.clone()
+            } else {
+                completion.callbacks.push(Box::new(callback));
+                return;
+            }
+        };
+        callback(result);
     }
 }
 
@@ -288,7 +321,7 @@ impl Db {
         let schema_manager = Arc::clone(&self.schema_manager);
         let state = Arc::new(ExportState {
             phase: AtomicU8::new(PENDING),
-            result: Mutex::new(None),
+            completion: Mutex::new(ExportCompletion::default()),
             completed: Condvar::new(),
             completed_async: Notify::new(),
             cancelled: Notify::new(),
@@ -314,8 +347,8 @@ impl Db {
                     Error::IoError(format!("Snapshot export pin release failed: {error}"))
                 })
             });
-            state.finish(result);
             drop(access);
+            let _ = tokio::task::spawn_blocking(move || state.finish(result)).await;
             drop(runtime_owner);
         });
         Ok(handle)

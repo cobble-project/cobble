@@ -985,3 +985,36 @@ fn dropping_export_handles_does_not_release_protection_or_abort_copies() {
             .exists()
     );
 }
+
+#[test]
+fn export_completion_callback_can_close_database_and_register_after_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let db = database(&root.path().join("source"));
+    db.put(0, b"key", 0, b"value").unwrap();
+    let snapshot = db.create_snapshot_and_wait("callback close").unwrap();
+    let destination = volume(&root.path().join("destination"));
+    let gate = Arc::new(Gate::default());
+    let fs = Arc::new(TestFs::new(&destination, Some(gate.clone()), false));
+    let handle = db
+        .export_snapshot_to_filesystem(snapshot, destination, Some(fs))
+        .unwrap();
+    gate.wait();
+    let (tx, rx) = std::sync::mpsc::channel();
+    handle.on_complete(move |result| {
+        db.close().unwrap();
+        tx.send(result).unwrap();
+    });
+    gate.release();
+    let exported = rx.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let completed = handle.clone();
+    handle.on_complete(move |result| {
+        assert_eq!(
+            result.unwrap().manifest_path,
+            completed.wait().unwrap().manifest_path
+        );
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(exported.snapshot_id, snapshot);
+}

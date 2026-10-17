@@ -11,9 +11,10 @@ use crate::priority_queue::{
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use cobble::{
-    BytesMergeOperator, ColumnEvolution, Config, Db, DbBuilder, DbIterator, Error, MemtableType,
-    MergeOperatorResolver, ReadOptions, RecoveryMode, Result, ScanOptions, Schema, SchemaBuilder,
-    ShardSnapshotMetadata, TransformSpec, WriteBatch, WriteOptions,
+    BytesMergeOperator, ColumnEvolution, Config, Db, DbBuilder, DbIterator, Error,
+    ExportSnapshotHandle, MemtableType, MergeOperatorResolver, ReadOptions, RecoveryMode, Result,
+    ScanOptions, Schema, SchemaBuilder, ShardSnapshotMetadata, TransformSpec, VolumeDescriptor,
+    WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -2104,6 +2105,15 @@ impl StructuredDb {
 
     pub fn cancel_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         self.db.cancel_snapshot(snapshot_id)
+    }
+
+    /// Export a completed snapshot independently using the kernel upload runtime.
+    pub fn export_snapshot(
+        &self,
+        snapshot_id: u64,
+        destination: VolumeDescriptor,
+    ) -> Result<ExportSnapshotHandle> {
+        self.db.export_snapshot(snapshot_id, destination)
     }
 
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
