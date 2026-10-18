@@ -1,6 +1,8 @@
 //! Coordinator node for global snapshot manifests.
+use crate::config::VolumeDescriptor;
 use crate::coordinator::CoordinatorConfig;
 use crate::coordinator::file::MetadataWriter;
+use crate::db_state::bucket_range_fits_total;
 use crate::error::Error::IoError;
 use crate::error::{Error, Result};
 use crate::file::atomic_replace::{self, ReplaceWriter};
@@ -8,10 +10,11 @@ use crate::file::{
     BufferedWriter, File, FileSystem, FileSystemRegistry, MetadataReader, SequentialWriteFile,
 };
 use crate::paths::{
-    SNAPSHOT_DIR, global_snapshot_current_path, global_snapshot_manifest_path,
-    snapshot_manifest_name,
+    SNAPSHOT_DIR, bucket_snapshot_manifest_path, global_snapshot_current_path,
+    global_snapshot_manifest_path, snapshot_manifest_name,
 };
 use crate::snapshot::ShardSnapshotMetadata;
+use crate::snapshot::export_paths::{append_path, overlaps, storage_url};
 use crate::util::{build_commit_short_id, build_version_string};
 use dashmap::DashSet;
 use log::info;
@@ -129,6 +132,18 @@ impl DbCoordinator {
         Self::build_global_snapshot(total_buckets, shard_snapshots, id)
     }
 
+    /// Assemble an independent export manifest with fixed id zero, without allocating an online id.
+    /// Every bucket must be covered exactly once and all shards must agree on column family ids.
+    pub fn take_exported_global_snapshot(
+        &self,
+        total_buckets: u32,
+        shard_snapshots: Vec<ShardSnapshotMetadata>,
+    ) -> Result<GlobalSnapshotManifest> {
+        let snapshot = Self::build_global_snapshot(total_buckets, shard_snapshots, 0)?;
+        validate_exported_global_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
     pub(crate) fn allocate_snapshot_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -183,22 +198,82 @@ impl DbCoordinator {
     /// Materialize a global snapshot manifest and update the pointer.
     pub fn materialize_global_snapshot(&self, snapshot: &GlobalSnapshotManifest) -> Result<()> {
         let _publication = self.publication.lock().unwrap();
-        let manifest_path = global_snapshot_manifest_path(snapshot.id);
-        let writer = MetadataWriter::new(&manifest_path, &self.fs)?;
-        let mut buffered = BufferedWriter::new(writer, 8192);
-        encode_global_manifest(&mut buffered, snapshot)?;
-        buffered.close()?;
-        self.publish_manifest_pointer(&snapshot_manifest_name(snapshot.id))?;
+        write_global_manifest(&self.fs, snapshot)?;
+        publish_manifest_pointer(&self.fs, &snapshot_manifest_name(snapshot.id))?;
         self.process_retention()?;
         Ok(())
     }
 
+    /// Publish an export into the caller's independent directory, using `snapshot/SNAPSHOT-0`
+    /// and `snapshot/CURRENT`. Shards must already have been exported under `shards/<db_id>`.
+    /// Online ids, CURRENT and retention are untouched. Identical retries are allowed; conflicting
+    /// manifests are rejected, and failures never delete the caller's exported shards.
+    ///
+    /// A destination must have a single active publishing coordinator. Storage aliases not
+    /// represented by filesystem URLs are unsupported, as with shard snapshot exports.
+    pub fn materialize_exported_global_snapshot(
+        &self,
+        snapshot: &GlobalSnapshotManifest,
+        destination: VolumeDescriptor,
+    ) -> Result<()> {
+        validate_exported_global_snapshot(snapshot)?;
+        let destination_url = storage_url(&destination.base_dir)?;
+        for volume in &self.config.volumes {
+            if overlaps(&destination_url, &storage_url(&volume.base_dir)?)? {
+                return Err(Error::ConfigError(
+                    "Global snapshot export destination overlaps online storage".into(),
+                ));
+            }
+        }
+        for shard in &snapshot.shard_snapshots {
+            if shard.db_id.is_empty()
+                || matches!(shard.db_id.as_str(), "." | "..")
+                || shard.db_id.contains('/')
+                || shard.db_id.contains('\\')
+            {
+                return Err(Error::ConfigError(
+                    "Invalid exported shard directory".into(),
+                ));
+            }
+            let expected = append_path(
+                &destination_url,
+                &format!(
+                    "shards/{}",
+                    bucket_snapshot_manifest_path(&shard.db_id, shard.snapshot_id)
+                ),
+            )?;
+            if storage_url(&shard.manifest_path)? != expected {
+                return Err(Error::ConfigError(format!(
+                    "Exported shard manifest must be located at {expected}"
+                )));
+            }
+        }
+        let _publication = self.publication.lock().unwrap();
+        let fs = FileSystemRegistry::new().get_or_register_volume(&destination)?;
+        if let Some(id) = load_latest_snapshot_id(&fs)?
+            && id != 0
+        {
+            return Err(Error::CoordinationError(
+                "Global snapshot export destination has a conflicting CURRENT".into(),
+            ));
+        }
+        let manifest_path = global_snapshot_manifest_path(0);
+        if fs.exists(&manifest_path)? {
+            if read_global_manifest(&fs, 0)? != *snapshot {
+                return Err(Error::CoordinationError(
+                    "Global snapshot export destination has a conflicting manifest".into(),
+                ));
+            }
+        } else {
+            fs.create_dir(SNAPSHOT_DIR)?;
+            write_global_manifest(&fs, snapshot)?;
+        }
+        publish_manifest_pointer(&fs, &snapshot_manifest_name(0))
+    }
+
     /// Load a global snapshot manifest by id.
     pub fn load_global_snapshot(&self, snapshot_id: u64) -> Result<GlobalSnapshotManifest> {
-        let manifest_path = global_snapshot_manifest_path(snapshot_id);
-        let reader = self.fs.open_read(&manifest_path)?;
-        let payload = MetadataReader::new(reader).read_all()?;
-        decode_global_manifest(payload.as_ref())
+        read_global_manifest(&self.fs, snapshot_id)
     }
 
     /// Load the latest global snapshot manifest referenced by the pointer.
@@ -264,15 +339,6 @@ impl DbCoordinator {
         Ok(true)
     }
 
-    fn publish_manifest_pointer(&self, manifest_name: &str) -> Result<()> {
-        let pointer_path = global_snapshot_current_path();
-        let writer = ReplaceWriter::new(Arc::clone(&self.fs), &pointer_path)?;
-        let mut writer = crate::file::MetadataWriter::new(writer);
-        writer.write(manifest_name.as_bytes())?;
-        writer.close()?;
-        Ok(())
-    }
-
     fn process_retention(&self) -> Result<()> {
         let Some(retention) = self.config.snapshot_retention else {
             return Ok(());
@@ -299,6 +365,73 @@ impl DbCoordinator {
         }
         Ok(())
     }
+}
+
+fn validate_exported_global_snapshot(snapshot: &GlobalSnapshotManifest) -> Result<()> {
+    snapshot.validate_version()?;
+    if snapshot.id != 0 || !(1..=u16::MAX as u32 + 1).contains(&snapshot.total_buckets) {
+        return Err(Error::ConfigError(
+            "Exported global snapshot requires id zero and 1..=65536 buckets".into(),
+        ));
+    }
+    let mut covered = vec![false; snapshot.total_buckets as usize];
+    for shard in &snapshot.shard_snapshots {
+        if shard.column_family_ids.is_empty()
+            || shard.column_family_ids != snapshot.column_family_ids
+        {
+            return Err(Error::CoordinationError(
+                "Exported shards must have identical column family ids".into(),
+            ));
+        }
+        for range in &shard.ranges {
+            if !bucket_range_fits_total(range, snapshot.total_buckets) {
+                return Err(Error::CoordinationError(format!(
+                    "Exported shard bucket range {range:?} is outside the global snapshot"
+                )));
+            }
+            for bucket in range.clone() {
+                if std::mem::replace(&mut covered[bucket as usize], true) {
+                    return Err(Error::CoordinationError(format!(
+                        "Exported shards overlap at bucket {bucket}"
+                    )));
+                }
+            }
+        }
+    }
+    if covered.contains(&false) {
+        return Err(Error::CoordinationError(
+            "Exported shards do not cover every bucket".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_global_manifest(
+    fs: &Arc<dyn FileSystem>,
+    snapshot: &GlobalSnapshotManifest,
+) -> Result<()> {
+    let manifest_path = global_snapshot_manifest_path(snapshot.id);
+    let writer = MetadataWriter::new(&manifest_path, fs)?;
+    let mut buffered = BufferedWriter::new(writer, 8192);
+    encode_global_manifest(&mut buffered, snapshot)?;
+    buffered.close()
+}
+
+fn read_global_manifest(
+    fs: &Arc<dyn FileSystem>,
+    snapshot_id: u64,
+) -> Result<GlobalSnapshotManifest> {
+    let reader = fs.open_read(&global_snapshot_manifest_path(snapshot_id))?;
+    let payload = MetadataReader::new(reader).read_all()?;
+    decode_global_manifest(&payload)
+}
+
+fn publish_manifest_pointer(fs: &Arc<dyn FileSystem>, manifest_name: &str) -> Result<()> {
+    let pointer_path = global_snapshot_current_path();
+    let writer = ReplaceWriter::new(Arc::clone(fs), &pointer_path)?;
+    let mut writer = crate::file::MetadataWriter::new(writer);
+    writer.write(manifest_name.as_bytes())?;
+    writer.close()
 }
 
 fn merge_column_family_ids(

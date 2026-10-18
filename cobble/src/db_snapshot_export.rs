@@ -7,16 +7,14 @@ use crate::manifest_model::manifest_schema_ids;
 use crate::paths::{metadata_temporary_path, schema_file_relative_path};
 use crate::schema::{SchemaManager, snapshot_column_families_from_schema};
 use crate::snapshot::ShardSnapshotMetadata;
+use crate::snapshot::export_paths::{append_path, overlaps, storage_url};
 use crate::snapshot::manifest::{ManifestPayload, ManifestSnapshot, encode_manifest_payload};
 use crate::snapshot::{load_manifest_for_snapshot, snapshot_manifest_name};
-use crate::util::normalize_storage_path_to_url;
 use std::collections::{BTreeMap, btree_map::Entry};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
-use url::Url;
 use uuid::Uuid;
 
 const PENDING: u8 = 0;
@@ -207,82 +205,6 @@ impl Drop for ExportDestination {
             }
         }
     }
-}
-
-fn storage_url(path: &str) -> Result<Url> {
-    let mut url = Url::parse(&normalize_storage_path_to_url(path)?)
-        .map_err(|error| Error::ConfigError(format!("Invalid export storage route: {error}")))?;
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
-}
-
-fn append_path(base: &Url, relative: &str) -> Result<Url> {
-    let mut url = base.clone();
-    let mut segments = url.path_segments_mut().map_err(|_| {
-        Error::ConfigError("Snapshot export requires a hierarchical storage URL".into())
-    })?;
-    segments.pop_if_empty();
-    for component in relative
-        .split('/')
-        .filter(|component| !component.is_empty())
-    {
-        segments.push(component);
-    }
-    drop(segments);
-    Ok(url)
-}
-
-fn canonical_future_path(path: &Path) -> Result<PathBuf> {
-    let mut existing = path;
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::canonicalize(existing) {
-            Ok(mut canonical) => {
-                for component in missing.into_iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = existing.file_name().ok_or_else(|| {
-                    Error::ConfigError("Cannot resolve snapshot export destination".into())
-                })?;
-                missing.push(name.to_os_string());
-                existing = existing.parent().ok_or_else(|| {
-                    Error::ConfigError("Cannot resolve snapshot export destination parent".into())
-                })?;
-            }
-            Err(error) => return Err(Error::IoError(error.to_string())),
-        }
-    }
-}
-
-fn overlaps(left: &Url, right: &Url) -> Result<bool> {
-    if left.scheme() != right.scheme()
-        || left.host_str() != right.host_str()
-        || left.port() != right.port()
-    {
-        return Ok(false);
-    }
-    if left.scheme() == "file" {
-        let local = |url: &Url| {
-            url.to_file_path()
-                .map_err(|_| Error::ConfigError("Invalid local export path".into()))
-                .and_then(|path| canonical_future_path(&path))
-        };
-        let left = local(left)?;
-        let right = local(right)?;
-        return Ok(left.starts_with(&right) || right.starts_with(&left));
-    }
-    let contains = |parent: &str, child: &str| {
-        child
-            .strip_prefix(parent.trim_end_matches('/'))
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    };
-    Ok(contains(left.path(), right.path()) || contains(right.path(), left.path()))
 }
 
 impl Db {

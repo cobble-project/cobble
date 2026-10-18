@@ -5,9 +5,11 @@ use crate::{Config, DbBuilder, ExpandStorageMode};
 use size::Size;
 use std::any::Any;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
+use url::Url;
 
 fn volume(path: &Path) -> VolumeDescriptor {
     VolumeDescriptor::single_volume(path.to_str().unwrap()).remove(0)

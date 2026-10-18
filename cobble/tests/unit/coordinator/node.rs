@@ -28,6 +28,288 @@ fn default_column_family_ids() -> BTreeMap<String, u8> {
 }
 
 #[test]
+fn exported_global_snapshot_is_independent_and_retryable() {
+    use crate::{Config, DbBuilder, Reader, ReaderConfig, VolumeDescriptor};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("online");
+    let destination = root.path().join("export");
+    let volumes = VolumeDescriptor::single_volume(source.to_str().unwrap());
+    let node = DbCoordinator::open(CoordinatorConfig {
+        volumes: volumes.clone(),
+        snapshot_retention: Some(1),
+    })
+    .unwrap();
+    let mut databases = Vec::new();
+    let mut online_shards = Vec::new();
+    let mut exported_shards = Vec::new();
+    for bucket in 0..2u16 {
+        let db = DbBuilder::new(Config {
+            volumes: volumes.clone(),
+            total_buckets: 2,
+            snapshot_on_flush: false,
+            snapshot_retention: None,
+            ..Config::default()
+        })
+        .db_id(format!("shard-{bucket}"))
+        .bucket_ranges(vec![bucket..=bucket])
+        .open()
+        .unwrap();
+        db.put(bucket, b"key", 0, format!("value-{bucket}").as_bytes())
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let id = db
+            .snapshot_with_callback(move |result| tx.send(result).unwrap())
+            .unwrap();
+        online_shards.push(
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap(),
+        );
+        exported_shards.push(
+            db.export_snapshot(
+                id,
+                VolumeDescriptor::single_volume(destination.join("shards").to_str().unwrap())
+                    .remove(0),
+            )
+            .unwrap()
+            .wait()
+            .unwrap(),
+        );
+        databases.push(db);
+    }
+    let first = node.take_global_snapshot(2, online_shards.clone()).unwrap();
+    node.materialize_global_snapshot(&first).unwrap();
+    assert!(node.retain_snapshot(first.id));
+    let second = node.take_global_snapshot(2, online_shards.clone()).unwrap();
+    node.materialize_global_snapshot(&second).unwrap();
+    let before_pointer = std::fs::read(source.join(global_snapshot_current_path())).unwrap();
+    let before_manifests = node.list_global_snapshots().unwrap();
+    let before_next = node.next_id.load(Ordering::SeqCst);
+
+    let exported = node
+        .take_exported_global_snapshot(2, exported_shards)
+        .unwrap();
+    assert_eq!(exported.id, 0);
+    let target = VolumeDescriptor::single_volume(destination.to_str().unwrap()).remove(0);
+    // A failed publication leaves all previously exported shards available for a retry.
+    std::fs::write(destination.join(SNAPSHOT_DIR), b"publication blocker").unwrap();
+    assert!(
+        node.materialize_exported_global_snapshot(&exported, target.clone())
+            .is_err()
+    );
+    for shard in &exported.shard_snapshots {
+        assert!(
+            url::Url::parse(&shard.manifest_path)
+                .unwrap()
+                .to_file_path()
+                .unwrap()
+                .exists()
+        );
+    }
+    std::fs::remove_file(destination.join(SNAPSHOT_DIR)).unwrap();
+    node.materialize_exported_global_snapshot(&exported, target.clone())
+        .unwrap();
+    let manifest_path = destination.join(global_snapshot_manifest_path(0));
+    let manifest_metadata = std::fs::metadata(&manifest_path).unwrap();
+    node.materialize_exported_global_snapshot(&exported, target.clone())
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&manifest_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        manifest_metadata.modified().unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&manifest_path).unwrap().ino(),
+            manifest_metadata.ino()
+        );
+    }
+    let mut conflicting = exported.clone();
+    conflicting.watermark_seconds = conflicting.watermark_seconds.saturating_add(1);
+    assert!(matches!(
+        node.materialize_exported_global_snapshot(&conflicting, target.clone()),
+        Err(Error::CoordinationError(_))
+    ));
+    let target_fs = FileSystemRegistry::new()
+        .get_or_register_volume(&target)
+        .unwrap();
+    publish_manifest_pointer(&target_fs, "SNAPSHOT-9").unwrap();
+    assert!(matches!(
+        node.materialize_exported_global_snapshot(&exported, target.clone()),
+        Err(Error::CoordinationError(_))
+    ));
+    publish_manifest_pointer(&target_fs, "SNAPSHOT-0").unwrap();
+    assert_eq!(node.next_id.load(Ordering::SeqCst), before_next);
+    assert_eq!(
+        std::fs::read(source.join(global_snapshot_current_path())).unwrap(),
+        before_pointer
+    );
+    assert_eq!(node.list_global_snapshots().unwrap(), before_manifests);
+    assert!(node.retained.contains(&first.id));
+    let third = node.take_global_snapshot(2, online_shards).unwrap();
+    assert_eq!(third.id, before_next);
+    node.materialize_global_snapshot(&third).unwrap();
+    assert_eq!(
+        node.list_global_snapshots()
+            .unwrap()
+            .iter()
+            .map(|snapshot| snapshot.id)
+            .collect::<Vec<_>>(),
+        vec![first.id, third.id]
+    );
+
+    let reader_config = ReaderConfig {
+        volumes: vec![target],
+        total_buckets: 2,
+        ..ReaderConfig::default()
+    };
+    {
+        let mut reader = Reader::open_current(reader_config.clone()).unwrap();
+        for bucket in 0..2u16 {
+            assert_eq!(
+                reader.get(bucket, b"key").unwrap().unwrap()[0].as_deref(),
+                Some(format!("value-{bucket}").as_bytes())
+            );
+        }
+    }
+    for db in databases {
+        db.close().unwrap();
+    }
+    std::fs::remove_dir_all(&source).unwrap();
+    let mut reader = Reader::open(reader_config, 0).unwrap();
+    for bucket in 0..2u16 {
+        assert_eq!(
+            reader.get(bucket, b"key").unwrap().unwrap()[0].as_deref(),
+            Some(format!("value-{bucket}").as_bytes())
+        );
+    }
+}
+
+#[test]
+fn exported_global_snapshot_validates_coverage_schema_and_routes() {
+    use crate::VolumeDescriptor;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("online");
+    let destination = root.path().join("export");
+    let node = DbCoordinator::open(CoordinatorConfig {
+        volumes: VolumeDescriptor::single_volume(source.to_str().unwrap()),
+        snapshot_retention: None,
+    })
+    .unwrap();
+    let target = VolumeDescriptor::single_volume(destination.to_str().unwrap()).remove(0);
+    let shard = ShardSnapshotMetadata {
+        ranges: vec![0..=1],
+        column_families: default_column_families(),
+        db_id: "exported-shard".into(),
+        snapshot_id: 7,
+        manifest_path: destination
+            .join("shards/exported-shard/snapshot/SNAPSHOT-7")
+            .to_str()
+            .unwrap()
+            .into(),
+        schema_id: 0,
+        timestamp_seconds: 0,
+        data_size_bytes: 0,
+        incremental_data_size_bytes: 0,
+    };
+    let valid = node
+        .take_exported_global_snapshot(2, vec![shard.clone()])
+        .unwrap();
+    // Normal coordinator calls retain their existing acceptance of partial coverage.
+    assert!(
+        node.take_global_snapshot_with_id(3, vec![shard.clone()], 42)
+            .is_ok()
+    );
+    assert!(
+        node.take_exported_global_snapshot(3, vec![shard.clone()])
+            .unwrap_err()
+            .to_string()
+            .contains("cover every bucket")
+    );
+    let mut overlapping = shard.clone();
+    overlapping.ranges = vec![1..=1];
+    assert!(
+        node.take_exported_global_snapshot(2, vec![shard.clone(), overlapping.clone()])
+            .unwrap_err()
+            .to_string()
+            .contains("overlap")
+    );
+    overlapping.ranges = vec![2..=2];
+    overlapping.column_families.insert(
+        "extra".into(),
+        SnapshotColumnFamily {
+            id: 1,
+            num_columns: 1,
+            options: ColumnFamilyOptions::default(),
+        },
+    );
+    assert!(
+        node.take_exported_global_snapshot(3, vec![shard.clone(), overlapping])
+            .unwrap_err()
+            .to_string()
+            .contains("identical column family ids")
+    );
+    let mut out_of_range = shard.clone();
+    out_of_range.ranges = vec![0..=2];
+    assert!(
+        node.take_exported_global_snapshot(2, vec![out_of_range])
+            .is_err()
+    );
+    let mut full_range = shard.clone();
+    full_range.ranges = vec![0..=u16::MAX];
+    assert!(
+        node.take_exported_global_snapshot(65536, vec![full_range])
+            .is_ok()
+    );
+    assert!(node.take_exported_global_snapshot(0, vec![shard]).is_err());
+    let mut invalid = valid.clone();
+    invalid.shard_snapshots[0].ranges = vec![0..=0];
+    assert!(
+        node.materialize_exported_global_snapshot(&invalid, target.clone())
+            .is_err()
+    );
+    invalid = valid.clone();
+    invalid.shard_snapshots[0].manifest_path =
+        source.join("shard/SNAPSHOT-7").to_str().unwrap().into();
+    assert!(
+        node.materialize_exported_global_snapshot(&invalid, target.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("must be located")
+    );
+    for path in [&source, root.path(), &source.join("child/../exports")] {
+        let volume = VolumeDescriptor::single_volume(path.to_str().unwrap()).remove(0);
+        assert!(
+            node.materialize_exported_global_snapshot(&valid, volume)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps online storage")
+        );
+    }
+    #[cfg(unix)]
+    {
+        let alias = root.path().join("online-alias");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let volume = VolumeDescriptor::single_volume(alias.to_str().unwrap()).remove(0);
+        assert!(
+            node.materialize_exported_global_snapshot(&valid, volume)
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps online storage")
+        );
+    }
+    assert!(!destination.exists());
+    assert_eq!(node.next_id.load(Ordering::SeqCst), 0);
+    assert!(node.load_current_global_snapshot().unwrap().is_none());
+}
+
+#[test]
 fn non_atomic_current_replacement_keeps_global_snapshots_flat() {
     let dir = tempfile::tempdir().unwrap();
     let config = CoordinatorConfig {
