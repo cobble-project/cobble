@@ -216,6 +216,29 @@ void VerifyRescale(const std::filesystem::path &root) {
   source.Close();
 }
 
+void VerifyExport(const std::filesystem::path &root) {
+  const auto source = root / "source";
+  const auto destination = root / "export";
+  auto db = cobble::structured::Db::Open(Config(source));
+  db.PutBytes(0, Bytes("key"), 0, Bytes("value"));
+  const auto shard = db.TakeSnapshot();
+  const auto handle = db.ExportSnapshot(
+      shard.snapshot_id, R"({"base_dir":")" + FileUrl(destination / "shards") +
+                             R"(","kinds":["snapshot"]})");
+  db.Close();
+  const std::array exports = {handle.Wait()};
+  COBBLE_CHECK(handle.Wait().db_id == exports[0].db_id);
+  COBBLE_CHECK(handle.IsFinished() && !handle.Cancel());
+  auto coordinator = cobble::DbCoordinator::Open(Config(source));
+  const auto global = coordinator.TakeExportedGlobalSnapshot(4, exports);
+  coordinator.MaterializeExportedGlobalSnapshot(
+      global,
+      R"({"base_dir":")" + FileUrl(destination) + R"(","kinds":["snapshot"]})");
+  std::filesystem::remove_all(source);
+  auto reader = cobble::structured::Reader::Open(Config(destination), 0);
+  COBBLE_CHECK(String(reader.Get(0, Bytes("key")).Bytes(0)) == "value");
+}
+
 }  // namespace
 
 int main() {
@@ -225,6 +248,7 @@ int main() {
     VerifySharded(root.path() / "sharded");
     VerifySingle(root.path() / "single");
     VerifyRescale(root.path() / "rescale");
+    VerifyExport(root.path() / "export");
     std::cout << "structured C++ basic capability test passed\n";
     return 0;
   } catch (const std::exception &error) {

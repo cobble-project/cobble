@@ -28,6 +28,12 @@ class COBBLE_CPP_API DbCoordinator final {
       std::uint32_t total_buckets, SnapshotId snapshot,
       std::span<const ShardSnapshot> shards) const;
   [[nodiscard]] GlobalSnapshot GetGlobalSnapshot(SnapshotId snapshot) const;
+  [[nodiscard]] GlobalSnapshot TakeExportedGlobalSnapshot(
+      std::uint32_t total_buckets, std::span<const ShardSnapshot> shards) const;
+  // One VolumeDescriptor, not Config; e.g.
+  // {"base_dir":"file:///export","kinds":["snapshot"]}.
+  void MaterializeExportedGlobalSnapshot(
+      const GlobalSnapshot& snapshot, std::string_view destination_json) const;
   [[nodiscard]] std::vector<GlobalSnapshot> ListGlobalSnapshots() const;
   [[nodiscard]] std::optional<GlobalSnapshot> LoadCurrentGlobalSnapshot() const;
   // Retain protection is local to this coordinator instance.

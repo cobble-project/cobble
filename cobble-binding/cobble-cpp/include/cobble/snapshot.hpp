@@ -11,6 +11,10 @@
 
 namespace cobble {
 
+namespace structured {
+class Db;
+}
+
 struct BucketRange {
   BucketId start_inclusive;
   BucketId end_inclusive;
@@ -88,6 +92,28 @@ class COBBLE_CPP_API PendingSnapshot final {
   explicit PendingSnapshot(std::unique_ptr<Impl>) noexcept;
   std::unique_ptr<Impl> impl_;
   friend class Database;
+};
+
+class COBBLE_CPP_API ExportSnapshotHandle final {
+ public:
+  ExportSnapshotHandle(ExportSnapshotHandle&&) noexcept;
+  ExportSnapshotHandle& operator=(ExportSnapshotHandle&&) noexcept;
+  ~ExportSnapshotHandle();
+  ExportSnapshotHandle(const ExportSnapshotHandle&) = delete;
+  ExportSnapshotHandle& operator=(const ExportSnapshotHandle&) = delete;
+
+  // Cached result; repeated and concurrent waits are supported. Destruction
+  // does not cancel.
+  [[nodiscard]] ShardSnapshot Wait() const;
+  [[nodiscard]] bool Cancel() const;
+  [[nodiscard]] bool IsFinished() const;
+
+ private:
+  struct Impl;
+  explicit ExportSnapshotHandle(std::unique_ptr<Impl>) noexcept;
+  std::unique_ptr<Impl> impl_;
+  friend class Db;
+  friend class structured::Db;
 };
 
 class COBBLE_CPP_API PendingShardSnapshot final {

@@ -67,15 +67,17 @@ use schema::{
 };
 use sharded_db::*;
 use snapshot::{
-    NativePendingShardSnapshot, NativePendingSnapshot, native_database_get_snapshot_typed,
-    native_database_list_snapshots_typed, native_database_start_snapshot,
-    native_database_take_snapshot, native_global_snapshot_from_json,
-    native_global_snapshot_to_json, native_load_global_snapshot_metadata,
-    native_load_global_snapshot_metadata_file, native_load_shard_snapshot_metadata,
-    native_load_shard_snapshot_metadata_file, native_pending_shard_snapshot_id,
-    native_pending_shard_snapshot_wait, native_pending_snapshot_id, native_pending_snapshot_wait,
-    native_shard_snapshot_from_json, native_shard_snapshot_to_json,
-    native_sharded_database_cancel_snapshot, native_sharded_database_expire_snapshot,
+    NativeExportSnapshotHandle, NativePendingShardSnapshot, NativePendingSnapshot,
+    native_database_get_snapshot_typed, native_database_list_snapshots_typed,
+    native_database_start_snapshot, native_database_take_snapshot, native_export_snapshot_cancel,
+    native_export_snapshot_is_finished, native_export_snapshot_wait,
+    native_global_snapshot_from_json, native_global_snapshot_to_json,
+    native_load_global_snapshot_metadata, native_load_global_snapshot_metadata_file,
+    native_load_shard_snapshot_metadata, native_load_shard_snapshot_metadata_file,
+    native_pending_shard_snapshot_id, native_pending_shard_snapshot_wait,
+    native_pending_snapshot_id, native_pending_snapshot_wait, native_shard_snapshot_from_json,
+    native_shard_snapshot_to_json, native_sharded_database_cancel_snapshot,
+    native_sharded_database_expire_snapshot, native_sharded_database_export_snapshot,
     native_sharded_database_get_shard_snapshot, native_sharded_database_retain_snapshot,
     native_sharded_database_snapshot, native_sharded_database_start_snapshot,
     native_sharded_database_take_snapshot,
@@ -214,6 +216,7 @@ mod ffi {
         type NativeMultiGetResult;
         type NativePendingSnapshot;
         type NativePendingShardSnapshot;
+        type NativeExportSnapshotHandle;
         type NativeSchemaBuilder;
         fn native_database_open(config_json: &str) -> Result<Box<NativeDatabase>>;
         fn native_database_open_file(config_path: &str) -> Result<Box<NativeDatabase>>;
@@ -551,6 +554,16 @@ mod ffi {
             db: &NativeShardedDatabase,
         ) -> Result<u64>;
         fn native_sharded_database_snapshot(db: &NativeShardedDatabase) -> Result<u64>;
+        fn native_sharded_database_export_snapshot(
+            db: &NativeShardedDatabase,
+            snapshot_id: u64,
+            destination_json: &str,
+        ) -> Result<Box<NativeExportSnapshotHandle>>;
+        fn native_export_snapshot_wait(
+            handle: &NativeExportSnapshotHandle,
+        ) -> Result<NativeShardSnapshot>;
+        fn native_export_snapshot_cancel(handle: &NativeExportSnapshotHandle) -> bool;
+        fn native_export_snapshot_is_finished(handle: &NativeExportSnapshotHandle) -> bool;
         fn native_sharded_database_start_snapshot(
             db: &NativeShardedDatabase,
         ) -> Result<Box<NativePendingShardSnapshot>>;
@@ -736,6 +749,16 @@ mod ffi {
             coordinator: &NativeCoordinator,
             snapshot_id: u64,
         ) -> Result<NativeSnapshot>;
+        fn native_coordinator_take_exported_global_snapshot(
+            coordinator: &NativeCoordinator,
+            total_buckets: u32,
+            shards: Vec<NativeShardSnapshot>,
+        ) -> Result<NativeSnapshot>;
+        fn native_coordinator_materialize_exported_global_snapshot(
+            coordinator: &NativeCoordinator,
+            snapshot: NativeSnapshot,
+            destination_json: &str,
+        ) -> Result<()>;
         fn native_coordinator_list_global_snapshots(
             coordinator: &NativeCoordinator,
         ) -> Result<Vec<NativeSnapshot>>;

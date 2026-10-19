@@ -135,6 +135,7 @@ pub(crate) mod ffi {
         type NativePriorityQueueBatch;
         type NativePriorityQueueCursor;
         type NativePendingShardSnapshot;
+        type NativeExportSnapshotHandle;
         type NativePendingSnapshot;
 
         fn native_structured_reader_open_current(
@@ -552,6 +553,16 @@ pub(crate) mod ffi {
         fn native_structured_db_set_time(db: &NativeStructuredDb, unix_seconds: u32);
         fn native_structured_db_now_seconds(db: &NativeStructuredDb) -> u32;
         fn native_structured_db_snapshot(db: &NativeStructuredDb) -> Result<u64>;
+        fn native_structured_db_export_snapshot(
+            db: &NativeStructuredDb,
+            snapshot_id: u64,
+            destination_json: &str,
+        ) -> Result<Box<NativeExportSnapshotHandle>>;
+        fn native_export_snapshot_wait(
+            handle: &NativeExportSnapshotHandle,
+        ) -> Result<NativeShardSnapshot>;
+        fn native_export_snapshot_cancel(handle: &NativeExportSnapshotHandle) -> bool;
+        fn native_export_snapshot_is_finished(handle: &NativeExportSnapshotHandle) -> bool;
         fn native_structured_db_start_snapshot(
             db: &NativeStructuredDb,
         ) -> Result<Box<NativePendingShardSnapshot>>;

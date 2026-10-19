@@ -37,6 +37,10 @@ pub(crate) struct NativePendingShardSnapshot {
         Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotMetadata>>>,
 }
 
+pub(crate) struct NativeExportSnapshotHandle {
+    pub(crate) handle: cobble_binding::ExportSnapshotHandle,
+}
+
 pub(crate) struct NativePendingSnapshot {
     pub(crate) id: u64,
     pub(crate) receiver:

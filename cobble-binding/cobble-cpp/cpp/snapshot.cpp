@@ -1,9 +1,13 @@
 #include <cobble/database.hpp>
+#include <cobble/structured/db.hpp>
 
 #include <utility>
+#include <variant>
 
 #include "detail/error.hpp"
 #include "detail/impl.hpp"
+#include "structured/detail/impl.hpp"
+#include "structured/detail/convert.hpp"
 
 namespace cobble {
 namespace detail {
@@ -123,6 +127,87 @@ struct PendingSnapshot::Impl {
 
   rust::Box<ffi::NativePendingSnapshot> native;
 };
+
+struct ExportSnapshotHandle::Impl {
+  explicit Impl(rust::Box<ffi::NativeExportSnapshotHandle> value)
+      : native(std::move(value)) {}
+  explicit Impl(rust::Box<structured_ffi::NativeExportSnapshotHandle> value)
+      : native(std::move(value)) {}
+  std::variant<rust::Box<ffi::NativeExportSnapshotHandle>,
+               rust::Box<structured_ffi::NativeExportSnapshotHandle>>
+      native;
+};
+
+ExportSnapshotHandle::ExportSnapshotHandle(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+ExportSnapshotHandle::ExportSnapshotHandle(ExportSnapshotHandle&&) noexcept =
+    default;
+ExportSnapshotHandle& ExportSnapshotHandle::operator=(
+    ExportSnapshotHandle&&) noexcept = default;
+ExportSnapshotHandle::~ExportSnapshotHandle() = default;
+
+ShardSnapshot ExportSnapshotHandle::Wait() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState,
+                "ExportSnapshotHandle has been moved from");
+  }
+  return std::visit(
+      [](const auto& native) {
+        using detail::ToShardSnapshot;
+        using structured::detail::ToShardSnapshot;
+        return ToShardSnapshot(detail::Translate(
+            [&] { return native_export_snapshot_wait(*native); }));
+      },
+      impl_->native);
+}
+
+bool ExportSnapshotHandle::Cancel() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState,
+                "ExportSnapshotHandle has been moved from");
+  }
+  return std::visit(
+      [](const auto& native) { return native_export_snapshot_cancel(*native); },
+      impl_->native);
+}
+
+bool ExportSnapshotHandle::IsFinished() const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState,
+                "ExportSnapshotHandle has been moved from");
+  }
+  return std::visit(
+      [](const auto& native) {
+        return native_export_snapshot_is_finished(*native);
+      },
+      impl_->native);
+}
+
+ExportSnapshotHandle Db::ExportSnapshot(
+    SnapshotId snapshot, std::string_view destination_json) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  auto native = detail::Translate([&] {
+    return ffi::native_sharded_database_export_snapshot(
+        *impl_->native, snapshot, detail::RustStr(destination_json));
+  });
+  return ExportSnapshotHandle(
+      std::make_unique<ExportSnapshotHandle::Impl>(std::move(native)));
+}
+
+ExportSnapshotHandle structured::Db::ExportSnapshot(
+    SnapshotId snapshot, std::string_view destination_json) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "structured Db has been moved from");
+  }
+  auto native = detail::Translate([&] {
+    return structured_ffi::native_structured_db_export_snapshot(
+        *impl_->native, snapshot, detail::RustStr(destination_json));
+  });
+  return ExportSnapshotHandle(
+      std::make_unique<ExportSnapshotHandle::Impl>(std::move(native)));
+}
 
 struct PendingShardSnapshot::Impl {
   explicit Impl(rust::Box<ffi::NativePendingShardSnapshot> native_snapshot)

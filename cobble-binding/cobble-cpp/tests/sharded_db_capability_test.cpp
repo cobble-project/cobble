@@ -342,6 +342,96 @@ void VerifyRescale(const std::filesystem::path& directory) {
   resumed.Close();
 }
 
+void VerifyExport(const std::filesystem::path& directory) {
+  const auto source = directory / "source";
+  const auto destination = directory / "export";
+  const auto config = Config(source, 4, false);
+  const auto target =
+      R"({"base_dir":")" + FileUrl(destination) + R"(","kinds":["snapshot"]})";
+  const auto shard_target = R"({"base_dir":")" +
+                            FileUrl(destination / "shards") +
+                            R"(","kinds":["snapshot"]})";
+  const std::array left_range = {cobble::BucketRange{0, 1}};
+  const std::array right_range = {cobble::BucketRange{2, 3}};
+  auto left = cobble::Db::Open(config, left_range);
+  auto right = cobble::Db::Open(config, right_range);
+  auto coordinator = cobble::DbCoordinator::Open(config);
+  for (cobble::BucketId bucket = 0; bucket < 4; ++bucket) {
+    auto& db = bucket < 2 ? left : right;
+    for (int index = 0; index < 64; ++index) {
+      const auto key = "key-" + std::to_string(index + 100);
+      db.Put(bucket, Bytes(key), 0, Bytes(std::string(256, 'a' + bucket)));
+    }
+  }
+  const std::array originals = {left.TakeSnapshot(), right.TakeSnapshot()};
+  (void)coordinator.MaterializeGlobalSnapshot(4, 7, originals);
+  COBBLE_CHECK(coordinator.RetainSnapshot(7));
+  (void)coordinator.MaterializeGlobalSnapshot(4, 8, originals);
+  const auto before = coordinator.LoadCurrentGlobalSnapshot()->ToJson();
+  ExpectInputError(
+      [&] { (void)left.ExportSnapshot(originals[0].snapshot_id, "{"); });
+  const auto left_handle =
+      left.ExportSnapshot(originals[0].snapshot_id, shard_target);
+  const auto right_handle =
+      right.ExportSnapshot(originals[1].snapshot_id, shard_target);
+  // Handles must not retain extra DB ownership or prevent Close from draining
+  // export I/O.
+  left.Close();
+  right.Close();
+  const std::array exports = {left_handle.Wait(), right_handle.Wait()};
+  COBBLE_CHECK(left_handle.Wait().db_id == exports[0].db_id);
+  COBBLE_CHECK(right_handle.Wait().db_id == exports[1].db_id);
+  COBBLE_CHECK(left_handle.IsFinished() && right_handle.IsFinished());
+  COBBLE_CHECK(!left_handle.Cancel() && !right_handle.Cancel());
+  const auto global = coordinator.TakeExportedGlobalSnapshot(4, exports);
+  COBBLE_CHECK(global.id == 0);
+  COBBLE_CHECK(!std::filesystem::exists(destination / "snapshot/SNAPSHOT-0"));
+  coordinator.MaterializeExportedGlobalSnapshot(global, target);
+  coordinator.MaterializeExportedGlobalSnapshot(global, target);
+  auto conflict = global;
+  ++conflict.watermark_seconds;
+  bool rejected = false;
+  try {
+    coordinator.MaterializeExportedGlobalSnapshot(conflict, target);
+  } catch (const cobble::Error&) {
+    rejected = true;
+  }
+  COBBLE_CHECK(rejected);
+  ExpectInputError([&] {
+    coordinator.MaterializeExportedGlobalSnapshot(
+        global,
+        R"({"base_dir":")" + FileUrl(source) + R"(","kinds":["snapshot"]})");
+  });
+  COBBLE_CHECK(coordinator.LoadCurrentGlobalSnapshot()->ToJson() == before);
+  COBBLE_CHECK(coordinator.ListGlobalSnapshots().size() == 2);
+  std::filesystem::remove_all(source);
+  const auto reader_config = Config(destination, 4, false);
+  for (const bool current : {true, false}) {
+    auto reader = current ? cobble::Reader::OpenCurrent(reader_config)
+                          : cobble::Reader::Open(reader_config, 0);
+    for (cobble::BucketId bucket = 0; bucket < 4; ++bucket) {
+      const std::string value(256, 'a' + bucket);
+      for (int index = 0; index < 64; ++index) {
+        const auto key = "key-" + std::to_string(index + 100);
+        COBBLE_CHECK(String(reader.Get(bucket, Bytes(key)).Column(0)) == value);
+      }
+      auto scan = reader.Scan(bucket, Bytes("key-"), Bytes("z"));
+      std::size_t count = 0;
+      while (true) {
+        const auto batch = scan.Next(17);
+        for (std::size_t index = 0; index < batch.RowCount(); ++index) {
+          COBBLE_CHECK(batch.Bucket(index) == bucket);
+          COBBLE_CHECK(String(batch.Key(index)) ==
+                       "key-" + std::to_string(count++ + 100));
+          COBBLE_CHECK(String(batch.Column(index, 0)) == value);
+        }
+        if (batch.End()) break;
+      }
+      COBBLE_CHECK(count == 64);
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -356,6 +446,7 @@ int main() {
 
     cobble_test::TempDirectory rescale_directory("cobble-cpp-sharded-rescale");
     VerifyRescale(rescale_directory.path());
+    VerifyExport(main_directory.path() / "export-flow");
 
     std::cout << "verified sharded C++ Db capability surface\n";
     return 0;

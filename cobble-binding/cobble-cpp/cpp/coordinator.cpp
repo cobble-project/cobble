@@ -51,6 +51,29 @@ GlobalSnapshot DbCoordinator::GetGlobalSnapshot(SnapshotId snapshot) const {
   }));
 }
 
+GlobalSnapshot DbCoordinator::TakeExportedGlobalSnapshot(
+    std::uint32_t total_buckets, std::span<const ShardSnapshot> shards) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
+  }
+  return detail::ToGlobalSnapshot(detail::Translate([&] {
+    return ffi::native_coordinator_take_exported_global_snapshot(
+        *impl_->native, total_buckets, detail::ToNativeShardSnapshots(shards));
+  }));
+}
+
+void DbCoordinator::MaterializeExportedGlobalSnapshot(
+    const GlobalSnapshot& snapshot, std::string_view destination_json) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");
+  }
+  detail::Translate([&] {
+    ffi::native_coordinator_materialize_exported_global_snapshot(
+        *impl_->native, detail::ToNativeGlobalSnapshot(snapshot),
+        detail::RustStr(destination_json));
+  });
+}
+
 std::vector<GlobalSnapshot> DbCoordinator::ListGlobalSnapshots() const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "DbCoordinator has been moved from");

@@ -4,7 +4,7 @@ use crate::{
     BridgeResult,
     error::{format_cobble_error, input_error},
     ffi,
-    snapshot::{shard_snapshot_metadata, snapshot},
+    snapshot::{global_snapshot_manifest, shard_snapshot_metadata, snapshot},
 };
 
 pub(crate) struct NativeCoordinator {
@@ -88,6 +88,36 @@ pub(crate) fn native_coordinator_get_global_snapshot(
         .coordinator
         .load_global_snapshot(snapshot_id)
         .map(snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_coordinator_take_exported_global_snapshot(
+    coordinator: &NativeCoordinator,
+    total_buckets: u32,
+    shards: Vec<ffi::NativeShardSnapshot>,
+) -> BridgeResult<ffi::NativeSnapshot> {
+    let shards = shards
+        .into_iter()
+        .map(shard_snapshot_metadata)
+        .collect::<BridgeResult<Vec<_>>>()?;
+    coordinator
+        .coordinator
+        .take_exported_global_snapshot(total_buckets, shards)
+        .map(snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_coordinator_materialize_exported_global_snapshot(
+    coordinator: &NativeCoordinator,
+    snapshot: ffi::NativeSnapshot,
+    destination_json: &str,
+) -> BridgeResult<()> {
+    let snapshot = global_snapshot_manifest(snapshot)?;
+    let destination = serde_json::from_str::<cobble_binding::VolumeDescriptor>(destination_json)
+        .map_err(|error| input_error(&error.to_string()))?;
+    coordinator
+        .coordinator
+        .materialize_exported_global_snapshot(&snapshot, destination)
         .map_err(format_cobble_error)
 }
 

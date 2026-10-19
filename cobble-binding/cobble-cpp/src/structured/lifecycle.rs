@@ -7,8 +7,8 @@ use crate::structured_bridge::ffi;
 
 use super::conversion::{format_error, input_error};
 use super::{
-    BridgeResult, NativePendingShardSnapshot, NativePendingSnapshot, NativeStructuredDb,
-    NativeStructuredSingleDb,
+    BridgeResult, NativeExportSnapshotHandle, NativePendingShardSnapshot, NativePendingSnapshot,
+    NativeStructuredDb, NativeStructuredSingleDb,
 };
 
 pub(crate) fn native_structured_db_set_time(db: &NativeStructuredDb, unix_seconds: u32) {
@@ -172,6 +172,37 @@ pub(crate) fn native_structured_db_take_snapshot(
 ) -> BridgeResult<ffi::NativeShardSnapshot> {
     let mut pending = native_structured_db_start_snapshot(db)?;
     native_pending_shard_snapshot_wait(&mut pending)
+}
+
+pub(crate) fn native_structured_db_export_snapshot(
+    db: &NativeStructuredDb,
+    snapshot_id: u64,
+    destination_json: &str,
+) -> BridgeResult<Box<NativeExportSnapshotHandle>> {
+    let destination = serde_json::from_str::<cobble_binding::VolumeDescriptor>(destination_json)
+        .map_err(|error| input_error(error.to_string()))?;
+    db.db
+        .export_snapshot(snapshot_id, destination)
+        .map(|handle| Box::new(NativeExportSnapshotHandle { handle }))
+        .map_err(format_error)
+}
+
+pub(crate) fn native_export_snapshot_wait(
+    handle: &NativeExportSnapshotHandle,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    handle
+        .handle
+        .wait()
+        .map(native_shard_snapshot)
+        .map_err(format_error)
+}
+
+pub(crate) fn native_export_snapshot_cancel(handle: &NativeExportSnapshotHandle) -> bool {
+    handle.handle.cancel()
+}
+
+pub(crate) fn native_export_snapshot_is_finished(handle: &NativeExportSnapshotHandle) -> bool {
+    handle.handle.is_finished()
 }
 
 pub(crate) fn native_structured_db_cancel_snapshot(

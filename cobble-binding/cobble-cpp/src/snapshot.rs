@@ -19,6 +19,41 @@ pub(crate) struct NativePendingShardSnapshot {
     receiver: Option<mpsc::Receiver<BridgeResult<cobble_binding::ShardSnapshotMetadata>>>,
 }
 
+pub(crate) struct NativeExportSnapshotHandle {
+    handle: cobble_binding::ExportSnapshotHandle,
+}
+
+pub(crate) fn native_sharded_database_export_snapshot(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    snapshot_id: u64,
+    destination_json: &str,
+) -> BridgeResult<Box<NativeExportSnapshotHandle>> {
+    let destination = serde_json::from_str::<cobble_binding::VolumeDescriptor>(destination_json)
+        .map_err(|error| input_error(&error.to_string()))?;
+    db.db
+        .export_snapshot(snapshot_id, destination)
+        .map(|handle| Box::new(NativeExportSnapshotHandle { handle }))
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_export_snapshot_wait(
+    handle: &NativeExportSnapshotHandle,
+) -> BridgeResult<ffi::NativeShardSnapshot> {
+    handle
+        .handle
+        .wait()
+        .map(shard_snapshot)
+        .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_export_snapshot_cancel(handle: &NativeExportSnapshotHandle) -> bool {
+    handle.handle.cancel()
+}
+
+pub(crate) fn native_export_snapshot_is_finished(handle: &NativeExportSnapshotHandle) -> bool {
+    handle.handle.is_finished()
+}
+
 fn family((name, id): (String, u8)) -> ffi::NativeFamily {
     ffi::NativeFamily { name, id }
 }
