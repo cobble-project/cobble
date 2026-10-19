@@ -6,10 +6,12 @@ use crate::options::{PyReadOptions, PyWriteOptions};
 use crate::row::PyOwnedRow;
 use crate::scan::PyScanCursor;
 use crate::schema::{PySchema, PySchemaBuilder, schema};
-use crate::snapshot::{PyBucketRange, PyPendingShardSnapshot, PyShardSnapshot, shard_metadata};
+use crate::snapshot::{
+    PyBucketRange, PyExportSnapshotHandle, PyPendingShardSnapshot, PyShardSnapshot, shard_metadata,
+};
 use crate::types::{PyBufferResult, PyExpandStorageMode, PyMemtableType, PyRecoveryMode};
 use crate::write_batch::PyWriteBatch;
-use cobble_binding::{Config, Db, ReadOptions, WriteOptions};
+use cobble_binding::{Config, Db, ReadOptions, VolumeDescriptor, WriteOptions};
 use pyo3::prelude::*;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -503,6 +505,25 @@ impl PyDb {
     fn start_snapshot(&self) -> PyResult<PyPendingShardSnapshot> {
         self.ensure_open()?;
         PyPendingShardSnapshot::start(&self.db)
+    }
+
+    /// Export a completed shard snapshot. destination_json is one VolumeDescriptor, not Config:
+    /// {"base_dir":"file:///export","kinds":["snapshot"]}.
+    fn export_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot_id: u64,
+        destination_json: String,
+    ) -> PyResult<PyExportSnapshotHandle> {
+        self.ensure_open()?;
+        let destination = serde_json::from_str::<VolumeDescriptor>(&destination_json)
+            .map_err(|error| input_error(error.to_string()))?;
+        py.detach(|| {
+            self.db
+                .export_snapshot(snapshot_id, destination)
+                .map(|handle| PyExportSnapshotHandle { handle })
+                .map_err(map_error)
+        })
     }
 
     fn take_snapshot(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {

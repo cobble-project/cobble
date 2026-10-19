@@ -634,6 +634,28 @@ pub(crate) struct PyPendingSnapshot {
 
 type ShardSnapshotResult = cobble_binding::Result<ShardSnapshotMetadata>;
 
+/// A protected asynchronous export. Dropping this handle does not cancel the export.
+#[pyclass(name = "ExportSnapshotHandle", module = "pycobble._native")]
+pub(crate) struct PyExportSnapshotHandle {
+    pub(crate) handle: cobble_binding::ExportSnapshotHandle,
+}
+
+#[pymethods]
+impl PyExportSnapshotHandle {
+    /// Wait for the cached result, releasing the GIL. Repeated and concurrent waits are supported.
+    fn wait(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
+        py.detach(|| self.handle.wait().map(shard_metadata).map_err(map_error))
+    }
+
+    fn cancel(&self) -> bool {
+        self.handle.cancel()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
 #[pyclass(name = "PendingShardSnapshot", module = "pycobble._native")]
 pub(crate) struct PyPendingShardSnapshot {
     id: u64,
@@ -760,6 +782,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyGlobalSnapshot>()?;
     module.add_class::<PyPendingSnapshot>()?;
     module.add_class::<PyPendingShardSnapshot>()?;
+    module.add_class::<PyExportSnapshotHandle>()?;
     module.add_function(wrap_pyfunction!(load_shard_snapshot_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(load_shard_snapshot_metadata_file, module)?)?;
     module.add_function(wrap_pyfunction!(load_global_snapshot_metadata, module)?)?;

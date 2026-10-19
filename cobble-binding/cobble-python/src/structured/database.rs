@@ -10,19 +10,19 @@ use crate::error::{input_error, invalid_state, map_error};
 use crate::metrics::{PyMetricSample, metrics};
 use crate::multi_get::extract_keys;
 use crate::snapshot::{
-    PyBucketRange, PyGlobalSnapshot, PyPendingShardSnapshot, PyPendingSnapshot, PyShardSnapshot,
-    shard_metadata, snapshot,
+    PyBucketRange, PyExportSnapshotHandle, PyGlobalSnapshot, PyPendingShardSnapshot,
+    PyPendingSnapshot, PyShardSnapshot, shard_metadata, snapshot,
 };
 use crate::types::{
     PickleReduction, PyBufferResult, PyBufferStatus, PyExpandStorageMode, PyMemtableType,
     PyRecoveryMode,
 };
-use cobble_binding::Config;
 use cobble_binding::structured::ffi as ds_ffi;
 use cobble_binding::structured::{
     StructuredColumnValue, StructuredDb, StructuredDbIterator, StructuredReadOnlyDb,
     StructuredScanSplitScanner, StructuredSingleDb, StructuredWriteOptions,
 };
+use cobble_binding::{Config, VolumeDescriptor};
 use pyo3::prelude::*;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -1433,6 +1433,24 @@ impl PyStructuredDb {
     }
     fn start_snapshot(&self) -> PyResult<PyPendingShardSnapshot> {
         PyPendingShardSnapshot::start_structured(&self.db)
+    }
+
+    /// Export a completed shard snapshot. destination_json is one VolumeDescriptor, not Config:
+    /// {"base_dir":"file:///export","kinds":["snapshot"]}.
+    fn export_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot_id: u64,
+        destination_json: String,
+    ) -> PyResult<PyExportSnapshotHandle> {
+        let destination = serde_json::from_str::<VolumeDescriptor>(&destination_json)
+            .map_err(|error| input_error(error.to_string()))?;
+        py.detach(|| {
+            self.db
+                .export_snapshot(snapshot_id, destination)
+                .map(|handle| PyExportSnapshotHandle { handle })
+                .map_err(map_error)
+        })
     }
     fn take_snapshot(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
         PyPendingShardSnapshot::start_structured(&self.db)?.wait_result(py)

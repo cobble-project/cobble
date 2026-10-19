@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import shutil
 import struct
 from pathlib import Path
 
@@ -25,6 +26,32 @@ def config(root: Path) -> str:
             "wal_enabled": False,
         }
     )
+
+
+def test_structured_db_exports_with_shared_handle(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "export"
+    cfg = config(source)
+    db = pycobble.StructuredDb.open(cfg)
+    db.put_bytes(0, b"key", 0, b"value")
+    shard = db.take_snapshot()
+    handle = db.export_snapshot(
+        shard.snapshot_id,
+        json.dumps({"base_dir": (destination / "shards").as_uri(), "kinds": ["snapshot"]}),
+    )
+    assert isinstance(handle, pycobble.ExportSnapshotHandle)
+    db.close()
+    exported = handle.wait()
+    assert handle.wait().db_id == exported.db_id
+    assert handle.is_finished() and not handle.cancel()
+    coordinator = pycobble.DbCoordinator.open(cfg)
+    global_snapshot = coordinator.take_exported_global_snapshot(4, [exported])
+    coordinator.materialize_exported_global_snapshot(
+        global_snapshot, json.dumps({"base_dir": destination.as_uri(), "kinds": ["snapshot"]})
+    )
+    shutil.rmtree(source)
+    reader = pycobble.StructuredReader.open(config(destination), 0)
+    assert bytes(reader.get(0, b"key").bytes(0)) == b"value"
 
 
 def decode_csrb(value: bytearray, length: int) -> list[tuple[int, bytes, bool, list[object]]]:

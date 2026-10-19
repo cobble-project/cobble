@@ -1,6 +1,10 @@
 use crate::error::{input_error, map_error};
-use crate::snapshot::{PyGlobalSnapshot, PyShardSnapshot, shard_snapshot_metadata, snapshot};
-use cobble_binding::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata};
+use crate::snapshot::{
+    PyGlobalSnapshot, PyShardSnapshot, global_snapshot, shard_snapshot_metadata, snapshot,
+};
+use cobble_binding::{
+    Config, CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata, VolumeDescriptor,
+};
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
@@ -91,6 +95,42 @@ impl PyDbCoordinator {
             self.coordinator
                 .load_global_snapshot(snapshot_id)
                 .map(snapshot)
+                .map_err(map_error)
+        })
+    }
+
+    fn take_exported_global_snapshot(
+        &self,
+        py: Python<'_>,
+        total_buckets: u32,
+        shards: Vec<PyShardSnapshot>,
+    ) -> PyResult<PyGlobalSnapshot> {
+        let shards = shards
+            .into_iter()
+            .map(shard_snapshot_metadata)
+            .collect::<PyResult<Vec<_>>>()?;
+        py.detach(|| {
+            self.coordinator
+                .take_exported_global_snapshot(total_buckets, shards)
+                .map(snapshot)
+                .map_err(map_error)
+        })
+    }
+
+    /// Publish an export. destination_json is one VolumeDescriptor, not Config:
+    /// {"base_dir":"file:///export","kinds":["snapshot"]}.
+    fn materialize_exported_global_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot: PyGlobalSnapshot,
+        destination_json: String,
+    ) -> PyResult<()> {
+        let snapshot = global_snapshot(snapshot)?;
+        let destination = serde_json::from_str::<VolumeDescriptor>(&destination_json)
+            .map_err(|error| input_error(error.to_string()))?;
+        py.detach(|| {
+            self.coordinator
+                .materialize_exported_global_snapshot(&snapshot, destination)
                 .map_err(map_error)
         })
     }

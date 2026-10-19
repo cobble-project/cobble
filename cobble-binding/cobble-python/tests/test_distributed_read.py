@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pycobble
@@ -68,6 +69,92 @@ def reconstruct_snapshot(value: pycobble.ShardSnapshot) -> pycobble.ShardSnapsho
             for family in value.schema_column_families
         ],
     )
+
+
+def test_exported_global_snapshot_survives_source_deletion(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "export"
+    settings = json.loads(config(source))
+    settings.update(
+        snapshot_retention=1,
+        snapshot_on_flush=False,
+        memtable_capacity="8KB",
+        value_separation_threshold=32,
+    )
+    cfg = json.dumps(settings)
+    target = json.dumps({"base_dir": destination.as_uri(), "kinds": ["snapshot"]})
+    shard_target = json.dumps(
+        {"base_dir": (destination / "shards").as_uri(), "kinds": ["snapshot"]}
+    )
+    left = pycobble.Db.open(cfg, [pycobble.BucketRange(0, 1)])
+    right = pycobble.Db.open(cfg, [pycobble.BucketRange(2, 3)])
+    for bucket, db in ((0, left), (1, left), (2, right), (3, right)):
+        for index in range(64):
+            db.put(bucket, f"key-{index:03}".encode(), 0, bytes([bucket + 10]) * 256)
+    originals = [left.take_snapshot(), right.take_snapshot()]
+    coordinator = pycobble.DbCoordinator.open(cfg)
+    coordinator.materialize_global_snapshot(4, 7, originals)
+    assert coordinator.retain_snapshot(7)
+    coordinator.materialize_global_snapshot(4, 8, originals)
+    pointer = (source / "snapshot/CURRENT").read_bytes()
+    with pytest.raises(pycobble.InputError):
+        left.export_snapshot(originals[0].snapshot_id, "{")
+    handles = [
+        db.export_snapshot(shard.snapshot_id, shard_target)
+        for db, shard in zip((left, right), originals)
+    ]
+    assert isinstance(handles[0], pycobble.ExportSnapshotHandle)
+    # A close may wait for export I/O, but must release the GIL and must not
+    # depend on releasing the export handle itself.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        closing = pool.submit(left.close)
+        first = pool.submit(handles[0].wait)
+        repeated = pool.submit(handles[0].wait)
+        second = pool.submit(handles[1].wait)
+        exports = [first.result(timeout=30), second.result(timeout=30)]
+        assert repeated.result(timeout=30).db_id == exports[0].db_id
+        closing.result(timeout=30)
+    right.close()
+    for handle, shard in zip(handles, exports):
+        assert handle.wait().db_id == shard.db_id
+        assert handle.is_finished()
+        assert not handle.cancel()
+    with pytest.raises(pycobble.InternalStateError):
+        left.export_snapshot(originals[0].snapshot_id, shard_target)
+    global_snapshot = coordinator.take_exported_global_snapshot(4, exports)
+    assert global_snapshot.id == 0
+    assert not (destination / "snapshot/SNAPSHOT-0").exists()
+    coordinator.materialize_exported_global_snapshot(global_snapshot, target)
+    coordinator.materialize_exported_global_snapshot(global_snapshot, target)
+    assert (destination / "snapshot/SNAPSHOT-0").exists()
+    with pytest.raises(pycobble.CoordinationError):
+        conflict = coordinator.take_exported_global_snapshot(4, exports[::-1])
+        coordinator.materialize_exported_global_snapshot(conflict, target)
+    with pytest.raises(pycobble.CoordinationError):
+        coordinator.take_exported_global_snapshot(5, exports)
+    with pytest.raises(pycobble.ConfigurationError):
+        coordinator.materialize_exported_global_snapshot(
+            global_snapshot, json.dumps({"base_dir": source.as_uri(), "kinds": ["snapshot"]})
+        )
+    assert (source / "snapshot/CURRENT").read_bytes() == pointer
+    assert coordinator.load_current_global_snapshot().id == 8
+    assert [s.id for s in coordinator.list_global_snapshots()] == [7, 8]
+    coordinator.materialize_global_snapshot(4, 9, originals)
+    assert [s.id for s in coordinator.list_global_snapshots()] == [7, 9]
+    shutil.rmtree(source)
+    reader_config = config(destination)
+    for reader in (
+        pycobble.Reader.open_current(reader_config),
+        pycobble.Reader.open(reader_config, 0),
+    ):
+        for bucket in range(4):
+            value = bytes([bucket + 10]) * 256
+            for index in range(64):
+                row = reader.get(bucket, f"key-{index:03}".encode())
+                assert bytes(row.column(0)) == value
+            assert collect(reader.scan(bucket, b"", b"z")) == [
+                (bucket, f"key-{index:03}".encode(), value) for index in range(64)
+            ]
 
 
 def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> None:
