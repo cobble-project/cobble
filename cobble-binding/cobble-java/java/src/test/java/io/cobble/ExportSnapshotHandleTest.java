@@ -5,7 +5,10 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -15,6 +18,126 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ExportSnapshotHandleTest {
+    @Test
+    void exportedGlobalSnapshotPublishesIndependentlyAndSurvivesSourceDeletion(@TempDir Path root)
+            throws Exception {
+        Path source = root.resolve("source");
+        Path destination = root.resolve("export");
+        Config config = new Config().addVolume(source.toString()).numColumns(1).totalBuckets(4);
+        config.memtableCapacity = 4096;
+        config.valueSeparationThreshold = 32;
+        config.snapshotOnFlush = false;
+        config.snapshotRetention = 1;
+        Config.VolumeDescriptor target =
+                Config.VolumeDescriptor.singleVolume(destination.toString());
+        try (Db first = Db.open(config, 0, 1);
+                Db second = Db.open(config, 2, 3);
+                DbCoordinator coordinator = DbCoordinator.open(config)) {
+            List<ShardSnapshot> originals = new ArrayList<>();
+            List<ShardSnapshot> exports = new ArrayList<>();
+            for (int shard = 0; shard < 2; shard++) {
+                Db db = shard == 0 ? first : second;
+                for (int bucket = shard * 2; bucket < shard * 2 + 2; bucket++) {
+                    byte[] value = new byte[256];
+                    Arrays.fill(value, (byte) (bucket + 10));
+                    for (int index = 0; index < 32; index++)
+                        db.put(bucket, new byte[] {(byte) index}, 0, value);
+                }
+                ShardSnapshot snapshot = db.snapshot();
+                originals.add(snapshot);
+                try (ExportSnapshotHandle handle =
+                        db.exportSnapshot(
+                                snapshot.snapshotId,
+                                Config.VolumeDescriptor.singleVolume(
+                                        destination.resolve("shards").toString()))) {
+                    exports.add(handle.future().get(30, TimeUnit.SECONDS));
+                }
+            }
+            coordinator.materializeGlobalSnapshot(4, 7, originals);
+            assertTrue(coordinator.retainSnapshot(7));
+            GlobalSnapshot online = coordinator.materializeGlobalSnapshot(4, 8, originals);
+            byte[] pointer = Files.readAllBytes(source.resolve("snapshot/CURRENT"));
+            GlobalSnapshot exported = coordinator.takeExportedGlobalSnapshot(4, exports);
+            assertEquals(0, exported.id);
+            assertEquals(2, exported.shardSnapshots.size());
+            assertEquals(online.columnFamilyIds, exported.columnFamilyIds);
+            assertFalse(Files.exists(destination.resolve("snapshot/SNAPSHOT-0")));
+            coordinator.materializeExportedGlobalSnapshot(exported, target);
+            coordinator.materializeExportedGlobalSnapshot(exported.copy(), target);
+            assertTrue(Files.exists(destination.resolve("snapshot/SNAPSHOT-0")));
+            assertArrayEquals(pointer, Files.readAllBytes(source.resolve("snapshot/CURRENT")));
+            assertEquals(online.toJson(), coordinator.loadCurrentGlobalSnapshot().toJson());
+            assertEquals(2, coordinator.listGlobalSnapshots().size());
+            coordinator.materializeGlobalSnapshot(4, 9, originals);
+            List<GlobalSnapshot> retained = coordinator.listGlobalSnapshots();
+            assertEquals(2, retained.size());
+            assertEquals(7, retained.get(0).id);
+            assertEquals(9, retained.get(1).id);
+
+            GlobalSnapshot conflict = exported.copy();
+            conflict.watermarkSeconds++;
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> coordinator.materializeExportedGlobalSnapshot(conflict, target));
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> coordinator.takeExportedGlobalSnapshot(5, exports));
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> coordinator.materializeExportedGlobalSnapshot(online, target));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> coordinator.takeExportedGlobalSnapshot(-1, exports));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> coordinator.takeExportedGlobalSnapshot(4, null));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> coordinator.takeExportedGlobalSnapshot(4, Collections.emptyList()));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            coordinator.takeExportedGlobalSnapshot(
+                                    4, Collections.singletonList(null)));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> coordinator.materializeExportedGlobalSnapshot(null, target));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> coordinator.materializeExportedGlobalSnapshot(exported, null));
+            coordinator.close();
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> coordinator.takeExportedGlobalSnapshot(4, exports));
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> coordinator.materializeExportedGlobalSnapshot(exported, target));
+        }
+        deleteTree(source);
+        Config readerConfig =
+                new Config().addVolume(destination.toString()).numColumns(1).totalBuckets(4);
+        for (boolean current : new boolean[] {true, false}) {
+            try (Reader reader =
+                    current ? Reader.openCurrent(readerConfig) : Reader.open(readerConfig, 0)) {
+                for (int bucket = 0; bucket < 4; bucket++) {
+                    byte[] value = new byte[256];
+                    Arrays.fill(value, (byte) (bucket + 10));
+                    for (int index = 0; index < 32; index++)
+                        assertArrayEquals(value, reader.get(bucket, new byte[] {(byte) index}, 0));
+                    try (ScanCursor cursor = reader.scan(bucket, null, null)) {
+                        int count = 0;
+                        for (ScanCursor.Entry row : cursor) {
+                            assertEquals(bucket, row.bucket);
+                            assertArrayEquals(new byte[] {(byte) count++}, row.key);
+                            assertArrayEquals(value, row.columns[0]);
+                        }
+                        assertEquals(32, count);
+                    }
+                }
+            }
+        }
+    }
+
     @Test
     void cancellationAndCloseBeforeCompletionKeepNativeWorkProtected(@TempDir Path root)
             throws Exception {

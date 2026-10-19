@@ -2,7 +2,10 @@ use crate::util::{
     decode_java_string, decode_u32, decode_u64_from_jlong, parse_config_json,
     throw_illegal_argument, throw_illegal_state, to_java_string_or_throw,
 };
-use cobble_binding::{Config, CoordinatorConfig, DbCoordinator, ShardSnapshotMetadata};
+use cobble_binding::{
+    Config, CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata,
+    VolumeDescriptor,
+};
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring};
@@ -152,6 +155,84 @@ pub extern "system" fn Java_io_cobble_DbCoordinator_materializeGlobalSnapshot(
 
 pub(crate) fn parse_shard_snapshots(json: &str) -> Result<Vec<ShardSnapshotMetadata>, String> {
     serde_json::from_str(json).map_err(|err| format!("invalid shard metadata json: {err}"))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DbCoordinator_takeExportedGlobalSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    total_buckets: jint,
+    shard_inputs_json: JString,
+) -> jstring {
+    let Some(coordinator) = coordinator_from_handle_or_throw(&mut env, native_handle) else {
+        return std::ptr::null_mut();
+    };
+    let total_buckets = match decode_u32("totalBuckets", total_buckets) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return std::ptr::null_mut();
+        }
+    };
+    let shard_snapshots = match decode_java_string(&mut env, shard_inputs_json)
+        .and_then(|json| parse_shard_snapshots(&json))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return std::ptr::null_mut();
+        }
+    };
+    let snapshot = match coordinator.take_exported_global_snapshot(total_buckets, shard_snapshots) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            throw_illegal_state(&mut env, error.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let json = match serde_json::to_string(&snapshot) {
+        Ok(json) => json,
+        Err(error) => {
+            throw_illegal_state(&mut env, error.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    to_java_string_or_throw(&mut env, json)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_DbCoordinator_materializeExportedGlobalSnapshot(
+    mut env: JNIEnv,
+    _class: JClass,
+    native_handle: jlong,
+    snapshot_json: JString,
+    destination_json: JString,
+) {
+    let Some(coordinator) = coordinator_from_handle_or_throw(&mut env, native_handle) else {
+        return;
+    };
+    let snapshot = match decode_java_string(&mut env, snapshot_json).and_then(|json| {
+        serde_json::from_str::<GlobalSnapshotManifest>(&json).map_err(|error| error.to_string())
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return;
+        }
+    };
+    let destination = match decode_java_string(&mut env, destination_json).and_then(|json| {
+        serde_json::from_str::<VolumeDescriptor>(&json).map_err(|error| error.to_string())
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            throw_illegal_argument(&mut env, error);
+            return;
+        }
+    };
+    if let Err(error) = coordinator.materialize_exported_global_snapshot(&snapshot, destination) {
+        throw_illegal_state(&mut env, error.to_string());
+    }
 }
 
 #[unsafe(no_mangle)]

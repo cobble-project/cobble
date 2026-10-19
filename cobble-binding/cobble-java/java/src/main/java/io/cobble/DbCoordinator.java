@@ -64,6 +64,28 @@ public final class DbCoordinator extends NativeObject {
                         ShardSnapshot.listToJson(shardInputs)));
     }
 
+    /** Assemble an independent export manifest with id zero without allocating an online id. */
+    public GlobalSnapshot takeExportedGlobalSnapshot(
+            int totalBuckets, List<ShardSnapshot> shardInputs) {
+        if (shardInputs == null || shardInputs.isEmpty()) {
+            throw new IllegalArgumentException("shardInputs must not be empty");
+        }
+        return GlobalSnapshot.fromJson(
+                takeExportedGlobalSnapshot(
+                        nativeHandle, totalBuckets, ShardSnapshot.listToJson(shardInputs)));
+    }
+
+    /**
+     * Publish an export whose shards are under destination/shards, without changing online state.
+     */
+    public void materializeExportedGlobalSnapshot(
+            GlobalSnapshot snapshot, Config.VolumeDescriptor destination) {
+        if (snapshot == null || destination == null) {
+            throw new IllegalArgumentException("snapshot and destination must not be null");
+        }
+        materializeExportedGlobalSnapshot(nativeHandle, snapshot.toJson(), destination.toJson());
+    }
+
     /**
      * Load one global snapshot by id.
      *
@@ -112,6 +134,12 @@ public final class DbCoordinator extends NativeObject {
 
     private static native String materializeGlobalSnapshot(
             long nativeHandle, int totalBuckets, long snapshotId, String shardInputsJson);
+
+    private static native String takeExportedGlobalSnapshot(
+            long nativeHandle, int totalBuckets, String shardInputsJson);
+
+    private static native void materializeExportedGlobalSnapshot(
+            long nativeHandle, String snapshotJson, String destinationJson);
 
     private static native String getGlobalSnapshotJson(long nativeHandle, long snapshotId);
 
