@@ -305,7 +305,7 @@ fn load_schema_from_reader(
             Ok(move |value| callback(value))
         })?;
     }
-    let read_only = builder.open(shard.snapshot_id)?;
+    let read_only = builder.open_shard_snapshot(shard)?;
     load_structured_schema_from_cobble_schema(&read_only.current_schema())
 }
 
