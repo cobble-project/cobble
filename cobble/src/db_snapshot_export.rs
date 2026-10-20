@@ -9,12 +9,12 @@ use crate::file::{
 use crate::manifest_model::manifest_schema_ids;
 use crate::paths::{metadata_temporary_path, schema_file_relative_path};
 use crate::schema::{SchemaManager, schema_to_file, snapshot_column_families_from_schema};
-use crate::snapshot::export_paths::{append_path, overlaps, storage_url};
 use crate::snapshot::manifest::{
     ManifestPayload, ManifestSnapshot, encode_manifest_payload, full_manifest,
 };
 use crate::snapshot::{DbSnapshot, ShardSnapshotMetadata, SnapshotExportGuard};
 use crate::snapshot::{load_manifest_for_snapshot, snapshot_manifest_name};
+use crate::storage_url::{append_path, overlaps, storage_location_url};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -363,7 +363,7 @@ impl PreparedExport {
             None => load_manifest_for_snapshot(file_manager, snapshot_id)?,
         };
         let export_id = Uuid::new_v4().to_string();
-        let export_url = append_path(&storage_url(&destination.base_dir)?, &export_id)?;
+        let export_url = append_path(&storage_location_url(&destination.base_dir)?, &export_id)?;
         let mut source_roots = file_manager.data_volume_absolute_paths("");
         source_roots.push(file_manager.metadata_file_full_path(""));
         let mut file_paths = BTreeMap::new();
@@ -393,7 +393,7 @@ impl PreparedExport {
             }
         }
         for path in file_paths.values() {
-            let mut url = storage_url(path)?;
+            let mut url = storage_location_url(path)?;
             // Normal data replicas live beneath <database>/data/<physical-file>.
             if let Ok(mut segments) = url.path_segments_mut() {
                 segments.pop().pop();
@@ -403,7 +403,7 @@ impl PreparedExport {
         source_roots.sort_unstable();
         source_roots.dedup();
         for source_root in source_roots {
-            if overlaps(&export_url, &storage_url(&source_root)?)? {
+            if overlaps(&export_url, &storage_location_url(&source_root)?)? {
                 return Err(Error::ConfigError(
                     "Snapshot export destination overlaps source storage".into(),
                 ));

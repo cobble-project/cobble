@@ -135,6 +135,7 @@ mod single_db;
 mod snapshot;
 mod snapshot_tool;
 mod sst;
+mod storage_url;
 mod time;
 mod ttl;
 mod r#type;

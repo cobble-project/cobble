@@ -14,7 +14,7 @@ use crate::paths::{
     global_snapshot_manifest_path, snapshot_manifest_name,
 };
 use crate::snapshot::ShardSnapshotMetadata;
-use crate::snapshot::export_paths::{append_path, overlaps, storage_url};
+use crate::storage_url::{append_path, overlaps, storage_location_url};
 use crate::util::{build_commit_short_id, build_version_string};
 use dashmap::DashSet;
 use log::info;
@@ -217,9 +217,9 @@ impl DbCoordinator {
         destination: VolumeDescriptor,
     ) -> Result<()> {
         validate_exported_global_snapshot(snapshot)?;
-        let destination_url = storage_url(&destination.base_dir)?;
+        let destination_url = storage_location_url(&destination.base_dir)?;
         for volume in &self.config.volumes {
-            if overlaps(&destination_url, &storage_url(&volume.base_dir)?)? {
+            if overlaps(&destination_url, &storage_location_url(&volume.base_dir)?)? {
                 return Err(Error::ConfigError(
                     "Global snapshot export destination overlaps online storage".into(),
                 ));
@@ -242,7 +242,7 @@ impl DbCoordinator {
                     bucket_snapshot_manifest_path(&shard.db_id, shard.snapshot_id)
                 ),
             )?;
-            if storage_url(&shard.manifest_path)? != expected {
+            if storage_location_url(&shard.manifest_path)? != expected {
                 return Err(Error::ConfigError(format!(
                     "Exported shard manifest must be located at {expected}"
                 )));

@@ -1,5 +1,4 @@
 //! Snapshot manager and manifest encoding for LSM state.
-pub(crate) mod export_paths;
 mod manager;
 pub(crate) mod manifest;
 mod memtable;

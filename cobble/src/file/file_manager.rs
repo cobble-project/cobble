@@ -25,7 +25,7 @@ use crate::file::offload::OffloadRuntime;
 use crate::lru::LruCache;
 use crate::metrics_manager::MetricsManager;
 use crate::snapshot::SnapshotLifecycleState;
-use crate::util::normalize_storage_path_to_url;
+use crate::storage_url::{append_storage_path, match_storage_path, normalize_storage_path_to_url};
 use bytes::Bytes;
 use dashmap::DashMap;
 use metrics::{Counter, Gauge, counter, gauge};
@@ -456,7 +456,7 @@ impl TrackedFile {
         let Some(base_dir) = volume.base_dir() else {
             return self.path.clone();
         };
-        format!("{}/{}", base_dir, self.path)
+        append_storage_path(base_dir, &self.path)
     }
 
     pub fn reference(&self) {
@@ -986,26 +986,17 @@ impl FileManager {
         )))
     }
 
-    fn trim_volume_base_dir<'a>(&self, path: &'a str, base_dir: &str) -> &'a str {
-        let base_dir = base_dir.trim_end_matches('/');
-        let Some(stripped) = path.strip_prefix(base_dir) else {
-            return path;
-        };
-        stripped.trim_start_matches('/')
-    }
-
     /// Resolves a file path to the corresponding data volume and relative path.
     /// This is used when registering existing files to determine which volume they belong to.
     fn resolve_volume_path(&self, path: &str) -> Result<(Arc<DataVolume>, String)> {
         let normalized = normalize_storage_path_to_url(path)?;
-        for volume in &self.data_volumes {
-            let Some(base_dir) = volume.base_dir() else {
-                continue;
-            };
-            if normalized.starts_with(base_dir) {
-                let relative = self.trim_volume_base_dir(&normalized, base_dir);
-                return Ok((Arc::clone(volume), relative.to_string()));
-            }
+        let bases = self
+            .data_volumes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, volume)| volume.base_dir().map(|base| (index, base)));
+        if let Some((index, relative)) = match_storage_path(&normalized, bases)? {
+            return Ok((Arc::clone(&self.data_volumes[index]), relative));
         }
         let volume = self.test_existence_for_path(path)?;
         Ok((Arc::clone(volume), path.to_string()))
@@ -1340,7 +1331,7 @@ impl FileManager {
                 };
                 let absolute_path = volume
                     .base_dir()
-                    .map(|base_dir| format!("{}/{}", base_dir.trim_end_matches('/'), relative_path))
+                    .map(|base_dir| append_storage_path(base_dir, &relative_path))
                     .unwrap_or_else(|| relative_path.clone());
                 files.push(PrimaryResidualFile {
                     file_name,
@@ -2312,7 +2303,7 @@ impl FileManager {
             let path = self.metadata_file_path(name);
             self.meta_volume
                 .base_dir()
-                .map(|base_dir| format!("{}/{}", base_dir, path))
+                .map(|base_dir| append_storage_path(base_dir, &path))
                 .unwrap_or(path)
         })
     }
@@ -2956,7 +2947,7 @@ impl FileManager {
             .filter_map(|volume| {
                 volume
                     .base_dir()
-                    .map(|bd| format!("{}/{}", bd, full_relative))
+                    .map(|bd| append_storage_path(bd, &full_relative))
             })
             .collect()
     }

@@ -4,7 +4,7 @@ use crate::file::files::{RandomAccessFile, SequentialWriteFile};
 use crate::file::opendal_fs::OpendalFileSystem;
 #[cfg(unix)]
 use crate::file::posix_fs::PosixFileSystem;
-use crate::util::normalize_storage_path_to_url;
+use crate::storage_url::normalize_storage_path_to_url;
 use dashmap::DashMap;
 use std::any::Any;
 use std::collections::HashMap;

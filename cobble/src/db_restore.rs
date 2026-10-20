@@ -734,18 +734,20 @@ impl Db {
         let active_memtable_source = if manifest.active_memtable_data.is_empty() {
             None
         } else {
-            let source_db_id = manifest_path.rsplit('/').nth(2).ok_or_else(|| {
-                Error::InvalidState("Source manifest path is missing the database ID".into())
-            })?;
+            let source_db_id = crate::paths::snapshot_source_db_id(&manifest_path)?;
             let source = if manifest_path.contains("://")
                 || std::path::Path::new(&manifest_path).is_absolute()
             {
-                super::rescale::snapshot_source_file_manager(&config, source_db_id, &manifest_path)?
-                    .0
+                super::rescale::snapshot_source_file_manager(
+                    &config,
+                    &source_db_id,
+                    &manifest_path,
+                )?
+                .0
             } else {
                 Arc::new(FileManager::from_config_readonly(
                     &config,
-                    source_db_id,
+                    &source_db_id,
                     Arc::clone(&metrics_manager),
                 )?)
             };

@@ -5,12 +5,11 @@ use crate::error::{Error, Result};
 use crate::file::{FileSystemRegistry, MetadataReader};
 use crate::paths::schema_file_path_from_snapshot_manifest_path;
 use crate::schema::{SnapshotColumnFamily, snapshot_column_families_from_payload};
-use crate::util::normalize_storage_path_to_url;
+use crate::storage_url::{match_storage_path, normalize_storage_path_to_url};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::Path;
-use url::Url;
 
 /// Complete transient metadata captured by one shard snapshot.
 ///
@@ -143,10 +142,15 @@ fn metadata_volume_and_relative_path<'a>(
         ));
     }
     let normalized_path = normalize_storage_path_to_url(path)?;
-    for volume in metadata_volumes {
-        if let Ok(relative) = relative_path_for_volume(volume, &normalized_path) {
-            return Ok((volume, relative));
-        }
+    let bases = metadata_volumes
+        .iter()
+        .map(|volume| normalize_storage_path_to_url(&volume.base_dir))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some((index, relative)) = match_storage_path(
+        &normalized_path,
+        bases.iter().map(String::as_str).enumerate(),
+    )? {
+        return Ok((metadata_volumes[index], relative));
     }
     Err(Error::ConfigError(format!(
         "snapshot metadata path is outside configured metadata volumes: {path}"
@@ -159,46 +163,11 @@ fn relative_path_for_volume(
 ) -> Result<String> {
     let normalized_path = normalize_storage_path_to_url(path)?;
     let normalized_base = normalize_storage_path_to_url(&volume.base_dir)?;
-    let path_url = Url::parse(&normalized_path).map_err(|error| {
-        Error::ConfigError(format!("Invalid snapshot metadata path {path}: {error}"))
-    })?;
-    let base_url = Url::parse(&normalized_base).map_err(|error| {
-        Error::ConfigError(format!(
-            "Invalid metadata volume path {}: {error}",
-            volume.base_dir
-        ))
-    })?;
-    if path_url.scheme() == "file" && base_url.scheme() == "file" {
-        let path = path_url.to_file_path().map_err(|_| {
-            Error::ConfigError(format!(
-                "Invalid file snapshot metadata path {normalized_path}"
-            ))
-        })?;
-        let base = base_url.to_file_path().map_err(|_| {
-            Error::ConfigError(format!(
-                "Invalid file metadata volume path {normalized_base}"
-            ))
-        })?;
-        return path
-            .strip_prefix(base)
-            .map(|relative| {
-                relative
-                    .to_string_lossy()
-                    .trim_start_matches('/')
-                    .to_string()
-            })
-            .map_err(|_| {
-                Error::ConfigError("snapshot metadata path is outside metadata volume".into())
-            });
-    }
-    let base = normalized_base.trim_end_matches('/');
-    let relative = normalized_path
-        .strip_prefix(base)
-        .filter(|relative| relative.is_empty() || relative.starts_with('/'))
+    match_storage_path(&normalized_path, [(0, normalized_base.as_str())])?
+        .map(|(_, relative)| relative)
         .ok_or_else(|| {
             Error::ConfigError("snapshot metadata path is outside metadata volume".into())
-        })?;
-    Ok(relative.trim_start_matches('/').to_string())
+        })
 }
 
 fn is_absolute_storage_path(path: &str) -> bool {

@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::file::FileSystemRegistry;
 use crate::properties::DB_PROPERTIES_NAME;
 use crate::schema::SchemaTransformRegistry;
-use crate::util::normalize_storage_path_to_url;
+use crate::storage_url::normalize_storage_path_to_url;
 use bytes::Bytes;
 use log::{debug, info, warn};
 use std::collections::{BTreeMap, HashMap, HashSet};

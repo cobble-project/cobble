@@ -20,9 +20,10 @@ use crate::snapshot::{
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
     list_snapshot_manifest_ids, load_manifest_entry,
 };
+use crate::storage_url::{match_storage_path, normalize_storage_path_to_url};
 use crate::util::{
-    normalize_bucket_ranges, normalize_storage_path_to_url, range_is_covered_by_ranges,
-    ranges_overlap, subtract_range_by_cuts, subtract_ranges,
+    normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap, subtract_range_by_cuts,
+    subtract_ranges,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
@@ -43,13 +44,9 @@ pub(super) fn snapshot_source_file_manager(
         normalize_storage_path_to_url(manifest_path)?
     };
     let mut root = url::Url::parse(&location)?;
-    if !root.username().is_empty()
-        || root.password().is_some()
-        || root.query().is_some()
-        || root.fragment().is_some()
-    {
+    if !root.username().is_empty() || root.password().is_some() || root.fragment().is_some() {
         return Err(Error::ConfigError(
-            "Source manifest location must not contain credentials or URL options".into(),
+            "Source manifest location must not contain credentials or fragments".into(),
         ));
     }
     let segments = root
@@ -81,19 +78,23 @@ pub(super) fn snapshot_source_file_manager(
         .pop()
         .pop()
         .pop();
-    let source_root = root.as_str().trim_end_matches('/');
-    let mut source_volume = config
+    let source_path = root.path().trim_end_matches('/').to_string();
+    root.set_path(&source_path);
+    let source_root = root.as_str();
+    let bases = config
         .volumes
         .iter()
-        .find(|volume| {
-            crate::config::volume_descriptor_identity(volume).trim_end_matches('/') == source_root
-        })
-        .cloned()
-        .ok_or_else(|| {
-            Error::ConfigError(format!(
-                "Source metadata volume is not configured: {source_root}"
-            ))
-        })?;
+        .map(|volume| normalize_storage_path_to_url(&volume.base_dir))
+        .collect::<Result<Vec<_>>>()?;
+    let mut source_volume =
+        match_storage_path(source_root, bases.iter().map(String::as_str).enumerate())?
+            .filter(|(_, relative)| relative.is_empty())
+            .map(|(index, _)| config.volumes[index].clone())
+            .ok_or_else(|| {
+                Error::ConfigError(format!(
+                    "Source metadata volume is not configured: {source_root}"
+                ))
+            })?;
     source_volume.kinds = 0;
     source_volume.set_usage(crate::VolumeUsageKind::Meta);
     source_volume.set_usage(crate::VolumeUsageKind::Snapshot);

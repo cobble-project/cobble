@@ -94,7 +94,8 @@ struct SnapshotS3Prefix {
     base_dir: Url,
     access_id: String,
     secret_key: String,
-    endpoint_scheme: String,
+    endpoint: String,
+    prefix: String,
 }
 
 impl SnapshotS3Prefix {
@@ -130,13 +131,20 @@ impl SnapshotS3Prefix {
             base_dir,
             access_id,
             secret_key,
-            endpoint_scheme: endpoint_url.scheme().to_string(),
+            endpoint,
+            prefix,
         }
     }
 
     fn volume(&self, directory: &str) -> VolumeDescriptor {
         let mut url = self.base_dir.clone();
         url.set_path(&format!("{}{directory}", self.base_dir.path()));
+        // Deliberately retain slashes in endpoint/root options: appending files must mutate only
+        // the URL path, and sibling/schema lookup must not split the query's slash components.
+        url.set_query(Some(&format!(
+            "endpoint={}&root=/{}/objects/{directory}&region=us-east-1&disable_config_load=true&disable_ec2_metadata=true&enable_virtual_host_style=false",
+            self.endpoint, self.prefix,
+        )));
         let mut volume = VolumeDescriptor::new(
             url.to_string(),
             vec![
@@ -147,19 +155,15 @@ impl SnapshotS3Prefix {
         );
         volume.access_id = Some(self.access_id.clone());
         volume.secret_key = Some(self.secret_key.clone());
-        // Keep filesystem options separate from persistent storage identity.
-        volume.custom_options = Some(
-            [
-                ("endpoint_scheme", self.endpoint_scheme.as_str()),
-                ("region", "us-east-1"),
-                ("disable_config_load", "true"),
-                ("disable_ec2_metadata", "true"),
-                ("enable_virtual_host_style", "false"),
-            ]
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect(),
-        );
+        volume
+    }
+
+    fn plain_volume(&self, directory: &str) -> VolumeDescriptor {
+        let mut volume = self.volume(directory);
+        let mut url = Url::parse(&volume.base_dir).unwrap();
+        volume.custom_options = Some(url.query_pairs().into_owned().collect());
+        url.set_query(None);
+        volume.base_dir = url.to_string();
         volume
     }
 
@@ -168,7 +172,7 @@ impl SnapshotS3Prefix {
         let relative = url.path().strip_prefix(self.base_dir.path()).unwrap();
         let bytes = self
             .runtime
-            .block_on(self.operator.read(relative))
+            .block_on(self.operator.read(&format!("objects/{relative}")))
             .unwrap()
             .to_bytes();
         assert!(bytes.ends_with(b"mcs1"));
@@ -176,8 +180,13 @@ impl SnapshotS3Prefix {
     }
 
     fn delete(&self, directory: &str) {
+        let physical = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("objects/{directory}")
+        };
         self.runtime
-            .block_on(async { self.operator.delete_with(directory).recursive(true).await })
+            .block_on(async { self.operator.delete_with(&physical).recursive(true).await })
             .unwrap();
     }
 }
@@ -323,7 +332,7 @@ fn s3_snapshot_to_preserves_incremental_chains_and_active_merge_cuts() {
     for (snapshot, stages) in [(&a, 1), (&b, 2), (&c, 3), (&d, 4)] {
         verify_snapshot_cut(source_config.clone(), snapshot, stages);
     }
-    verify_snapshot_cut(snapshot_config(export_volume.clone(), 0.0), &e, 3);
+    verify_snapshot_cut(snapshot_config(storage.plain_volume("exports"), 0.0), &e, 3);
     assert!(db.expire_snapshot(a.snapshot_id).unwrap());
     assert!(db.expire_snapshot(b.snapshot_id).unwrap());
     verify_snapshot_cut(source_config.clone(), &c, 3);

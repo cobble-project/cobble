@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::storage_url::{map_url_path, url_path};
 
 /// An unpublished metadata file beside its destination, outside the destination's name prefix.
 pub fn metadata_temporary_path(path: &str) -> String {
@@ -44,17 +45,19 @@ pub(crate) fn sibling_snapshot_manifest_path(
     manifest_path: &str,
     snapshot_id: u64,
 ) -> Result<String> {
-    let (snapshot_dir, _) = manifest_path.rsplit_once('/').ok_or_else(|| {
-        Error::InvalidState(format!(
-            "Snapshot manifest path missing file name: {}",
-            manifest_path
+    map_url_path(manifest_path, |path| {
+        let (snapshot_dir, _) = path.rsplit_once('/').ok_or_else(|| {
+            Error::InvalidState(format!(
+                "Snapshot manifest path missing file name: {}",
+                manifest_path
+            ))
+        })?;
+        Ok(format!(
+            "{}/{}",
+            snapshot_dir,
+            snapshot_manifest_name(snapshot_id)
         ))
-    })?;
-    Ok(format!(
-        "{}/{}",
-        snapshot_dir,
-        snapshot_manifest_name(snapshot_id)
-    ))
+    })
 }
 
 pub(crate) fn schema_file_name(id: u64) -> String {
@@ -69,30 +72,39 @@ pub(crate) fn schema_file_path_from_snapshot_manifest_path(
     manifest_path: &str,
     schema_id: u64,
 ) -> Result<String> {
-    let (snapshot_dir, _) = manifest_path.rsplit_once('/').ok_or_else(|| {
-        Error::InvalidState(format!(
-            "Snapshot manifest path missing file name: {}",
-            manifest_path
+    map_url_path(manifest_path, |path| {
+        let (snapshot_dir, _) = path.rsplit_once('/').ok_or_else(|| {
+            Error::InvalidState(format!(
+                "Snapshot manifest path missing file name: {}",
+                manifest_path
+            ))
+        })?;
+        let (db_root, dir_name) = snapshot_dir.rsplit_once('/').ok_or_else(|| {
+            Error::InvalidState(format!(
+                "Snapshot manifest path missing parent directory: {}",
+                manifest_path
+            ))
+        })?;
+        if dir_name != SNAPSHOT_DIR {
+            return Err(Error::InvalidState(format!(
+                "Snapshot manifest path {} is not under /{}/",
+                manifest_path, SNAPSHOT_DIR
+            )));
+        }
+        Ok(format!(
+            "{}/{}/{}",
+            db_root,
+            SCHEMA_DIR,
+            schema_file_name(schema_id)
         ))
-    })?;
-    let (db_root, dir_name) = snapshot_dir.rsplit_once('/').ok_or_else(|| {
-        Error::InvalidState(format!(
-            "Snapshot manifest path missing parent directory: {}",
-            manifest_path
-        ))
-    })?;
-    if dir_name != SNAPSHOT_DIR {
-        return Err(Error::InvalidState(format!(
-            "Snapshot manifest path {} is not under /{}/",
-            manifest_path, SNAPSHOT_DIR
-        )));
-    }
-    Ok(format!(
-        "{}/{}/{}",
-        db_root,
-        SCHEMA_DIR,
-        schema_file_name(schema_id)
-    ))
+    })
+}
+
+pub(crate) fn snapshot_source_db_id(manifest_path: &str) -> Result<String> {
+    let path = url_path(manifest_path)?;
+    path.rsplit('/').nth(2).map(str::to_string).ok_or_else(|| {
+        Error::InvalidState("Source manifest path is missing the database ID".into())
+    })
 }
 
 pub(crate) fn global_snapshot_current_path() -> String {

@@ -37,9 +37,9 @@ use crate::metrics_manager::MetricsManager;
 use crate::runtime_manifest::{LoadedRuntimeManifest, RuntimeManifestStore};
 use crate::schema::{SchemaManager, SchemaTransformRegistry};
 use crate::snapshot::manifest::{list_snapshot_manifest_ids, load_manifest_for_snapshot};
+use crate::storage_url::{normalize_storage_path_to_url, storage_location_url};
 use crate::time::ManualTimeProvider;
 use crate::ttl::{TTLProvider, TtlConfig};
-use crate::util::normalize_storage_path_to_url;
 use crate::vlog::VlogVersion;
 use crate::writer_options::WriterOptionsFactory;
 use bytes::Bytes;
@@ -150,12 +150,12 @@ impl DedicatedCompactionPlan {
             ));
         }
         for path in &plan.volume_paths {
-            let sanitized = sanitized_absolute_volume_path(path).map_err(|err| {
+            let sanitized = storage_location_url(path).map_err(|err| {
                 Error::InvalidState(format!(
                     "Invalid dedicated compaction plan volume path {path}: {err}"
                 ))
             })?;
-            if sanitized != *path {
+            if sanitized.as_str() != path {
                 return Err(Error::InvalidState(format!(
                     "Dedicated compaction plan volume path must be absolute and credential-free: {path}"
                 )));
@@ -670,7 +670,7 @@ impl DedicatedCompactor {
                     .config
                     .volumes
                     .iter()
-                    .map(|volume| sanitized_absolute_volume_path(&volume.base_dir))
+                    .map(|volume| storage_location_url(&volume.base_dir).map(|url| url.to_string()))
                     .collect::<Result<Vec<_>>>()?,
                 source: observation.source.clone(),
                 topology_epoch: observation.topology_epoch,
@@ -1319,24 +1319,6 @@ impl crate::SchemaTransformRegistrar for DedicatedCompactionExecutor {
     {
         DedicatedCompactionExecutor::register_schema_transform(self, transform_type, factory)
     }
-}
-
-fn sanitized_absolute_volume_path(path: &str) -> Result<String> {
-    let normalized = normalize_storage_path_to_url(path)?;
-    let mut url = url::Url::parse(&normalized)?;
-    if !url.username().is_empty() {
-        url.set_username("").map_err(|_| {
-            Error::ConfigError(format!("Cannot sanitize compaction volume path {path}"))
-        })?;
-    }
-    if url.password().is_some() {
-        url.set_password(None).map_err(|_| {
-            Error::ConfigError(format!("Cannot sanitize compaction volume path {path}"))
-        })?;
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
 }
 
 fn apply_plan_volume_path(configured_path: &str, plan_path: &str) -> Result<String> {

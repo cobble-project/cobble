@@ -3,10 +3,9 @@ use crate::SstCompressionAlgorithm;
 use crate::data_file::DataFileType;
 use crate::error::{Error, Result};
 use crate::schema::Schema;
+use crate::storage_url::normalize_storage_path_to_url;
 use crate::time::TimeProviderKind;
-use crate::util::{
-    column_mask_last_byte, normalize_storage_path_to_url, size_to_u64, size_to_usize,
-};
+use crate::util::{column_mask_last_byte, size_to_u64, size_to_usize};
 use arc_swap::ArcSwapOption;
 use config::{Config as ConfigLoader, File as ConfigFile, FileFormat as ConfigFileFormat};
 use log::warn;
