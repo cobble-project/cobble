@@ -316,6 +316,7 @@ pub(crate) struct SnapshotCompletion {
     pub(crate) truncation_cursors: Option<TruncationCursorSnapshot>,
     pub(crate) wal_checkpoint_id: u64,
     pub(crate) wal_volume: Option<crate::config::VolumeDescriptor>,
+    pub(crate) force_full: bool,
 }
 
 pub(crate) struct ActiveMemtable {
@@ -2337,6 +2338,7 @@ impl MemtableManager {
                 truncation_cursors: None,
                 wal_checkpoint_id: 0,
                 wal_volume: None,
+                force_full: false,
             });
         let auto_snapshot_id = auto_snapshot
             .as_ref()
@@ -2396,6 +2398,7 @@ impl MemtableManager {
             manager,
             wal_checkpoint_id,
             wal_volume,
+            false,
         )?;
         Ok(snapshot_id)
     }
@@ -2405,7 +2408,17 @@ impl MemtableManager {
         snapshot_id: u64,
         manager: SnapshotManager,
     ) -> Result<()> {
-        self.flush_snapshot_with_checkpoint_under_rotation(snapshot_id, manager, 0, None)
+        self.flush_snapshot_with_checkpoint_under_rotation(snapshot_id, manager, 0, None, false)
+    }
+
+    pub(crate) fn create_independent_snapshot(
+        &self,
+        manager: SnapshotManager,
+        callback: crate::snapshot::IndependentSnapshotCallback,
+    ) -> Result<()> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+        let snapshot_id = manager.create_independent_snapshot(callback).id;
+        self.flush_snapshot_with_checkpoint_under_rotation(snapshot_id, manager, 0, None, true)
     }
 
     fn flush_snapshot_with_checkpoint_under_rotation(
@@ -2414,6 +2427,7 @@ impl MemtableManager {
         manager: SnapshotManager,
         wal_checkpoint_id: u64,
         wal_volume: Option<crate::config::VolumeDescriptor>,
+        force_full: bool,
     ) -> Result<()> {
         let snapshot = SnapshotCompletion {
             snapshot_id,
@@ -2421,6 +2435,7 @@ impl MemtableManager {
             truncation_cursors: None,
             wal_checkpoint_id,
             wal_volume,
+            force_full,
         };
         match self.flush_active_internal(Some(snapshot), FlushCause::Snapshot) {
             Ok(_) => Ok(()),
@@ -2457,6 +2472,9 @@ impl MemtableManager {
             let mut inner_active = active.write().unwrap();
             if let Some(memtable) = inner_active.readable_memtable()
                 && !memtable.is_empty()
+                && !snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.force_full)
                 && self.should_use_active_incremental_snapshot(memtable)
             {
                 let capture_end = memtable.data_offset();

@@ -4,6 +4,7 @@ use cobble::{Config, SingleDb, VolumeDescriptor, VolumeUsageKind};
 use opendal::Operator;
 use opendal::services;
 use size::Size;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -85,6 +86,378 @@ fn list_wal_objects(
         .filter(|entry| entry.name().starts_with("WAL-"))
         .map(|entry| entry.path().to_string())
         .collect()
+}
+
+struct SnapshotS3Prefix {
+    runtime: tokio::runtime::Runtime,
+    operator: Operator,
+    base_dir: Url,
+    access_id: String,
+    secret_key: String,
+    endpoint_scheme: String,
+}
+
+impl SnapshotS3Prefix {
+    fn new() -> Self {
+        let endpoint = must_env("COBBLE_S3_ENDPOINT");
+        let bucket = must_env("COBBLE_S3_BUCKET");
+        let access_id = must_env("COBBLE_S3_ACCESS_ID");
+        let secret_key = must_env("COBBLE_S3_SECRET_KEY");
+        let endpoint_url = Url::parse(&endpoint).unwrap();
+        let prefix = format!("cobble-snapshot-to-{}", uuid::Uuid::new_v4());
+        let operator = Operator::new(
+            services::S3::default()
+                .bucket(&bucket)
+                .root(&prefix)
+                .endpoint(&endpoint)
+                .region("us-east-1")
+                .access_key_id(&access_id)
+                .secret_access_key(&secret_key),
+        )
+        .unwrap();
+        let base_dir = Url::parse(&format!(
+            "s3://{}:{}/{}/{}/",
+            endpoint_url.host_str().unwrap(),
+            endpoint_url.port_or_known_default().unwrap(),
+            bucket,
+            prefix,
+        ))
+        .unwrap();
+        eprintln!("[snapshot-to-s3] endpoint={endpoint} bucket={bucket} prefix={prefix}");
+        Self {
+            runtime: tokio::runtime::Runtime::new().unwrap(),
+            operator,
+            base_dir,
+            access_id,
+            secret_key,
+            endpoint_scheme: endpoint_url.scheme().to_string(),
+        }
+    }
+
+    fn volume(&self, directory: &str) -> VolumeDescriptor {
+        let mut url = self.base_dir.clone();
+        url.set_path(&format!("{}{directory}", self.base_dir.path()));
+        let mut volume = VolumeDescriptor::new(
+            url.to_string(),
+            vec![
+                VolumeUsageKind::Meta,
+                VolumeUsageKind::PrimaryDataPriorityHigh,
+                VolumeUsageKind::Snapshot,
+            ],
+        );
+        volume.access_id = Some(self.access_id.clone());
+        volume.secret_key = Some(self.secret_key.clone());
+        // Keep filesystem options separate from persistent storage identity.
+        volume.custom_options = Some(
+            [
+                ("endpoint_scheme", self.endpoint_scheme.as_str()),
+                ("region", "us-east-1"),
+                ("disable_config_load", "true"),
+                ("disable_ec2_metadata", "true"),
+                ("enable_virtual_host_style", "false"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        );
+        volume
+    }
+
+    fn manifest(&self, metadata: &cobble::ShardSnapshotMetadata) -> serde_json::Value {
+        let url = Url::parse(&metadata.manifest_path).unwrap();
+        let relative = url.path().strip_prefix(self.base_dir.path()).unwrap();
+        let bytes = self
+            .runtime
+            .block_on(self.operator.read(relative))
+            .unwrap()
+            .to_bytes();
+        assert!(bytes.ends_with(b"mcs1"));
+        serde_json::from_slice(&bytes[..bytes.len() - 8]).unwrap()
+    }
+
+    fn delete(&self, directory: &str) {
+        self.runtime
+            .block_on(async { self.operator.delete_with(directory).recursive(true).await })
+            .unwrap();
+    }
+}
+
+impl Drop for SnapshotS3Prefix {
+    fn drop(&mut self) {
+        self.delete("");
+        eprintln!("[snapshot-to-s3] cleaned isolated test prefix");
+    }
+}
+
+fn snapshot_config(volume: VolumeDescriptor, active_ratio: f64) -> Config {
+    Config {
+        volumes: vec![volume],
+        total_buckets: 1,
+        num_columns: 1,
+        memtable_capacity: Size::from_mib(16),
+        memtable_buffer_count: 2,
+        l0_file_limit: 100,
+        snapshot_on_flush: false,
+        snapshot_retention: None,
+        block_cache_size: Size::from_const(0),
+        value_separation_threshold: Some(Size::from_const(16)),
+        active_memtable_incremental_snapshot_ratio: active_ratio,
+        ..Config::default()
+    }
+}
+
+fn wait_snapshot(db: &cobble::Db) -> cobble::ShardSnapshotMetadata {
+    let (sender, receiver) = mpsc::channel();
+    db.snapshot_with_callback(move |result| sender.send(result).unwrap())
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap()
+        .unwrap()
+}
+
+fn write_snapshot_stage(db: &cobble::Db, stage: usize) {
+    for i in 0..128 {
+        let index = stage * 128 + i;
+        db.put(
+            0,
+            format!("key-{index:04}").as_bytes(),
+            0,
+            make_value(index, 256),
+        )
+        .unwrap();
+    }
+}
+
+fn verify_snapshot_cut(config: Config, metadata: &cobble::ShardSnapshotMetadata, stages: usize) {
+    let restored =
+        cobble::Db::open_new_with_manifest_path(config, &metadata.manifest_path).unwrap();
+    for index in 0..stages * 128 {
+        assert_eq!(
+            restored
+                .get(0, format!("key-{index:04}").as_bytes())
+                .unwrap()
+                .unwrap()[0]
+                .as_deref(),
+            Some(make_value(index, 256).as_slice())
+        );
+    }
+    assert!(
+        restored
+            .get(0, format!("key-{:04}", stages * 128).as_bytes())
+            .unwrap()
+            .is_none()
+    );
+    let rows = restored
+        .scan(0, b"".as_slice()..b"zz".as_slice())
+        .unwrap()
+        .collect::<cobble::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), stages * 128);
+    for (index, (key, columns)) in rows.iter().enumerate() {
+        assert_eq!(key.as_ref(), format!("key-{index:04}").as_bytes());
+        assert_eq!(
+            columns[0].as_deref(),
+            Some(make_value(index, 256).as_slice())
+        );
+    }
+    restored.close().unwrap();
+}
+
+#[test]
+fn s3_snapshot_to_preserves_incremental_chains_and_active_merge_cuts() {
+    if !has_required_env() {
+        eprintln!("skipping snapshot_to S3 test: COBBLE_S3_* env vars are not fully set");
+        return;
+    }
+    let storage = SnapshotS3Prefix::new();
+    let source_config = snapshot_config(storage.volume("source"), 0.0);
+    let export_volume = storage.volume("exports");
+    let db = cobble::DbBuilder::new(source_config.clone())
+        .db_id("sst-chain")
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+    write_snapshot_stage(&db, 0);
+    let a = wait_snapshot(&db);
+    write_snapshot_stage(&db, 1);
+    let b = wait_snapshot(&db);
+    write_snapshot_stage(&db, 2);
+    let e = db
+        .snapshot_to(export_volume.clone())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let c = wait_snapshot(&db); // Only E's one new L0 file differs from B.
+    write_snapshot_stage(&db, 3);
+    let d = wait_snapshot(&db);
+    for (name, snapshot, base) in [
+        ("A", &a, None),
+        ("B", &b, Some(a.snapshot_id)),
+        ("E", &e, None),
+        ("C", &c, Some(b.snapshot_id)),
+        ("D", &d, Some(c.snapshot_id)),
+    ] {
+        let manifest = storage.manifest(snapshot);
+        assert_eq!(
+            manifest
+                .get("base_snapshot_id")
+                .and_then(|value| value.as_u64()),
+            base,
+            "{name} has wrong raw manifest base"
+        );
+        eprintln!(
+            "[snapshot-to-s3] SST {name} id={} base={base:?}",
+            snapshot.snapshot_id
+        );
+    }
+    let exported = storage.manifest(&e);
+    assert!(
+        exported["active_memtable_data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!exported["vlog_files"].as_array().unwrap().is_empty());
+    assert!(exported.get("tree_levels").is_some());
+    for (snapshot, stages) in [(&a, 1), (&b, 2), (&c, 3), (&d, 4)] {
+        verify_snapshot_cut(source_config.clone(), snapshot, stages);
+    }
+    verify_snapshot_cut(snapshot_config(export_volume.clone(), 0.0), &e, 3);
+    assert!(db.expire_snapshot(a.snapshot_id).unwrap());
+    assert!(db.expire_snapshot(b.snapshot_id).unwrap());
+    verify_snapshot_cut(source_config.clone(), &c, 3);
+    // The existing delta format permits one new L0 file per tree. Two are a valid full fallback.
+    write_snapshot_stage(&db, 4);
+    let e2 = db
+        .snapshot_to(export_volume.clone())
+        .unwrap()
+        .wait()
+        .unwrap();
+    write_snapshot_stage(&db, 5);
+    let fallback = wait_snapshot(&db);
+    assert!(
+        storage
+            .manifest(&fallback)
+            .get("base_snapshot_id")
+            .is_none()
+    );
+    eprintln!(
+        "[snapshot-to-s3] SST fallback id={} full (two new L0 files since D={})",
+        fallback.snapshot_id, d.snapshot_id
+    );
+    verify_snapshot_cut(source_config, &fallback, 6);
+    db.close().unwrap();
+    storage.delete("source/");
+    verify_snapshot_cut(snapshot_config(export_volume.clone(), 0.0), &e, 3);
+    verify_snapshot_cut(snapshot_config(export_volume.clone(), 0.0), &e2, 5);
+
+    let active_config = snapshot_config(storage.volume("active-source"), 1.0);
+    let db = cobble::DbBuilder::new(active_config.clone())
+        .db_id("active-chain")
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+    let mut schema = db.update_schema();
+    schema
+        .set_column_operator(None, 0, Arc::new(cobble::U64CounterMergeOperator))
+        .unwrap();
+    schema.commit();
+    db.put(0, b"counter", 0, 100u64.to_le_bytes()).unwrap();
+    // Seed an existing L0 so E later adds to B's level instead of introducing a new level,
+    // which the ordinary delta format legitimately encodes as a full fallback.
+    db.snapshot_to(export_volume.clone())
+        .unwrap()
+        .wait()
+        .unwrap();
+    db.merge(0, b"counter", 0, 1u64.to_le_bytes()).unwrap();
+    let a = wait_snapshot(&db);
+    db.merge(0, b"counter", 0, 2u64.to_le_bytes()).unwrap();
+    let b = wait_snapshot(&db);
+    assert!(
+        !storage.manifest(&b)["active_memtable_data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    db.merge(0, b"counter", 0, 4u64.to_le_bytes()).unwrap();
+    let e = db
+        .snapshot_to(export_volume.clone())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let c = wait_snapshot(&db);
+    assert_eq!(
+        storage.manifest(&c)["base_snapshot_id"].as_u64(),
+        Some(b.snapshot_id)
+    );
+    assert!(
+        storage.manifest(&c)["active_memtable_data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    db.merge(0, b"counter", 0, 8u64.to_le_bytes()).unwrap();
+    let d = wait_snapshot(&db);
+    assert!(
+        !storage.manifest(&d)["active_memtable_data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for (name, snapshot, expected, config) in [
+        ("A", &a, 101u64, active_config.clone()),
+        ("B", &b, 103, active_config.clone()),
+        ("E", &e, 107, snapshot_config(export_volume.clone(), 1.0)),
+        ("C", &c, 107, active_config.clone()),
+        ("D", &d, 115, active_config.clone()),
+    ] {
+        let restored =
+            cobble::Db::open_new_with_manifest_path(config, &snapshot.manifest_path).unwrap();
+        let value = restored.get(0, b"counter").unwrap().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(value[0].as_deref().unwrap().try_into().unwrap()),
+            expected,
+            "active {name} replayed an overlapping segment"
+        );
+        let rows = restored
+            .scan(0, b"".as_slice()..b"zz".as_slice())
+            .unwrap()
+            .collect::<cobble::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.as_ref(), b"counter");
+        assert_eq!(
+            rows[0].1[0].as_deref(),
+            Some(expected.to_le_bytes().as_slice())
+        );
+        restored.close().unwrap();
+        eprintln!(
+            "[snapshot-to-s3] active {name} id={} counter={expected}",
+            snapshot.snapshot_id
+        );
+    }
+    assert!(
+        storage.manifest(&e)["active_memtable_data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    db.close().unwrap();
+    storage.delete("active-source/");
+    let restored = cobble::Db::open_new_with_manifest_path(
+        snapshot_config(export_volume, 1.0),
+        &e.manifest_path,
+    )
+    .unwrap();
+    assert_eq!(
+        restored.get(0, b"counter").unwrap().unwrap()[0].as_deref(),
+        Some(107u64.to_le_bytes().as_slice())
+    );
+    restored.close().unwrap();
+    eprintln!(
+        "[snapshot-to-s3] all raw bases, point reads, scans, expiration and source deletion checks passed"
+    );
 }
 
 #[test]

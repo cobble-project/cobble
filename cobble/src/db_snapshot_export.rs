@@ -1,19 +1,24 @@
 use super::Db;
 use crate::config::VolumeDescriptor;
+use crate::db_status::OwnedDbAccessGuard;
 use crate::error::{Error, Result};
 use crate::file::logical_file::ReplicaOrigin;
-use crate::file::{File, FileManager, FileSystem, FileSystemRegistry, MetadataWriter};
+use crate::file::{
+    BufferedWriter, File, FileManager, FileSystem, FileSystemRegistry, MetadataWriter,
+};
 use crate::manifest_model::manifest_schema_ids;
 use crate::paths::{metadata_temporary_path, schema_file_relative_path};
-use crate::schema::{SchemaManager, snapshot_column_families_from_schema};
-use crate::snapshot::ShardSnapshotMetadata;
+use crate::schema::{SchemaManager, schema_to_file, snapshot_column_families_from_schema};
 use crate::snapshot::export_paths::{append_path, overlaps, storage_url};
-use crate::snapshot::manifest::{ManifestPayload, ManifestSnapshot, encode_manifest_payload};
+use crate::snapshot::manifest::{
+    ManifestPayload, ManifestSnapshot, encode_manifest_payload, full_manifest,
+};
+use crate::snapshot::{DbSnapshot, ShardSnapshotMetadata, SnapshotExportGuard};
 use crate::snapshot::{load_manifest_for_snapshot, snapshot_manifest_name};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::{Notify, OwnedSemaphorePermit, oneshot};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -158,6 +163,11 @@ struct PreparedExport {
     copies: Vec<ExportCopy>,
 }
 
+enum ExportSource {
+    Published(u64, SnapshotExportGuard),
+    Capturing(oneshot::Receiver<Result<(Arc<DbSnapshot>, SnapshotExportGuard)>>),
+}
+
 async fn acquire_export_transfer_permit(
     file_manager: &FileManager,
     state: &ExportState,
@@ -239,6 +249,52 @@ impl Db {
     ) -> Result<ExportSnapshotHandle> {
         let access = self.db_lifecycle.begin_owned_access()?;
         let pin = self.snapshot_manager.pin_completed_snapshot(snapshot_id)?;
+        Ok(self.start_export(
+            ExportSource::Published(snapshot_id, pin),
+            destination,
+            fs,
+            access,
+        ))
+    }
+
+    /// Capture the current state as a new full snapshot in an independent UUID directory.
+    /// Only this operation disables incremental capture. It consumes a snapshot id but does not
+    /// publish an online snapshot, change retention or CURRENT, or truncate the WAL.
+    /// Cancellation, copying and destination requirements match `export_snapshot`.
+    pub fn snapshot_to(&self, destination: VolumeDescriptor) -> Result<ExportSnapshotHandle> {
+        self.snapshot_to_filesystem(destination, None)
+    }
+
+    fn snapshot_to_filesystem(
+        &self,
+        destination: VolumeDescriptor,
+        fs: Option<Arc<dyn FileSystem>>,
+    ) -> Result<ExportSnapshotHandle> {
+        let access = self.db_lifecycle.begin_owned_access()?;
+        // Keep the write sequencer closed until rotation has enqueued the capture, just as for
+        // ordinary snapshots, but never install their successful-publication WAL truncation.
+        let _barrier = self
+            .wal_writer
+            .as_ref()
+            .map(|writer| writer.begin_snapshot_barrier())
+            .transpose()?;
+        let (sender, receiver) = oneshot::channel();
+        self.memtable_manager.create_independent_snapshot(
+            self.snapshot_manager.clone(),
+            Box::new(move |result| {
+                let _ = sender.send(result);
+            }),
+        )?;
+        Ok(self.start_export(ExportSource::Capturing(receiver), destination, fs, access))
+    }
+
+    fn start_export(
+        &self,
+        source: ExportSource,
+        destination: VolumeDescriptor,
+        fs: Option<Arc<dyn FileSystem>>,
+        access: OwnedDbAccessGuard,
+    ) -> ExportSnapshotHandle {
         let file_manager = Arc::clone(&self.file_manager);
         let schema_manager = Arc::clone(&self.schema_manager);
         let state = Arc::new(ExportState {
@@ -254,26 +310,40 @@ impl Db {
         let runtime = self.snapshot_manager.upload_runtime();
         let runtime_owner = Arc::clone(&runtime);
         runtime.spawn(async move {
-            let result = run_export(
-                file_manager,
-                schema_manager,
-                snapshot_id,
-                destination,
-                fs,
-                Arc::clone(&state),
-            )
-            .await;
-            let release = tokio::task::spawn_blocking(move || drop(pin)).await;
-            let result = result.and_then(|metadata| {
-                release.map(|()| metadata).map_err(|error| {
-                    Error::IoError(format!("Snapshot export pin release failed: {error}"))
-                })
-            });
+            let captured = match source {
+                ExportSource::Published(id, pin) => Ok((id, None, pin)),
+                ExportSource::Capturing(receiver) => receiver
+                    .await
+                    .map_err(|error| Error::IoError(format!("Snapshot capture failed: {error}")))
+                    .and_then(|result| result)
+                    .map(|(snapshot, pin)| (snapshot.id, Some(snapshot), pin)),
+            };
+            let result = match captured {
+                Ok((snapshot_id, snapshot, pin)) => {
+                    let result = run_export(
+                        file_manager,
+                        schema_manager,
+                        snapshot_id,
+                        snapshot,
+                        destination,
+                        fs,
+                        Arc::clone(&state),
+                    )
+                    .await;
+                    let release = tokio::task::spawn_blocking(move || drop(pin)).await;
+                    result.and_then(|metadata| {
+                        release.map(|()| metadata).map_err(|error| {
+                            Error::IoError(format!("Snapshot export pin release failed: {error}"))
+                        })
+                    })
+                }
+                Err(error) => Err(error),
+            };
             drop(access);
             let _ = tokio::task::spawn_blocking(move || state.finish(result)).await;
             drop(runtime_owner);
         });
-        Ok(handle)
+        handle
     }
 }
 
@@ -282,12 +352,16 @@ impl PreparedExport {
         file_manager: &Arc<FileManager>,
         schema_manager: &SchemaManager,
         snapshot_id: u64,
+        snapshot: Option<Arc<DbSnapshot>>,
         destination: VolumeDescriptor,
         fs: Arc<dyn FileSystem>,
         state: &ExportState,
     ) -> Result<Self> {
         state.check_cancelled()?;
-        let mut manifest = load_manifest_for_snapshot(file_manager, snapshot_id)?;
+        let mut manifest = match &snapshot {
+            Some(snapshot) => full_manifest(snapshot),
+            None => load_manifest_for_snapshot(file_manager, snapshot_id)?,
+        };
         let export_id = Uuid::new_v4().to_string();
         let export_url = append_path(&storage_url(&destination.base_dir)?, &export_id)?;
         let mut source_roots = file_manager.data_volume_absolute_paths("");
@@ -380,10 +454,25 @@ impl PreparedExport {
         for schema_id in manifest_schema_ids(manifest.latest_schema_id, &manifest.tree_levels) {
             let relative = schema_file_relative_path(schema_id);
             let path = target.own_file(format!("{export_id}/{relative}"));
-            copies.push(ExportCopy {
-                source: file_manager.metadata_file_full_path(&relative),
-                destination: path,
-            });
+            if snapshot.is_some() {
+                // A new capture's schema may never have been persisted online.
+                let schema = schema_manager.schema(schema_id)?;
+                let bytes =
+                    serde_json::to_vec(&schema_to_file(schema.as_ref())).map_err(|error| {
+                        Error::FileFormatError(format!("Failed to encode schema file: {error}"))
+                    })?;
+                let mut writer =
+                    BufferedWriter::new(MetadataWriter::new(target.fs.open_write(&path)?), 4096);
+                let result = writer.write(&bytes);
+                let close_result = writer.close();
+                result?;
+                close_result?;
+            } else {
+                copies.push(ExportCopy {
+                    source: file_manager.metadata_file_full_path(&relative),
+                    destination: path,
+                });
+            }
         }
         let mut active_paths: BTreeMap<String, String> = BTreeMap::new();
         for segment in &mut manifest.active_memtable_data {
@@ -455,6 +544,7 @@ async fn run_export(
     file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
     snapshot_id: u64,
+    snapshot: Option<Arc<DbSnapshot>>,
     destination: VolumeDescriptor,
     fs: Option<Arc<dyn FileSystem>>,
     state: Arc<ExportState>,
@@ -471,6 +561,7 @@ async fn run_export(
             &prepare_manager,
             &schema_manager,
             snapshot_id,
+            snapshot,
             destination,
             fs,
             &prepare_state,

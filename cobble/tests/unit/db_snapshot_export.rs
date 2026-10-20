@@ -327,6 +327,270 @@ fn snapshot_export_restores_vlog_and_schema_after_source_deletion() {
 }
 
 #[test]
+fn snapshot_to_is_full_and_isolated_from_online_snapshots_and_wal() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("destination");
+    let mut options = config(&source);
+    options.active_memtable_incremental_snapshot_ratio = 1.0;
+    options.snapshot_retention = Some(1);
+    options.value_separation_threshold = Some(Size::from_const(16));
+    options.wal_enabled = true;
+    options.volumes[0].set_usage(crate::VolumeUsageKind::Wal);
+    let db = DbBuilder::new(options.clone())
+        .db_id("source")
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+    let payload = vec![42; 256];
+    for i in 0..128 {
+        db.put(0, format!("key-{i:03}").as_bytes(), 0, &payload)
+            .unwrap();
+    }
+    let base = db.create_snapshot_and_wait("online active base").unwrap();
+    assert!(
+        !load_manifest_for_snapshot(&db.file_manager, base)
+            .unwrap()
+            .active_memtable_data
+            .is_empty()
+    );
+    assert!(db.retain_snapshot(base));
+    let current = source.join(db.id()).join("snapshot/CURRENT");
+    let current_before = std::fs::read(&current).ok();
+    let mut schema = db.update_schema();
+    schema.add_column(1, None, None, None).unwrap();
+    schema.commit();
+    db.put(0, b"new-schema", 0, b"new value").unwrap();
+    db.put(0, b"new-schema", 1, b"new column").unwrap();
+    let store = crate::wal::WalStore::open(&options, db.id(), &FileSystemRegistry::new())
+        .unwrap()
+        .unwrap();
+    let wal_before = store.list().unwrap();
+    assert!(!wal_before.is_empty());
+    let suggested_base = db.db_state.load().suggested_base_snapshot_id;
+    let handle = db.snapshot_to(volume(&destination)).unwrap();
+    db.put(0, b"later", 0, b"not captured").unwrap();
+    let exported = handle.wait().unwrap();
+    assert_eq!(handle.wait().unwrap(), exported);
+    assert!(handle.is_finished());
+    assert!(!handle.cancel());
+    assert_eq!(exported.snapshot_id, base + 1);
+    assert_eq!(std::fs::read(&current).ok(), current_before);
+    assert_eq!(
+        db.db_state.load().suggested_base_snapshot_id,
+        suggested_base
+    );
+    db.snapshot_manager.process_retention().unwrap();
+    assert!(db.snapshot_manager.is_retained(base));
+    assert!(db.snapshot_manager.pin_completed_snapshot(base).is_ok());
+    assert!(
+        db.snapshot_manager
+            .pin_completed_snapshot(exported.snapshot_id)
+            .is_err()
+    );
+    assert!(!db.retain_snapshot(exported.snapshot_id));
+    assert!(
+        !source
+            .join(db.id())
+            .join(snapshot_manifest_name(exported.snapshot_id))
+            .exists()
+    );
+    assert!(
+        wal_before
+            .iter()
+            .all(|id| store.list().unwrap().contains(id)),
+        "independent publication truncated WAL"
+    );
+    let manifest = exported_manifest(&exported);
+    assert!(!manifest.vlog_files.is_empty());
+    assert!(
+        manifest
+            .tree_levels
+            .iter()
+            .flatten()
+            .any(|level| !level.files.is_empty())
+    );
+    assert!(manifest.active_memtable_data.is_empty());
+    assert_eq!(manifest.latest_schema_id, 1);
+    assert_eq!(manifest.wal_checkpoint_id, 0);
+    assert!(manifest.wal_volume.is_none());
+    assert_eq!(
+        manifest.data_size_bytes,
+        manifest.incremental_data_size_bytes
+    );
+    let next = db
+        .create_snapshot_and_wait("online after independent")
+        .unwrap();
+    assert_eq!(next, exported.snapshot_id + 1);
+    assert!(
+        !load_manifest_for_snapshot(&db.file_manager, next)
+            .unwrap()
+            .active_memtable_data
+            .is_empty(),
+        "ordinary snapshots must keep active incremental capture enabled"
+    );
+    assert!(
+        store.list().unwrap().is_empty(),
+        "ordinary snapshots still truncate WAL"
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+    let restored =
+        Db::open_new_with_manifest_path(config(&destination), &exported.manifest_path).unwrap();
+    for i in 0..128 {
+        assert_value(&restored, format!("key-{i:03}").as_bytes(), &payload);
+    }
+    assert_value(&restored, b"new-schema", b"new value");
+    assert_eq!(
+        restored.get(0, b"new-schema").unwrap().unwrap()[1].as_deref(),
+        Some(b"new column".as_slice())
+    );
+    assert!(restored.get(0, b"later").unwrap().is_none());
+    restored.close().unwrap();
+}
+
+#[test]
+fn snapshot_to_failure_cancel_and_concurrent_exports_release_access_before_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let db = database(&source);
+    db.put(0, b"first", 0, b"value").unwrap();
+    let destination = volume(&root.path().join("cancelled"));
+    let gate = Arc::new(Gate::default());
+    let fs = Arc::new(TestFs::new(&destination, Some(gate.clone()), false));
+    let cancelled = db
+        .snapshot_to_filesystem(destination, Some(fs.clone()))
+        .unwrap();
+    gate.wait();
+    assert!(cancelled.cancel());
+    assert!(
+        !cancelled.is_finished(),
+        "open writers must drain before completion"
+    );
+    db.put(0, b"second", 0, b"other value").unwrap();
+    let parallel = db
+        .snapshot_to(volume(&root.path().join("parallel")))
+        .unwrap();
+    let parallel_metadata = bounded_result(parallel).unwrap();
+    gate.release();
+    assert!(matches!(
+        bounded_result(cancelled),
+        Err(Error::CancelledError(_))
+    ));
+    assert_eq!(fs.active.load(Ordering::SeqCst), 0);
+    assert!(
+        std::fs::read_dir(root.path().join("cancelled"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let destination = volume(&root.path().join("failed"));
+    let fs = Arc::new(TestFs::new(&destination, None, true));
+    assert!(
+        bounded_result(
+            db.snapshot_to_filesystem(destination, Some(fs.clone()))
+                .unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(fs.active.load(Ordering::SeqCst), 0);
+    assert_value(&db, b"second", b"other value");
+    db.put(0, b"after-failure", 0, b"still writable").unwrap();
+    assert!(!source.join(db.id()).join("snapshot/CURRENT").exists());
+    assert!(
+        db.snapshot_manager
+            .pin_completed_snapshot(parallel_metadata.snapshot_id)
+            .is_err()
+    );
+    let handle = db
+        .snapshot_to(volume(&root.path().join("completed")))
+        .unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let closing_db = db.clone();
+    handle.on_complete(move |result| {
+        result.unwrap();
+        sender.send(closing_db.close()).unwrap();
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(20))
+        .expect("completion callback must not retain database access")
+        .unwrap();
+    assert!(handle.wait().is_ok());
+}
+
+#[test]
+fn snapshot_to_preserves_recovered_wal_until_an_online_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("destination");
+    let mut options = config(&source);
+    options.wal_enabled = true;
+    options.volumes[0].set_usage(crate::VolumeUsageKind::Wal);
+    let db = DbBuilder::new(options.clone())
+        .db_id("source")
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+    db.put(0, b"base", 0, b"base value").unwrap();
+    let base = db.create_snapshot_and_wait("WAL recovery base").unwrap();
+    let mut schema = db.update_schema();
+    schema.add_column(1, None, None, None).unwrap();
+    schema.commit();
+    db.put(0, b"tail", 0, b"recovered value").unwrap();
+    db.put(0, b"tail", 1, b"recovered column").unwrap();
+    db.force_close();
+    let store = crate::wal::WalStore::open(&options, "source", &FileSystemRegistry::new())
+        .unwrap()
+        .unwrap();
+    let wal_before = store.list().unwrap();
+    assert!(!wal_before.is_empty());
+    options.wal_enabled = false;
+    let recovered = Db::resume_from_snapshot_with_recovery_mode(
+        options.clone(),
+        base,
+        "source",
+        crate::RecoveryMode::LatestWithWal,
+    )
+    .unwrap();
+    assert!(recovered.wal_writer.is_none());
+    assert_value(&recovered, b"tail", b"recovered value");
+    let exported = recovered
+        .snapshot_to(volume(&destination))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(store.list().unwrap(), wal_before);
+    recovered.force_close();
+    // The export must not garbage-collect online schema files required by this WAL tail.
+    let recovered = Db::resume_from_snapshot_with_recovery_mode(
+        options,
+        base,
+        "source",
+        crate::RecoveryMode::LatestWithWal,
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.get(0, b"tail").unwrap().unwrap()[1].as_deref(),
+        Some(b"recovered column".as_slice())
+    );
+    recovered
+        .create_snapshot_and_wait("truncate recovered WAL online")
+        .unwrap();
+    assert!(store.list().unwrap().is_empty());
+    recovered.close().unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+    let restored =
+        Db::open_new_with_manifest_path(config(&destination), exported.manifest_path).unwrap();
+    assert_value(&restored, b"base", b"base value");
+    assert_value(&restored, b"tail", b"recovered value");
+    assert_eq!(
+        restored.get(0, b"tail").unwrap().unwrap()[1].as_deref(),
+        Some(b"recovered column".as_slice())
+    );
+    restored.close().unwrap();
+}
+
+#[test]
 fn snapshot_export_pins_expired_snapshot_and_parallel_exports_independently() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");

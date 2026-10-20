@@ -116,7 +116,11 @@ struct SnapshotManagerState {
     // Reference counts for schema files used by live snapshots.
     schema_ref_counts: HashMap<u64, usize>,
     in_flight: usize,
+    independent_captures: HashMap<u64, IndependentSnapshotCallback>,
 }
+
+pub(crate) type IndependentSnapshotCallback =
+    Box<dyn FnOnce(Result<(Arc<DbSnapshot>, SnapshotExportGuard)>) + Send>;
 
 pub(crate) struct SnapshotExportGuard {
     manager: SnapshotManager,
@@ -315,7 +319,7 @@ impl SnapshotManager {
     /// callback. In that window no other worker will complete the caller's future, so cleanup and
     /// callback delivery must happen together here.
     pub(crate) fn fail_snapshot(&self, id: u64, error: Error) {
-        let callback = {
+        let (callback, independent_callback) = {
             let mut state = self.state.lock().unwrap();
             let Some(current) = state.snapshots.get(&id).cloned() else {
                 return;
@@ -327,10 +331,13 @@ impl SnapshotManager {
             let mut updated = (*current).clone();
             let callback = updated.callback.take();
             state.snapshots.insert(id, Arc::new(updated));
-            callback
+            (callback, state.independent_captures.remove(&id))
         };
         self.cleanup_unpublished_snapshot(id);
         if let Some(callback) = callback {
+            callback(Err(error.clone()));
+        }
+        if let Some(callback) = independent_callback {
             callback(Err(error));
         }
     }
@@ -417,6 +424,7 @@ impl SnapshotManager {
                 incremental_ref_counts: HashMap::new(),
                 schema_ref_counts: HashMap::new(),
                 in_flight: 0,
+                independent_captures: HashMap::new(),
             })),
             retention,
             snapshot_only_track,
@@ -452,11 +460,30 @@ impl SnapshotManager {
     }
 
     pub(crate) fn create_snapshot(&self, callback: Option<SnapshotCallback>) -> Arc<DbSnapshot> {
+        self.create_snapshot_internal(callback, None)
+    }
+
+    pub(crate) fn create_independent_snapshot(
+        &self,
+        callback: IndependentSnapshotCallback,
+    ) -> Arc<DbSnapshot> {
+        self.create_snapshot_internal(None, Some(callback))
+    }
+
+    fn create_snapshot_internal(
+        &self,
+        callback: Option<SnapshotCallback>,
+        independent_callback: Option<IndependentSnapshotCallback>,
+    ) -> Arc<DbSnapshot> {
         let mut state = self.state.lock().unwrap();
         let id = state.next_id;
         state.next_id += 1;
         let manifest_path = self.file_manager.metadata_path(&snapshot_manifest_name(id));
         let mut snapshot = DbSnapshot::new(id, &manifest_path, callback);
+        if let Some(callback) = independent_callback {
+            snapshot.independent = true;
+            state.independent_captures.insert(id, callback);
+        }
         snapshot.timestamp_seconds = self.time_provider.now_seconds();
         snapshot.bucket_ranges = self.bucket_ranges.read().unwrap().clone();
         // Schema is snapshot metadata, so capture its version at the same cut as the snapshot id
@@ -481,6 +508,9 @@ impl SnapshotManager {
             let Some(current) = state.snapshots.get(&id).cloned() else {
                 return Ok(false);
             };
+            if current.independent {
+                return Ok(false);
+            }
             if !current.try_cancel() {
                 return Ok(false);
             }
@@ -602,11 +632,12 @@ impl SnapshotManager {
             )
             .collect();
         snapshot.vlog_version = clone_vlog_version_untracked(&db_state.vlog_version);
-        snapshot.base_snapshot_id = if self.snapshot_disable_incremental_base_link {
-            None
-        } else {
-            db_state.suggested_base_snapshot_id
-        };
+        snapshot.base_snapshot_id =
+            if snapshot.independent || self.snapshot_disable_incremental_base_link {
+                None
+            } else {
+                db_state.suggested_base_snapshot_id
+            };
         snapshot.active_memtable_data = active_memtable_data;
         let snapshot = Arc::new(snapshot);
         // Publish captured resources only after acquiring all of their references. Cancellation
@@ -619,6 +650,19 @@ impl SnapshotManager {
         if snapshot.is_cancelled() {
             drop(state);
             self.cleanup_unpublished_snapshot(id);
+            return false;
+        }
+        if snapshot.independent {
+            // Transfer the allocation's self-reference to the export task's temporary pin.
+            // Invoke outside the lock: a dropped receiver immediately releases that pin.
+            state.incremental_references.remove(&id);
+            let callback = state.independent_captures.remove(&id).unwrap();
+            let pin = SnapshotExportGuard {
+                manager: self.clone(),
+                snapshot_id: id,
+            };
+            drop(state);
+            callback(Ok((snapshot, pin)));
             return false;
         }
         state.completed.insert(id);
@@ -644,7 +688,11 @@ impl SnapshotManager {
 
     pub(crate) fn retain_snapshot(&self, id: u64) -> bool {
         let mut state = self.state.lock().unwrap();
-        if !state.snapshots.contains_key(&id) {
+        if state
+            .snapshots
+            .get(&id)
+            .is_none_or(|snapshot| snapshot.independent)
+        {
             return false;
         }
         state.retained.insert(id);
@@ -795,6 +843,7 @@ impl SnapshotManager {
             timestamp_seconds: manifest.timestamp_seconds,
             manifest_path,
             base_snapshot_id,
+            independent: false,
             lsm_versions,
             tracked_data_files,
             logical_data_files: BTreeMap::new(),
@@ -1247,6 +1296,9 @@ impl SnapshotManager {
             let Some(snapshot) = state.snapshots.get(&id).cloned() else {
                 return Ok(false);
             };
+            if snapshot.independent && !snapshot.is_cancelled() {
+                return Ok(false);
+            }
             if snapshot.request_expire_after_publication_start() {
                 return Ok(true);
             }
@@ -1275,10 +1327,15 @@ impl SnapshotManager {
         removed_snapshots: Vec<Arc<DbSnapshot>>,
         live_active_data_paths: HashSet<String>,
     ) -> Result<()> {
+        let cleanup_online_schemas = removed_snapshots
+            .iter()
+            .any(|snapshot| !snapshot.independent);
         let mut removed_active_data_paths = HashSet::new();
         for snapshot in &removed_snapshots {
-            self.file_manager
-                .remove_metadata_file(&snapshot_manifest_name(snapshot.id))?;
+            if !snapshot.independent {
+                self.file_manager
+                    .remove_metadata_file(&snapshot_manifest_name(snapshot.id))?;
+            }
             // cleanup the active memtable data segments that are no longer referenced by any live snapshots
             for segment in &snapshot.active_memtable_data {
                 if live_active_data_paths.contains(&segment.path) {
@@ -1293,7 +1350,11 @@ impl SnapshotManager {
                 .values()
                 .for_each(|file| file.dereference());
         }
-        self.cleanup_expired_schema_files()?;
+        // Independent captures do not own online metadata. In particular, newly persisted WAL
+        // schemas may not belong to any online snapshot yet and must survive export completion.
+        if cleanup_online_schemas {
+            self.cleanup_expired_schema_files()?;
+        }
         Ok(())
     }
 

@@ -19,7 +19,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-pub(crate) use manager::SnapshotManager;
+pub(crate) use manager::{IndependentSnapshotCallback, SnapshotExportGuard, SnapshotManager};
 pub(crate) use manifest::{
     LoadedManifest, ManifestSnapshot, build_tree_scopes_from_manifest,
     build_tree_versions_from_manifest, build_truncation_cursors_from_manifest,
@@ -66,6 +66,8 @@ pub(crate) struct DbSnapshot {
     pub timestamp_seconds: u32,
     pub manifest_path: String,
     pub base_snapshot_id: Option<u64>,
+    /// Captured for independent export, never published or retained by this manager.
+    pub independent: bool,
     // Per-tree LSM versions without tracked file references.
     pub lsm_versions: Vec<LSMTreeVersion>,
     // Source data file id -> tracked snapshot file.
@@ -117,6 +119,7 @@ impl DbSnapshot {
             timestamp_seconds: 0,
             manifest_path: manifest_path.to_string(),
             base_snapshot_id: None,
+            independent: false,
             lsm_versions: vec![],
             tracked_data_files: BTreeMap::new(),
             logical_data_files: BTreeMap::new(),

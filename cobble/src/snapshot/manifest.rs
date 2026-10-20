@@ -529,46 +529,18 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
                 truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
             })
         } else {
-            ManifestPayload::Snapshot(ManifestSnapshot {
-                version: MANIFEST_VERSION_CURRENT,
-                id: snapshot.id,
-                timestamp_seconds: snapshot.timestamp_seconds,
-                seq_id: snapshot.seq_id,
-                topology_epoch: snapshot.topology_epoch,
-                wal_checkpoint_id: snapshot.wal_checkpoint_id,
-                wal_volume: snapshot.wal_volume.clone(),
-                latest_schema_id: snapshot.latest_schema_id,
-                data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
+            ManifestPayload::Snapshot(full_manifest_with_sizes(
+                snapshot,
+                file_data_size_bytes + current_active_memtable_bytes,
                 incremental_data_size_bytes,
-                bucket_ranges: snapshot.bucket_ranges.clone(),
-                lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
-                tree_scopes: snapshot.tree_scopes.clone(),
-                tree_levels: manifest_tree_levels_from_snapshot(snapshot),
-                vlog_files: manifest_vlog_files_from_snapshot(snapshot),
-                active_memtable_data: snapshot.active_memtable_data.clone(),
-                truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
-            })
+            ))
         }
     } else {
-        ManifestPayload::Snapshot(ManifestSnapshot {
-            version: MANIFEST_VERSION_CURRENT,
-            id: snapshot.id,
-            timestamp_seconds: snapshot.timestamp_seconds,
-            seq_id: snapshot.seq_id,
-            topology_epoch: snapshot.topology_epoch,
-            wal_checkpoint_id: snapshot.wal_checkpoint_id,
-            wal_volume: snapshot.wal_volume.clone(),
-            latest_schema_id: snapshot.latest_schema_id,
-            data_size_bytes: file_data_size_bytes + current_active_memtable_bytes,
+        ManifestPayload::Snapshot(full_manifest_with_sizes(
+            snapshot,
+            file_data_size_bytes + current_active_memtable_bytes,
             incremental_data_size_bytes,
-            bucket_ranges: snapshot.bucket_ranges.clone(),
-            lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
-            tree_scopes: snapshot.tree_scopes.clone(),
-            tree_levels: manifest_tree_levels_from_snapshot(snapshot),
-            vlog_files: manifest_vlog_files_from_snapshot(snapshot),
-            active_memtable_data: snapshot.active_memtable_data.clone(),
-            truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
-        })
+        ))
     };
     encode_manifest_payload(writer, &manifest)?;
     let (incremental_base_id, data_size_bytes, active_memtable_total_size_bytes) = match &manifest {
@@ -592,6 +564,43 @@ pub(crate) fn encode_manifest<W: SequentialWriteFile>(
         incremental_data_size_bytes,
         active_memtable_total_size_bytes,
     })
+}
+
+/// Build a standalone manifest exclusively from the physical replicas retained at capture.
+pub(crate) fn full_manifest(snapshot: &DbSnapshot) -> ManifestSnapshot {
+    let data_size_bytes = snapshot_file_sizes(snapshot).values().copied().sum::<u64>()
+        + snapshot
+            .active_memtable_data
+            .iter()
+            .map(|segment| segment.end_offset.saturating_sub(segment.start_offset))
+            .sum::<u64>();
+    full_manifest_with_sizes(snapshot, data_size_bytes, data_size_bytes)
+}
+
+fn full_manifest_with_sizes(
+    snapshot: &DbSnapshot,
+    data_size_bytes: u64,
+    incremental_data_size_bytes: u64,
+) -> ManifestSnapshot {
+    ManifestSnapshot {
+        version: MANIFEST_VERSION_CURRENT,
+        id: snapshot.id,
+        timestamp_seconds: snapshot.timestamp_seconds,
+        seq_id: snapshot.seq_id,
+        topology_epoch: snapshot.topology_epoch,
+        wal_checkpoint_id: snapshot.wal_checkpoint_id,
+        wal_volume: snapshot.wal_volume.clone(),
+        latest_schema_id: snapshot.latest_schema_id,
+        data_size_bytes,
+        incremental_data_size_bytes,
+        bucket_ranges: snapshot.bucket_ranges.clone(),
+        lsm_tree_bucket_ranges: snapshot.lsm_tree_bucket_ranges.clone(),
+        tree_scopes: snapshot.tree_scopes.clone(),
+        tree_levels: manifest_tree_levels_from_snapshot(snapshot),
+        vlog_files: manifest_vlog_files_from_snapshot(snapshot),
+        active_memtable_data: snapshot.active_memtable_data.clone(),
+        truncation_cursors: manifest_truncation_cursors_from_snapshot(snapshot),
+    }
 }
 
 fn snapshot_file_sizes(snapshot: &DbSnapshot) -> BTreeMap<String, u64> {
