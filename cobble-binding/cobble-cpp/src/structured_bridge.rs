@@ -558,6 +558,10 @@ pub(crate) mod ffi {
             snapshot_id: u64,
             destination_json: &str,
         ) -> Result<Box<NativeExportSnapshotHandle>>;
+        fn native_structured_db_snapshot_to(
+            db: &NativeStructuredDb,
+            destination_json: &str,
+        ) -> Result<Box<NativeExportSnapshotHandle>>;
         fn native_export_snapshot_wait(
             handle: &NativeExportSnapshotHandle,
         ) -> Result<NativeShardSnapshot>;

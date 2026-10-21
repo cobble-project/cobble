@@ -79,8 +79,8 @@ use snapshot::{
     native_shard_snapshot_to_json, native_sharded_database_cancel_snapshot,
     native_sharded_database_expire_snapshot, native_sharded_database_export_snapshot,
     native_sharded_database_get_shard_snapshot, native_sharded_database_retain_snapshot,
-    native_sharded_database_snapshot, native_sharded_database_start_snapshot,
-    native_sharded_database_take_snapshot,
+    native_sharded_database_snapshot, native_sharded_database_snapshot_to,
+    native_sharded_database_start_snapshot, native_sharded_database_take_snapshot,
 };
 use write_batch::{
     NativeWriteBatch, native_write_batch_delete, native_write_batch_len, native_write_batch_merge,
@@ -557,6 +557,10 @@ mod ffi {
         fn native_sharded_database_export_snapshot(
             db: &NativeShardedDatabase,
             snapshot_id: u64,
+            destination_json: &str,
+        ) -> Result<Box<NativeExportSnapshotHandle>>;
+        fn native_sharded_database_snapshot_to(
+            db: &NativeShardedDatabase,
             destination_json: &str,
         ) -> Result<Box<NativeExportSnapshotHandle>>;
         fn native_export_snapshot_wait(

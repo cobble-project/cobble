@@ -36,6 +36,18 @@ pub(crate) fn native_sharded_database_export_snapshot(
         .map_err(format_cobble_error)
 }
 
+pub(crate) fn native_sharded_database_snapshot_to(
+    db: &crate::sharded_db::NativeShardedDatabase,
+    destination_json: &str,
+) -> BridgeResult<Box<NativeExportSnapshotHandle>> {
+    let destination = serde_json::from_str::<cobble_binding::VolumeDescriptor>(destination_json)
+        .map_err(|error| input_error(&error.to_string()))?;
+    db.db
+        .snapshot_to(destination)
+        .map(|handle| Box::new(NativeExportSnapshotHandle { handle }))
+        .map_err(format_cobble_error)
+}
+
 pub(crate) fn native_export_snapshot_wait(
     handle: &NativeExportSnapshotHandle,
 ) -> BridgeResult<ffi::NativeShardSnapshot> {

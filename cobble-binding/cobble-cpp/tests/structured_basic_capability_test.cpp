@@ -222,9 +222,16 @@ void VerifyExport(const std::filesystem::path &root) {
   auto db = cobble::structured::Db::Open(Config(source));
   db.PutBytes(0, Bytes("key"), 0, Bytes("value"));
   const auto shard = db.TakeSnapshot();
-  const auto handle = db.ExportSnapshot(
-      shard.snapshot_id, R"({"base_dir":")" + FileUrl(destination / "shards") +
-                             R"(","kinds":["snapshot"]})");
+  const auto target = R"({"base_dir":")" + FileUrl(destination / "shards") +
+                      R"(","kinds":["snapshot"]})";
+  COBBLE_CHECK(
+      db.ExportSnapshot(shard.snapshot_id, target).Wait().snapshot_id ==
+      shard.snapshot_id);
+  db.PutBytes(0, Bytes("new-key"), 0, Bytes("new-value"));
+  const auto handle = db.SnapshotTo(target);
+  const auto exported = handle.Wait();
+  COBBLE_CHECK(exported.snapshot_id == shard.snapshot_id + 1);
+  db.PutBytes(0, Bytes("later"), 0, Bytes("excluded"));
   db.Close();
   const std::array exports = {handle.Wait()};
   COBBLE_CHECK(handle.Wait().db_id == exports[0].db_id);
@@ -237,6 +244,8 @@ void VerifyExport(const std::filesystem::path &root) {
   std::filesystem::remove_all(source);
   auto reader = cobble::structured::Reader::Open(Config(destination), 0);
   COBBLE_CHECK(String(reader.Get(0, Bytes("key")).Bytes(0)) == "value");
+  COBBLE_CHECK(String(reader.Get(0, Bytes("new-key")).Bytes(0)) == "new-value");
+  COBBLE_CHECK(!reader.Get(0, Bytes("later")).Found());
 }
 
 }  // namespace

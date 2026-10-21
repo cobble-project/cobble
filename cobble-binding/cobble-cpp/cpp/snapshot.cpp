@@ -209,6 +209,31 @@ ExportSnapshotHandle structured::Db::ExportSnapshot(
       std::make_unique<ExportSnapshotHandle::Impl>(std::move(native)));
 }
 
+ExportSnapshotHandle Db::SnapshotTo(std::string_view destination_json) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "Db has been moved from");
+  }
+  auto native = detail::Translate([&] {
+    return ffi::native_sharded_database_snapshot_to(
+        *impl_->native, detail::RustStr(destination_json));
+  });
+  return ExportSnapshotHandle(
+      std::make_unique<ExportSnapshotHandle::Impl>(std::move(native)));
+}
+
+ExportSnapshotHandle structured::Db::SnapshotTo(
+    std::string_view destination_json) const {
+  if (!impl_) {
+    throw Error(ErrorCode::kInvalidState, "structured Db has been moved from");
+  }
+  auto native = detail::Translate([&] {
+    return structured_ffi::native_structured_db_snapshot_to(
+        *impl_->native, detail::RustStr(destination_json));
+  });
+  return ExportSnapshotHandle(
+      std::make_unique<ExportSnapshotHandle::Impl>(std::move(native)));
+}
+
 struct PendingShardSnapshot::Impl {
   explicit Impl(rust::Box<ffi::NativePendingShardSnapshot> native_snapshot)
       : native(std::move(native_snapshot)) {}

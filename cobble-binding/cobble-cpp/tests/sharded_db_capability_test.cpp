@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <thread>
@@ -342,7 +343,8 @@ void VerifyRescale(const std::filesystem::path& directory) {
   resumed.Close();
 }
 
-void VerifyExport(const std::filesystem::path& directory) {
+void VerifyExport(const std::filesystem::path& directory,
+                  bool capture_current) {
   const auto source = directory / "source";
   const auto destination = directory / "export";
   const auto config = Config(source, 4, false);
@@ -370,10 +372,22 @@ void VerifyExport(const std::filesystem::path& directory) {
   const auto before = coordinator.LoadCurrentGlobalSnapshot()->ToJson();
   ExpectInputError(
       [&] { (void)left.ExportSnapshot(originals[0].snapshot_id, "{"); });
+  ExpectInputError([&] { (void)left.SnapshotTo("{"); });
+  if (capture_current) {
+    for (cobble::BucketId bucket = 0; bucket < 4; ++bucket) {
+      (bucket < 2 ? left : right)
+          .Put(bucket, Bytes("key-164"), 0,
+               Bytes(std::string(256, 'a' + bucket)));
+    }
+  }
   const auto left_handle =
-      left.ExportSnapshot(originals[0].snapshot_id, shard_target);
+      capture_current
+          ? left.SnapshotTo(shard_target)
+          : left.ExportSnapshot(originals[0].snapshot_id, shard_target);
   const auto right_handle =
-      right.ExportSnapshot(originals[1].snapshot_id, shard_target);
+      capture_current
+          ? right.SnapshotTo(shard_target)
+          : right.ExportSnapshot(originals[1].snapshot_id, shard_target);
   // Handles must not retain extra DB ownership or prevent Close from draining
   // export I/O.
   left.Close();
@@ -411,7 +425,7 @@ void VerifyExport(const std::filesystem::path& directory) {
                           : cobble::Reader::Open(reader_config, 0);
     for (cobble::BucketId bucket = 0; bucket < 4; ++bucket) {
       const std::string value(256, 'a' + bucket);
-      for (int index = 0; index < 64; ++index) {
+      for (int index = 0; index < (capture_current ? 65 : 64); ++index) {
         const auto key = "key-" + std::to_string(index + 100);
         COBBLE_CHECK(String(reader.Get(bucket, Bytes(key)).Column(0)) == value);
       }
@@ -427,8 +441,73 @@ void VerifyExport(const std::filesystem::path& directory) {
         }
         if (batch.End()) break;
       }
-      COBBLE_CHECK(count == 64);
+      COBBLE_CHECK(count == (capture_current ? 65 : 64));
     }
+  }
+}
+
+void VerifySnapshotTo(const std::filesystem::path& directory) {
+  const auto source = directory / "source";
+  const auto destination = directory / "standalone";
+  const auto config =
+      R"({"volumes":[{"base_dir":")" + FileUrl(source) +
+      R"(","kinds":["meta","primary_data_priority_high","snapshot"]}],"num_columns":1,"total_buckets":4,"wal_enabled":false,"memtable_capacity":"1MB","l0_file_limit":100,"snapshot_on_flush":false,"snapshot_retention":1,"value_separation_threshold":16})";
+  const auto target =
+      R"({"base_dir":")" + FileUrl(destination) + R"(","kinds":["snapshot"]})";
+  const auto manifest = [](const std::filesystem::path& root,
+                           const cobble::ShardSnapshot& shard) {
+    std::ifstream input(root / shard.db_id / "snapshot" /
+                            ("SNAPSHOT-" + std::to_string(shard.snapshot_id)),
+                        std::ios::binary);
+    COBBLE_CHECK(input.is_open());
+    return std::string(std::istreambuf_iterator<char>(input), {});
+  };
+  const auto base_field = [](cobble::SnapshotId id) {
+    return "\"base_snapshot_id\":" + std::to_string(id) + ",";
+  };
+  auto db = cobble::Db::Open(config);
+  const std::string value(128, 'v');
+  db.Put(0, Bytes("a"), 0, Bytes(value));
+  const auto a = db.TakeSnapshot();
+  db.Put(0, Bytes("b"), 0, Bytes(value));
+  const auto b = db.TakeSnapshot();
+  COBBLE_CHECK(manifest(source, a).find("base_snapshot_id") ==
+               std::string::npos);
+  COBBLE_CHECK(manifest(source, b).find(base_field(a.snapshot_id)) !=
+               std::string::npos);
+  db.Put(0, Bytes("c"), 0, Bytes(value));
+  const auto handle = db.SnapshotTo(target);
+  const auto exported = handle.Wait();
+  COBBLE_CHECK(handle.Wait().manifest_path == exported.manifest_path);
+  COBBLE_CHECK(handle.IsFinished() && !handle.Cancel());
+  COBBLE_CHECK(exported.snapshot_id == b.snapshot_id + 1);
+  const auto full = manifest(destination, exported);
+  COBBLE_CHECK(full.find("base_snapshot_id") == std::string::npos);
+  COBBLE_CHECK(full.find("\"active_memtable_data\":[]") != std::string::npos);
+  COBBLE_CHECK(full.find("\"vlog_files\":[]") == std::string::npos);
+  COBBLE_CHECK(!std::filesystem::exists(
+      source / b.db_id / "snapshot" /
+      ("SNAPSHOT-" + std::to_string(exported.snapshot_id))));
+  const auto c = db.TakeSnapshot();  // E added only one L0 file since B.
+  COBBLE_CHECK(c.snapshot_id == exported.snapshot_id + 1);
+  COBBLE_CHECK(manifest(source, c).find(base_field(b.snapshot_id)) !=
+               std::string::npos);
+  COBBLE_CHECK(!manifest(source, a).empty() && !manifest(source, b).empty());
+  db.Put(0, Bytes("d"), 0, Bytes(value));
+  db.Close();
+  std::filesystem::remove_all(source);
+  auto restored = cobble::Db::RestoreNewFromManifest(
+      Config(destination, 4, false), exported.manifest_path);
+  for (const auto key : {"a", "b", "c"}) {
+    COBBLE_CHECK(String(restored.Get(0, Bytes(key)).Column(0)) == value);
+  }
+  COBBLE_CHECK(!restored.Get(0, Bytes("d")).Found());
+  auto scan = restored.Scan(0, std::nullopt, std::nullopt);
+  const auto rows = scan.Next(10);
+  COBBLE_CHECK(rows.RowCount() == 3 && rows.End());
+  for (std::size_t index = 0; index < 3; ++index) {
+    COBBLE_CHECK(String(rows.Key(index)) == std::string(1, 'a' + index));
+    COBBLE_CHECK(String(rows.Column(index, 0)) == value);
   }
 }
 
@@ -446,7 +525,9 @@ int main() {
 
     cobble_test::TempDirectory rescale_directory("cobble-cpp-sharded-rescale");
     VerifyRescale(rescale_directory.path());
-    VerifyExport(main_directory.path() / "export-flow");
+    VerifyExport(main_directory.path() / "export-flow", false);
+    VerifyExport(main_directory.path() / "snapshot-to-flow", true);
+    VerifySnapshotTo(main_directory.path() / "snapshot-to-chain");
 
     std::cout << "verified sharded C++ Db capability surface\n";
     return 0;

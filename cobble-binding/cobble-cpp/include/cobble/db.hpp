@@ -106,6 +106,10 @@ class COBBLE_CPP_API Db final {
   // {"base_dir":"file:///export","kinds":["snapshot"]}.
   [[nodiscard]] ExportSnapshotHandle ExportSnapshot(
       SnapshotId snapshot, std::string_view destination_json) const;
+  // Capture current state as a new standalone full snapshot. Same destination
+  // VolumeDescriptor JSON as ExportSnapshot.
+  [[nodiscard]] ExportSnapshotHandle SnapshotTo(
+      std::string_view destination_json) const;
   [[nodiscard]] bool CancelSnapshot(SnapshotId snapshot) const;
   [[nodiscard]] ShardSnapshot GetShardSnapshot(SnapshotId snapshot) const;
   [[nodiscard]] bool RetainSnapshot(SnapshotId snapshot) const;
