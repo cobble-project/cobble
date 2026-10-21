@@ -1371,6 +1371,13 @@ public final class Db extends NativeObject {
         return io.cobble.ExportSnapshotHandle.start(nativeHandle, snapshotId, destination, true);
     }
 
+    /**
+     * Capture current state as a standalone full snapshot without publishing an online snapshot.
+     */
+    public io.cobble.ExportSnapshotHandle snapshotTo(Config.VolumeDescriptor destination) {
+        return io.cobble.ExportSnapshotHandle.startSnapshotTo(nativeHandle, destination, true);
+    }
+
     /** Trigger snapshot creation and block until manifest is materialized. */
     public ShardSnapshot snapshot() {
         try {

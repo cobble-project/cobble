@@ -1267,6 +1267,13 @@ public final class Db extends NativeObject {
     }
 
     /**
+     * Capture current state as a standalone full snapshot without publishing an online snapshot.
+     */
+    public ExportSnapshotHandle snapshotTo(Config.VolumeDescriptor destination) {
+        return ExportSnapshotHandle.startSnapshotTo(nativeHandle, destination, false);
+    }
+
+    /**
      * Trigger snapshot creation and block until snapshot manifest is materialized.
      *
      * @return shard snapshot payload

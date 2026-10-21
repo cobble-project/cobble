@@ -19,10 +19,31 @@ public final class ExportSnapshotHandle extends NativeObject {
             long snapshotId,
             Config.VolumeDescriptor destination,
             boolean structured) {
+        return start(dbHandle, snapshotId, destination, structured, false);
+    }
+
+    /** Internal cross-package binding entrypoint; prefer Db.snapshotTo. */
+    public static ExportSnapshotHandle startSnapshotTo(
+            long dbHandle, Config.VolumeDescriptor destination, boolean structured) {
+        return start(dbHandle, 0, destination, structured, true);
+    }
+
+    private static ExportSnapshotHandle start(
+            long dbHandle,
+            long snapshotId,
+            Config.VolumeDescriptor destination,
+            boolean structured,
+            boolean captureCurrent) {
         Objects.requireNonNull(destination, "destination");
         CompletableFuture<String> jsonFuture = new CompletableFuture<>();
         return new ExportSnapshotHandle(
-                startNative(dbHandle, snapshotId, destination.toJson(), structured, jsonFuture),
+                startNative(
+                        dbHandle,
+                        snapshotId,
+                        destination.toJson(),
+                        structured,
+                        captureCurrent,
+                        jsonFuture),
                 jsonFuture);
     }
 
@@ -54,6 +75,7 @@ public final class ExportSnapshotHandle extends NativeObject {
             long snapshotId,
             String destinationJson,
             boolean structured,
+            boolean captureCurrent,
             CompletableFuture<String> jsonFuture);
 
     private static native boolean cancelNative(long handle);

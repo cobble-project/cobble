@@ -1,10 +1,15 @@
 package io.cobble;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -18,6 +23,74 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ExportSnapshotHandleTest {
+    @Test
+    void snapshotToCapturesNewStateWithoutChangingTheOnlineIncrementalBase(@TempDir Path root)
+            throws Exception {
+        Path source = root.resolve("source");
+        Path destination = root.resolve("snapshot-to");
+        Config config = new Config().addVolume(source.toString()).numColumns(1).totalBuckets(1);
+        config.memtableCapacity = 1024 * 1024;
+        config.l0FileLimit = 100;
+        config.snapshotOnFlush = false;
+        config.snapshotRetention = 1;
+        config.valueSeparationThreshold = 16;
+        Config.VolumeDescriptor target =
+                Config.VolumeDescriptor.singleVolume(destination.toString());
+        byte[] value = new byte[128];
+        Arrays.fill(value, (byte) 42);
+        ShardSnapshot exported;
+        try (Db db = Db.open(config)) {
+            db.put(0, new byte[] {1}, 0, value);
+            ShardSnapshot a = db.snapshot();
+            db.put(0, new byte[] {2}, 0, value);
+            ShardSnapshot b = db.snapshot();
+            assertFalse(manifest(a).has("base_snapshot_id"));
+            assertEquals(a.snapshotId, manifest(b).get("base_snapshot_id").getAsLong());
+            db.put(0, new byte[] {3}, 0, value);
+            try (ExportSnapshotHandle handle = db.snapshotTo(target)) {
+                exported = handle.future().get(30, TimeUnit.SECONDS);
+                assertSame(exported, handle.future().get(30, TimeUnit.SECONDS));
+                assertFalse(handle.cancel());
+            }
+            assertEquals(b.snapshotId + 1, exported.snapshotId);
+            assertNotEquals(b.dbId, exported.dbId);
+            JsonObject full = manifest(exported);
+            assertFalse(full.has("base_snapshot_id"));
+            assertEquals(0, full.getAsJsonArray("active_memtable_data").size());
+            assertFalse(full.getAsJsonArray("vlog_files").isEmpty());
+            assertFalse(
+                    Files.exists(
+                            source.resolve(b.dbId)
+                                    .resolve("snapshot/SNAPSHOT-" + exported.snapshotId)));
+            assertFalse(Files.exists(source.resolve(b.dbId).resolve("snapshot/CURRENT")));
+            ShardSnapshot c = db.snapshot(); // No new flush: E added only one L0 file since B.
+            assertEquals(exported.snapshotId + 1, c.snapshotId);
+            assertEquals(b.snapshotId, manifest(c).get("base_snapshot_id").getAsLong());
+            assertTrue(Files.exists(Paths.get(URI.create(a.manifestPath))));
+            assertTrue(Files.exists(Paths.get(URI.create(b.manifestPath))));
+            db.put(0, new byte[] {4}, 0, value);
+            assertThrows(NullPointerException.class, () -> db.snapshotTo(null));
+            db.close();
+            assertThrows(IllegalStateException.class, () -> db.snapshotTo(target));
+        }
+        deleteTree(source);
+        Config restoredConfig =
+                new Config().addVolume(destination.toString()).numColumns(1).totalBuckets(1);
+        try (Db restored = Db.restoreWithManifest(restoredConfig, exported.manifestPath)) {
+            for (int key = 1; key <= 3; key++)
+                assertArrayEquals(value, restored.get(0, new byte[] {(byte) key}, 0));
+            assertNull(restored.get(0, new byte[] {4}, 0));
+            try (ScanCursor cursor = restored.scan(0, null, null)) {
+                int count = 0;
+                for (ScanCursor.Entry row : cursor) {
+                    assertArrayEquals(new byte[] {(byte) ++count}, row.key);
+                    assertArrayEquals(value, row.columns[0]);
+                }
+                assertEquals(3, count);
+            }
+        }
+    }
+
     @Test
     void exportedGlobalSnapshotPublishesIndependentlyAndSurvivesSourceDeletion(@TempDir Path root)
             throws Exception {
@@ -148,42 +221,53 @@ class ExportSnapshotHandleTest {
                         .totalBuckets(1);
         try (Db db = Db.open(config)) {
             db.put(0, new byte[] {1}, 0, new byte[8192]);
-            for (boolean cancel : new boolean[] {true, false}) {
-                BlockingDestination destination = new BlockingDestination();
-                ProcessFileSystems.registerCustomRegistry(
-                        request ->
-                                request.baseDir().startsWith("exporttest://") ? destination : null);
-                try {
-                    ShardSnapshot source = db.snapshot();
-                    ExportSnapshotHandle handle =
-                            db.exportSnapshot(
-                                    source.snapshotId,
-                                    Config.VolumeDescriptor.singleVolume("exporttest://target/"));
-                    assertTrue(destination.started.await(30, TimeUnit.SECONDS));
-                    if (cancel) assertTrue(handle.cancel());
-                    handle.close();
-                    assertFalse(
-                            handle.future().isDone(),
-                            "closing the handle must not detach or finish blocked work");
-                    destination.proceed.countDown();
-                    if (cancel) {
-                        ExecutionException failure =
-                                assertThrows(
-                                        ExecutionException.class,
-                                        () -> handle.future().get(30, TimeUnit.SECONDS));
-                        assertInstanceOf(CancelledError.class, failure.getCause());
-                        assertTrue(destination.paths.isEmpty(), "cancelled target must be cleaned");
-                    } else {
-                        assertNotNull(handle.future().get(30, TimeUnit.SECONDS));
-                        assertFalse(destination.paths.isEmpty());
+            for (boolean captureCurrent : new boolean[] {false, true}) {
+                for (boolean cancel : new boolean[] {true, false}) {
+                    BlockingDestination destination = new BlockingDestination();
+                    ProcessFileSystems.registerCustomRegistry(
+                            request ->
+                                    request.baseDir().startsWith("exporttest://")
+                                            ? destination
+                                            : null);
+                    try {
+                        ShardSnapshot source = db.snapshot();
+                        ExportSnapshotHandle handle =
+                                captureCurrent
+                                        ? db.snapshotTo(
+                                                Config.VolumeDescriptor.singleVolume(
+                                                        "exporttest://target/"))
+                                        : db.exportSnapshot(
+                                                source.snapshotId,
+                                                Config.VolumeDescriptor.singleVolume(
+                                                        "exporttest://target/"));
+                        assertTrue(destination.started.await(30, TimeUnit.SECONDS));
+                        if (cancel) assertTrue(handle.cancel());
+                        handle.close();
+                        assertFalse(
+                                handle.future().isDone(),
+                                "closing the handle must not detach or finish blocked work");
+                        destination.proceed.countDown();
+                        if (cancel) {
+                            ExecutionException failure =
+                                    assertThrows(
+                                            ExecutionException.class,
+                                            () -> handle.future().get(30, TimeUnit.SECONDS));
+                            assertInstanceOf(CancelledError.class, failure.getCause());
+                            assertTrue(
+                                    destination.paths.isEmpty(),
+                                    "cancelled target must be cleaned");
+                        } else {
+                            assertNotNull(handle.future().get(30, TimeUnit.SECONDS));
+                            assertFalse(destination.paths.isEmpty());
+                        }
+                        assertTrue(db.expireSnapshot(source.snapshotId));
+                        ShardSnapshot next = db.snapshot();
+                        assertTrue(db.expireSnapshot(next.snapshotId));
+                        assertArrayEquals(new byte[8192], db.get(0, new byte[] {1}, 0));
+                    } finally {
+                        destination.proceed.countDown();
+                        ProcessFileSystems.clearCustomRegistry();
                     }
-                    assertTrue(db.expireSnapshot(source.snapshotId));
-                    ShardSnapshot next = db.snapshot();
-                    assertTrue(db.expireSnapshot(next.snapshotId));
-                    assertArrayEquals(new byte[8192], db.get(0, new byte[] {1}, 0));
-                } finally {
-                    destination.proceed.countDown();
-                    ProcessFileSystems.clearCustomRegistry();
                 }
             }
         }
@@ -318,6 +402,8 @@ class ExportSnapshotHandleTest {
                         .addVolume(root.resolve("source").toString())
                         .numColumns(1)
                         .totalBuckets(1);
+        config.activeMemtableIncrementalSnapshotRatio = 1.0;
+        config.snapshotOnFlush = false;
         ShardSnapshot exported;
         try (io.cobble.structured.Db db = io.cobble.structured.Db.open(config)) {
             db.put(0, new byte[] {1}, 0, new byte[] {2});
@@ -327,8 +413,21 @@ class ExportSnapshotHandleTest {
                             snapshot.snapshotId,
                             Config.VolumeDescriptor.singleVolume(
                                     root.resolve("export").toString()))) {
+                assertEquals(
+                        snapshot.snapshotId, handle.future().get(30, TimeUnit.SECONDS).snapshotId);
+            }
+            db.put(0, new byte[] {2}, 0, new byte[] {3});
+            try (ExportSnapshotHandle handle =
+                    db.snapshotTo(
+                            Config.VolumeDescriptor.singleVolume(
+                                    root.resolve("export").toString()))) {
                 exported = handle.future().get(30, TimeUnit.SECONDS);
             }
+            assertEquals(snapshot.snapshotId + 1, exported.snapshotId);
+            assertEquals(0, manifest(exported).getAsJsonArray("active_memtable_data").size());
+            db.put(0, new byte[] {3}, 0, new byte[] {4});
+            ShardSnapshot next = db.snapshot();
+            assertFalse(manifest(next).getAsJsonArray("active_memtable_data").isEmpty());
             assertTrue(db.expireSnapshot(snapshot.snapshotId));
         }
         deleteTree(root.resolve("source"));
@@ -340,7 +439,17 @@ class ExportSnapshotHandleTest {
         try (io.cobble.structured.Db db =
                 io.cobble.structured.Db.restoreWithManifest(restored, exported.manifestPath)) {
             assertArrayEquals(new byte[] {2}, db.get(0, new byte[] {1}).getBytes(0));
+            assertArrayEquals(new byte[] {3}, db.get(0, new byte[] {2}).getBytes(0));
+            assertNull(db.get(0, new byte[] {3}));
         }
+    }
+
+    private static JsonObject manifest(ShardSnapshot snapshot) throws Exception {
+        byte[] bytes = Files.readAllBytes(Paths.get(URI.create(snapshot.manifestPath)));
+        assertEquals("mcs1", new String(bytes, bytes.length - 4, 4, StandardCharsets.US_ASCII));
+        return JsonParser.parseString(
+                        new String(bytes, 0, bytes.length - 8, StandardCharsets.UTF_8))
+                .getAsJsonObject();
     }
 
     private static void deleteTree(Path root) throws Exception {

@@ -2116,6 +2116,11 @@ impl StructuredDb {
         self.db.export_snapshot(snapshot_id, destination)
     }
 
+    /// Capture current state as a standalone full snapshot in independent destination storage.
+    pub fn snapshot_to(&self, destination: VolumeDescriptor) -> Result<ExportSnapshotHandle> {
+        self.db.snapshot_to(destination)
+    }
+
     pub fn expire_snapshot(&self, snapshot_id: u64) -> Result<bool> {
         self.db.expire_snapshot(snapshot_id)
     }

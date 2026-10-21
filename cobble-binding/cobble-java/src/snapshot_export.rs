@@ -15,13 +15,18 @@ pub extern "system" fn Java_io_cobble_ExportSnapshotHandle_startNative(
     snapshot_id: jlong,
     destination_json: JString,
     structured: jboolean,
+    capture_current: jboolean,
     future_json: JObject,
 ) -> jlong {
-    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
-        Ok(value) => value,
-        Err(error) => {
-            throw_illegal_argument(&mut env, error);
-            return 0;
+    let snapshot_id = if capture_current != JNI_FALSE {
+        None
+    } else {
+        match decode_u64_from_jlong("snapshotId", snapshot_id) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                throw_illegal_argument(&mut env, error);
+                return 0;
+            }
         }
     };
     let destination = match decode_java_string(&mut env, destination_json).and_then(|json| {
@@ -55,12 +60,18 @@ pub extern "system" fn Java_io_cobble_ExportSnapshotHandle_startNative(
         let Some(db) = crate::structured::db_from_handle(&mut env, db_handle) else {
             return 0;
         };
-        db.export_snapshot(snapshot_id, destination)
+        match snapshot_id {
+            Some(id) => db.export_snapshot(id, destination),
+            None => db.snapshot_to(destination),
+        }
     } else {
         let Some(db) = crate::db::db_from_handle_or_throw(&mut env, db_handle) else {
             return 0;
         };
-        db.export_snapshot(snapshot_id, destination)
+        match snapshot_id {
+            Some(id) => db.export_snapshot(id, destination),
+            None => db.snapshot_to(destination),
+        }
     };
     let handle = match result {
         Ok(handle) => handle,
