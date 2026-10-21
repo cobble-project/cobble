@@ -71,7 +71,10 @@ def reconstruct_snapshot(value: pycobble.ShardSnapshot) -> pycobble.ShardSnapsho
     )
 
 
-def test_exported_global_snapshot_survives_source_deletion(tmp_path: Path) -> None:
+@pytest.mark.parametrize("capture_current", [False, True])
+def test_exported_global_snapshot_survives_source_deletion(
+    tmp_path: Path, capture_current: bool
+) -> None:
     source = tmp_path / "source"
     destination = tmp_path / "export"
     settings = json.loads(config(source))
@@ -99,8 +102,17 @@ def test_exported_global_snapshot_survives_source_deletion(tmp_path: Path) -> No
     pointer = (source / "snapshot/CURRENT").read_bytes()
     with pytest.raises(pycobble.InputError):
         left.export_snapshot(originals[0].snapshot_id, "{")
+    with pytest.raises(pycobble.InputError):
+        left.snapshot_to("{")
+    if capture_current:
+        for bucket in range(4):
+            (left if bucket < 2 else right).put(
+                bucket, b"key-064", 0, bytes([bucket + 10]) * 256
+            )
     handles = [
-        db.export_snapshot(shard.snapshot_id, shard_target)
+        db.snapshot_to(shard_target)
+        if capture_current
+        else db.export_snapshot(shard.snapshot_id, shard_target)
         for db, shard in zip((left, right), originals)
     ]
     assert isinstance(handles[0], pycobble.ExportSnapshotHandle)
@@ -121,6 +133,8 @@ def test_exported_global_snapshot_survives_source_deletion(tmp_path: Path) -> No
         assert not handle.cancel()
     with pytest.raises(pycobble.InternalStateError):
         left.export_snapshot(originals[0].snapshot_id, shard_target)
+    with pytest.raises(pycobble.InternalStateError):
+        left.snapshot_to(shard_target)
     global_snapshot = coordinator.take_exported_global_snapshot(4, exports)
     assert global_snapshot.id == 0
     assert not (destination / "snapshot/SNAPSHOT-0").exists()
@@ -149,12 +163,68 @@ def test_exported_global_snapshot_survives_source_deletion(tmp_path: Path) -> No
     ):
         for bucket in range(4):
             value = bytes([bucket + 10]) * 256
-            for index in range(64):
+            for index in range(65 if capture_current else 64):
                 row = reader.get(bucket, f"key-{index:03}".encode())
                 assert bytes(row.column(0)) == value
             assert collect(reader.scan(bucket, b"", b"z")) == [
-                (bucket, f"key-{index:03}".encode(), value) for index in range(64)
+                (bucket, f"key-{index:03}".encode(), value)
+                for index in range(65 if capture_current else 64)
             ]
+
+
+def test_snapshot_to_preserves_online_incremental_chain(tmp_path: Path) -> None:
+    source, destination = tmp_path / "source", tmp_path / "standalone"
+    settings = json.loads(config(source))
+    settings.update(
+        memtable_capacity="1MB",
+        l0_file_limit=100,
+        snapshot_on_flush=False,
+        snapshot_retention=1,
+        value_separation_threshold=16,
+    )
+    cfg = json.dumps(settings)
+    target = json.dumps({"base_dir": destination.as_uri(), "kinds": ["snapshot"]})
+
+    def manifest(root: Path, shard: pycobble.ShardSnapshot) -> dict:
+        path = root / shard.db_id / f"snapshot/SNAPSHOT-{shard.snapshot_id}"
+        payload = path.read_bytes()
+        assert payload[-4:] == b"mcs1"
+        return json.loads(payload[:-8])
+
+    db = pycobble.Db.open(cfg)
+    value = b"v" * 128
+    db.put(0, b"a", 0, value)
+    a = db.take_snapshot()
+    db.put(0, b"b", 0, value)
+    b = db.take_snapshot()
+    assert "base_snapshot_id" not in manifest(source, a)
+    assert manifest(source, b)["base_snapshot_id"] == a.snapshot_id
+    db.put(0, b"c", 0, value)
+    handle = db.snapshot_to(target)
+    exported = handle.wait()
+    assert handle.wait().manifest_path == exported.manifest_path
+    assert handle.is_finished() and not handle.cancel()
+    assert exported.snapshot_id == b.snapshot_id + 1
+    full = manifest(destination, exported)
+    assert "base_snapshot_id" not in full
+    assert not full["active_memtable_data"] and full["vlog_files"]
+    assert not (source / b.db_id / f"snapshot/SNAPSHOT-{exported.snapshot_id}").exists()
+    c = db.take_snapshot()  # E added only one L0 file since B; no new flush.
+    assert c.snapshot_id == exported.snapshot_id + 1
+    assert manifest(source, c)["base_snapshot_id"] == b.snapshot_id
+    # Retention preserves the online base chain.
+    assert manifest(source, a) and manifest(source, b)
+    db.put(0, b"d", 0, value)
+    db.close()
+    shutil.rmtree(source)
+    restored = pycobble.Db.restore_new_from_manifest(
+        config(destination), exported.manifest_path
+    )
+    for key in (b"a", b"b", b"c"):
+        assert bytes(restored.get(0, key).column(0)) == value
+    assert not restored.get(0, b"d").found
+    assert collect(restored.scan(0)) == [(0, key, value) for key in (b"a", b"b", b"c")]
+    restored.close()
 
 
 def test_coordinator_reader_read_only_and_distributed_scan(tmp_path: Path) -> None:

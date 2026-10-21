@@ -35,13 +35,18 @@ def test_structured_db_exports_with_shared_handle(tmp_path: Path) -> None:
     db = pycobble.StructuredDb.open(cfg)
     db.put_bytes(0, b"key", 0, b"value")
     shard = db.take_snapshot()
-    handle = db.export_snapshot(
-        shard.snapshot_id,
-        json.dumps({"base_dir": (destination / "shards").as_uri(), "kinds": ["snapshot"]}),
+    target = json.dumps(
+        {"base_dir": (destination / "shards").as_uri(), "kinds": ["snapshot"]}
     )
+    original = db.export_snapshot(shard.snapshot_id, target).wait()
+    assert original.snapshot_id == shard.snapshot_id
+    db.put_bytes(0, b"new-key", 0, b"new-value")
+    handle = db.snapshot_to(target)
     assert isinstance(handle, pycobble.ExportSnapshotHandle)
-    db.close()
     exported = handle.wait()
+    assert exported.snapshot_id == shard.snapshot_id + 1
+    db.put_bytes(0, b"later", 0, b"excluded")
+    db.close()
     assert handle.wait().db_id == exported.db_id
     assert handle.is_finished() and not handle.cancel()
     coordinator = pycobble.DbCoordinator.open(cfg)
@@ -52,6 +57,8 @@ def test_structured_db_exports_with_shared_handle(tmp_path: Path) -> None:
     shutil.rmtree(source)
     reader = pycobble.StructuredReader.open(config(destination), 0)
     assert bytes(reader.get(0, b"key").bytes(0)) == b"value"
+    assert bytes(reader.get(0, b"new-key").bytes(0)) == b"new-value"
+    assert not reader.get(0, b"later").found
 
 
 def decode_csrb(value: bytearray, length: int) -> list[tuple[int, bytes, bool, list[object]]]:

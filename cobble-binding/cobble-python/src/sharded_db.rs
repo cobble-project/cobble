@@ -526,6 +526,24 @@ impl PyDb {
         })
     }
 
+    /// Capture current state as a standalone full snapshot. destination_json is one
+    /// VolumeDescriptor, as with export_snapshot, not Config.
+    fn snapshot_to(
+        &self,
+        py: Python<'_>,
+        destination_json: String,
+    ) -> PyResult<PyExportSnapshotHandle> {
+        self.ensure_open()?;
+        let destination = serde_json::from_str::<VolumeDescriptor>(&destination_json)
+            .map_err(|error| input_error(error.to_string()))?;
+        py.detach(|| {
+            self.db
+                .snapshot_to(destination)
+                .map(|handle| PyExportSnapshotHandle { handle })
+                .map_err(map_error)
+        })
+    }
+
     fn take_snapshot(&self, py: Python<'_>) -> PyResult<PyShardSnapshot> {
         self.ensure_open()?;
         PyPendingShardSnapshot::start(&self.db)?.wait_result(py)
