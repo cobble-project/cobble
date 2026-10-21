@@ -139,6 +139,8 @@ read_only.scan_with_options_bounds(bucket, start_key_inclusive, end_key_exclusiv
 db.snapshot() -> Result<u64>
 db.snapshot_with_callback(callback) -> Result<u64>
 db.switch_to_snapshot(snapshot_id) -> Result<()>
+db.snapshot_to(destination) -> Result<ExportSnapshotHandle>
+db.export_snapshot(snapshot_id, destination) -> Result<ExportSnapshotHandle>
 db.switch_memtable_type(memtable_type, flush_current) -> Result<()>
 db.cancel_snapshot(snapshot_id) -> Result<bool>
 db.expire_snapshot(snapshot_id) -> Result<bool>
@@ -178,6 +180,9 @@ schema definitions without opening a DB or resolving merge operators/transforms.
 - `db.cancel_snapshot(snapshot_id)` only succeeds before manifest publication completes.
 - `db.expire_snapshot(snapshot_id)` releases snapshot ownership and file references.
 - `db.retain_snapshot(snapshot_id)` keeps a completed snapshot alive across retention passes.
+
+For `snapshot_to`, `export_snapshot`, and exported global snapshot usage, see
+[Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
 
 `load_readonly_files_to_primary()` is also available on `StructuredDb` and
 `StructuredSingleDb`. See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).

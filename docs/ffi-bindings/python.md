@@ -97,6 +97,24 @@ volume. `load_shard_snapshot_metadata(config, db_id, manifest_path)` loads a
 shard's snapshot and schema metadata. Both loaders have `_file` variants for
 configuration files and do not open a database.
 
+## Standalone snapshots and exports
+
+`Db` and `StructuredDb` provide `snapshot_to(destination_json)` for current state and
+`export_snapshot(id, destination_json)` for a completed snapshot. For a global export:
+
+```python
+destination = json.dumps({"base_dir": "file:///backups/run-001", "kinds": ["snapshot"]})
+shard_destination = json.dumps({
+    "base_dir": "file:///backups/run-001/shards", "kinds": ["snapshot"]
+})
+reports = [shard.snapshot_to(shard_destination).wait() for shard in shards]
+snapshot = coordinator.take_exported_global_snapshot(total_buckets, reports)
+coordinator.materialize_exported_global_snapshot(snapshot, destination)
+```
+
+Pass a VolumeDescriptor JSON, not a full DB config. Use a fresh destination outside online storage.
+See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
+
 ## Structured columns
 
 Use `StructuredSingleDb` for BYTES and LIST columns. Run this example against

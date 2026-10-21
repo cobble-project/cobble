@@ -32,6 +32,38 @@ For [single-machine use](../getting-started/single-db) via `SingleDb`, this two-
 
 `snapshot_with_callback` is useful when you need to trigger downstream processing (such as notifying a read service or recording the snapshot ID) only after the manifest is safely persisted. The callback fires after the manifest file has been written, and receives the manifest object so you can inspect it or extract its ID.
 
+## Standalone Snapshots and Exports
+
+Use `snapshot_to(destination)` to save current state as an independent full snapshot,
+or `export_snapshot(id, destination)` to copy a completed snapshot. Call `wait()` for the result.
+
+For multiple shards, reuse your existing `DbCoordinator`. Export every shard into
+`<destination>/shards`, then assemble and publish the global snapshot:
+
+```rust
+use cobble::{VolumeDescriptor, VolumeUsageKind};
+
+let destination = VolumeDescriptor::new(
+    "file:///backups/run-001", vec![VolumeUsageKind::Snapshot]);
+let shard_destination = VolumeDescriptor::new(
+    "file:///backups/run-001/shards", vec![VolumeUsageKind::Snapshot]);
+
+let mut reports = Vec::new();
+for db in &shards {
+    reports.push(db.snapshot_to(shard_destination.clone())?.wait()?);
+}
+let snapshot = coordinator.take_exported_global_snapshot(total_buckets, reports)?;
+coordinator.materialize_exported_global_snapshot(&snapshot, destination)?;
+```
+
+Include all buckets and coordinate shard captures if a common checkpoint is required.
+Use a fresh destination outside online storage. Its global snapshot and `CURRENT` are
+independent; online retention and incremental snapshot chains are unchanged.
+
+See the [Java](../ffi-bindings/java#standalone-snapshots-and-exports),
+[C++](../ffi-bindings/cpp#standalone-snapshots-and-exports), and
+[Python](../ffi-bindings/python#standalone-snapshots-and-exports) examples.
+
 ## Restoring from Snapshots
 
 Restore is the process of opening a database from a previously taken snapshot. The key requirement is that **all files referenced by the snapshot must still be accessible** from the configured [volumes](multi-volume). This includes data files, VLOG files, manifests, and schema files.

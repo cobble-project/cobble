@@ -508,6 +508,29 @@ For hot paths, prefer direct buffer APIs.
 | Direct view (`DirectColumns`/`DirectRow`) | Lower copy, lower allocation | Good default for performance |
 | `DirectEncodedRow` | Lowest decode overhead, best control | **Best performance path** |
 
+## Standalone Snapshots and Exports
+
+Raw and structured `Db` provide `snapshotTo(destination)` for current state and
+`exportSnapshot(id, destination)` for a completed snapshot. For a global export:
+
+```java
+Config.VolumeDescriptor destination =
+        Config.VolumeDescriptor.singleVolume("file:///backups/run-001");
+Config.VolumeDescriptor shardDestination =
+        Config.VolumeDescriptor.singleVolume("file:///backups/run-001/shards");
+List<ShardSnapshot> reports = new ArrayList<>();
+for (Db shard : shards) {
+    try (ExportSnapshotHandle handle = shard.snapshotTo(shardDestination)) {
+        reports.add(handle.future().get());
+    }
+}
+GlobalSnapshot snapshot = coordinator.takeExportedGlobalSnapshot(totalBuckets, reports);
+coordinator.materializeExportedGlobalSnapshot(snapshot, destination);
+```
+
+Use a fresh destination outside online storage, with all shards under `shards/`.
+See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
+
 ## Snapshot Lifecycle APIs
 
 Distributed `Db` also exposes asynchronous snapshot lifecycle control for checkpoint-style integrations:

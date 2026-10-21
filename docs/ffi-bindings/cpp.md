@@ -108,6 +108,27 @@ For shard-level writes and recovery, use `Db`; it returns a `ShardSnapshot`
 from `TakeSnapshot()`. A `DbCoordinator` combines shard reports into a global
 snapshot. See [Distributed Deployment](../getting-started/distributed).
 
+## Standalone snapshots and exports
+
+Raw and structured `Db` provide `SnapshotTo(destination_json)` for current state and
+`ExportSnapshot(id, destination_json)` for a completed snapshot. For a global export:
+
+```cpp
+const std::string destination =
+    R"({"base_dir":"file:///backups/run-001","kinds":["snapshot"]})";
+const std::string shard_destination =
+    R"({"base_dir":"file:///backups/run-001/shards","kinds":["snapshot"]})";
+std::vector<cobble::ShardSnapshot> reports;
+for (const auto& shard : shards) {
+  reports.push_back(shard.SnapshotTo(shard_destination).Wait());
+}
+auto snapshot = coordinator.TakeExportedGlobalSnapshot(total_buckets, reports);
+coordinator.MaterializeExportedGlobalSnapshot(snapshot, destination);
+```
+
+Pass a VolumeDescriptor JSON, not a full DB config. Use a fresh destination outside online storage.
+See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
+
 ## Snapshot readers
 
 Use `Reader::OpenCurrent(config)` to follow committed global snapshots, and
