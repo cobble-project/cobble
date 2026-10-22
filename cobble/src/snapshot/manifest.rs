@@ -139,6 +139,56 @@ pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestPayload> {
     Ok(payload)
 }
 
+/// Apply a delta to one resolved snapshot without cloning its existing LSM layout.
+/// The caller resolves the base dependency and must discard this working copy on error.
+pub(crate) fn apply_incremental_manifest(
+    base: &mut ManifestSnapshot,
+    incremental: &ManifestIncrementalSnapshot,
+) -> Result<()> {
+    // Exhaustive mapping makes newly added metadata fields a compile-time obligation.
+    let ManifestIncrementalSnapshot {
+        version,
+        id,
+        timestamp_seconds,
+        seq_id,
+        topology_epoch,
+        wal_checkpoint_id,
+        wal_volume,
+        base_snapshot_id: _,
+        latest_schema_id,
+        data_size_bytes,
+        incremental_data_size_bytes,
+        bucket_ranges,
+        lsm_tree_bucket_ranges,
+        tree_scopes,
+        tree_level_edits,
+        vlog_files,
+        active_memtable_data,
+        truncation_cursors,
+    } = incremental;
+    apply_manifest_tree_level_edits(&mut base.tree_levels, tree_level_edits)?;
+    *base = ManifestSnapshot {
+        version: *version,
+        id: *id,
+        timestamp_seconds: *timestamp_seconds,
+        seq_id: *seq_id,
+        topology_epoch: *topology_epoch,
+        wal_checkpoint_id: *wal_checkpoint_id,
+        wal_volume: wal_volume.clone(),
+        latest_schema_id: *latest_schema_id,
+        data_size_bytes: *data_size_bytes,
+        incremental_data_size_bytes: *incremental_data_size_bytes,
+        bucket_ranges: bucket_ranges.clone(),
+        lsm_tree_bucket_ranges: lsm_tree_bucket_ranges.clone(),
+        tree_scopes: tree_scopes.clone(),
+        tree_levels: std::mem::take(&mut base.tree_levels),
+        vlog_files: vlog_files.clone(),
+        active_memtable_data: active_memtable_data.clone(),
+        truncation_cursors: truncation_cursors.clone(),
+    };
+    Ok(())
+}
+
 pub(crate) fn parse_snapshot_manifest_id(name: &str) -> Option<u64> {
     let name = name.rsplit('/').next().unwrap_or(name);
     name.strip_prefix("SNAPSHOT-")?.parse::<u64>().ok()
@@ -176,26 +226,7 @@ pub(crate) fn load_manifest_entry(
             let base_snapshot_id = Some(incremental.base_snapshot_id);
             let manifest = if let Some(base) = loaded_by_id.get(&incremental.base_snapshot_id) {
                 let mut resolved = base.manifest.clone();
-                apply_manifest_tree_level_edits(
-                    &mut resolved.tree_levels,
-                    &incremental.tree_level_edits,
-                )?;
-                resolved.version = incremental.version;
-                resolved.timestamp_seconds = incremental.timestamp_seconds;
-                resolved.topology_epoch = incremental.topology_epoch;
-                resolved.wal_checkpoint_id = incremental.wal_checkpoint_id;
-                resolved.wal_volume = incremental.wal_volume;
-                resolved.vlog_files = incremental.vlog_files;
-                resolved.id = incremental.id;
-                resolved.seq_id = incremental.seq_id;
-                resolved.latest_schema_id = incremental.latest_schema_id;
-                resolved.data_size_bytes = incremental.data_size_bytes;
-                resolved.incremental_data_size_bytes = incremental.incremental_data_size_bytes;
-                resolved.active_memtable_data = incremental.active_memtable_data;
-                resolved.bucket_ranges = incremental.bucket_ranges;
-                resolved.lsm_tree_bucket_ranges = incremental.lsm_tree_bucket_ranges;
-                resolved.tree_scopes = incremental.tree_scopes;
-                resolved.truncation_cursors = incremental.truncation_cursors;
+                apply_incremental_manifest(&mut resolved, &incremental)?;
                 resolved
             } else {
                 load_manifest_for_snapshot(file_manager, snapshot_id)?
@@ -215,7 +246,6 @@ pub(crate) fn load_manifest_chain(
     file_manager: &Arc<FileManager>,
     snapshot_id: u64,
 ) -> Result<Vec<LoadedManifest>> {
-    let mut chain = Vec::new();
     let mut visited = HashSet::new();
     let mut raw_payloads = Vec::new();
     let mut next_id = Some(snapshot_id);
@@ -235,53 +265,7 @@ pub(crate) fn load_manifest_chain(
         };
         raw_payloads.push((current_id, payload));
     }
-    raw_payloads.reverse();
-
-    let mut resolved_by_id: HashMap<u64, ManifestSnapshot> = HashMap::new();
-    for (current_id, payload) in raw_payloads {
-        let (base_snapshot_id, resolved_manifest) = match payload {
-            ManifestPayload::Snapshot(manifest) => (None, manifest),
-            ManifestPayload::IncrementalSnapshot(manifest) => {
-                let mut resolved_base = resolved_by_id
-                    .get(&manifest.base_snapshot_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::IoError(format!(
-                            "Missing base manifest {} for snapshot {}",
-                            manifest.base_snapshot_id, current_id
-                        ))
-                    })?;
-                apply_manifest_tree_level_edits(
-                    &mut resolved_base.tree_levels,
-                    &manifest.tree_level_edits,
-                )?;
-                resolved_base.version = manifest.version;
-                resolved_base.timestamp_seconds = manifest.timestamp_seconds;
-                resolved_base.topology_epoch = manifest.topology_epoch;
-                resolved_base.wal_checkpoint_id = manifest.wal_checkpoint_id;
-                resolved_base.wal_volume = manifest.wal_volume;
-                resolved_base.vlog_files = manifest.vlog_files;
-                resolved_base.id = manifest.id;
-                resolved_base.seq_id = manifest.seq_id;
-                resolved_base.latest_schema_id = manifest.latest_schema_id;
-                resolved_base.data_size_bytes = manifest.data_size_bytes;
-                resolved_base.incremental_data_size_bytes = manifest.incremental_data_size_bytes;
-                resolved_base.active_memtable_data = manifest.active_memtable_data;
-                resolved_base.bucket_ranges = manifest.bucket_ranges;
-                resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
-                resolved_base.tree_scopes = manifest.tree_scopes;
-                resolved_base.truncation_cursors = manifest.truncation_cursors;
-                (Some(manifest.base_snapshot_id), resolved_base)
-            }
-        };
-        resolved_by_id.insert(current_id, resolved_manifest.clone());
-        chain.push(LoadedManifest {
-            snapshot_id: current_id,
-            base_snapshot_id,
-            manifest: resolved_manifest,
-        });
-    }
-    Ok(chain)
+    resolve_manifest_chain(raw_payloads)
 }
 
 /// Load the manifest dependency chain starting from an explicit manifest path.
@@ -289,7 +273,6 @@ pub(crate) fn load_manifest_chain_from_path(
     file_manager: &Arc<FileManager>,
     manifest_path: &str,
 ) -> Result<Vec<LoadedManifest>> {
-    let mut chain = Vec::new();
     let mut visited = HashSet::new();
     let mut raw_payloads = Vec::new();
     let mut next_path = Some(manifest_path.to_string());
@@ -315,44 +298,34 @@ pub(crate) fn load_manifest_chain_from_path(
         };
         raw_payloads.push((current_id, payload));
     }
-    raw_payloads.reverse();
+    resolve_manifest_chain(raw_payloads)
+}
 
-    let mut resolved_by_id: HashMap<u64, ManifestSnapshot> = HashMap::new();
-    for (current_id, payload) in raw_payloads {
+// Loaders collect newest-first; reconstruct oldest-first so each base precedes its delta.
+fn resolve_manifest_chain(
+    raw_payloads: Vec<(u64, ManifestPayload)>,
+) -> Result<Vec<LoadedManifest>> {
+    let mut chain: Vec<LoadedManifest> = Vec::with_capacity(raw_payloads.len());
+    for (current_id, payload) in raw_payloads.into_iter().rev() {
         let (base_snapshot_id, resolved_manifest) = match payload {
             ManifestPayload::Snapshot(manifest) => (None, manifest),
             ManifestPayload::IncrementalSnapshot(manifest) => {
-                let mut resolved_base = resolved_by_id
-                    .get(&manifest.base_snapshot_id)
-                    .cloned()
+                let base = chain
+                    .last()
+                    .filter(|entry| entry.snapshot_id == manifest.base_snapshot_id)
                     .ok_or_else(|| {
                         Error::IoError(format!(
                             "Missing base manifest {} for snapshot {}",
                             manifest.base_snapshot_id, current_id
                         ))
                     })?;
-                apply_manifest_tree_level_edits(
-                    &mut resolved_base.tree_levels,
-                    &manifest.tree_level_edits,
-                )?;
-                resolved_base.version = manifest.version;
-                resolved_base.timestamp_seconds = manifest.timestamp_seconds;
-                resolved_base.topology_epoch = manifest.topology_epoch;
-                resolved_base.wal_checkpoint_id = manifest.wal_checkpoint_id;
-                resolved_base.wal_volume = manifest.wal_volume;
-                resolved_base.vlog_files = manifest.vlog_files;
-                resolved_base.id = manifest.id;
-                resolved_base.seq_id = manifest.seq_id;
-                resolved_base.latest_schema_id = manifest.latest_schema_id;
-                resolved_base.active_memtable_data = manifest.active_memtable_data;
-                resolved_base.bucket_ranges = manifest.bucket_ranges;
-                resolved_base.lsm_tree_bucket_ranges = manifest.lsm_tree_bucket_ranges;
-                resolved_base.tree_scopes = manifest.tree_scopes;
-                resolved_base.truncation_cursors = manifest.truncation_cursors;
+                // The previous output is the sole base in a dependency chain. Clone
+                // once to retain that historical result, not into a second full map.
+                let mut resolved_base = base.manifest.clone();
+                apply_incremental_manifest(&mut resolved_base, &manifest)?;
                 (Some(manifest.base_snapshot_id), resolved_base)
             }
         };
-        resolved_by_id.insert(current_id, resolved_manifest.clone());
         chain.push(LoadedManifest {
             snapshot_id: current_id,
             base_snapshot_id,
@@ -401,7 +374,7 @@ pub(crate) fn load_manifest_from_path(
         .ok_or_else(|| Error::IoError(format!("Snapshot manifest not found: {}", manifest_path)))
 }
 
-pub(crate) fn apply_manifest_tree_level_edits(
+fn apply_manifest_tree_level_edits(
     tree_levels: &mut [Vec<ManifestLevel>],
     edits: &[ManifestTreeLevelEdit],
 ) -> Result<()> {

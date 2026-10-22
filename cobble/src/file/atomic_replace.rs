@@ -135,6 +135,26 @@ fn delete_versions(fs: &dyn FileSystem, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove both the plain metadata file and its immutable replacement commits.
+/// Like publication, this requires an externally serialized writer.
+pub fn delete(fs: &dyn FileSystem, path: &str) -> Result<()> {
+    if fs.exists(path)? {
+        fs.delete(path)?;
+    }
+    let dir = directory(path);
+    let mut names = entries(fs, &dir)?;
+    // Remove older completion markers first and all markers before their payloads.
+    // Retrying after an interrupted deletion must not select a missing payload.
+    names.sort();
+    for entry in names.iter().filter(|name| name.contains(".complete-")) {
+        fs.delete(&format!(
+            "{dir}/{}",
+            entry.rsplit('/').next().unwrap_or(entry)
+        ))?;
+    }
+    delete_versions(fs, path)
+}
+
 /// A streaming publication writer. Payload bytes are not transformed.
 pub struct ReplaceWriter {
     fs: Arc<dyn FileSystem>,

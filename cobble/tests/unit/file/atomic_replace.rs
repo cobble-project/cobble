@@ -11,6 +11,9 @@ pub(crate) struct TestFileSystem {
     pub(crate) atomic: AtomicBool,
     fail_marker: AtomicBool,
     fail_delete: AtomicBool,
+    pub(crate) fail_delete_at: AtomicUsize,
+    pub(crate) fail_delete_after: AtomicBool,
+    pub(crate) delete_trace: Mutex<Vec<String>>,
     rename_calls: AtomicUsize,
     before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(crate) fail_rename_to: Mutex<Option<String>>,
@@ -23,6 +26,9 @@ impl TestFileSystem {
             atomic: AtomicBool::new(false),
             fail_marker: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
+            fail_delete_at: AtomicUsize::new(usize::MAX),
+            fail_delete_after: AtomicBool::new(false),
+            delete_trace: Mutex::new(Vec::new()),
             rename_calls: AtomicUsize::new(0),
             before_read: Mutex::new(None),
             fail_rename_to: Mutex::new(None),
@@ -52,10 +58,24 @@ impl FileSystem for TestFileSystem {
         self.inner.exists(path)
     }
     fn delete(&self, path: &str) -> Result<()> {
+        let mut trace = self.delete_trace.lock().unwrap();
+        let index = trace.len();
+        trace.push(path.to_string());
+        drop(trace);
+        let indexed_failure = self.fail_delete_at.load(Ordering::SeqCst) == index;
+        if indexed_failure && !self.fail_delete_after.load(Ordering::SeqCst) {
+            return Err(Error::IoError("injected indexed cleanup failure".into()));
+        }
         if self.fail_delete.load(Ordering::SeqCst) {
             return Err(Error::IoError("injected cleanup failure".to_string()));
         }
-        self.inner.delete(path)
+        self.inner.delete(path)?;
+        if indexed_failure {
+            return Err(Error::IoError(
+                "injected error after successful deletion".into(),
+            ));
+        }
+        Ok(())
     }
     fn delete_async(&self, path: &str) -> Result<()> {
         self.delete(path)
@@ -206,5 +226,30 @@ fn migration_priorities_and_cleanup_are_explicit() {
         b"versioned-again"[..]
     );
     write(fs.clone(), "CURRENT", b"flat-again").unwrap();
+    assert!(!fs.exists("CURRENT-ATOMIC/").unwrap());
+}
+
+#[test]
+fn offline_delete_removes_both_formats_and_abandoned_payloads() {
+    let (_dir, fs) = setup();
+    fs.fail_delete.store(true, Ordering::SeqCst);
+    write(fs.clone(), "CURRENT", b"first").unwrap();
+    write(fs.clone(), "CURRENT", b"second").unwrap();
+    raw_write(fs.inner.as_ref(), "CURRENT", b"legacy");
+    assert!(delete(fs.as_ref(), "CURRENT").is_err());
+    assert_eq!(read(fs.as_ref(), "CURRENT").unwrap(), b"second"[..]);
+    fs.fail_delete.store(false, Ordering::SeqCst);
+    delete(fs.as_ref(), "CURRENT").unwrap();
+    assert!(!exists(fs.as_ref(), "CURRENT").unwrap());
+    assert!(!fs.exists("CURRENT-ATOMIC/").unwrap());
+    fs.create_dir("CURRENT-ATOMIC").unwrap();
+    raw_write(
+        fs.as_ref(),
+        "CURRENT-ATOMIC/00000000000000000001.data",
+        b"orphan",
+    );
+    assert!(!exists(fs.as_ref(), "CURRENT").unwrap());
+    delete(fs.as_ref(), "CURRENT").unwrap();
+    delete(fs.as_ref(), "CURRENT").unwrap();
     assert!(!fs.exists("CURRENT-ATOMIC/").unwrap());
 }

@@ -60,6 +60,12 @@ fn log_progress(
     );
 }
 
+fn s3_test_runtime() -> &'static tokio::runtime::Runtime {
+    // OpenDAL shares its HTTP pool, so its connections must outlive individual tests.
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+}
+
 fn list_wal_objects(
     endpoint: &str,
     bucket: &str,
@@ -78,8 +84,7 @@ fn list_wal_objects(
     // OpenDAL ≥ 0.58: `Operator::new` returns a finished `Operator` directly
     // (the previous `.finish()` builder terminator was removed, see opendal #7743).
     let operator = Operator::new(builder).unwrap();
-    tokio::runtime::Runtime::new()
-        .unwrap()
+    s3_test_runtime()
         .block_on(operator.list(&format!("{db_id}/wal/")))
         .unwrap()
         .into_iter()
@@ -89,7 +94,7 @@ fn list_wal_objects(
 }
 
 struct SnapshotS3Prefix {
-    runtime: tokio::runtime::Runtime,
+    runtime: &'static tokio::runtime::Runtime,
     operator: Operator,
     base_dir: Url,
     access_id: String,
@@ -126,7 +131,7 @@ impl SnapshotS3Prefix {
         .unwrap();
         eprintln!("[snapshot-to-s3] endpoint={endpoint} bucket={bucket} prefix={prefix}");
         Self {
-            runtime: tokio::runtime::Runtime::new().unwrap(),
+            runtime: s3_test_runtime(),
             operator,
             base_dir,
             access_id,
@@ -271,6 +276,426 @@ fn verify_snapshot_cut(config: Config, metadata: &cobble::ShardSnapshotMetadata,
         );
     }
     restored.close().unwrap();
+}
+
+#[test]
+fn s3_snapshot_cleanup_shard_global_and_exported_cases() {
+    if !has_required_env() {
+        eprintln!("skipping snapshot cleanup S3 test: COBBLE_S3_* env vars are not fully set");
+        return;
+    }
+    use cobble::{
+        CoordinatorConfig, Db, DbCoordinator, SnapshotCleanupOptions, cleanup_global_snapshot,
+        cleanup_shard_snapshot,
+    };
+
+    let storage = SnapshotS3Prefix::new();
+    let exists = |directory: &str, relative: &str| {
+        storage
+            .runtime
+            .block_on(
+                storage
+                    .operator
+                    .exists(&format!("objects/{directory}/{relative}")),
+            )
+            .unwrap()
+    };
+    for preserve_dependencies in [true, false] {
+        for include_older_snapshots in [false, true] {
+            let options = SnapshotCleanupOptions {
+                preserve_dependencies,
+                include_older_snapshots,
+            };
+            for global in [false, true] {
+                let directory =
+                    format!("cleanup-{global}-{preserve_dependencies}-{include_older_snapshots}");
+                let shard_directory = format!("{directory}/shards");
+                let volume = storage.volume(&shard_directory);
+                let config = snapshot_config(volume.clone(), 0.0);
+                let db = Db::open(config.clone(), std::iter::once(0..=0).collect()).unwrap();
+                let mut snapshots = Vec::new();
+                for stage in 0..3 {
+                    write_snapshot_stage(&db, stage);
+                    snapshots.push(wait_snapshot(&db));
+                }
+                let [a, b, c] = snapshots.as_slice() else {
+                    unreachable!()
+                };
+                assert_eq!(storage.manifest(b)["base_snapshot_id"], a.snapshot_id);
+                assert_eq!(storage.manifest(c)["base_snapshot_id"], b.snapshot_id);
+                db.close().unwrap();
+
+                if global {
+                    let meta = storage.volume(&directory);
+                    let coordinator = DbCoordinator::open(CoordinatorConfig {
+                        volumes: vec![meta.clone()],
+                        snapshot_retention: None,
+                    })
+                    .unwrap();
+                    // Global ids deliberately differ from shard ids. G40 reuses B directly.
+                    for (id, shard) in [(10, a), (20, b), (30, c), (40, b)] {
+                        let snapshot = coordinator
+                            .take_global_snapshot_with_id(1, vec![shard.clone()], id)
+                            .unwrap();
+                        coordinator.materialize_global_snapshot(&snapshot).unwrap();
+                    }
+                    drop(coordinator);
+                    let result =
+                        cleanup_global_snapshot(&meta, std::slice::from_ref(&volume), 20, options)
+                            .unwrap();
+                    assert_eq!(result.deleted_files == 0, preserve_dependencies);
+                    assert_eq!(
+                        result.deleted_global_snapshots,
+                        if include_older_snapshots { 2 } else { 1 }
+                    );
+                    assert!(!exists(&directory, "snapshot/SNAPSHOT-20"));
+                    assert_eq!(
+                        exists(&directory, "snapshot/SNAPSHOT-10"),
+                        !include_older_snapshots
+                    );
+                    let coordinator = DbCoordinator::open(CoordinatorConfig {
+                        volumes: vec![meta.clone()],
+                        snapshot_retention: None,
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        coordinator
+                            .load_current_global_snapshot()
+                            .unwrap()
+                            .map(|s| s.id),
+                        preserve_dependencies.then_some(40)
+                    );
+                    drop(coordinator);
+                    assert_eq!(
+                        cleanup_global_snapshot(&meta, std::slice::from_ref(&volume), 20, options)
+                            .unwrap()
+                            .deleted_global_snapshots,
+                        0
+                    );
+                } else {
+                    let result =
+                        cleanup_shard_snapshot(&volume, &[], &b.db_id, b.snapshot_id, options)
+                            .unwrap();
+                    assert_eq!(result.deleted_files == 0, preserve_dependencies);
+                    assert_eq!(
+                        result.deleted_shard_snapshots,
+                        if preserve_dependencies {
+                            0
+                        } else if include_older_snapshots {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                    assert_eq!(
+                        cleanup_shard_snapshot(&volume, &[], &b.db_id, b.snapshot_id, options)
+                            .unwrap()
+                            .deleted_shard_snapshots,
+                        0
+                    );
+                }
+                assert_eq!(
+                    exists(
+                        &shard_directory,
+                        &format!("{}/snapshot/SNAPSHOT-{}", b.db_id, b.snapshot_id)
+                    ),
+                    preserve_dependencies
+                );
+                if preserve_dependencies {
+                    verify_snapshot_cut(config, c, 3);
+                } else {
+                    assert!(Db::open_new_with_manifest_path(config, &c.manifest_path).is_err());
+                }
+            }
+
+            // Independent shard exports have no base chain. Preserve a sibling export.
+            let directory = format!("export-{preserve_dependencies}-{include_older_snapshots}");
+            let source = storage.volume(&format!("{directory}/source"));
+            let destination = storage.volume(&format!("{directory}/shards"));
+            let db = Db::open(
+                snapshot_config(source, 1.0),
+                std::iter::once(0..=0).collect(),
+            )
+            .unwrap();
+            write_snapshot_stage(&db, 0);
+            let active = wait_snapshot(&db);
+            let exported = db
+                .export_snapshot(active.snapshot_id, destination.clone())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(
+                !storage.manifest(&exported)["active_memtable_data"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let sibling = db.snapshot_to(destination.clone()).unwrap().wait().unwrap();
+            db.close().unwrap();
+            let result = cleanup_shard_snapshot(
+                &destination,
+                &[],
+                &exported.db_id,
+                exported.snapshot_id,
+                options,
+            )
+            .unwrap();
+            assert_eq!(result.deleted_shard_snapshots, 1);
+            assert!(result.deleted_files > 0);
+            verify_snapshot_cut(snapshot_config(destination.clone(), 0.0), &sibling, 1);
+
+            // Publish the remaining independent shard as a global export and delete its CURRENT.
+            let coordinator = DbCoordinator::open(CoordinatorConfig {
+                volumes: vec![storage.volume("export-coordinator")],
+                snapshot_retention: None,
+            })
+            .unwrap();
+            let snapshot = coordinator
+                .take_exported_global_snapshot(1, vec![sibling.clone()])
+                .unwrap();
+            let meta = storage.volume(&directory);
+            coordinator
+                .materialize_exported_global_snapshot(&snapshot, meta.clone())
+                .unwrap();
+            drop(coordinator);
+            let result =
+                cleanup_global_snapshot(&meta, std::slice::from_ref(&destination), 0, options)
+                    .unwrap();
+            assert_eq!(result.deleted_global_snapshots, 1);
+            assert_eq!(result.deleted_shard_snapshots, 1);
+            assert!(result.deleted_files > 0);
+            assert!(!exists(&directory, "snapshot/SNAPSHOT-0"));
+            assert!(!exists(
+                &directory,
+                &format!(
+                    "shards/{}/snapshot/SNAPSHOT-{}",
+                    sibling.db_id, sibling.snapshot_id
+                )
+            ));
+            assert_eq!(
+                cleanup_global_snapshot(&meta, &[destination], 0, options)
+                    .unwrap()
+                    .deleted_files,
+                0
+            );
+            eprintln!(
+                "[snapshot-cleanup-s3] preserve={preserve_dependencies} older={include_older_snapshots}: shard/global/export passed"
+            );
+        }
+    }
+}
+
+#[test]
+fn s3_snapshot_cleanup_nested_routes_and_missing_objects() {
+    if !has_required_env() {
+        eprintln!("skipping snapshot cleanup S3 test: COBBLE_S3_* env vars are not fully set");
+        return;
+    }
+    use cobble::{
+        CoordinatorConfig, Db, DbCoordinator, SnapshotCleanupOptions, cleanup_global_snapshot,
+        cleanup_shard_snapshot,
+    };
+
+    let storage = SnapshotS3Prefix::new();
+    let source = snapshot_config(storage.volume("corner-source"), 0.0);
+    let destination = storage.volume("corner-exports");
+    let db = Db::open(source, std::iter::once(0..=0).collect()).unwrap();
+    write_snapshot_stage(&db, 0);
+    let snapshot = wait_snapshot(&db);
+    let mut exports = Vec::new();
+    for _ in 0..3 {
+        exports.push(
+            db.export_snapshot(snapshot.snapshot_id, destination.clone())
+                .unwrap()
+                .wait()
+                .unwrap(),
+        );
+    }
+    db.close().unwrap();
+    for (index, exported) in exports.iter().enumerate() {
+        let manifest = storage.manifest(exported);
+        let files = manifest["tree_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|levels| levels.as_array().unwrap())
+            .flat_map(|level| level["files"].as_array().unwrap())
+            .chain(manifest["vlog_files"].as_array().unwrap())
+            .map(|file| {
+                let url = Url::parse(file["path"].as_str().unwrap()).unwrap();
+                format!(
+                    "objects/{}",
+                    url.path().strip_prefix(storage.base_dir.path()).unwrap()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(files.len() >= 2, "cover both SST and VLOG");
+        let sentinel = format!("objects/corner-exports/{}/keep-me", exported.db_id);
+        storage
+            .runtime
+            .block_on(storage.operator.write(&sentinel, "unrelated"))
+            .unwrap();
+        let missing = cleanup_shard_snapshot(
+            &destination,
+            &[],
+            &exported.db_id,
+            exported.snapshot_id + 100,
+            SnapshotCleanupOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(missing.deleted_files + missing.deleted_shard_snapshots, 0);
+        let nested = storage.volume(&format!("corner-exports/{}/data", exported.db_id));
+        if index == 2 {
+            // Export paths omit URL options. A surviving full snapshot can refer to the same
+            // objects through the parent volume's configured URL instead of the nested route.
+            let mut survivor = manifest.clone();
+            survivor["id"] = (exported.snapshot_id + 1).into();
+            let query = Url::parse(&destination.base_dir)
+                .unwrap()
+                .query()
+                .unwrap()
+                .to_owned();
+            for levels in survivor["tree_levels"].as_array_mut().unwrap() {
+                for level in levels.as_array_mut().unwrap() {
+                    for file in level["files"].as_array_mut().unwrap() {
+                        let mut path = Url::parse(file["path"].as_str().unwrap()).unwrap();
+                        path.set_query(Some(&query));
+                        file["path"] = path.to_string().into();
+                    }
+                }
+            }
+            for file in survivor["vlog_files"].as_array_mut().unwrap() {
+                let mut path = Url::parse(file["path"].as_str().unwrap()).unwrap();
+                path.set_query(Some(&query));
+                file["path"] = path.to_string().into();
+            }
+            let mut bytes = serde_json::to_vec(&survivor).unwrap();
+            bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+            bytes.extend_from_slice(b"mcs1");
+            let mut metadata = exported.clone();
+            metadata.snapshot_id += 1;
+            let mut path = Url::parse(&metadata.manifest_path).unwrap();
+            path.set_path(&format!(
+                "{}/SNAPSHOT-{}",
+                path.path().rsplit_once('/').unwrap().0,
+                metadata.snapshot_id
+            ));
+            metadata.manifest_path = path.to_string();
+            let object = format!(
+                "objects/{}",
+                path.path().strip_prefix(storage.base_dir.path()).unwrap()
+            );
+            storage
+                .runtime
+                .block_on(storage.operator.write(&object, bytes))
+                .unwrap();
+            verify_snapshot_cut(snapshot_config(destination.clone(), 0.0), &metadata, 1);
+            let result = cleanup_shard_snapshot(
+                &destination,
+                &[nested],
+                &exported.db_id,
+                exported.snapshot_id,
+                SnapshotCleanupOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(result.deleted_shard_snapshots, 1);
+            assert_eq!(
+                result.deleted_files, 0,
+                "shared objects reached through different configured roots must be protected"
+            );
+            verify_snapshot_cut(snapshot_config(destination.clone(), 0.0), &metadata, 1);
+            // The same shard manifest can also be shared by globals using two routes.
+            let meta = storage.volume("");
+            let coordinator = DbCoordinator::open(CoordinatorConfig {
+                volumes: vec![meta.clone()],
+                snapshot_retention: None,
+            })
+            .unwrap();
+            for id in [10, 20] {
+                let mut reference = metadata.clone();
+                if id == 20 {
+                    let mut path = Url::parse(&reference.manifest_path).unwrap();
+                    path.set_query(Url::parse(&meta.base_dir).unwrap().query());
+                    reference.manifest_path = path.to_string();
+                }
+                let global = coordinator
+                    .take_global_snapshot_with_id(1, vec![reference], id)
+                    .unwrap();
+                coordinator.materialize_global_snapshot(&global).unwrap();
+            }
+            drop(coordinator);
+            let result = cleanup_global_snapshot(
+                &meta,
+                std::slice::from_ref(&destination),
+                10,
+                SnapshotCleanupOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(result.deleted_global_snapshots, 1);
+            assert_eq!(
+                result.deleted_shard_snapshots, 0,
+                "a manifest shared through two routes must survive"
+            );
+            let coordinator = DbCoordinator::open(CoordinatorConfig {
+                volumes: vec![meta],
+                snapshot_retention: None,
+            })
+            .unwrap();
+            assert_eq!(
+                coordinator
+                    .load_current_global_snapshot()
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                20
+            );
+            verify_snapshot_cut(snapshot_config(destination.clone(), 0.0), &metadata, 1);
+            continue;
+        }
+        // A missing data object must not stop cleanup of the remaining snapshot assets.
+        storage
+            .runtime
+            .block_on(storage.operator.delete(&files[0]))
+            .unwrap();
+        // Both descriptors address the same object namespace, with different configured roots.
+        let routes = if index == 0 { Vec::new() } else { vec![nested] };
+        let result = cleanup_shard_snapshot(
+            &destination,
+            &routes,
+            &exported.db_id,
+            exported.snapshot_id,
+            SnapshotCleanupOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.deleted_shard_snapshots, 1);
+        for file in files {
+            assert!(
+                !storage
+                    .runtime
+                    .block_on(storage.operator.exists(&file))
+                    .unwrap(),
+                "orphan snapshot object: {file}"
+            );
+        }
+        assert!(
+            storage
+                .runtime
+                .block_on(storage.operator.exists(&sentinel))
+                .unwrap()
+        );
+        assert_eq!(
+            cleanup_shard_snapshot(
+                &destination,
+                &routes,
+                &exported.db_id,
+                exported.snapshot_id,
+                SnapshotCleanupOptions::default(),
+            )
+            .unwrap()
+            .deleted_files,
+            0
+        );
+    }
 }
 
 #[test]

@@ -133,10 +133,10 @@ mod scan;
 mod schema;
 mod single_db;
 mod snapshot;
-mod snapshot_tool;
 mod sst;
 mod storage_url;
 mod time;
+mod tool;
 mod ttl;
 mod r#type;
 mod util;
@@ -189,9 +189,12 @@ pub use single_db::SingleDb;
 pub use snapshot::{
     ShardSnapshotMetadata, load_global_snapshot_metadata, load_shard_snapshot_metadata,
 };
-pub use snapshot_tool::prune_shard_snapshot;
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
+pub use tool::{
+    ShardSnapshotIdentity, SnapshotCleanupOptions, SnapshotCleanupResult, cleanup_global_snapshot,
+    cleanup_shard_snapshot, prune_shard_snapshot,
+};
 pub use r#type::ValueType;
 pub use url::Url;
 pub use write_batch::{WriteBatch, WriteBatchOperationRef};
