@@ -12,6 +12,21 @@
 namespace cobble {
 namespace detail {
 
+SnapshotCleanupResult ToCleanupResult(
+    const ffi::NativeSnapshotCleanupResult& native) {
+  SnapshotCleanupResult result{native.deleted_files,
+                               native.deleted_shard_snapshots,
+                               native.deleted_global_snapshots,
+                               {}};
+  result.preserved_snapshots.reserve(native.preserved_snapshots.size());
+  for (const auto& snapshot : native.preserved_snapshots) {
+    result.preserved_snapshots.push_back({std::string(snapshot.db_id),
+                                          snapshot.snapshot_id,
+                                          std::string(snapshot.manifest_path)});
+  }
+  return result;
+}
+
 ShardSnapshot ToShardSnapshot(const ffi::NativeShardSnapshot& native) {
   ShardSnapshot shard;
   shard.db_id = std::string(native.db_id);
@@ -56,6 +71,30 @@ GlobalSnapshot ToGlobalSnapshot(const ffi::NativeSnapshot& native) {
 }
 
 }  // namespace detail
+
+SnapshotCleanupResult CleanupShardSnapshot(
+    std::string_view metadata_volume_json, std::string_view other_volumes_json,
+    std::string_view db_id, SnapshotId snapshot_id,
+    SnapshotCleanupOptions options) {
+  return detail::ToCleanupResult(detail::Translate([&] {
+    return ffi::native_cleanup_shard_snapshot(
+        detail::RustStr(metadata_volume_json),
+        detail::RustStr(other_volumes_json), detail::RustStr(db_id),
+        snapshot_id, options.preserve_dependencies,
+        options.include_older_snapshots);
+  }));
+}
+
+SnapshotCleanupResult CleanupGlobalSnapshot(
+    std::string_view metadata_volume_json, std::string_view other_volumes_json,
+    SnapshotId snapshot_id, SnapshotCleanupOptions options) {
+  return detail::ToCleanupResult(detail::Translate([&] {
+    return ffi::native_cleanup_global_snapshot(
+        detail::RustStr(metadata_volume_json),
+        detail::RustStr(other_volumes_json), snapshot_id,
+        options.preserve_dependencies, options.include_older_snapshots);
+  }));
+}
 
 std::string ShardSnapshot::ToJson() const {
   const auto json = detail::Translate([&] {

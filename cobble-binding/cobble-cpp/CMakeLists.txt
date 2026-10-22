@@ -157,6 +157,10 @@ endif()
 
 if(COBBLE_CPP_BUILD_TESTS)
   enable_testing()
+  add_executable(cobble_cpp_snapshot_cleanup_test tests/snapshot_cleanup_test.cpp)
+  target_link_libraries(cobble_cpp_snapshot_cleanup_test PRIVATE cobble::cobble)
+  add_test(NAME cobble_cpp_snapshot_cleanup COMMAND cobble_cpp_snapshot_cleanup_test)
+  set_tests_properties(cobble_cpp_snapshot_cleanup PROPERTIES TIMEOUT 120)
   add_executable(cobble_cpp_rescale_manifest_test tests/rescale_manifest_test.cpp)
   target_link_libraries(cobble_cpp_rescale_manifest_test PRIVATE cobble::cobble)
   add_test(NAME cobble_cpp_rescale_manifest

@@ -63,6 +63,45 @@ struct COBBLE_CPP_API GlobalSnapshot {
   [[nodiscard]] static GlobalSnapshot FromJson(std::string_view json);
 };
 
+struct SnapshotCleanupOptions {
+  // Disabling this can make surviving snapshots unrecoverable.
+  bool preserve_dependencies = true;
+  // Select IDs at or below the requested ID (global IDs for global cleanup).
+  bool include_older_snapshots = false;
+};
+
+struct ShardSnapshotIdentity {
+  std::string db_id;
+  SnapshotId snapshot_id;
+  std::string manifest_path;
+};
+
+struct SnapshotCleanupResult {
+  // Data, schema, and active-memtable files, excluding manifests and CURRENT.
+  std::size_t deleted_files;
+  std::size_t deleted_shard_snapshots;
+  std::size_t deleted_global_snapshots;
+  std::vector<ShardSnapshotIdentity> preserved_snapshots;
+};
+
+// Offline maintenance: no readers, writers, compactors, or snapshot publication
+// may overlap. Descriptors use the same JSON format as ExportSnapshot; other
+// volumes is a JSON array supplying routes and credentials ("[]" is allowed).
+// The shard metadata base is the parent of db_id/snapshot, or an export's
+// shards directory. Only this shard's snapshots are roots: account for global
+// refs or use CleanupGlobalSnapshot instead. See options for destructive
+// consequences.
+[[nodiscard]] COBBLE_CPP_API SnapshotCleanupResult CleanupShardSnapshot(
+    std::string_view metadata_volume_json, std::string_view other_volumes_json,
+    std::string_view db_id, SnapshotId snapshot_id,
+    SnapshotCleanupOptions options = {});
+// Global metadata base contains snapshot/SNAPSHOT-<global-id> (the export root,
+// not its shards directory). The same offline restrictions apply. Older-ID
+// selection compares global IDs, never shard IDs.
+[[nodiscard]] COBBLE_CPP_API SnapshotCleanupResult CleanupGlobalSnapshot(
+    std::string_view metadata_volume_json, std::string_view other_volumes_json,
+    SnapshotId snapshot_id, SnapshotCleanupOptions options = {});
+
 // Metadata-only reads: no DB, SST files, or coordinator are opened. Paths must
 // be absolute and inside a configured metadata volume.
 [[nodiscard]] COBBLE_CPP_API ShardSnapshot

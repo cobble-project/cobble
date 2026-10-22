@@ -68,6 +68,7 @@ use schema::{
 use sharded_db::*;
 use snapshot::{
     NativeExportSnapshotHandle, NativePendingShardSnapshot, NativePendingSnapshot,
+    native_cleanup_global_snapshot, native_cleanup_shard_snapshot,
     native_database_get_snapshot_typed, native_database_list_snapshots_typed,
     native_database_start_snapshot, native_database_take_snapshot, native_export_snapshot_cancel,
     native_export_snapshot_is_finished, native_export_snapshot_wait,
@@ -150,6 +151,17 @@ mod ffi {
         families: Vec<NativeFamily>,
         shards: Vec<NativeShardSnapshot>,
         watermark_seconds: u32,
+    }
+    struct NativeShardSnapshotIdentity {
+        db_id: String,
+        snapshot_id: u64,
+        manifest_path: String,
+    }
+    struct NativeSnapshotCleanupResult {
+        deleted_files: usize,
+        deleted_shard_snapshots: usize,
+        deleted_global_snapshots: usize,
+        preserved_snapshots: Vec<NativeShardSnapshotIdentity>,
     }
     struct NativeScanSplit {
         shard: NativeShardSnapshot,
@@ -723,6 +735,21 @@ mod ffi {
             db_id: &str,
             manifest_path: &str,
         ) -> Result<NativeShardSnapshot>;
+        fn native_cleanup_shard_snapshot(
+            metadata_volume_json: &str,
+            other_volumes_json: &str,
+            db_id: &str,
+            snapshot_id: u64,
+            preserve_dependencies: bool,
+            include_older_snapshots: bool,
+        ) -> Result<NativeSnapshotCleanupResult>;
+        fn native_cleanup_global_snapshot(
+            metadata_volume_json: &str,
+            other_volumes_json: &str,
+            snapshot_id: u64,
+            preserve_dependencies: bool,
+            include_older_snapshots: bool,
+        ) -> Result<NativeSnapshotCleanupResult>;
         fn native_load_shard_snapshot_metadata_file(
             config_path: &str,
             db_id: &str,

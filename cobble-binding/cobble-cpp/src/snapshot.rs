@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, ops::RangeInclusive, sync::mpsc};
 
+use cobble_binding::{SnapshotCleanupOptions, SnapshotCleanupResult, VolumeDescriptor};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -8,6 +9,79 @@ use crate::{
     error::{format_cobble_error, input_error},
     ffi,
 };
+
+fn cleanup_result(value: SnapshotCleanupResult) -> ffi::NativeSnapshotCleanupResult {
+    ffi::NativeSnapshotCleanupResult {
+        deleted_files: value.deleted_files,
+        deleted_shard_snapshots: value.deleted_shard_snapshots,
+        deleted_global_snapshots: value.deleted_global_snapshots,
+        preserved_snapshots: value
+            .preserved_snapshots
+            .into_iter()
+            .map(|snapshot| ffi::NativeShardSnapshotIdentity {
+                db_id: snapshot.db_id,
+                snapshot_id: snapshot.snapshot_id,
+                manifest_path: snapshot.manifest_path,
+            })
+            .collect(),
+    }
+}
+
+fn cleanup_volumes(
+    metadata_json: &str,
+    others_json: &str,
+) -> BridgeResult<(VolumeDescriptor, Vec<VolumeDescriptor>)> {
+    opendal::install_default();
+    let metadata = serde_json::from_str(metadata_json)
+        .map_err(|error| input_error(&format!("invalid metadata volume JSON: {error}")))?;
+    let others = serde_json::from_str(others_json)
+        .map_err(|error| input_error(&format!("invalid other volumes JSON: {error}")))?;
+    Ok((metadata, others))
+}
+
+pub(crate) fn native_cleanup_shard_snapshot(
+    metadata_volume_json: &str,
+    other_volumes_json: &str,
+    db_id: &str,
+    snapshot_id: u64,
+    preserve_dependencies: bool,
+    include_older_snapshots: bool,
+) -> BridgeResult<ffi::NativeSnapshotCleanupResult> {
+    let (metadata, others) = cleanup_volumes(metadata_volume_json, other_volumes_json)?;
+    cobble_binding::cleanup_shard_snapshot(
+        &metadata,
+        &others,
+        db_id,
+        snapshot_id,
+        SnapshotCleanupOptions {
+            preserve_dependencies,
+            include_older_snapshots,
+        },
+    )
+    .map(cleanup_result)
+    .map_err(format_cobble_error)
+}
+
+pub(crate) fn native_cleanup_global_snapshot(
+    metadata_volume_json: &str,
+    other_volumes_json: &str,
+    snapshot_id: u64,
+    preserve_dependencies: bool,
+    include_older_snapshots: bool,
+) -> BridgeResult<ffi::NativeSnapshotCleanupResult> {
+    let (metadata, others) = cleanup_volumes(metadata_volume_json, other_volumes_json)?;
+    cobble_binding::cleanup_global_snapshot(
+        &metadata,
+        &others,
+        snapshot_id,
+        SnapshotCleanupOptions {
+            preserve_dependencies,
+            include_older_snapshots,
+        },
+    )
+    .map(cleanup_result)
+    .map_err(format_cobble_error)
+}
 
 pub(crate) struct NativePendingSnapshot {
     id: u64,
