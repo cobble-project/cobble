@@ -4,7 +4,8 @@ use crate::types::PickleReduction;
 use cobble_binding::structured::{StructuredDb, StructuredSingleDb};
 use cobble_binding::{
     ColumnFamilyOptions, Config, Db, GlobalSnapshotManifest, ShardSnapshotMetadata,
-    ShardSnapshotRef, SingleDb, SnapshotColumnFamily,
+    ShardSnapshotRef, SingleDb, SnapshotCleanupOptions, SnapshotCleanupResult,
+    SnapshotColumnFamily, VolumeDescriptor,
 };
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
@@ -13,6 +14,201 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
 type PickledSnapshotColumnFamily = (String, u8, usize, bool, Option<String>);
+
+#[pyclass(
+    name = "ShardSnapshotIdentity",
+    module = "pycobble._native",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub(crate) struct PyShardSnapshotIdentity {
+    #[pyo3(get)]
+    db_id: String,
+    #[pyo3(get)]
+    snapshot_id: u64,
+    #[pyo3(get)]
+    manifest_path: String,
+}
+
+#[pymethods]
+impl PyShardSnapshotIdentity {
+    #[new]
+    fn new(db_id: String, snapshot_id: u64, manifest_path: String) -> Self {
+        Self {
+            db_id,
+            snapshot_id,
+            manifest_path,
+        }
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PickleReduction<(String, u64, String)> {
+        (
+            py.get_type::<Self>().into_any().unbind(),
+            (
+                self.db_id.clone(),
+                self.snapshot_id,
+                self.manifest_path.clone(),
+            ),
+        )
+    }
+}
+
+#[pyclass(
+    name = "SnapshotCleanupResult",
+    module = "pycobble._native",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub(crate) struct PySnapshotCleanupResult {
+    #[pyo3(get)]
+    deleted_files: usize,
+    #[pyo3(get)]
+    deleted_shard_snapshots: usize,
+    #[pyo3(get)]
+    deleted_global_snapshots: usize,
+    preserved_snapshots: Vec<PyShardSnapshotIdentity>,
+}
+
+#[pymethods]
+impl PySnapshotCleanupResult {
+    #[new]
+    fn new(
+        deleted_files: usize,
+        deleted_shard_snapshots: usize,
+        deleted_global_snapshots: usize,
+        preserved_snapshots: Vec<PyShardSnapshotIdentity>,
+    ) -> Self {
+        Self {
+            deleted_files,
+            deleted_shard_snapshots,
+            deleted_global_snapshots,
+            preserved_snapshots,
+        }
+    }
+
+    #[getter]
+    fn preserved_snapshots(&self) -> Vec<PyShardSnapshotIdentity> {
+        self.preserved_snapshots.clone()
+    }
+
+    fn __reduce__(
+        &self,
+        py: Python<'_>,
+    ) -> PickleReduction<(usize, usize, usize, Vec<PyShardSnapshotIdentity>)> {
+        (
+            py.get_type::<Self>().into_any().unbind(),
+            (
+                self.deleted_files,
+                self.deleted_shard_snapshots,
+                self.deleted_global_snapshots,
+                self.preserved_snapshots.clone(),
+            ),
+        )
+    }
+}
+
+fn cleanup_result(value: SnapshotCleanupResult) -> PySnapshotCleanupResult {
+    PySnapshotCleanupResult {
+        deleted_files: value.deleted_files,
+        deleted_shard_snapshots: value.deleted_shard_snapshots,
+        deleted_global_snapshots: value.deleted_global_snapshots,
+        preserved_snapshots: value
+            .preserved_snapshots
+            .into_iter()
+            .map(|snapshot| PyShardSnapshotIdentity {
+                db_id: snapshot.db_id,
+                snapshot_id: snapshot.snapshot_id,
+                manifest_path: snapshot.manifest_path,
+            })
+            .collect(),
+    }
+}
+
+fn cleanup_volumes(
+    metadata_json: &str,
+    others_json: &str,
+) -> PyResult<(VolumeDescriptor, Vec<VolumeDescriptor>)> {
+    let metadata = serde_json::from_str(metadata_json)
+        .map_err(|error| input_error(format!("invalid metadata volume JSON: {error}")))?;
+    let others = serde_json::from_str(others_json)
+        .map_err(|error| input_error(format!("invalid other volumes JSON: {error}")))?;
+    Ok((metadata, others))
+}
+
+/// Remove selected shard snapshots offline, without opening a database.
+///
+/// No readers, writers, compactors, or snapshot publication may overlap this call.
+/// metadata_volume_json is a VolumeDescriptor whose base is the parent of
+/// db_id/snapshot (an export's shards directory). other_volumes_json is a JSON
+/// array of descriptors supplying additional routes and credentials; use "[]" if empty.
+/// Only this shard's snapshots are preservation roots: account for global references
+/// or use cleanup_global_snapshot. Disabling preserve_dependencies can make surviving
+/// snapshots unrecoverable. include_older_snapshots selects shard IDs <= snapshot_id.
+#[pyfunction]
+#[pyo3(signature = (metadata_volume_json, other_volumes_json, db_id, snapshot_id, *, preserve_dependencies=true, include_older_snapshots=false))]
+fn cleanup_shard_snapshot(
+    py: Python<'_>,
+    metadata_volume_json: String,
+    other_volumes_json: String,
+    db_id: String,
+    snapshot_id: u64,
+    preserve_dependencies: bool,
+    include_older_snapshots: bool,
+) -> PyResult<PySnapshotCleanupResult> {
+    py.detach(move || {
+        opendal::install_default();
+        let (metadata, others) = cleanup_volumes(&metadata_volume_json, &other_volumes_json)?;
+        cobble_binding::cleanup_shard_snapshot(
+            &metadata,
+            &others,
+            &db_id,
+            snapshot_id,
+            SnapshotCleanupOptions {
+                preserve_dependencies,
+                include_older_snapshots,
+            },
+        )
+        .map(cleanup_result)
+        .map_err(map_error)
+    })
+}
+
+/// Remove selected global snapshots and their actual shard references offline.
+///
+/// No readers, writers, compactors, or snapshot publication may overlap this call.
+/// metadata_volume_json is a VolumeDescriptor with snapshot/SNAPSHOT-<global-id>
+/// under its base (the export root, not its shards directory). other_volumes_json
+/// is a JSON array of additional descriptors with routes and credentials; "[]" is allowed.
+/// Disabling preserve_dependencies can make surviving snapshots unrecoverable.
+/// include_older_snapshots selects global IDs <= snapshot_id, never shard IDs.
+#[pyfunction]
+#[pyo3(signature = (metadata_volume_json, other_volumes_json, snapshot_id, *, preserve_dependencies=true, include_older_snapshots=false))]
+fn cleanup_global_snapshot(
+    py: Python<'_>,
+    metadata_volume_json: String,
+    other_volumes_json: String,
+    snapshot_id: u64,
+    preserve_dependencies: bool,
+    include_older_snapshots: bool,
+) -> PyResult<PySnapshotCleanupResult> {
+    py.detach(move || {
+        opendal::install_default();
+        let (metadata, others) = cleanup_volumes(&metadata_volume_json, &other_volumes_json)?;
+        cobble_binding::cleanup_global_snapshot(
+            &metadata,
+            &others,
+            snapshot_id,
+            SnapshotCleanupOptions {
+                preserve_dependencies,
+                include_older_snapshots,
+            },
+        )
+        .map(cleanup_result)
+        .map_err(map_error)
+    })
+}
 
 #[pyclass(
     name = "BucketRange",
@@ -775,6 +971,10 @@ impl PyPendingSnapshot {
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyShardSnapshotIdentity>()?;
+    module.add_class::<PySnapshotCleanupResult>()?;
+    module.add_function(wrap_pyfunction!(cleanup_shard_snapshot, module)?)?;
+    module.add_function(wrap_pyfunction!(cleanup_global_snapshot, module)?)?;
     module.add_class::<PyBucketRange>()?;
     module.add_class::<PyColumnFamilyId>()?;
     module.add_class::<PySnapshotColumnFamily>()?;
