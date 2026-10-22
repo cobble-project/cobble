@@ -13,6 +13,102 @@ public final class SnapshotTools {
 
     private SnapshotTools() {}
 
+    /** Clean one shard snapshot with dependency preservation and no older-snapshot selection. */
+    public static SnapshotCleanupResult cleanupShardSnapshot(
+            Config.VolumeDescriptor metadataVolume,
+            List<Config.VolumeDescriptor> otherVolumes,
+            String dbId,
+            long snapshotId) {
+        return cleanupShardSnapshot(
+                metadataVolume, otherVolumes, dbId, snapshotId, new SnapshotCleanupOptions());
+    }
+
+    /**
+     * Remove selected shard snapshots without opening a database.
+     *
+     * <p>This is offline maintenance: no reader, writer, compactor, or snapshot publication may
+     * overlap it. The metadata base is the parent of {@code dbId/snapshot}; for exported shards use
+     * the export's {@code shards} directory. Other volumes supply routes and credentials (an empty
+     * list is allowed). Only this shard's snapshots are preservation roots: callers must account
+     * for global references, or use {@link #cleanupGlobalSnapshot} instead.
+     *
+     * <p>Disabling dependency preservation can break surviving snapshots. Older-snapshot selection
+     * includes all shard IDs at or below {@code snapshotId}.
+     */
+    public static SnapshotCleanupResult cleanupShardSnapshot(
+            Config.VolumeDescriptor metadataVolume,
+            List<Config.VolumeDescriptor> otherVolumes,
+            String dbId,
+            long snapshotId,
+            SnapshotCleanupOptions options) {
+        validateCleanup(metadataVolume, otherVolumes, snapshotId, options);
+        if (dbId == null || dbId.trim().isEmpty()) {
+            throw new IllegalArgumentException("dbId must not be empty");
+        }
+        return SnapshotCleanupResult.fromJson(
+                cleanupShardSnapshotFromJson(
+                        metadataVolume.toJson(),
+                        Config.VolumeDescriptor.listToJson(otherVolumes),
+                        dbId,
+                        snapshotId,
+                        options.preserveDependencies,
+                        options.includeOlderSnapshots));
+    }
+
+    /** Clean one global snapshot with dependency preservation and no older-snapshot selection. */
+    public static SnapshotCleanupResult cleanupGlobalSnapshot(
+            Config.VolumeDescriptor metadataVolume,
+            List<Config.VolumeDescriptor> otherVolumes,
+            long snapshotId) {
+        return cleanupGlobalSnapshot(
+                metadataVolume, otherVolumes, snapshotId, new SnapshotCleanupOptions());
+    }
+
+    /**
+     * Remove selected global snapshots and their actual shard snapshot references.
+     *
+     * <p>This is offline maintenance: no reader, writer, compactor, or snapshot publication may
+     * overlap it. The metadata base contains {@code snapshot/SNAPSHOT-<global-id>}; for exports use
+     * the export root, not its {@code shards} directory. Other volumes supply routes and
+     * credentials (an empty list is allowed).
+     *
+     * <p>Disabling dependency preservation can break surviving snapshots. Older-snapshot selection
+     * compares global IDs at or below {@code snapshotId}, never shard IDs.
+     */
+    public static SnapshotCleanupResult cleanupGlobalSnapshot(
+            Config.VolumeDescriptor metadataVolume,
+            List<Config.VolumeDescriptor> otherVolumes,
+            long snapshotId,
+            SnapshotCleanupOptions options) {
+        validateCleanup(metadataVolume, otherVolumes, snapshotId, options);
+        return SnapshotCleanupResult.fromJson(
+                cleanupGlobalSnapshotFromJson(
+                        metadataVolume.toJson(),
+                        Config.VolumeDescriptor.listToJson(otherVolumes),
+                        snapshotId,
+                        options.preserveDependencies,
+                        options.includeOlderSnapshots));
+    }
+
+    private static void validateCleanup(
+            Config.VolumeDescriptor metadataVolume,
+            List<Config.VolumeDescriptor> otherVolumes,
+            long snapshotId,
+            SnapshotCleanupOptions options) {
+        if (metadataVolume == null || otherVolumes == null || options == null) {
+            throw new IllegalArgumentException(
+                    "metadataVolume, otherVolumes, and options must not be null");
+        }
+        for (Config.VolumeDescriptor volume : otherVolumes) {
+            if (volume == null) {
+                throw new IllegalArgumentException("otherVolumes must not contain null");
+            }
+        }
+        if (snapshotId < 0) {
+            throw new IllegalArgumentException("snapshotId must be >= 0");
+        }
+    }
+
     /**
      * Prune one shard snapshot by dbId and snapshotId.
      *
@@ -118,6 +214,21 @@ public final class SnapshotTools {
 
     private static native boolean pruneShardSnapshotFromJson(
             String configJson, String dbId, long snapshotId);
+
+    private static native String cleanupShardSnapshotFromJson(
+            String metadataVolumeJson,
+            String otherVolumesJson,
+            String dbId,
+            long snapshotId,
+            boolean preserveDependencies,
+            boolean includeOlderSnapshots);
+
+    private static native String cleanupGlobalSnapshotFromJson(
+            String metadataVolumeJson,
+            String otherVolumesJson,
+            long snapshotId,
+            boolean preserveDependencies,
+            boolean includeOlderSnapshots);
 
     private static native String loadShardSnapshotFromJson(
             String configJson, String dbId, String manifestPath);

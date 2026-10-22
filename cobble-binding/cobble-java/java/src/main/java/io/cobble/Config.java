@@ -264,6 +264,10 @@ public final class Config {
             return GSON.toJson(this);
         }
 
+        static String listToJson(List<VolumeDescriptor> volumes) {
+            return GSON.toJson(volumes);
+        }
+
         /** Volume base directory URL/path. */
         public String baseDir;
 

@@ -4,12 +4,124 @@ use crate::util::{
     throw_illegal_state,
 };
 use cobble_binding::{
-    DbCoordinator, ShardSnapshotMetadata, load_global_snapshot_metadata,
+    DbCoordinator, ShardSnapshotMetadata, SnapshotCleanupOptions, VolumeDescriptor,
+    cleanup_global_snapshot, cleanup_shard_snapshot, load_global_snapshot_metadata,
     load_shard_snapshot_metadata, prune_shard_snapshot,
 };
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jlong, jstring};
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SnapshotTools_cleanupShardSnapshotFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    metadata_volume_json: JString,
+    other_volumes_json: JString,
+    db_id: JString,
+    snapshot_id: jlong,
+    preserve_dependencies: jboolean,
+    include_older_snapshots: jboolean,
+) -> jstring {
+    let db_id = match decode_java_string(&mut env, db_id) {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    cleanup_snapshot_from_json(
+        &mut env,
+        (metadata_volume_json, other_volumes_json),
+        Some(&db_id),
+        snapshot_id,
+        SnapshotCleanupOptions {
+            preserve_dependencies: preserve_dependencies != JNI_FALSE,
+            include_older_snapshots: include_older_snapshots != JNI_FALSE,
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_SnapshotTools_cleanupGlobalSnapshotFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    metadata_volume_json: JString,
+    other_volumes_json: JString,
+    snapshot_id: jlong,
+    preserve_dependencies: jboolean,
+    include_older_snapshots: jboolean,
+) -> jstring {
+    cleanup_snapshot_from_json(
+        &mut env,
+        (metadata_volume_json, other_volumes_json),
+        None,
+        snapshot_id,
+        SnapshotCleanupOptions {
+            preserve_dependencies: preserve_dependencies != JNI_FALSE,
+            include_older_snapshots: include_older_snapshots != JNI_FALSE,
+        },
+    )
+}
+
+fn cleanup_snapshot_from_json(
+    env: &mut JNIEnv,
+    volume_json: (JString, JString),
+    db_id: Option<&str>,
+    snapshot_id: jlong,
+    options: SnapshotCleanupOptions,
+) -> jstring {
+    let inputs = (|| {
+        let metadata_json = decode_java_string(env, volume_json.0)?;
+        let others_json = decode_java_string(env, volume_json.1)?;
+        let metadata: VolumeDescriptor = serde_json::from_str(&metadata_json)
+            .map_err(|err| format!("invalid metadata volume json: {err}"))?;
+        let others: Vec<VolumeDescriptor> = serde_json::from_str(&others_json)
+            .map_err(|err| format!("invalid other volumes json: {err}"))?;
+        let snapshot_id = decode_u64_from_jlong("snapshotId", snapshot_id)?;
+        Ok::<_, String>((metadata, others, snapshot_id))
+    })();
+    let (metadata, others, snapshot_id) = match inputs {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(env, err);
+            return std::ptr::null_mut();
+        }
+    };
+    let result = match db_id {
+        Some(db_id) => cleanup_shard_snapshot(&metadata, &others, db_id, snapshot_id, options),
+        None => cleanup_global_snapshot(&metadata, &others, snapshot_id, options),
+    };
+    match result {
+        Ok(result) => {
+            let preserved: Vec<_> = result
+                .preserved_snapshots
+                .iter()
+                .map(|snapshot| {
+                    serde_json::json!({
+                        "db_id": snapshot.db_id,
+                        "snapshot_id": snapshot.snapshot_id,
+                        "manifest_path": snapshot.manifest_path,
+                    })
+                })
+                .collect();
+            to_java_string_or_throw(
+                env,
+                serde_json::json!({
+                    "deleted_files": result.deleted_files,
+                    "deleted_shard_snapshots": result.deleted_shard_snapshots,
+                    "deleted_global_snapshots": result.deleted_global_snapshots,
+                    "preserved_snapshots": preserved,
+                })
+                .to_string(),
+            )
+        }
+        Err(err) => {
+            throw_illegal_state(env, err.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_SnapshotTools_pruneShardSnapshotFromJson(
