@@ -97,24 +97,6 @@ volume. `load_shard_snapshot_metadata(config, db_id, manifest_path)` loads a
 shard's snapshot and schema metadata. Both loaders have `_file` variants for
 configuration files and do not open a database.
 
-## Standalone snapshots and exports
-
-`Db` and `StructuredDb` provide `snapshot_to(destination_json)` for current state and
-`export_snapshot(id, destination_json)` for a completed snapshot. For a global export:
-
-```python
-destination = json.dumps({"base_dir": "file:///backups/run-001", "kinds": ["snapshot"]})
-shard_destination = json.dumps({
-    "base_dir": "file:///backups/run-001/shards", "kinds": ["snapshot"]
-})
-reports = [shard.snapshot_to(shard_destination).wait() for shard in shards]
-snapshot = coordinator.take_exported_global_snapshot(total_buckets, reports)
-coordinator.materialize_exported_global_snapshot(snapshot, destination)
-```
-
-Pass a VolumeDescriptor JSON, not a full DB config. Use a fresh destination outside online storage.
-See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
-
 ## Structured columns
 
 Use `StructuredSingleDb` for BYTES and LIST columns. Run this example against
@@ -157,6 +139,42 @@ snapshot reads, including `multi_get`, scans, and column projection through
 
 See [Distributed Deployment](../getting-started/distributed) and
 [Reader & Distributed Scan](../getting-started/reader-and-scan) for the workflow.
+
+## Standalone snapshots and exports
+
+`Db` and `StructuredDb` provide `snapshot_to(destination_json)` for current state and
+`export_snapshot(id, destination_json)` for a completed snapshot. For a global export:
+
+```python
+destination = json.dumps({"base_dir": "file:///backups/run-001", "kinds": ["snapshot"]})
+shard_destination = json.dumps({
+    "base_dir": "file:///backups/run-001/shards", "kinds": ["snapshot"]
+})
+reports = [shard.snapshot_to(shard_destination).wait() for shard in shards]
+snapshot = coordinator.take_exported_global_snapshot(total_buckets, reports)
+coordinator.materialize_exported_global_snapshot(snapshot, destination)
+```
+
+Pass a VolumeDescriptor JSON, not a full DB config. Use a fresh destination outside online storage.
+See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
+
+## Snapshot cleanup
+
+After stopping all readers, writers, compactors, and snapshot publication:
+
+```python
+result = pycobble.cleanup_global_snapshot(
+    metadata_volume_json, "[]", snapshot_id, include_older_snapshots=True
+)
+```
+
+For one shard, use `pycobble.cleanup_shard_snapshot(metadata_volume_json,
+other_volumes_json, db_id, snapshot_id)`. Both accept keyword options
+`preserve_dependencies=True` and `include_older_snapshots=False`. Volume arguments
+are a single descriptor JSON and an array of additional descriptors. Results include
+deletion counts and `preserved_snapshots`, and support pickle.
+See [Snapshot Cleanup](../reference/tools#snapshot-cleanup) for directory layout
+and dependency safety.
 
 ## Usage notes
 

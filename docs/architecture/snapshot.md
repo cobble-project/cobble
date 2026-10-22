@@ -88,6 +88,9 @@ By default, Cobble keeps all snapshots. In long-running systems, old snapshots a
 
 Retention removes references, not every file named by the expired snapshot. Space is reclaimed only after no retained snapshot, active reader, current database view, or in-progress compaction still needs the file.
 
+For offline removal of shard or global snapshots, including exports, see
+[Snapshot Cleanup](../reference/tools#snapshot-cleanup).
+
 ## Memtable Snapshotting
 
 When a snapshot is taken, Cobble flushes the active memtable to an L0 file to ensure all recent writes are captured. This guarantees that the snapshot reflects a consistent state of the database, including any in-memory data.

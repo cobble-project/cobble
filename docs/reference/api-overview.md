@@ -219,6 +219,10 @@ split.create_scanner(config, &scan_options) -> Result<ScanSplitScanner> // choos
 for row in scanner { let (bucket, key, columns) = row?; }
 ```
 
+#### Snapshot Maintenance
+
+For offline shard/global snapshot removal, see [Snapshot Cleanup](tools#snapshot-cleanup).
+
 ---
 
 ## cobble-data-structure (Structured Wrappers)

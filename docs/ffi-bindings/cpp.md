@@ -108,27 +108,6 @@ For shard-level writes and recovery, use `Db`; it returns a `ShardSnapshot`
 from `TakeSnapshot()`. A `DbCoordinator` combines shard reports into a global
 snapshot. See [Distributed Deployment](../getting-started/distributed).
 
-## Standalone snapshots and exports
-
-Raw and structured `Db` provide `SnapshotTo(destination_json)` for current state and
-`ExportSnapshot(id, destination_json)` for a completed snapshot. For a global export:
-
-```cpp
-const std::string destination =
-    R"({"base_dir":"file:///backups/run-001","kinds":["snapshot"]})";
-const std::string shard_destination =
-    R"({"base_dir":"file:///backups/run-001/shards","kinds":["snapshot"]})";
-std::vector<cobble::ShardSnapshot> reports;
-for (const auto& shard : shards) {
-  reports.push_back(shard.SnapshotTo(shard_destination).Wait());
-}
-auto snapshot = coordinator.TakeExportedGlobalSnapshot(total_buckets, reports);
-coordinator.MaterializeExportedGlobalSnapshot(snapshot, destination);
-```
-
-Pass a VolumeDescriptor JSON, not a full DB config. Use a fresh destination outside online storage.
-See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
-
 ## Snapshot readers
 
 Use `Reader::OpenCurrent(config)` to follow committed global snapshots, and
@@ -195,6 +174,43 @@ if (row.Found() && row.HasColumn(1)) {
 
 Run this example against a separate database from the raw example. Structured
 readers support the same current, fixed-ID, and existing-`GlobalSnapshot` modes.
+
+## Standalone snapshots and exports
+
+Raw and structured `Db` provide `SnapshotTo(destination_json)` for current state and
+`ExportSnapshot(id, destination_json)` for a completed snapshot. For a global export:
+
+```cpp
+const std::string destination =
+    R"({"base_dir":"file:///backups/run-001","kinds":["snapshot"]})";
+const std::string shard_destination =
+    R"({"base_dir":"file:///backups/run-001/shards","kinds":["snapshot"]})";
+std::vector<cobble::ShardSnapshot> reports;
+for (const auto& shard : shards) {
+  reports.push_back(shard.SnapshotTo(shard_destination).Wait());
+}
+auto snapshot = coordinator.TakeExportedGlobalSnapshot(total_buckets, reports);
+coordinator.MaterializeExportedGlobalSnapshot(snapshot, destination);
+```
+
+Pass a VolumeDescriptor JSON, not a full DB config. Use a fresh destination outside online storage.
+See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
+
+## Snapshot cleanup
+
+After stopping all readers, writers, compactors, and snapshot publication:
+
+```cpp
+cobble::SnapshotCleanupOptions options; // Preserve dependencies by default.
+options.include_older_snapshots = true;
+auto result = cobble::CleanupGlobalSnapshot(metadata_volume_json, "[]", snapshot_id, options);
+```
+
+For one shard, use `CleanupShardSnapshot(metadata_volume_json, other_volumes_json,
+db_id, snapshot_id, options)`. The volume arguments are a single VolumeDescriptor
+JSON and an array of additional descriptors, respectively. Results include deletion
+counts and `preserved_snapshots`. See [Snapshot Cleanup](../reference/tools#snapshot-cleanup)
+for directory layout, options, and dependency safety.
 
 ## Usage notes
 

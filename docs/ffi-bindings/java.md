@@ -508,29 +508,6 @@ For hot paths, prefer direct buffer APIs.
 | Direct view (`DirectColumns`/`DirectRow`) | Lower copy, lower allocation | Good default for performance |
 | `DirectEncodedRow` | Lowest decode overhead, best control | **Best performance path** |
 
-## Standalone Snapshots and Exports
-
-Raw and structured `Db` provide `snapshotTo(destination)` for current state and
-`exportSnapshot(id, destination)` for a completed snapshot. For a global export:
-
-```java
-Config.VolumeDescriptor destination =
-        Config.VolumeDescriptor.singleVolume("file:///backups/run-001");
-Config.VolumeDescriptor shardDestination =
-        Config.VolumeDescriptor.singleVolume("file:///backups/run-001/shards");
-List<ShardSnapshot> reports = new ArrayList<>();
-for (Db shard : shards) {
-    try (ExportSnapshotHandle handle = shard.snapshotTo(shardDestination)) {
-        reports.add(handle.future().get());
-    }
-}
-GlobalSnapshot snapshot = coordinator.takeExportedGlobalSnapshot(totalBuckets, reports);
-coordinator.materializeExportedGlobalSnapshot(snapshot, destination);
-```
-
-Use a fresh destination outside online storage, with all shards under `shards/`.
-See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
-
 ## Snapshot Lifecycle APIs
 
 Distributed `Db` also exposes asynchronous snapshot lifecycle control for checkpoint-style integrations:
@@ -558,8 +535,50 @@ SnapshotTools.pruneShardSnapshot(config, snapshot.dbId, snapshot.snapshotId);
 - `cancelSnapshot(snapshotId)` only succeeds before manifest publication completes.
 - After the snapshot future completes, use `ShardSnapshot.manifestPath` with
   `SnapshotTools.loadShardSnapshot(config, dbId, path)` to read captured metadata without opening a writer DB.
-- `SnapshotTools.pruneShardSnapshot(config, dbId, snapshotId)` is the explicit out-of-band shard cleanup API.
+- `SnapshotTools.pruneShardSnapshot(config, dbId, snapshotId)` supports external shard lifecycle managers;
+  use the [cleanup tools](#snapshot-cleanup) for offline shard/global removal with explicit options.
 - The same snapshot lifecycle APIs are also available on `io.cobble.structured.Db`.
+
+## Standalone Snapshots and Exports
+
+Raw and structured `Db` provide `snapshotTo(destination)` for current state and
+`exportSnapshot(id, destination)` for a completed snapshot. For a global export:
+
+```java
+Config.VolumeDescriptor destination =
+        Config.VolumeDescriptor.singleVolume("file:///backups/run-001");
+Config.VolumeDescriptor shardDestination =
+        Config.VolumeDescriptor.singleVolume("file:///backups/run-001/shards");
+List<ShardSnapshot> reports = new ArrayList<>();
+for (Db shard : shards) {
+    try (ExportSnapshotHandle handle = shard.snapshotTo(shardDestination)) {
+        reports.add(handle.future().get());
+    }
+}
+GlobalSnapshot snapshot = coordinator.takeExportedGlobalSnapshot(totalBuckets, reports);
+coordinator.materializeExportedGlobalSnapshot(snapshot, destination);
+```
+
+Use a fresh destination outside online storage, with all shards under `shards/`.
+See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snapshots-and-exports).
+
+## Snapshot Cleanup
+
+After stopping all readers, writers, compactors, and snapshot publication:
+
+```java
+SnapshotCleanupOptions options = new SnapshotCleanupOptions();
+options.includeOlderSnapshots = true;
+SnapshotCleanupResult result = SnapshotTools.cleanupGlobalSnapshot(
+        metadataVolume, Collections.emptyList(), snapshotId, options);
+```
+
+For one shard, use `SnapshotTools.cleanupShardSnapshot(metadataVolume, otherVolumes,
+dbId, snapshotId, options)`. Volumes use `Config.VolumeDescriptor`, including any
+required credentials. Omitting `options` preserves dependencies and selects only
+the requested snapshot. Results include deletion counts and `preservedSnapshots`.
+See [Snapshot Cleanup](../reference/tools#snapshot-cleanup) for directory layout,
+options, and dependency safety.
 
 ## Memory Management
 
