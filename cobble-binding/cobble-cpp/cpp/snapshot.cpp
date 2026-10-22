@@ -1,6 +1,7 @@
 #include <cobble/database.hpp>
 #include <cobble/structured/db.hpp>
 
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -192,10 +193,14 @@ ShardSnapshot ExportSnapshotHandle::Wait() const {
   }
   return std::visit(
       [](const auto& native) {
-        using detail::ToShardSnapshot;
-        using structured::detail::ToShardSnapshot;
-        return ToShardSnapshot(detail::Translate(
-            [&] { return native_export_snapshot_wait(*native); }));
+        auto snapshot = detail::Translate(
+            [&] { return native_export_snapshot_wait(*native); });
+        if constexpr (std::is_same_v<decltype(snapshot),
+                                     ffi::NativeShardSnapshot>) {
+          return detail::ToShardSnapshot(snapshot);
+        } else {
+          return structured::detail::ToShardSnapshot(snapshot);
+        }
       },
       impl_->native);
 }
