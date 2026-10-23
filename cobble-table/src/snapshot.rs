@@ -9,9 +9,20 @@
 
 use crate::metadata::TableMetadata;
 use crate::{Result, TableError};
-use cobble::{DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata};
+use cobble::{Db, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+
+pub(crate) fn snapshot_and_wait(db: &Db) -> Result<ShardSnapshotMetadata> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    db.snapshot_with_callback(move |result| {
+        let _ = sender.send(result);
+    })?;
+    receiver
+        .recv()
+        .map_err(|error| TableError::internal(format!("snapshot callback disconnected: {error}")))?
+        .map_err(Into::into)
+}
 
 /// Collects shard snapshots and materializes each complete table checkpoint.
 pub struct TableSnapshotCommitter {

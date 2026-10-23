@@ -1,8 +1,8 @@
 use crate::metadata::TableMetadata;
-use crate::runtime::TableSchemaTransformFactories;
 #[cfg(feature = "ffi")]
 use crate::table::build_scan_options_for_fields;
 use crate::table::{CompiledTable, compile_table, decode_table_scan_row, validate_name};
+use crate::transform::TableSchemaTransformFactories;
 use crate::{Result, TableError, TableSchema, Value};
 use bytes::Bytes;
 use cobble::{

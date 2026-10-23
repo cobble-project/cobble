@@ -7,7 +7,7 @@ use cobble::{
     ShardSnapshotMetadata, ShardSnapshotRef, WriteOptions,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 #[path = "batch.rs"]
 mod batch;
@@ -454,14 +454,7 @@ impl Table {
 
     /// Create a snapshot and wait for its callback, without polling.
     pub fn snapshot_and_wait(&self) -> Result<ShardSnapshotMetadata> {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        self.snapshot_with_callback(move |result| {
-            let _ = sender.send(result);
-        })?;
-        receiver
-            .recv()
-            .map_err(|err| TableError::internal(format!("snapshot callback disconnected: {err}")))?
-            .map_err(Into::into)
+        crate::snapshot::snapshot_and_wait(&self.db)
     }
 
     /// Return complete metadata for a completed shard snapshot.

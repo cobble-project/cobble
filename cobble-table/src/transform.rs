@@ -2,9 +2,64 @@ use crate::{LogicalType, LogicalTypeKind, Result, TableError, Value, ValueCodec}
 use bytes::Bytes;
 use cobble::{SchemaTransformRegistrar, TransformSpec};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Transform type for lossless built-in table value representation changes.
 pub(crate) const TABLE_TRANSFORM_TYPE: &str = "cobble.table/v1";
+
+type SchemaTransformCallback =
+    Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
+type SchemaTransformFactory =
+    Arc<dyn Fn(&[u8]) -> cobble::Result<SchemaTransformCallback> + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct TableSchemaTransformFactories(Vec<(String, SchemaTransformFactory)>);
+
+impl TableSchemaTransformFactories {
+    pub(crate) fn register<F, T>(
+        &mut self,
+        transform_type: impl Into<String>,
+        factory: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
+        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
+    {
+        let transform_type = transform_type.into();
+        if transform_type == TABLE_TRANSFORM_TYPE {
+            return Err(TableError::Storage(cobble::Error::InvalidState(format!(
+                "Schema transform '{TABLE_TRANSFORM_TYPE}' is reserved by cobble-table"
+            ))));
+        }
+        if transform_type.trim().is_empty() {
+            return Err(TableError::Storage(cobble::Error::InvalidState(
+                "Schema transform type must not be empty".to_string(),
+            )));
+        }
+        if self
+            .0
+            .iter()
+            .any(|(existing, _)| existing == &transform_type)
+        {
+            return Err(TableError::Storage(cobble::Error::InvalidState(format!(
+                "Schema transform '{}' is already registered",
+                transform_type
+            ))));
+        }
+        let factory: SchemaTransformFactory = Arc::new(move |spec| Ok(Box::new(factory(spec)?)));
+        self.0.push((transform_type, factory));
+        Ok(())
+    }
+
+    pub(crate) fn apply_to<B: SchemaTransformRegistrar>(&self, builder: B) -> Result<B> {
+        register_schema_transforms(&builder)?;
+        for (transform_type, factory) in &self.0 {
+            let factory = Arc::clone(factory);
+            builder.register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
+        }
+        Ok(builder)
+    }
+}
 
 /// Install Table's built-in transforms before opening a core builder or starting a compactor.
 ///

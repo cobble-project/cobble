@@ -4,77 +4,22 @@ use crate::table::{
     TypedRead, load_table_metadata, load_table_metadata_for_shard,
     load_table_metadata_from_snapshot, validate_name,
 };
-use crate::transform::TABLE_TRANSFORM_TYPE;
+use crate::transform::TableSchemaTransformFactories;
 use crate::{
     ReadOnlyTable, Result, Table, TableError, TableKey, TableKeyBuilder, TableProjection,
-    TableScan, TableSchema, TableWritePlan, Value, register_schema_transforms,
+    TableScan, TableSchema, TableWritePlan, Value,
 };
 use arc_swap::{ArcSwap, Guard};
 use bytes::Bytes;
 use cobble::{
     Config, Db, DbBuilder, DbGovernance, DbIterator, FileSystem, FileSystemDbGovernance,
     FileSystemRegistry, GovernanceMode, NoopDbGovernance, ReadOnlyDbBuilder, ReadOptions, Reader,
-    ReaderBuilder, ReaderConfig, ScanOptions, SchemaTransformRegistrar, VolumeUsageKind,
-    bucket_snapshot_manifest_path,
+    ReaderBuilder, ReaderConfig, ScanOptions, VolumeUsageKind, bucket_snapshot_manifest_path,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-type SchemaTransformCallback =
-    Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
-type SchemaTransformFactory =
-    Arc<dyn Fn(&[u8]) -> cobble::Result<SchemaTransformCallback> + Send + Sync>;
-
-#[derive(Default)]
-pub(crate) struct TableSchemaTransformFactories(Vec<(String, SchemaTransformFactory)>);
-
-impl TableSchemaTransformFactories {
-    pub(crate) fn register<F, T>(
-        &mut self,
-        transform_type: impl Into<String>,
-        factory: F,
-    ) -> Result<()>
-    where
-        F: Fn(&[u8]) -> cobble::Result<T> + Send + Sync + 'static,
-        T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
-    {
-        let transform_type = transform_type.into();
-        if transform_type == TABLE_TRANSFORM_TYPE {
-            return Err(TableError::Storage(cobble::Error::InvalidState(format!(
-                "Schema transform '{TABLE_TRANSFORM_TYPE}' is reserved by cobble-table"
-            ))));
-        }
-        if transform_type.trim().is_empty() {
-            return Err(TableError::Storage(cobble::Error::InvalidState(
-                "Schema transform type must not be empty".to_string(),
-            )));
-        }
-        if self
-            .0
-            .iter()
-            .any(|(existing, _)| existing == &transform_type)
-        {
-            return Err(TableError::Storage(cobble::Error::InvalidState(format!(
-                "Schema transform '{}' is already registered",
-                transform_type
-            ))));
-        }
-        let factory: SchemaTransformFactory = Arc::new(move |spec| Ok(Box::new(factory(spec)?)));
-        self.0.push((transform_type, factory));
-        Ok(())
-    }
-
-    pub(crate) fn apply_to<B: SchemaTransformRegistrar>(&self, builder: B) -> Result<B> {
-        register_schema_transforms(&builder)?;
-        for (transform_type, factory) in &self.0 {
-            let factory = Arc::clone(factory);
-            builder.register_schema_transform(transform_type.clone(), move |spec| factory(spec))?;
-        }
-        Ok(builder)
-    }
-}
 
 /// Builder for a standalone writable typed table shard.
 pub struct TableWriterBuilder {

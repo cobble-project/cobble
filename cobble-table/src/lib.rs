@@ -16,6 +16,7 @@ mod runtime;
 mod scan;
 mod schema;
 pub mod snapshot;
+mod store;
 mod table;
 mod transform;
 mod write;
@@ -44,6 +45,7 @@ pub use scan::{
     TableScanPlan, TableScanSplit, TableScanSplitScanner, TableScanSplitScannerBuilder,
 };
 pub use schema::{TableSchema, TableSchemaBuilder};
+pub use store::{TableStore, TableStoreBuilder};
 pub use table::{
     ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,
 };
