@@ -1,4 +1,4 @@
-//! In-process coordination for table shard snapshots.
+//! Global checkpoint publication and metadata loading for table shards.
 //!
 //! [`TableSnapshotCommitter`] keeps partial commits only in memory, with a bounded number of
 //! commit IDs rather than a wall-clock TTL. The runtime must replay incomplete commits after
@@ -9,7 +9,9 @@
 
 use crate::metadata::TableMetadata;
 use crate::{Result, TableError};
-use cobble::{Db, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata};
+use cobble::{
+    Config, CoordinatorConfig, Db, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotMetadata,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -24,7 +26,14 @@ pub(crate) fn snapshot_and_wait(db: &Db) -> Result<ShardSnapshotMetadata> {
         .map_err(Into::into)
 }
 
-/// Collects shard snapshots and materializes each complete table checkpoint.
+/// Coordinates global checkpoint publication and loads published checkpoint metadata.
+///
+/// Collects shard reports, validates bucket coverage and table schema consistency, and publishes
+/// complete global snapshots. Loading a snapshot returns its manifest for the caller to arrange
+/// reads or recovery; it does not open tables, restore databases, or recover pending commits.
+///
+/// A checkpoint may cover multiple tables sharing each shard's store. The external runtime owns
+/// checkpoint completion and recovery selection; Cobble's CURRENT only records publication.
 pub struct TableSnapshotCommitter {
     coordinator: Arc<DbCoordinator>,
     total_buckets: u32,
@@ -45,6 +54,18 @@ struct PendingCommit {
 }
 
 impl TableSnapshotCommitter {
+    /// Open a committer for publishing and loading checkpoints in shared/operator storage.
+    ///
+    /// This scope is independent of any catalog table. Application commit IDs remain
+    /// process-local; the runtime owns their durable mapping to global snapshot IDs.
+    pub fn open(config: &Config, max_pending_commits: usize) -> Result<Self> {
+        Self::new(
+            Arc::new(DbCoordinator::open(CoordinatorConfig::from_config(config))?),
+            config.total_buckets,
+            max_pending_commits,
+        )
+    }
+
     pub fn new(
         coordinator: Arc<DbCoordinator>,
         total_buckets: u32,
@@ -71,6 +92,17 @@ impl TableSnapshotCommitter {
                 pending: BTreeMap::new(),
             }),
         })
+    }
+
+    /// Load a persisted checkpoint by global snapshot ID, not application commit ID.
+    pub fn load_global_snapshot(&self, snapshot_id: u64) -> Result<GlobalSnapshotManifest> {
+        Ok(self.coordinator.load_global_snapshot(snapshot_id)?)
+    }
+
+    /// Load the persisted checkpoint selected by CURRENT, if one has been published.
+    /// CURRENT records Cobble publication, not completion of an external runtime checkpoint.
+    pub fn load_current_global_snapshot(&self) -> Result<Option<GlobalSnapshotManifest>> {
+        Ok(self.coordinator.load_current_global_snapshot()?)
     }
 
     /// Submit one full shard report for a process-local commit ID.
