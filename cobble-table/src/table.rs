@@ -22,6 +22,7 @@ pub(crate) struct CompiledTable {
     value_types: Vec<LogicalType>,
     physical_columns: usize,
     bucket_hash: BucketHash,
+    list_columns: HashMap<String, (u16, usize)>,
 }
 
 struct TableKeyData {
@@ -241,6 +242,66 @@ impl Table {
     pub fn put_with_options(&self, row: &[Value], options: &WriteOptions) -> Result<()> {
         let bound = self.rebound_write_options(options);
         self.put_bound(row, &bound)
+    }
+
+    /// Append new elements to a top-level List with one merge and no read-before-write.
+    /// Initialize rows with other required value fields first; a single-List value row can be
+    /// created by append. TTL renewal follows the core's best-effort merge behavior.
+    pub fn append(&self, key: &TableKey, field: &str, elements: &[Value]) -> Result<()> {
+        self.append_with_options(key, field, elements, &WriteOptions::default())
+    }
+
+    /// Append with the ordinary row TTL and durability options. TTL renewal is best effort,
+    /// not guaranteed across SST/compaction boundaries; no retained TTL metadata is added.
+    /// An empty append is a no-op and does not renew TTL.
+    pub fn append_with_options(
+        &self,
+        key: &TableKey,
+        field: &str,
+        elements: &[Value],
+        options: &WriteOptions,
+    ) -> Result<()> {
+        let (column, ty) = self.list_column(field)?;
+        if elements.is_empty() {
+            return Ok(());
+        }
+        let crate::LogicalTypeKind::List { element_type } = &ty.kind else {
+            unreachable!()
+        };
+        let encoded = ValueCodec::encode_list_elements(element_type, ty.nullable, elements)?;
+        self.db.merge_with_options(
+            key.bucket(),
+            key.encoded(),
+            column,
+            encoded,
+            &self.rebound_write_options(options),
+        )?;
+        Ok(())
+    }
+
+    /// Replace only this List with an empty terminal Put, preventing older elements from
+    /// resurfacing on subsequent appends. Other value fields are untouched.
+    pub fn clear_list(&self, key: &TableKey, field: &str) -> Result<()> {
+        let (column, ty) = self.list_column(field)?;
+        let encoded = ValueCodec::encode_validated(ty, &Value::List(vec![]))?;
+        self.db.put_with_options(
+            key.bucket(),
+            key.encoded(),
+            column,
+            encoded,
+            &self.write_options,
+        )?;
+        Ok(())
+    }
+
+    fn list_column(&self, name: &str) -> Result<(u16, &LogicalType)> {
+        let (column, position) = self.compiled.list_columns.get(name).ok_or_else(|| {
+            TableError::InvalidSchema(format!("field '{name}' is not a top-level List value"))
+        })?;
+        Ok((
+            *column,
+            &self.compiled.schema.fields[*position].logical_type,
+        ))
     }
 
     /// Write all non-key fields in schema order, reusing an encoded table key.
@@ -471,6 +532,7 @@ impl Table {
         if self.compiled.column_family_options.metadata.as_ref() == Some(&metadata.to_value()?) {
             return Ok(false);
         }
+        crate::append::prepare_list_columns(&self.db, &self.name, &metadata.schema)?;
         self.compiled = compile_table(metadata, self.db.total_buckets())?;
         (self.read_options, self.scan_options, self.write_options) =
             build_bound_options(&self.name, &self.compiled);
@@ -491,6 +553,7 @@ impl Table {
         metadata: TableMetadata,
     ) -> Result<Self> {
         let compiled = compile_table(metadata, db.total_buckets())?;
+        crate::append::prepare_list_columns(&db, &name, &compiled.schema)?;
         let (read_options, scan_options, write_options) = build_bound_options(&name, &compiled);
         Ok(Self {
             read_backend: ReadBackend::Writable(Arc::clone(&db)),
@@ -573,7 +636,19 @@ fn ensure_table_schema(db: &Db, name: &str, schema: TableSchema) -> Result<Table
         let mut builder = db.update_schema();
         builder.ensure_column_family_exists(name.to_string())?;
         for column in 0..expected_columns {
-            builder.add_column(column, None, None, Some(name.to_string()))?;
+            let operator = metadata
+                .layout
+                .value_columns
+                .get(column)
+                .and_then(|column| {
+                    metadata
+                        .schema
+                        .fields
+                        .iter()
+                        .find(|field| field.id == column.field_id)
+                })
+                .and_then(|field| crate::append::list_operator(&field.logical_type));
+            builder.add_column(column, operator, None, Some(name.to_string()))?;
         }
         builder.set_column_family_options(
             Some(name.to_string()),
@@ -1199,6 +1274,15 @@ pub(crate) fn compile_table(
         .iter()
         .map(|position| metadata.schema.fields[*position].logical_type.clone())
         .collect::<Vec<_>>();
+    let list_columns = value_positions
+        .iter()
+        .enumerate()
+        .filter_map(|(column, position)| {
+            let field = &metadata.schema.fields[*position];
+            matches!(field.logical_type.kind, crate::LogicalTypeKind::List { .. })
+                .then(|| (field.name.clone(), (column as u16, *position)))
+        })
+        .collect();
     Ok(Arc::new(CompiledTable {
         schema: Arc::new(metadata.schema),
         column_family_options,
@@ -1209,6 +1293,7 @@ pub(crate) fn compile_table(
         value_types,
         physical_columns: metadata.layout.value_columns.len().max(1),
         bucket_hash: BucketHash::new(total_buckets)?,
+        list_columns,
     }))
 }
 

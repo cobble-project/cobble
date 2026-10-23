@@ -340,6 +340,21 @@ impl DedicatedCompactionService {
         )
     }
 
+    /// Like `open_storage_paths`, with runtime resolution of persisted custom operators.
+    pub fn open_storage_paths_with_resolver(
+        config: Config,
+        paths: Vec<String>,
+        worker_count: usize,
+        scan_interval: Duration,
+        resolver: Arc<dyn crate::MergeOperatorResolver>,
+    ) -> Result<Self> {
+        Self::from_monitor(
+            DedicatedCompactionMonitor::new(config, paths, true, Some(resolver))?,
+            worker_count,
+            scan_interval,
+        )
+    }
+
     /// Creates the convenience service around an independently configured monitor.
     pub fn from_monitor(
         monitor: DedicatedCompactionMonitor,

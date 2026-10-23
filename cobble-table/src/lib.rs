@@ -1,9 +1,9 @@
 //! Typed table schemas, codecs, and runtime access for Cobble.
 //!
-//! `cobble-table` is independent from `cobble-data-structure`: table rows use a
-//! versioned cross-language codec, while specialized structures such as lists
-//! and priority queues keep their existing APIs and storage semantics.
+//! Table rows use a versioned cross-language codec. List appends reuse native framing primitives
+//! without changing that codec or depending on structured database wrappers.
 
+mod append;
 mod bucket;
 pub mod catalog;
 mod codec;
@@ -33,6 +33,7 @@ mod metadata_tests;
 #[path = "../tests/unit/evolution.rs"]
 mod evolution_tests;
 
+pub use append::{list_element_transform, table_merge_operator_ids, table_merge_operator_resolver};
 pub use bucket::BucketHash;
 pub use codec::{KeyCodec, Value, ValueCodec};
 pub use error::{Result, TableError};

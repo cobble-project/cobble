@@ -27,7 +27,8 @@ pub struct TableStoreBuilder {
 impl TableStoreBuilder {
     pub fn new(config: Config) -> Self {
         Self {
-            builder: DbBuilder::new(config),
+            builder: DbBuilder::new(config)
+                .merge_operator_resolver(crate::table_merge_operator_resolver(None)),
             transforms: TableSchemaTransformFactories::default(),
         }
     }
@@ -43,7 +44,9 @@ impl TableStoreBuilder {
     }
 
     pub fn merge_operator_resolver(mut self, resolver: Arc<dyn MergeOperatorResolver>) -> Self {
-        self.builder = self.builder.merge_operator_resolver(resolver);
+        self.builder = self
+            .builder
+            .merge_operator_resolver(crate::table_merge_operator_resolver(Some(resolver)));
         self
     }
 

@@ -206,11 +206,33 @@ pub(crate) fn transform_list_elements<F>(
 where
     F: Fn(Bytes) -> Result<Bytes>,
 {
+    transform_list_elements_with_prefix(payload, preserve_element_ttl, transform, &[])
+}
+
+/// Transform a count/length-framed list without element TTL, writing an optional outer prefix
+/// directly into the result allocation. Element contents remain opaque to this framing helper.
+pub fn transform_list_payload<F>(payload: Bytes, transform: &F, prefix: &[u8]) -> Result<Bytes>
+where
+    F: Fn(Bytes) -> Result<Bytes>,
+{
+    transform_list_elements_with_prefix(payload, false, transform, prefix)
+}
+
+fn transform_list_elements_with_prefix<F>(
+    payload: Bytes,
+    preserve_element_ttl: bool,
+    transform: &F,
+    prefix: &[u8],
+) -> Result<Bytes>
+where
+    F: Fn(Bytes) -> Result<Bytes>,
+{
     if payload.is_empty() {
         return Ok(payload);
     }
     let mut cursor = ListPayloadCursor::new(&payload, preserve_element_ttl)?;
-    let mut output = BytesMut::with_capacity(payload.len());
+    let mut output = BytesMut::with_capacity(prefix.len() + payload.len());
+    output.extend_from_slice(prefix);
     output.put_u32_le(cursor.remaining_elements as u32);
     while let Some(element) = cursor.next()? {
         let value = transform(element.value)?;
@@ -467,6 +489,17 @@ fn try_fast_append_batch(
     if config.preserve_element_ttl {
         return Ok(None);
     }
+    concat_list_payloads(existing, operands, &[], config.max_elements)
+}
+
+/// Concatenate count/length-framed list bodies without decoding elements. An optional output
+/// prefix is written in the same allocation. Returns None when the caller's cap needs trimming.
+pub fn concat_list_payloads(
+    existing: &Bytes,
+    operands: &[Bytes],
+    prefix: &[u8],
+    max_elements: Option<usize>,
+) -> Result<Option<Bytes>> {
     let (mut total_count, existing_body) = parse_payload_body(existing)?;
     let mut operand_bodies = Vec::with_capacity(operands.len());
     for operand in operands {
@@ -479,7 +512,7 @@ fn try_fast_append_batch(
         })?;
         operand_bodies.push(body);
     }
-    if let Some(max_elements) = config.max_elements
+    if let Some(max_elements) = max_elements
         && total_count > max_elements
     {
         return Ok(None);
@@ -490,9 +523,19 @@ fn try_fast_append_batch(
             total_count
         )));
     }
-    let total_body_size =
-        existing_body.len() + operand_bodies.iter().map(Bytes::len).sum::<usize>();
-    let mut out = BytesMut::with_capacity(size_of::<u32>() + total_body_size);
+    let total_size = operand_bodies.iter().try_fold(
+        prefix
+            .len()
+            .checked_add(size_of::<u32>())
+            .and_then(|size| size.checked_add(existing_body.len()))
+            .ok_or_else(|| Error::InputError("list size overflow".into()))?,
+        |size, body| {
+            size.checked_add(body.len())
+                .ok_or_else(|| Error::InputError("list size overflow".into()))
+        },
+    )?;
+    let mut out = BytesMut::with_capacity(total_size);
+    out.extend_from_slice(prefix);
     out.put_u32_le(total_count as u32);
     out.extend_from_slice(existing_body.as_ref());
     for body in operand_bodies {

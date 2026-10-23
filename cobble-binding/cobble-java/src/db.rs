@@ -713,7 +713,8 @@ fn open_db_with_owned_range(
 }
 
 fn table_db_builder(config: Config) -> cobble_binding::Result<DbBuilder> {
-    let builder = DbBuilder::new(config);
+    let builder = DbBuilder::new(config)
+        .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None));
     register_schema_transforms(&builder)?;
     Ok(builder)
 }

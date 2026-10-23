@@ -237,6 +237,19 @@ impl KeyCodec {
 pub struct ValueCodec;
 
 impl ValueCodec {
+    /// Encode a List operand from borrowed new elements using the ordinary value format.
+    pub(crate) fn encode_list_elements(
+        element_type: &LogicalType,
+        nullable: bool,
+        values: &[Value],
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        if nullable {
+            out.push(1);
+        }
+        append_list_elements(element_type, values, &mut out)?;
+        Ok(out)
+    }
     pub fn encode(logical_type: &LogicalType, value: &Value) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         Self::encode_into(logical_type, value, &mut out)?;
@@ -521,10 +534,7 @@ fn encode_non_null(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>)
         (LogicalTypeKind::String, Value::String(value)) => out.extend_from_slice(value.as_bytes()),
         (LogicalTypeKind::Binary, Value::Binary(value)) => out.extend_from_slice(value),
         (LogicalTypeKind::List { element_type }, Value::List(values)) => {
-            append_count(values.len(), out)?;
-            for value in values {
-                append_framed(element_type, value, out)?;
-            }
+            append_list_elements(element_type, values, out)?;
         }
         (
             LogicalTypeKind::Map {
@@ -794,6 +804,18 @@ fn append_framed(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>) -
         }
     };
     out[start..start + 4].copy_from_slice(&length.to_le_bytes());
+    Ok(())
+}
+
+fn append_list_elements(
+    element_type: &LogicalType,
+    values: &[Value],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    append_count(values.len(), out)?;
+    for value in values {
+        append_framed(element_type, value, out)?;
+    }
     Ok(())
 }
 

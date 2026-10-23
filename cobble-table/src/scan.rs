@@ -192,7 +192,10 @@ impl TableScanSplit {
         config.volumes.extend(source_volumes);
         config.total_buckets = self.total_buckets;
 
-        let builder = transforms.apply_to(ReadOnlyDbBuilder::new(config))?;
+        let builder = transforms.apply_to(
+            ReadOnlyDbBuilder::new(config)
+                .merge_operator_resolver(crate::table_merge_operator_resolver(None)),
+        )?;
         let scanner = self
             .split
             .create_scanner_with_builder(builder, &scan_options)?;

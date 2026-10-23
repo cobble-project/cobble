@@ -418,8 +418,8 @@ fn builtin_type_changes_are_lossless_and_validate_persisted_specs() {
             LogicalType::timestamp(9, TimestampKind::WithLocalTimeZone),
         ),
         (
-            LogicalType::list(LogicalType::int8()),
             LogicalType::list(LogicalType::int16()),
+            LogicalType::list(LogicalType::int8()),
         ),
     ] {
         let schema = TableSchema::builder()

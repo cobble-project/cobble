@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 /// Transform type for lossless built-in table value representation changes.
 pub(crate) const TABLE_TRANSFORM_TYPE: &str = "cobble.table/v1";
+const TABLE_LIST_TRANSFORM_TYPE: &str = "cobble.table.list-elements/v1";
 
 type SchemaTransformCallback =
     Box<dyn Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync>;
@@ -26,9 +27,9 @@ impl TableSchemaTransformFactories {
         T: Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static,
     {
         let transform_type = transform_type.into();
-        if transform_type == TABLE_TRANSFORM_TYPE {
+        if transform_type == TABLE_TRANSFORM_TYPE || transform_type == TABLE_LIST_TRANSFORM_TYPE {
             return Err(TableError::Storage(cobble::Error::InvalidState(format!(
-                "Schema transform '{TABLE_TRANSFORM_TYPE}' is reserved by cobble-table"
+                "Schema transform '{transform_type}' is reserved by cobble-table"
             ))));
         }
         if transform_type.trim().is_empty() {
@@ -66,7 +67,72 @@ impl TableSchemaTransformFactories {
 /// Table builders do this automatically. Register once per target; duplicate
 /// registrations are rejected by the target's normal registration rules.
 pub fn register_schema_transforms(target: &impl SchemaTransformRegistrar) -> cobble::Result<()> {
-    target.register_schema_transform(TABLE_TRANSFORM_TYPE, table_transform_factory)
+    target.register_schema_transform(TABLE_TRANSFORM_TYPE, table_transform_factory)?;
+    target.register_schema_transform(TABLE_LIST_TRANSFORM_TYPE, list_transform_factory)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListTransformSpec {
+    source: LogicalType,
+    target: LogicalType,
+}
+
+fn list_transform_factory(
+    spec: &[u8],
+) -> cobble::Result<
+    impl Fn(Option<Bytes>) -> cobble::Result<Option<Bytes>> + Send + Sync + 'static + use<>,
+> {
+    let spec: ListTransformSpec = serde_json::from_slice(spec)
+        .map_err(|error| cobble::Error::InputError(error.to_string()))?;
+    let (source, target) =
+        list_element_types(&spec.source, &spec.target).map_err(table_transform_error)?;
+    let operation = if source == target {
+        None
+    } else {
+        Some(table_transform_operation(source, target).map_err(table_transform_error)?)
+    };
+    let (source, target) = (source.clone(), target.clone());
+    Ok(crate::list_element_transform(
+        spec.source.nullable,
+        spec.target.nullable,
+        move |bytes| {
+            let Some(operation) = operation else {
+                return Ok(bytes);
+            };
+            let value = ValueCodec::decode_bytes_validated(&source, bytes)
+                .map_err(table_transform_error)?;
+            let value =
+                convert_table_value(value, &target, operation).map_err(table_transform_error)?;
+            ValueCodec::encode_validated(&target, &value)
+                .map(Bytes::from)
+                .map_err(table_transform_error)
+        },
+    ))
+}
+
+fn list_element_types<'a>(
+    source: &'a LogicalType,
+    target: &'a LogicalType,
+) -> Result<(&'a LogicalType, &'a LogicalType)> {
+    source.validate()?;
+    target.validate()?;
+    if source.nullable && !target.nullable {
+        return Err(TableError::InvalidSchema(
+            "cannot tighten List nullability".into(),
+        ));
+    }
+    let (LogicalTypeKind::List { element_type: from }, LogicalTypeKind::List { element_type: to }) =
+        (&source.kind, &target.kind)
+    else {
+        return Err(TableError::InvalidSchema(
+            "List widening must retain the List type".into(),
+        ));
+    };
+    if from != to {
+        table_transform_operation(from, to)?;
+    }
+    Ok((from, to))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,6 +160,18 @@ pub(crate) fn compile_table_transform(
 ) -> Result<Option<TransformSpec>> {
     if source == target {
         return Ok(None);
+    }
+    if matches!(source.kind, LogicalTypeKind::List { .. }) {
+        list_element_types(source, target)?;
+        return Ok(Some(TransformSpec {
+            transform_type: TABLE_LIST_TRANSFORM_TYPE.into(),
+            spec: serde_json::to_vec(&ListTransformSpec {
+                source: source.clone(),
+                target: target.clone(),
+            })
+            .map(Bytes::from)
+            .map_err(|error| TableError::internal(error.to_string()))?,
+        }));
     }
     let operation = table_transform_operation(source, target)?;
     let spec = TableTransformSpec {

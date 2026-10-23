@@ -105,7 +105,9 @@ fn open_table_read_only_db(
     snapshot_id: u64,
     db_id: String,
 ) -> cobble_binding::Result<ReadOnlyDb> {
-    let builder = ReadOnlyDbBuilder::new(config).db_id(db_id);
+    let builder = ReadOnlyDbBuilder::new(config)
+        .db_id(db_id)
+        .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None));
     register_schema_transforms(&builder)?;
     builder.open(snapshot_id)
 }

@@ -725,6 +725,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "cobble",
+ "cobble-data-structure",
  "serde",
  "serde_json",
  "sha2 0.10.9",

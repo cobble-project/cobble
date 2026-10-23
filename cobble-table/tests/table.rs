@@ -289,7 +289,13 @@ fn table_runtime_create_open_and_typed_rows() {
     db.close().unwrap();
 
     let read_only = Arc::new(
-        cobble::ReadOnlyDb::open_with_db_id(config.clone(), snapshot_id, "table-runtime").unwrap(),
+        cobble::ReadOnlyDb::open_with_db_id_and_resolver(
+            config.clone(),
+            snapshot_id,
+            "table-runtime",
+            cobble_table::table_merge_operator_resolver(None),
+        )
+        .unwrap(),
     );
     {
         let table = ReadOnlyTable::open(Arc::clone(&read_only), "events").unwrap();
@@ -370,8 +376,13 @@ fn table_runtime_create_open_and_typed_rows() {
     }
     drop(read_only);
 
-    let reopened =
-        Arc::new(cobble::Db::open_from_snapshot(config, snapshot_id, "table-runtime").unwrap());
+    let reopened = Arc::new(
+        DbBuilder::new(config)
+            .db_id("table-runtime")
+            .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None))
+            .open_from_snapshot(snapshot_id)
+            .unwrap(),
+    );
     {
         let table = Table::open(Arc::clone(&reopened), "events").unwrap();
         let key2 = build_key(

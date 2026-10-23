@@ -174,7 +174,8 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromGlobalSnapshot(
             return 0;
         }
     };
-    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config));
+    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config))
+        .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None));
     if let Err(err) = register_schema_transforms(&builder) {
         throw_illegal_state(&mut env, err.to_string());
         return 0;
@@ -189,13 +190,15 @@ pub extern "system" fn Java_io_cobble_Reader_openHandleFromGlobalSnapshot(
 }
 
 fn open_table_reader(config: Config, snapshot_id: u64) -> cobble_binding::Result<Reader> {
-    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config));
+    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config))
+        .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None));
     register_schema_transforms(&builder)?;
     builder.open(snapshot_id)
 }
 
 fn open_table_reader_current(config: Config) -> cobble_binding::Result<Reader> {
-    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config));
+    let builder = ReaderBuilder::new(ReaderConfig::from_config(&config))
+        .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None));
     register_schema_transforms(&builder)?;
     builder.open_current()
 }

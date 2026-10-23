@@ -232,6 +232,7 @@ impl TableWriterBuilder {
         let config = self.bucket_config()?;
         self.transforms.apply_to(
             DbBuilder::new(config)
+                .merge_operator_resolver(crate::table_merge_operator_resolver(None))
                 .bucket_ranges(vec![bucket..=bucket])
                 .db_id(bucket_db_id(bucket))
                 .governance(governance),
@@ -691,9 +692,10 @@ impl TableReaderBuilder {
 
     pub fn open(self) -> Result<TableReader> {
         let name = self.required_table_name()?;
-        let builder = self
-            .transforms
-            .apply_to(ReaderBuilder::new(ReaderConfig::from_config(&self.config)))?;
+        let builder = self.transforms.apply_to(
+            ReaderBuilder::new(ReaderConfig::from_config(&self.config))
+                .merge_operator_resolver(crate::table_merge_operator_resolver(None)),
+        )?;
         let mut reader = match self.selection.ok_or_else(|| {
             TableError::InvalidSchema("TableReaderBuilder requires a snapshot selection".into())
         })? {
@@ -775,7 +777,11 @@ impl ReadOnlyTableBuilder {
         })?;
         let db = Arc::new(
             self.transforms
-                .apply_to(ReadOnlyDbBuilder::new(self.config).db_id(db_id))?
+                .apply_to(
+                    ReadOnlyDbBuilder::new(self.config)
+                        .db_id(db_id)
+                        .merge_operator_resolver(crate::table_merge_operator_resolver(None)),
+                )?
                 .open(snapshot_id)?,
         );
         let metadata = load_table_metadata(&db.current_schema(), &name)?;

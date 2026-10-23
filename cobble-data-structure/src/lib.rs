@@ -55,7 +55,7 @@
 #[cfg(feature = "ffi")]
 #[doc(hidden)]
 pub mod ffi;
-mod list;
+pub mod list;
 mod priority_queue;
 mod structured_db;
 mod structured_read_only_db;
