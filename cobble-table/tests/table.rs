@@ -213,7 +213,14 @@ fn table_runtime_create_open_and_typed_rows() {
                 .unwrap(),
             vec![vec![row1[3].clone()], vec![row2[3].clone()]]
         );
-        assert!(table.project_by_names::<&str>(&[]).is_err());
+        assert_eq!(
+            table
+                .project_by_names::<&str>(&[])
+                .unwrap()
+                .get(&key1)
+                .unwrap(),
+            Some(vec![])
+        );
         assert!(table.project_by_names(&["tenant", "tenant"]).is_err());
         assert!(table.project_by_names(&["missing"]).is_err());
 
@@ -244,6 +251,16 @@ fn table_runtime_create_open_and_typed_rows() {
         keys.put_values(&key_only_key, &[], &WriteOptions::default())
             .unwrap();
         assert_eq!(keys.get_values(&key_only_key).unwrap(), Some(vec![]));
+        let empty_projection = keys.project_by_names::<&str>(&[]).unwrap();
+        assert_eq!(empty_projection.get(&key_only_key).unwrap(), Some(vec![]));
+        assert_eq!(
+            empty_projection
+                .scan(key_only_key.bucket())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![vec![]]
+        );
         // An all-0xff encoded prefix has no finite exclusive upper bound.
         let max_key = build_key(&keys, &[Value::Int64(i64::MAX)]);
         keys.put_values(&max_key, &[], &WriteOptions::default())

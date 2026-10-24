@@ -505,6 +505,11 @@ impl TableReader {
         self.view_for_access()?.project_by_names(field_names)
     }
 
+    /// Compile a nested read projection over the current fixed view.
+    pub fn project(&self, read_schema: &crate::TableReadSchema) -> Result<TableProjection> {
+        self.view_for_access()?.project(read_schema)
+    }
+
     /// Read one row by primary key.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.view_for_access()?.get(key)

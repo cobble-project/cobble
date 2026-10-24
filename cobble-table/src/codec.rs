@@ -300,20 +300,20 @@ impl ValueCodec {
     }
 }
 
-enum Input<'a> {
+pub(crate) enum Input<'a> {
     Borrowed(&'a [u8]),
     Owned(Bytes),
 }
 
 impl Input<'_> {
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             Self::Borrowed(bytes) => bytes,
             Self::Owned(bytes) => bytes,
         }
     }
 
-    fn slice(&self, range: Range<usize>) -> Self {
+    pub(crate) fn slice(&self, range: Range<usize>) -> Self {
         match self {
             Self::Borrowed(bytes) => Self::Borrowed(&bytes[range]),
             Self::Owned(bytes) => Self::Owned(bytes.slice(range)),
@@ -569,18 +569,25 @@ fn encode_non_null(logical_type: &LogicalType, value: &Value, out: &mut Vec<u8>)
     Ok(())
 }
 
-fn decode_value(logical_type: &LogicalType, input: Input<'_>) -> Result<Value> {
-    if !logical_type.nullable {
-        return decode_non_null(logical_type, input);
+pub(crate) fn decode_value(logical_type: &LogicalType, input: Input<'_>) -> Result<Value> {
+    match non_null_input(logical_type.nullable, input)? {
+        Some(input) => decode_non_null(logical_type, input),
+        None => Ok(Value::Null),
+    }
+}
+
+pub(crate) fn non_null_input(nullable: bool, input: Input<'_>) -> Result<Option<Input<'_>>> {
+    if !nullable {
+        return Ok(Some(input));
     }
     let bytes = input.bytes();
     let Some((&marker, payload)) = bytes.split_first() else {
         return Err(TableError::codec("nullable value is missing marker"));
     };
     match marker {
-        0 if payload.is_empty() => Ok(Value::Null),
+        0 if payload.is_empty() => Ok(None),
         0 => Err(TableError::codec("null value has trailing bytes")),
-        1 => decode_non_null(logical_type, input.slice(1..bytes.len())),
+        1 => Ok(Some(input.slice(1..bytes.len()))),
         _ => Err(TableError::codec("invalid nullable marker")),
     }
 }
@@ -824,13 +831,20 @@ fn decode_framed(
     input: &Input<'_>,
     cursor: &mut usize,
 ) -> Result<Value> {
-    let bytes = input.bytes();
+    decode_value(logical_type, read_frame(input, cursor)?)
+}
+
+pub(crate) fn read_frame<'a>(input: &Input<'a>, cursor: &mut usize) -> Result<Input<'a>> {
+    Ok(input.slice(read_frame_range(input.bytes(), cursor)?))
+}
+
+pub(crate) fn read_frame_range(bytes: &[u8], cursor: &mut usize) -> Result<Range<usize>> {
     let length = read_u32(bytes, cursor)? as usize;
     let end = cursor
         .checked_add(length)
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| TableError::codec("nested value length exceeds container"))?;
-    let value = decode_value(logical_type, input.slice(*cursor..end))?;
+    let value = *cursor..end;
     *cursor = end;
     Ok(value)
 }
@@ -844,7 +858,7 @@ fn append_count(count: usize, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn read_count(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
+pub(crate) fn read_count(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
     Ok(read_u32(bytes, cursor)? as usize)
 }
 
@@ -1003,7 +1017,7 @@ fn require_exact_len(bytes: &[u8], length: usize) -> Result<()> {
         Ok(())
     }
 }
-fn ensure_consumed(length: usize, consumed: usize) -> Result<()> {
+pub(crate) fn ensure_consumed(length: usize, consumed: usize) -> Result<()> {
     if length == consumed {
         Ok(())
     } else {

@@ -12,6 +12,7 @@ mod evolution;
 mod layout;
 mod logical_type;
 mod metadata;
+mod projection;
 mod runtime;
 mod scan;
 mod schema;
@@ -41,11 +42,12 @@ pub use evolution::SchemaChange;
 pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
+pub use projection::ValueProjection;
 pub use runtime::{ReadOnlyTableBuilder, TableReader, TableReaderBuilder, TableWriterBuilder};
 pub use scan::{
     TableScanPlan, TableScanSplit, TableScanSplitScanner, TableScanSplitScannerBuilder,
 };
-pub use schema::{TableSchema, TableSchemaBuilder};
+pub use schema::{TableReadSchema, TableSchema, TableSchemaBuilder};
 pub use store::{TableStore, TableStoreBuilder};
 pub use table::{
     ProjectedTableScan, ReadOnlyTable, Table, TableKey, TableKeyBuilder, TableProjection, TableScan,

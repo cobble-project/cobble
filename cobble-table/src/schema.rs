@@ -3,6 +3,36 @@ use crate::{DataField, FieldId, LogicalType, LogicalTypeKind, Result, TableError
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Fields selected for a read, including nested struct subsets in output order.
+/// Unlike a table schema, a read schema may be empty and has no key constraints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableReadSchema {
+    pub fields: Vec<DataField>,
+}
+
+impl TableReadSchema {
+    pub fn new(fields: Vec<DataField>) -> Result<Self> {
+        let schema = Self { fields };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        for field in &self.fields {
+            validate_field_tree(field, &mut ids)?;
+            if !names.insert(&field.name) {
+                return Err(TableError::InvalidSchema(format!(
+                    "duplicate read field name: {}",
+                    field.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// User-visible semantic schema of a table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {

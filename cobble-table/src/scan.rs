@@ -1,9 +1,12 @@
 use crate::metadata::TableMetadata;
 #[cfg(feature = "ffi")]
 use crate::table::build_scan_options_for_fields;
-use crate::table::{CompiledTable, compile_table, decode_table_scan_row, validate_name};
+use crate::table::{
+    CompiledTable, ProjectionPlan, build_schema_projection_parts, compile_table,
+    decode_projected_scan_row, decode_table_scan_row, validate_name,
+};
 use crate::transform::TableSchemaTransformFactories;
-use crate::{Result, TableError, TableSchema, Value};
+use crate::{Result, TableError, TableReadSchema, TableSchema, Value};
 use bytes::Bytes;
 use cobble::{
     Config, ReadOnlyDbBuilder, ScanOptions, ScanSplit, ScanSplitScanner, ShardSnapshotRef,
@@ -14,6 +17,34 @@ use std::sync::Arc;
 
 const TABLE_SCAN_PLAN_FORMAT: &str = "cobble-table-scan-plan";
 const TABLE_SCAN_PLAN_VERSION: u32 = 1;
+
+type ScanProjection = Arc<CompiledScanProjection>;
+
+struct CompiledScanProjection {
+    compiled: Arc<CompiledTable>,
+    plan: Arc<ProjectionPlan>,
+    options: ScanOptions,
+}
+
+fn compile_projection(
+    name: &str,
+    metadata: &TableMetadata,
+    total_buckets: u32,
+    selection: Option<&TableReadSchema>,
+) -> Result<Option<ScanProjection>> {
+    selection
+        .map(|schema| {
+            let compiled = compile_table(metadata.clone(), total_buckets)?;
+            let (plan, _, options) =
+                build_schema_projection_parts(name, Arc::clone(&compiled), schema)?;
+            Ok(Arc::new(CompiledScanProjection {
+                compiled,
+                plan,
+                options,
+            }))
+        })
+        .transpose()
+}
 
 /// A serializable, fixed global-snapshot scan plan for one typed table.
 ///
@@ -31,6 +62,12 @@ pub struct TableScanPlan {
     source_volumes: Vec<VolumeDescriptor>,
     #[serde(skip)]
     auth_source: Option<Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_schema: Option<TableReadSchema>,
+    // Only the selection is transported. In-process splits share this compiled plan;
+    // transported workers compile at scanner setup, then reuse it for every row.
+    #[serde(skip)]
+    projection: Option<ScanProjection>,
 }
 
 impl TableScanPlan {
@@ -52,6 +89,8 @@ impl TableScanPlan {
             shards,
             source_volumes: source_volumes(&config),
             auth_source: Some(config),
+            read_schema: None,
+            projection: None,
         };
         plan.validate()?;
         Ok(plan)
@@ -72,6 +111,28 @@ impl TableScanPlan {
         &self.metadata.schema
     }
 
+    /// Select fields by stable identity relative to this plan's captured source schema.
+    /// The selection applies to all workers; it does not evolve or replace the source schema.
+    pub fn project(&self, read_schema: &TableReadSchema) -> Result<Self> {
+        let projection = compile_projection(
+            &self.name,
+            &self.metadata,
+            self.total_buckets,
+            Some(read_schema),
+        )?;
+        let mut plan = self.clone();
+        plan.read_schema = Some(read_schema.clone());
+        plan.projection = projection;
+        Ok(plan)
+    }
+
+    /// Return the selected fields in output order, or all source fields when unprojected.
+    pub fn read_schema(&self) -> TableReadSchema {
+        self.read_schema.clone().unwrap_or_else(|| TableReadSchema {
+            fields: self.metadata.schema.fields.clone(),
+        })
+    }
+
     /// Return the total encoded data size reported by all shard snapshots.
     pub fn data_size_bytes(&self) -> u64 {
         self.shards.iter().fold(0_u64, |total, shard| {
@@ -82,6 +143,15 @@ impl TableScanPlan {
     /// Produce one independently serializable split per shard snapshot.
     pub fn splits(&self) -> Result<Vec<TableScanSplit>> {
         self.validate()?;
+        let projection = match &self.projection {
+            Some(projection) => Some(Arc::clone(projection)),
+            None => compile_projection(
+                &self.name,
+                &self.metadata,
+                self.total_buckets,
+                self.read_schema.as_ref(),
+            )?,
+        };
         Ok(self
             .shards
             .iter()
@@ -96,6 +166,8 @@ impl TableScanPlan {
                 split: full_scan_split(shard),
                 source_volumes: self.source_volumes.clone(),
                 auth_source: self.auth_source.clone(),
+                read_schema: self.read_schema.clone(),
+                projection: projection.clone(),
             })
             .collect())
     }
@@ -131,9 +203,36 @@ pub struct TableScanSplit {
     source_volumes: Vec<VolumeDescriptor>,
     #[serde(skip)]
     auth_source: Option<Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_schema: Option<TableReadSchema>,
+    // Never deserialize compiled indexes: worker-local scanner setup validates and
+    // compiles the selection once, and row decoding reuses the resulting plan.
+    #[serde(skip)]
+    projection: Option<ScanProjection>,
 }
 
 impl TableScanSplit {
+    /// Select fields relative to the captured source schema for this worker assignment.
+    pub fn project(&self, read_schema: &TableReadSchema) -> Result<Self> {
+        let projection = compile_projection(
+            &self.name,
+            &self.metadata,
+            self.total_buckets,
+            Some(read_schema),
+        )?;
+        let mut split = self.clone();
+        split.read_schema = Some(read_schema.clone());
+        split.projection = projection;
+        Ok(split)
+    }
+
+    /// Return selected fields in output order, or all source fields when unprojected.
+    pub fn read_schema(&self) -> TableReadSchema {
+        self.read_schema.clone().unwrap_or_else(|| TableReadSchema {
+            fields: self.metadata.schema.fields.clone(),
+        })
+    }
+
     /// Return the global snapshot that assigned this shard.
     pub fn snapshot_id(&self) -> u64 {
         self.global_snapshot_id
@@ -144,7 +243,7 @@ impl TableScanSplit {
         self.split.shard.snapshot_id
     }
 
-    /// Open this shard and return a typed full-scan iterator.
+    /// Open this shard and decode the selected fields for every assigned row.
     pub fn create_scanner(&self, runtime: Config) -> Result<TableScanSplitScanner> {
         self.create_scanner_with_transforms(runtime, &TableSchemaTransformFactories::default())
     }
@@ -163,15 +262,32 @@ impl TableScanSplit {
         runtime: Config,
         transforms: &TableSchemaTransformFactories,
     ) -> Result<TableScanSplitScanner> {
-        let compiled = compile_table(self.metadata.clone(), self.total_buckets)?;
+        let projection = match &self.projection {
+            Some(projection) => Some(Arc::clone(projection)),
+            None => compile_projection(
+                &self.name,
+                &self.metadata,
+                self.total_buckets,
+                self.read_schema.as_ref(),
+            )?,
+        };
+        let compiled = match &projection {
+            Some(projection) => Arc::clone(&projection.compiled),
+            None => compile_table(self.metadata.clone(), self.total_buckets)?,
+        };
         let scanner = self.create_raw_scanner_with_transforms(
             runtime,
             transforms,
-            ScanOptions::default().with_column_family(self.name.clone()),
+            projection
+                .as_ref()
+                .map(|projection| projection.options.clone())
+                .unwrap_or_else(|| ScanOptions::default().with_column_family(self.name.clone())),
         )?;
         Ok(TableScanSplitScanner {
             inner: scanner,
             compiled,
+            projection: projection.map(|projection| Arc::clone(&projection.plan)),
+            read_schema: self.read_schema(),
         })
     }
 
@@ -276,6 +392,11 @@ pub struct TableScanSplitScannerBuilder {
 }
 
 impl TableScanSplitScannerBuilder {
+    /// Select fields before opening this worker-local scanner.
+    pub fn project(mut self, read_schema: &TableReadSchema) -> Result<Self> {
+        self.split = self.split.project(read_schema)?;
+        Ok(self)
+    }
     /// Register a factory for persisted schema transform specifications before opening.
     pub fn register_schema_transform<F, T>(
         mut self,
@@ -301,6 +422,15 @@ impl TableScanSplitScannerBuilder {
 pub struct TableScanSplitScanner {
     inner: ScanSplitScanner,
     compiled: Arc<CompiledTable>,
+    projection: Option<Arc<ProjectionPlan>>,
+    read_schema: TableReadSchema,
+}
+
+impl TableScanSplitScanner {
+    /// Return the fields decoded by this scanner, in output order.
+    pub fn read_schema(&self) -> &TableReadSchema {
+        &self.read_schema
+    }
 }
 
 impl Iterator for TableScanSplitScanner {
@@ -309,7 +439,12 @@ impl Iterator for TableScanSplitScanner {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|row| {
             let (_, key, columns) = row?;
-            decode_table_scan_row(&self.compiled, &key, &columns)
+            match &self.projection {
+                Some(projection) => {
+                    decode_projected_scan_row(&self.compiled, projection, &key, &columns)
+                }
+                None => decode_table_scan_row(&self.compiled, &key, &columns),
+            }
         })
     }
 }

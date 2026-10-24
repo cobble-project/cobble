@@ -1,6 +1,9 @@
 use crate::codec::KeyCodec;
 use crate::metadata::TableMetadata;
-use crate::{BucketHash, FieldId, LogicalType, Result, TableError, TableSchema, Value, ValueCodec};
+use crate::{
+    BucketHash, FieldId, LogicalType, Result, TableError, TableReadSchema, TableSchema, Value,
+    ValueCodec, ValueProjection,
+};
 use bytes::Bytes;
 use cobble::{
     ColumnFamilyOptions, Config, Db, DbIterator, ReadOnlyDb, ReadOptions, ScanOptions, Schema,
@@ -68,14 +71,20 @@ enum ProjectedFieldSource {
     Value {
         /// Position in the compact column list returned by the projection read options.
         projected_column: usize,
-        /// Position in the table's physical value columns, used to select its logical type.
-        physical_column: usize,
+        decoder: ValueProjection,
     },
 }
 
-struct ProjectionPlan {
+pub(crate) struct ProjectionPlan {
     sources: Vec<ProjectedFieldSource>,
     has_key_fields: bool,
+    read_schema: TableReadSchema,
+}
+
+impl ProjectionPlan {
+    pub(crate) fn read_schema(&self) -> &TableReadSchema {
+        &self.read_schema
+    }
 }
 
 #[derive(Clone)]
@@ -230,6 +239,16 @@ impl Table {
             &self.name,
             Arc::clone(&self.compiled),
             field_names,
+        )
+    }
+
+    /// Compile a reusable read projection, selecting nested struct fields by stable ids.
+    pub fn project(&self, read_schema: &TableReadSchema) -> Result<TableProjection> {
+        build_schema_projection(
+            self.read_backend.clone(),
+            &self.name,
+            Arc::clone(&self.compiled),
+            read_schema,
         )
     }
 
@@ -719,6 +738,11 @@ impl ReadOnlyTable {
         self.typed.project_by_names(field_names)
     }
 
+    /// Compile a reusable nested read projection over this fixed view.
+    pub fn project(&self, read_schema: &TableReadSchema) -> Result<TableProjection> {
+        self.typed.project(read_schema)
+    }
+
     /// Read one row by primary key.
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.typed.get(key)
@@ -747,6 +771,15 @@ impl ReadOnlyTable {
 }
 
 impl TypedRead {
+    /// Compile a reusable nested read projection over this fixed view.
+    pub fn project(&self, read_schema: &TableReadSchema) -> Result<TableProjection> {
+        build_schema_projection(
+            self.read_backend.clone(),
+            &self.name,
+            Arc::clone(&self.compiled),
+            read_schema,
+        )
+    }
     pub(crate) fn scan_encoded_bounds(
         &self,
         bucket: u16,
@@ -893,6 +926,10 @@ impl TypedRead {
 }
 
 impl TableProjection {
+    /// Selected fields in output order.
+    pub fn read_schema(&self) -> &TableReadSchema {
+        self.plan.read_schema()
+    }
     #[cfg(feature = "ffi")]
     pub(crate) fn ffi_into_raw_access(self) -> crate::ffi::RawTableAccess {
         crate::ffi::RawTableAccess::new(self.backend, self.read_options, self.scan_options)
@@ -901,14 +938,7 @@ impl TableProjection {
     pub fn get(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
         self.backend
             .get_with_options(key.inner.bucket, &key.inner.encoded, &self.read_options)?
-            .map(|columns| {
-                assemble_projected_row(
-                    &self.compiled,
-                    &self.plan,
-                    Some(&key.inner.values),
-                    &columns,
-                )
-            })
+            .map(|columns| assemble_projected_row(&self.plan, Some(&key.inner.values), &columns))
             .transpose()
     }
 
@@ -925,12 +955,7 @@ impl TableProjection {
             .map(|(columns, key)| {
                 columns
                     .map(|columns| {
-                        assemble_projected_row(
-                            &self.compiled,
-                            &self.plan,
-                            Some(&key.inner.values),
-                            &columns,
-                        )
+                        assemble_projected_row(&self.plan, Some(&key.inner.values), &columns)
                     })
                     .transpose()
             })
@@ -988,14 +1013,22 @@ impl Iterator for ProjectedTableScan {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|row| {
             let (key, columns) = row?;
-            let key_values = self
-                .plan
-                .has_key_fields
-                .then(|| KeyCodec::decode_row_validated(&self.compiled.key_types, &key))
-                .transpose()?;
-            assemble_projected_row(&self.compiled, &self.plan, key_values.as_deref(), &columns)
+            decode_projected_scan_row(&self.compiled, &self.plan, &key, &columns)
         })
     }
+}
+
+pub(crate) fn decode_projected_scan_row(
+    compiled: &CompiledTable,
+    plan: &ProjectionPlan,
+    key: &[u8],
+    columns: &[Option<Bytes>],
+) -> Result<Vec<Value>> {
+    let key_values = plan
+        .has_key_fields
+        .then(|| KeyCodec::decode_row_validated(&compiled.key_types, key))
+        .transpose()?;
+    assemble_projected_row(plan, key_values.as_deref(), columns)
 }
 
 impl Iterator for TableScan {
@@ -1090,7 +1123,6 @@ fn encode_table_row(
 }
 
 fn assemble_projected_row(
-    compiled: &CompiledTable,
     plan: &ProjectionPlan,
     key_values: Option<&[Value]>,
     columns: &[Option<Bytes>],
@@ -1103,16 +1135,13 @@ fn assemble_projected_row(
             }
             ProjectedFieldSource::Value {
                 projected_column,
-                physical_column,
+                decoder,
             } => {
                 let value = columns
                     .get(*projected_column)
                     .and_then(|value| value.as_ref())
                     .ok_or_else(|| TableError::codec("table row is missing a value column"))?;
-                row.push(ValueCodec::decode_bytes_validated(
-                    &compiled.value_types[*physical_column],
-                    value.clone(),
-                )?);
+                row.push(decoder.decode_bytes(value.clone())?);
             }
         }
     }
@@ -1161,30 +1190,68 @@ fn build_projection_parts<S: AsRef<str>>(
     compiled: Arc<CompiledTable>,
     field_names: &[S],
 ) -> Result<(Arc<ProjectionPlan>, ReadOptions, ScanOptions)> {
-    if field_names.is_empty() {
-        return Err(TableError::InvalidSchema(
-            "table projection must contain at least one field".to_string(),
-        ));
-    }
-    let mut seen = std::collections::HashSet::with_capacity(field_names.len());
-    let mut sources = Vec::with_capacity(field_names.len());
+    let fields = field_names
+        .iter()
+        .map(|name| {
+            compiled
+                .schema
+                .fields
+                .iter()
+                .find(|field| field.name == name.as_ref())
+                .cloned()
+                .ok_or_else(|| {
+                    TableError::InvalidSchema(format!(
+                        "projection field '{}' does not exist",
+                        name.as_ref()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    build_schema_projection_parts(name, compiled, &TableReadSchema::new(fields)?)
+}
+
+fn build_schema_projection(
+    backend: ReadBackend,
+    name: &str,
+    compiled: Arc<CompiledTable>,
+    read_schema: &TableReadSchema,
+) -> Result<TableProjection> {
+    let (plan, read_options, scan_options) =
+        build_schema_projection_parts(name, Arc::clone(&compiled), read_schema)?;
+    Ok(TableProjection {
+        backend,
+        compiled,
+        plan,
+        read_options,
+        scan_options,
+    })
+}
+
+pub(crate) fn build_schema_projection_parts(
+    name: &str,
+    compiled: Arc<CompiledTable>,
+    read_schema: &TableReadSchema,
+) -> Result<(Arc<ProjectionPlan>, ReadOptions, ScanOptions)> {
+    read_schema.validate()?;
+    let mut sources = Vec::with_capacity(read_schema.fields.len());
     let mut physical_columns = Vec::new();
     let mut has_key_fields = false;
-    for field_name in field_names {
-        let field_name = field_name.as_ref();
-        if !seen.insert(field_name) {
-            return Err(TableError::InvalidSchema(format!(
-                "duplicate projection field: '{field_name}'"
-            )));
-        }
+    for selected in &read_schema.fields {
         let schema_position = compiled
             .schema
             .fields
             .iter()
-            .position(|field| field.name == field_name)
+            .position(|field| field.id == selected.id)
             .ok_or_else(|| {
-                TableError::InvalidSchema(format!("projection field '{field_name}' does not exist"))
+                TableError::InvalidSchema(format!(
+                    "projection field {} does not exist",
+                    selected.id.0
+                ))
             })?;
+        let decoder = ValueProjection::compile_validated(
+            &compiled.schema.fields[schema_position].logical_type,
+            &selected.logical_type,
+        )?;
         if let Some(key_index) = compiled
             .key_positions
             .iter()
@@ -1202,7 +1269,7 @@ fn build_projection_parts<S: AsRef<str>>(
             physical_columns.push(physical_column);
             sources.push(ProjectedFieldSource::Value {
                 projected_column,
-                physical_column,
+                decoder,
             });
         }
     }
@@ -1213,6 +1280,7 @@ fn build_projection_parts<S: AsRef<str>>(
         Arc::new(ProjectionPlan {
             sources,
             has_key_fields,
+            read_schema: read_schema.clone(),
         }),
         ReadOptions::for_columns_in_family(name.to_string(), physical_columns.clone())
             .bound_to_column_family_schema(
