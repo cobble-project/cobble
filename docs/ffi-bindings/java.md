@@ -220,8 +220,25 @@ changes, call `writer.refreshSchema()`. Rebuild projections after refreshing, an
 concurrently with writer operations. Custom transforms are not supported in Java.
 
 For distributed scans, call `reader.scanPlan()` to capture the reader's selected fixed snapshot.
-Send the serializable plan or its splits to workers and call
-`split.openTypedScanner(config, readAheadBytes)` on each worker. Use
+Use `plan.project(Arrays.asList("id", "name"))` for top-level fields, or
+`plan.project(new TableReadSchema(selectedFields))` for nested selections. Build selections
+from the existing schema, preserving field IDs and types; see
+[Read selected fields](../getting-started/table#read-selected-fields).
+
+```java
+TableScanPlan plan = reader.scanPlan().project(new TableReadSchema(selectedFields));
+for (TableScanSplit split : plan.splits()) {
+    // Send each split to a worker using Java serialization.
+}
+// On a worker, after deserializing its split:
+try (TableScanCursor scanner = split.openTypedScanner(config, readAheadBytes)) {
+    List<Value> row;
+    while ((row = scanner.nextRow()) != null) consume(row);
+}
+```
+
+Each split carries its projection; workers do not need the original plan. Projection decoding
+is prepared once and reused, not rebuilt per row. Use
 `openScanner(config, fieldNames, readAheadBytes)` when encoded rows are preferred.
 
 Close tables, readers, projections, direct rows, and scanners when finished. Retain referenced

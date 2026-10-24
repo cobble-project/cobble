@@ -41,6 +41,27 @@ calling `Db::close()` affects all users of that database.
 
 `ReadOnlyTable::open(Arc::clone(&db), name)` uses an existing read-only shard.
 
+## Read selected fields
+
+Use `project_by_names(&["id", "name"])` for top-level fields. For nested selections,
+build a `TableReadSchema` from the existing schema's fields, keeping their IDs, leaf types,
+and nullability. Struct fields may be selected and reordered, including inside List elements
+and Map values; Map keys remain unchanged. Returned values follow the selected field order.
+
+```rust
+let read_schema = TableReadSchema::new(selected_fields)?;
+let projected = table.project(&read_schema)?;
+let row = projected.get(&key)?;
+let rows = projected.multi_get(&keys)?;
+for row in projected.scan(bucket)? {
+    consume(row?);
+}
+```
+
+The same API is available on `ReadOnlyTable` and `TableReader`. Reuse the projection across
+reads; its decoding plan is prepared once. An empty selection still returns one empty row
+per visible record, useful for counting rows.
+
 ## Global readers and refresh
 
 `TableReader::open(reader, name)` takes ownership of a core `Reader`. A reader opened from core
@@ -160,6 +181,8 @@ For distributed reading, capture a fixed scan plan from a `TableReader` and send
 
 ```rust
 let plan = reader.scan_plan()?;
+// Optional: select fields, including nested fields, before distributing the splits.
+let plan = plan.project(&read_schema)?;
 for split in plan.splits()? {
     let payload = serde_json::to_vec(&split)?;
     // On a worker, after receiving the payload:
@@ -175,6 +198,9 @@ Workers need no Catalog. The plan fixes the snapshot, schema, bucket count, and 
 runtime configuration supplies local storage and credentials. Later CURRENT or Catalog schema
 changes do not alter an existing plan. Applications must retain the referenced snapshots until
 scanning finishes; serializing a plan does not retain them.
+
+Each split carries its selected read schema. Workers can open a received split directly;
+the scanner prepares decoding once and reuses it for all rows.
 
 The plan carries the table definition from the reader view selected by `scan_plan()`.
 Workers use that definition without rereading shard metadata for consistency checks. Execution delegates shard opening and
