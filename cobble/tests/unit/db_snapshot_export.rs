@@ -1177,6 +1177,66 @@ fn cloned_export_handles_support_concurrent_async_and_cached_results() {
 }
 
 #[test]
+fn snapshot_to_and_queued_flushes_finish_after_close_starts() {
+    struct ReleaseGate(Arc<Gate>);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let db = database(&root.path().join("source"));
+    let gate = Arc::new(Gate::default());
+    let destination = root.path().join("destination");
+    let handle = std::thread::scope(|scope| {
+        // The callback runs on the flush worker. Hold it before admitting more work so the
+        // independent capture and ordinary flush below are both queued when close starts.
+        let _release = ReleaseGate(Arc::clone(&gate));
+        let blocking = Arc::clone(&gate);
+        db.memtable_manager
+            .create_independent_snapshot(
+                db.snapshot_manager.clone(),
+                Box::new(move |result| {
+                    blocking.enter();
+                    drop(result.unwrap());
+                }),
+            )
+            .unwrap();
+        gate.wait();
+        db.put(0, b"captured", 0, b"snapshot value").unwrap();
+        let handle = db.snapshot_to(volume(&destination)).unwrap();
+        db.put(0, b"later", 0, b"not exported").unwrap();
+        db.memtable_manager.flush_active().unwrap();
+
+        let closing = scope.spawn(|| db.close());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while db.db_lifecycle.state() == crate::db_status::DbLifecycleState::Open
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let state = db.db_lifecycle.state();
+        let rejected = db.put(0, b"closed", 0, b"must fail");
+        gate.release();
+        closing.join().unwrap().unwrap();
+        assert_eq!(state, crate::db_status::DbLifecycleState::Closing);
+        assert!(matches!(rejected, Err(Error::InvalidState(_))));
+        handle
+    });
+
+    let exported = bounded_result(handle).unwrap();
+    let flushes = db.memtable_manager.wait_for_flushes();
+    assert_eq!(flushes.len(), 2);
+    assert!(flushes.iter().all(Result::is_ok));
+    let restored =
+        Db::open_new_with_manifest_path(config(&destination), exported.manifest_path).unwrap();
+    assert_value(&restored, b"captured", b"snapshot value");
+    assert!(restored.get(0, b"later").unwrap().is_none());
+    restored.close().unwrap();
+}
+
+#[test]
 fn export_keeps_database_access_until_io_finishes_and_handles_forced_close() {
     for forced in [false, true] {
         let root = tempfile::tempdir().unwrap();

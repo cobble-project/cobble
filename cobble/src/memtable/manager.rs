@@ -1341,7 +1341,7 @@ impl MemtableManager {
             .name("cobble-flush".to_string())
             .spawn(move || {
                 while let Ok(job) = flush_rx.recv() {
-                    if let Err(err) = db_lifecycle.ensure_open() {
+                    if let Err(err) = db_lifecycle.ensure_flush_allowed() {
                         Self::fail_snapshot(&job.snapshot, err);
                         // Remove immutable from state so the memtable can be
                         // fully dropped, triggering the reclaimer → buffer_ready.

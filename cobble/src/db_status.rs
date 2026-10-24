@@ -242,6 +242,14 @@ impl DbLifecycle {
         Err(self.error_or_invalid_state())
     }
 
+    /// Already-admitted flush jobs must drain during graceful close, before workers stop.
+    pub(crate) fn ensure_flush_allowed(&self) -> Result<()> {
+        match self.state() {
+            DbLifecycleState::Open | DbLifecycleState::Closing => Ok(()),
+            state => Err(self.error_for_state(state)),
+        }
+    }
+
     pub(crate) fn begin_access(&self) -> Result<DbAccessGuard<'_>> {
         self.try_begin_access()?;
         Ok(DbAccessGuard { lifecycle: self })
@@ -373,7 +381,10 @@ impl DbLifecycle {
     }
 
     fn error_or_invalid_state(&self) -> Error {
-        let state = self.state();
+        self.error_for_state(self.state())
+    }
+
+    fn error_for_state(&self, state: DbLifecycleState) -> Error {
         if state == DbLifecycleState::Error
             && let Some(err) = self.error.load_full()
         {

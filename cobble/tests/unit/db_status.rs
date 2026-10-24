@@ -20,15 +20,20 @@ fn lifecycle_transitions_preserve_errors_and_reject_new_accesses_when_closing() 
     {
         let lifecycle = DbLifecycle::new_initializing();
         assert_eq!(lifecycle.state(), DbLifecycleState::Initializing);
+        assert!(lifecycle.ensure_flush_allowed().is_err());
         lifecycle.mark_open().unwrap();
         assert_eq!(lifecycle.state(), DbLifecycleState::Open);
+        lifecycle.ensure_flush_allowed().unwrap();
         assert_eq!(
             lifecycle.begin_close().unwrap(),
             CloseTransition::Transitioned
         );
         assert_eq!(lifecycle.state(), DbLifecycleState::Closing);
+        lifecycle.ensure_flush_allowed().unwrap();
+        assert!(lifecycle.ensure_open().is_err());
         lifecycle.mark_closed();
         assert_eq!(lifecycle.state(), DbLifecycleState::Closed);
+        assert!(lifecycle.ensure_flush_allowed().is_err());
         assert_eq!(
             lifecycle.begin_close().unwrap(),
             CloseTransition::AlreadyClosingOrClosed
@@ -42,6 +47,10 @@ fn lifecycle_transitions_preserve_errors_and_reject_new_accesses_when_closing() 
         assert_eq!(lifecycle.state(), DbLifecycleState::Error);
         let err = lifecycle.ensure_open().unwrap_err();
         assert_eq!(err.to_string(), original.to_string());
+        assert_eq!(
+            lifecycle.ensure_flush_allowed().unwrap_err().to_string(),
+            original.to_string()
+        );
     }
 
     {
