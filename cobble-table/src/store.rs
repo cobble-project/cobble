@@ -70,6 +70,23 @@ impl TableStoreBuilder {
         })
     }
 
+    /// Restore a new store from a source snapshot, retaining registered schema transforms.
+    ///
+    /// A fresh DB identity and snapshot chain are created; the builder's DB ID is ignored.
+    /// Bucket ranges come from the source manifest, not the builder. The source WAL is not replayed.
+    pub fn open_new_with_manifest_path(
+        self,
+        manifest_path: impl Into<String>,
+    ) -> Result<TableStore> {
+        Ok(TableStore {
+            db: Arc::new(
+                self.transforms
+                    .apply_to(self.builder)?
+                    .open_new_with_manifest_path(manifest_path)?,
+            ),
+        })
+    }
+
     /// Resume the existing store's snapshot chain at exactly this snapshot.
     ///
     /// This is snapshot-only recovery: later durable WAL records are not replayed.

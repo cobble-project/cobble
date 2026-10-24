@@ -531,6 +531,23 @@ fn list_catalog_widening_custom_transform_and_dedicated_compaction_keep_common_e
     assert_eq!(table.get(&key).unwrap(), Some(expected.clone()));
     let latest = store.snapshot_and_wait().unwrap();
     drop(table);
+
+    // Importing into a new store must install both custom transforms and the List resolver.
+    let imported = make_store()
+        .open_new_with_manifest_path(&latest.manifest_path)
+        .unwrap();
+    assert_ne!(imported.id(), store.id());
+    assert_eq!(
+        imported
+            .open_materialized_table(&transformed)
+            .unwrap()
+            .get(&key)
+            .unwrap(),
+        Some(expected.clone())
+    );
+    imported.close().unwrap();
+    drop(imported);
+
     store.switch_to_snapshot(old.snapshot_id).unwrap();
     assert_eq!(
         store

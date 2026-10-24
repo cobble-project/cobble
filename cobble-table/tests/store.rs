@@ -131,7 +131,7 @@ fn store_snapshots_restore_all_tables_and_require_released_handles() {
 
     // Process-style exact recovery also installs widening transforms before opening the DB,
     // and does not replay the durable post-checkpoint WAL tail.
-    let store = TableStore::builder(config)
+    let store = TableStore::builder(config.clone())
         .db_id("shared")
         .resume_from_snapshot(checkpoint.snapshot_id)
         .unwrap();
@@ -146,6 +146,51 @@ fn store_snapshots_restore_all_tables_and_require_released_handles() {
         right.get(&right_key).unwrap(),
         Some(vec![Value::Int64(1), Value::String("checkpoint".into())])
     );
+
+    // A new job imports the checkpoint without taking over the source identity or WAL tail.
+    let imported = TableStore::builder(config.clone())
+        .open_new_with_manifest_path(&checkpoint.manifest_path)
+        .unwrap();
+    assert_ne!(imported.id(), store.id());
+    {
+        let left = imported.open_materialized_table(&evolved).unwrap();
+        let right = imported.open_table("right").unwrap();
+        assert_eq!(left.schema(), evolved.schema());
+        assert_eq!(
+            left.get(&left_key).unwrap(),
+            Some(vec![Value::Int64(1), Value::Int64(10)])
+        );
+        assert_eq!(
+            right.get(&right_key).unwrap(),
+            Some(vec![Value::Int64(1), Value::String("checkpoint".into())])
+        );
+        assert!(imported.open_table("later").is_err());
+        right
+            .put(&[Value::Int64(1), Value::String("new job".into())])
+            .unwrap();
+    }
+    let imported_snapshot = imported.snapshot_and_wait().unwrap();
+    assert_eq!(imported_snapshot.db_id, imported.id());
+    assert_eq!(imported_snapshot.ranges, checkpoint.ranges);
+    imported.close().unwrap();
+    drop(imported);
+    let imported = TableStore::builder(config)
+        .db_id(&imported_snapshot.db_id)
+        .resume_from_snapshot(imported_snapshot.snapshot_id)
+        .unwrap();
+    assert_eq!(
+        imported
+            .open_table("right")
+            .unwrap()
+            .get(&right_key)
+            .unwrap(),
+        Some(vec![Value::Int64(1), Value::String("new job".into())])
+    );
+    assert_eq!(
+        right.get(&right_key).unwrap(),
+        Some(vec![Value::Int64(1), Value::String("checkpoint".into())])
+    );
+    imported.close().unwrap();
     assert!(!store.cancel_snapshot(checkpoint.snapshot_id).unwrap());
     assert!(store.expire_snapshot(first.snapshot_id).unwrap());
     store.close().unwrap();
