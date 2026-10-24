@@ -31,6 +31,122 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class TableScanPlanTest {
 
     @Test
+    void recursiveProjectionSurvivesSerializationSplitAndPartition() throws Exception {
+        Path root = Files.createTempDirectory("cobble-java-recursive-projection-");
+        Config config = new Config().addVolume(root.toString()).numColumns(1).totalBuckets(1);
+        DataField kept = new DataField(11, "kept", LogicalTypes.int32());
+        StructType nested =
+                LogicalTypes.struct(
+                        new RecordType(
+                                Arrays.asList(
+                                        new DataField(10, "unused", LogicalTypes.string()), kept)));
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(2, "nested", nested)),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        GlobalSnapshot snapshot;
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "data", schema)) {
+            for (int id = 1; id <= 2; id++)
+                table.put(
+                        Arrays.asList(
+                                Value.int64(id),
+                                Value.struct(
+                                        Arrays.asList(Value.string("skip"), Value.int32(id)))));
+            try (TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 1, 1)) {
+                snapshot = committer.commitBatch(1, Collections.singletonList(db.snapshot()));
+            }
+        }
+        TableScanPlan full;
+        try (TableReader reader = TableReader.open(config, "data", snapshot.id)) {
+            full = reader.scanPlan();
+        }
+        TableReadSchema selection =
+                new TableReadSchema(
+                        Arrays.asList(
+                                new DataField(
+                                        2,
+                                        "nested",
+                                        LogicalTypes.struct(
+                                                new RecordType(Collections.singletonList(kept)))),
+                                schema.fields().get(0)));
+        TableScanPlan plan = roundTrip(full.project(selection));
+        assertEquals(selection.fields(), plan.readSchema().fields());
+        assertTrue(plan == plan.project(selection));
+        List<List<Value>> expected =
+                Arrays.asList(
+                        Arrays.asList(
+                                Value.struct(Collections.singletonList(Value.int32(1))),
+                                Value.int64(1)),
+                        Arrays.asList(
+                                Value.struct(Collections.singletonList(Value.int32(2))),
+                                Value.int64(2)));
+        TableScanSplit split = roundTrip(plan.splits().get(0));
+        assertEquals(selection.fields(), split.readSchema().fields());
+        assertEquals(expected, readTyped(config, split));
+        assertEquals(expected, readProjected(config, plan.forSplit(full.splits().get(0))));
+        TableScanPlan.Partition partition =
+                plan.partitionAfter(
+                        plan.splits().get(0),
+                        0,
+                        KeyCodec.encode(
+                                Collections.singletonList(LogicalTypes.int64()),
+                                Collections.singletonList(Value.int64(1))));
+        assertEquals(expected.subList(0, 1), readProjected(config, roundTrip(partition.before)));
+        assertEquals(expected.subList(1, 2), readProjected(config, roundTrip(partition.after)));
+        assertEquals(
+                expected.subList(0, 1),
+                readTyped(config, roundTrip(partition.before.splits().get(0))));
+        assertEquals(
+                expected.subList(1, 2),
+                readTyped(config, roundTrip(partition.after.splits().get(0))));
+        assertTrue(
+                plan.splits().get(0).nativeProjection()
+                        == partition.before.splits().get(0).nativeProjection());
+        TableScanPlan empty = plan.project(Collections.<String>emptyList());
+        assertEquals(
+                Arrays.asList(Collections.emptyList(), Collections.emptyList()),
+                readTyped(config, roundTrip(empty.splits().get(0))));
+        assertEquals(
+                Arrays.asList(Collections.emptyList(), Collections.emptyList()),
+                readProjected(config, empty));
+        // Raw explicit-field reads remain independent of the split's captured typed selection.
+        try (ScanCursor raw = split.openScanner(config, Arrays.asList("id", "nested"), 0)) {
+            ScanCursor.Entry entry = raw.nextEntry();
+            assertEquals(
+                    Value.struct(Arrays.asList(Value.string("skip"), Value.int32(1))),
+                    ValueCodec.decode(nested, ByteBuffer.wrap(entry.columns[0])));
+        }
+        assertEquals(
+                physicalBytes(config, full.project(Collections.singletonList("nested"))),
+                physicalBytes(config, plan));
+        assertEquals(
+                full.readSchema().fields(),
+                plan.project(Arrays.asList("id", "nested")).readSchema().fields());
+        assertEquals(
+                readTyped(config, full.splits().get(0)),
+                readTyped(config, plan.project(Arrays.asList("id", "nested")).splits().get(0)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        full.project(
+                                new TableReadSchema(
+                                        Arrays.asList(
+                                                schema.fields().get(0), schema.fields().get(0)))));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        full.project(
+                                new TableReadSchema(
+                                        Arrays.asList(
+                                                schema.fields().get(0),
+                                                new DataField(2, "id", nested)))));
+    }
+
+    @Test
     void scansShardManifestPathsOutsideTheRuntimeRoot() throws Exception {
         Path root = Files.createTempDirectory("cobble-java-table-scan-shards-");
         Config coordinatorConfig =
@@ -328,7 +444,7 @@ class TableScanPlanTest {
             throws Exception {
         List<List<Value>> rows = new ArrayList<List<Value>>();
         for (TableScanSplit split : plan.splits()) {
-            try (TableReadProvider<List<Value>, ?> provider = plan.open(config, split);
+            try (TableReadProvider<List<Value>, ?> provider = split.open(config);
                     TableReadSession<List<Value>, ?> session = provider.open();
                     TableReadCursor<List<Value>> cursor =
                             session.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
@@ -339,6 +455,15 @@ class TableScanPlanTest {
                     rows.add(entry.value());
                 }
             }
+        }
+        return rows;
+    }
+
+    private static List<List<Value>> readTyped(Config config, TableScanSplit split) {
+        List<List<Value>> rows = new ArrayList<List<Value>>();
+        try (TableScanCursor cursor = split.openTypedScanner(config, 4096)) {
+            List<Value> row;
+            while ((row = cursor.nextRow()) != null) rows.add(row);
         }
         return rows;
     }

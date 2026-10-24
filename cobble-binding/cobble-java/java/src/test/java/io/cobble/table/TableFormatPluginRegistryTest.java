@@ -148,6 +148,23 @@ class TableFormatPluginRegistryTest {
                 roundTrip(plan.project(Arrays.asList("value", "id"))),
                 split,
                 Arrays.asList(Value.string("one"), Value.int64(1)));
+        // The neutral plugin execution path also travels with a standalone split.
+        TableScanPlan pluginPlan =
+                TableScanPlan.forRead(
+                                snapshot,
+                                new TableReadSchema(schema.fields()),
+                                new TableReadCapabilities(true, true, true),
+                                0L)
+                        .project(Arrays.asList("value", "id"));
+        TableScanSplit pluginSplit = roundTrip(pluginPlan.splits().get(0));
+        assertEquals(pluginPlan.readSchema().fields(), pluginSplit.readSchema().fields());
+        try (TableReadProvider<List<Value>, ?> provider = pluginSplit.open(config);
+                TableReadSession<List<Value>, ?> session = provider.open();
+                TableReadCursor<List<Value>> cursor =
+                        session.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
+            assertEquals(Arrays.asList(Value.string("one"), Value.int64(1)), cursor.next().value());
+            assertEquals(null, cursor.next());
+        }
         try (PhysicalTableReadSession session =
                 new PhysicalTableReadSession(
                         config, snapshot, new NativeTableFormatPlugin().bind(snapshot))) {

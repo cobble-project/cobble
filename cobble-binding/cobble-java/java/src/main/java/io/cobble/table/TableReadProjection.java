@@ -1,22 +1,32 @@
 package io.cobble.table;
 
-import java.util.ArrayList;
+import java.io.Serializable;
 import java.util.List;
 
-/** Java-side typed row projection for format plugins without native pushdown. */
-final class TableReadProjection {
-    private TableReadProjection() {}
+/** Compiled row projection shared by native scans and format plugins. */
+final class TableReadProjection implements Serializable {
+    private static final long serialVersionUID = 1L;
+    final TableReadSchema schema;
+    final ValueProjection fields;
+
+    TableReadProjection(TableReadSchema source, TableReadSchema output) {
+        this.schema = output;
+        this.fields =
+                ValueProjection.compile(
+                        LogicalTypes.struct(new RecordType(source.fields())),
+                        LogicalTypes.struct(new RecordType(output.fields())));
+    }
 
     static TableReadCursor<List<Value>> cursor(
-            TableReadCursor<List<Value>> delegate, int[] projection) {
-        return new Cursor(delegate, projection.clone());
+            TableReadCursor<List<Value>> delegate, TableReadProjection projection) {
+        return projection.fields.identity ? delegate : new Cursor(delegate, projection);
     }
 
     private static final class Cursor implements TableReadCursor<List<Value>> {
         private final TableReadCursor<List<Value>> delegate;
-        private final int[] projection;
+        private final TableReadProjection projection;
 
-        private Cursor(TableReadCursor<List<Value>> delegate, int[] projection) {
+        private Cursor(TableReadCursor<List<Value>> delegate, TableReadProjection projection) {
             this.delegate = delegate;
             this.projection = projection;
         }
@@ -34,9 +44,8 @@ final class TableReadProjection {
     }
 
     private static TableReadEntry<List<Value>> project(
-            TableReadEntry<List<Value>> entry, int[] projection) {
-        ArrayList<Value> values = new ArrayList<Value>(projection.length);
-        for (int index : projection) values.add(entry.value().get(index));
+            TableReadEntry<List<Value>> entry, TableReadProjection projection) {
+        List<Value> values = projection.fields.projectFields(entry.value());
         return new TableReadEntry<List<Value>>(
                 entry.position(), values, entry.physicalBytes(), entry.countsPhysicalEntry());
     }

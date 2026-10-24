@@ -12,7 +12,6 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import java.io.Serializable;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -21,21 +20,22 @@ import java.util.Set;
 /**
  * Serializable scan assignment for one fixed shard snapshot.
  *
- * <p>Use {@link TableScanPlan#open(Config, TableScanSplit)} for format-independent typed reads. The
- * encoded and direct scanner methods are specific to native Cobble tables.
+ * <p>Use {@link #open(Config)} for format-independent projected reads. The encoded and direct
+ * scanner methods are specific to native Cobble tables.
  */
 public class TableScanSplit implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final String splitJson;
-    private TableSchema schema;
-    private int totalBuckets;
+    private final TableSchema schema;
+    private final int totalBuckets;
     private final String formatId;
     private final String columnFamily;
     private final ShardSnapshot shardSnapshot;
     private final String metadataJson;
+    private final TableScanReadContext readContext;
 
-    TableScanSplit(String splitJson) {
+    TableScanSplit(String splitJson, TableScanReadContext readContext) {
         if (splitJson == null || splitJson.trim().isEmpty()) {
             throw new IllegalArgumentException("splitJson must not be empty");
         }
@@ -46,7 +46,13 @@ public class TableScanSplit implements Serializable {
         this.shardSnapshot =
                 ShardSnapshot.fromJson(value.getAsJsonObject("split").get("shard").toString());
         this.metadataJson = value.get("metadata").toString();
-        loadMetadata();
+        this.readContext = Objects.requireNonNull(readContext, "readContext");
+        JsonObject metadata = value.getAsJsonObject("metadata");
+        this.schema = TableSchema.fromJson(metadata.getAsJsonObject("schema").toString());
+        this.totalBuckets = value.get("total_buckets").getAsInt();
+        if (totalBuckets < 1 || totalBuckets > 65536) {
+            throw new IllegalArgumentException("split total_buckets must be in range 1..=65536");
+        }
     }
 
     /** Creates a plugin assignment retaining the exact metadata of its fixed shard. */
@@ -60,6 +66,45 @@ public class TableScanSplit implements Serializable {
         this.columnFamily = requireText(columnFamily, "columnFamily");
         this.shardSnapshot = Objects.requireNonNull(shardSnapshot, "shardSnapshot").copy();
         this.metadataJson = requireText(metadataJson, "metadataJson");
+        this.readContext = null;
+        this.schema = null;
+        this.totalBuckets = 0;
+    }
+
+    private TableScanSplit(TableScanSplit assignment, TableScanReadContext readContext) {
+        this.splitJson = assignment.splitJson;
+        this.schema = assignment.schema;
+        this.totalBuckets = assignment.totalBuckets;
+        this.formatId = assignment.formatId;
+        this.columnFamily = assignment.columnFamily;
+        this.shardSnapshot = assignment.shardSnapshot;
+        this.metadataJson = assignment.metadataJson;
+        this.readContext = Objects.requireNonNull(readContext, "readContext");
+    }
+
+    TableScanSplit withReadContext(TableScanReadContext context) {
+        return readContext == context ? this : new TableScanSplit(this, context);
+    }
+
+    /** Logical fields returned by this split, in selected output order. */
+    public TableReadSchema readSchema() {
+        return requireReadContext().projection.schema;
+    }
+
+    /** Opens this standalone assignment using the format plugin installed in the worker JVM. */
+    public TableReadProvider<List<Value>, ?> open(Config config) {
+        return requireReadContext().open(Objects.requireNonNull(config, "config"), this);
+    }
+
+    private TableScanReadContext requireReadContext() {
+        if (readContext == null)
+            throw new IllegalStateException("split has no captured read context");
+        return readContext;
+    }
+
+    NativeTableScanProjection nativeProjection() {
+        requireNative();
+        return requireReadContext().nativeProjection;
     }
 
     public final String formatId() {
@@ -137,10 +182,10 @@ public class TableScanSplit implements Serializable {
         return Integer.compare(leftKey.length, rightKey.length);
     }
 
-    private static TableScanSplit withPhysicalSplit(JsonObject envelope, ScanSplit physicalSplit) {
+    private TableScanSplit withPhysicalSplit(JsonObject envelope, ScanSplit physicalSplit) {
         JsonObject copy = envelope.deepCopy();
         copy.add("split", JsonParser.parseString(physicalSplit.toJson()));
-        return new TableScanSplit(copy.toString());
+        return new TableScanSplit(copy.toString(), readContext);
     }
 
     static String requireText(String value, String name) {
@@ -153,7 +198,7 @@ public class TableScanSplit implements Serializable {
     private void requireNative() {
         if (splitJson == null) {
             throw new UnsupportedOperationException(
-                    "format '" + formatId + "' requires the plan's plugin reader");
+                    "format '" + formatId + "' has no native encoded scanner; use open()");
         }
     }
 
@@ -231,32 +276,18 @@ public class TableScanSplit implements Serializable {
     }
 
     /**
-     * Open a typed full-row scan using this split's fixed schema.
+     * Open a typed scan using this split's captured projection and fixed source schema.
      *
      * <p>Decodes directly from a reusable native I/O buffer without intermediate byte arrays.
      * Returned rows own their data and remain valid after the cursor advances or closes.
      *
-     * <p>This requests every semantic field, so it is intentionally distinct from {@link
-     * #openScanner(Config, List, int)}, which retains the raw projected connector path.
+     * <p>{@link #openScanner(Config, List, int)} remains an independent raw column-selection path.
      */
     public TableScanCursor openTypedScanner(Config config, int readAheadBytes) {
         requireNative();
-        List<String> fieldNames = new ArrayList<String>(schema.fields().size());
-        for (DataField field : schema.fields()) fieldNames.add(field.name());
-        Table.Compiled compiled = Table.Compiled.from(schema, totalBuckets);
-        DirectScanCursor cursor = openDirectScanner(config, fieldNames, readAheadBytes);
-        return new TableScanCursor(
-                cursor, cursor, entry -> Table.decodeDirectScannedRowOwned(compiled, entry));
-    }
-
-    private void loadMetadata() {
-        JsonObject split = JsonParser.parseString(splitJson).getAsJsonObject();
-        JsonObject metadata = split.getAsJsonObject("metadata");
-        schema = TableSchema.fromJson(metadata.getAsJsonObject("schema").toString());
-        totalBuckets = split.get("total_buckets").getAsInt();
-        if (totalBuckets < 1 || totalBuckets > 65536) {
-            throw new IllegalArgumentException("split total_buckets must be in range 1..=65536");
-        }
+        NativeTableScanProjection projection = nativeProjection();
+        DirectScanCursor cursor = openDirectScanner(config, projection.fieldNames, readAheadBytes);
+        return new TableScanCursor(cursor, cursor, projection::decode);
     }
 
     private static native NativeObject openScannerNative(

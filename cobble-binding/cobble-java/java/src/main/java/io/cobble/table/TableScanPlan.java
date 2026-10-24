@@ -20,12 +20,10 @@ public final class TableScanPlan implements Serializable {
 
     private final String formatId;
     private final TableSchema nativeSchema;
-    private final TableReadSnapshot snapshot;
-    private final TableReadCapabilities capabilities;
     private final TableReadSchema sourceSchema;
     private final TableReadSchema readSchema;
     private final List<TableScanSplit> splits;
-    private final int[] projection;
+    private final TableScanReadContext readContext;
     private final long snapshotId;
     private final int totalBuckets;
     private final long dataSizeBytes;
@@ -33,28 +31,26 @@ public final class TableScanPlan implements Serializable {
     private TableScanPlan(
             String formatId,
             TableSchema nativeSchema,
-            TableReadSnapshot snapshot,
-            TableReadCapabilities capabilities,
             TableReadSchema sourceSchema,
             TableReadSchema readSchema,
             List<? extends TableScanSplit> splits,
-            int[] projection,
+            TableScanReadContext readContext,
             long snapshotId,
             int totalBuckets,
             long dataSizeBytes) {
         this.formatId = TableScanSplit.requireText(formatId, "formatId");
         this.nativeSchema = nativeSchema;
-        this.snapshot = snapshot;
-        this.capabilities = capabilities;
         this.sourceSchema = Objects.requireNonNull(sourceSchema, "sourceSchema");
         this.readSchema = Objects.requireNonNull(readSchema, "readSchema");
-        this.splits = Collections.unmodifiableList(new ArrayList<TableScanSplit>(splits));
-        for (TableScanSplit split : this.splits) {
+        this.readContext = Objects.requireNonNull(readContext, "readContext");
+        List<TableScanSplit> assignments = new ArrayList<TableScanSplit>(splits.size());
+        for (TableScanSplit split : splits) {
             if (!formatId.equals(split.formatId())) {
                 throw new IllegalArgumentException("split format differs from plan format");
             }
+            assignments.add(split.withReadContext(readContext));
         }
-        this.projection = projection.clone();
+        this.splits = Collections.unmodifiableList(assignments);
         if (snapshotId < 0 || totalBuckets < 1 || totalBuckets > 65536 || dataSizeBytes < 0) {
             throw new IllegalArgumentException(
                     "invalid scan snapshot identity, bucket count or size");
@@ -88,12 +84,11 @@ public final class TableScanPlan implements Serializable {
         return new TableScanPlan(
                 snapshot.formatId(),
                 null,
-                snapshot,
-                capabilities,
                 schema,
                 schema,
                 splits,
-                identityProjection(schema),
+                new TableScanReadContext(
+                        snapshot, capabilities, new TableReadProjection(schema, schema)),
                 global.id,
                 global.totalBuckets,
                 dataSizeBytes);
@@ -137,26 +132,24 @@ public final class TableScanPlan implements Serializable {
     public TableScanPlan project(List<String> fieldNames) {
         Objects.requireNonNull(fieldNames, "fieldNames");
         List<DataField> fields = new ArrayList<DataField>();
-        int[] indexes = new int[fieldNames.size()];
         for (int i = 0; i < fieldNames.size(); i++) {
             int index = sourceIndex(fieldNames.get(i));
-            for (int j = 0; j < i; j++) {
-                if (indexes[j] == index)
-                    throw new IllegalArgumentException(
-                            "duplicate read field: " + fieldNames.get(i));
-            }
-            indexes[i] = index;
             fields.add(sourceSchema.fields().get(index));
         }
+        return project(new TableReadSchema(fields));
+    }
+
+    /** Projects nested fields by stable ID; leaf types and map keys must remain unchanged. */
+    public TableScanPlan project(TableReadSchema schema) {
+        if (readSchema.fields().equals(schema.fields())) return this;
+        TableReadProjection selected = new TableReadProjection(sourceSchema, schema);
         return new TableScanPlan(
                 formatId,
                 nativeSchema,
-                snapshot,
-                capabilities,
                 sourceSchema,
-                new TableReadSchema(fields),
+                schema,
                 splits,
-                indexes,
+                readContext.project(nativeSchema, selected),
                 snapshotId,
                 totalBuckets,
                 dataSizeBytes);
@@ -171,7 +164,7 @@ public final class TableScanPlan implements Serializable {
     /** Partitions an assigned native split at an encoded physical key for exact scan resume. */
     public Partition partitionAfter(TableScanSplit split, int bucket, byte[] encodedKeyInclusive) {
         requireAssignedSplit(split);
-        if (snapshot != null) {
+        if (readContext.nativeProjection == null) {
             throw new UnsupportedOperationException(
                     "physical-key split partitioning requires a native table");
         }
@@ -193,12 +186,10 @@ public final class TableScanPlan implements Serializable {
         return new TableScanPlan(
                 formatId,
                 nativeSchema,
-                snapshot,
-                capabilities,
                 sourceSchema,
                 readSchema,
                 Collections.singletonList(split),
-                projection,
+                readContext,
                 snapshotId,
                 totalBuckets,
                 dataSizeBytes);
@@ -210,14 +201,7 @@ public final class TableScanPlan implements Serializable {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(split, "split");
         requireAssignedSplit(split);
-        if (!formatId.equals(split.formatId()))
-            throw new IllegalArgumentException("split format differs from plan format");
-        if (snapshot == null) {
-            return new NativeTableScanReadProvider(config, split, projection);
-        }
-        TableFormatPlugin plugin = TableFormatPluginRegistry.resolve(formatId);
-        return new PhysicalProvider(
-                config, snapshot, plugin, capabilities, split, readSchema, projection);
+        return split.withReadContext(readContext).open(config);
     }
 
     /** Opens a sequential logical cursor across this plan's assigned fixed splits. */
@@ -231,9 +215,7 @@ public final class TableScanPlan implements Serializable {
         for (TableScanSplit assigned : splits) {
             if (sameSplit(assigned, requested)) return;
         }
-        {
-            throw new IllegalArgumentException("split is not part of this plan");
-        }
+        throw new IllegalArgumentException("split is not part of this plan");
     }
 
     private static boolean sameSplit(TableScanSplit left, TableScanSplit right) {
@@ -269,12 +251,6 @@ public final class TableScanPlan implements Serializable {
             if (name.equals(sourceSchema.fields().get(i).name())) return i;
         }
         throw new IllegalArgumentException("unknown read field: " + name);
-    }
-
-    private static int[] identityProjection(TableReadSchema schema) {
-        int[] indexes = new int[schema.fields().size()];
-        for (int i = 0; i < indexes.length; i++) indexes[i] = i;
-        return indexes;
     }
 
     private static final class PlannedCursor implements TableReadCursor<List<Value>> {
@@ -375,96 +351,6 @@ public final class TableScanPlan implements Serializable {
         }
     }
 
-    private static final class PhysicalProvider implements TableReadProvider<List<Value>, Void> {
-        private final Config config;
-        private final TableReadSnapshot snapshot;
-        private final TableFormatPlugin plugin;
-        private final TableReadCapabilities capabilities;
-        private final TableScanSplit split;
-        private final TableReadSchema schema;
-        private final int[] projection;
-
-        private PhysicalProvider(
-                Config config,
-                TableReadSnapshot snapshot,
-                TableFormatPlugin plugin,
-                TableReadCapabilities capabilities,
-                TableScanSplit split,
-                TableReadSchema schema,
-                int[] projection) {
-            this.config = config.copy();
-            this.snapshot = snapshot;
-            this.plugin = plugin;
-            this.capabilities = capabilities;
-            this.split = split;
-            this.schema = schema;
-            this.projection = projection.clone();
-        }
-
-        @Override
-        public TableReadCapabilities capabilities() {
-            return capabilities;
-        }
-
-        @Override
-        public TableReadSession<List<Value>, Void> open() throws Exception {
-            TableFormatBinding binding = plugin.bind(snapshot);
-            return new SplitSession(
-                    new PhysicalTableReadSession(config, snapshot, binding),
-                    split,
-                    schema,
-                    projection);
-        }
-
-        @Override
-        public void close() {}
-    }
-
-    private static final class SplitSession implements TableReadSession<List<Value>, Void> {
-        private final PhysicalTableReadSession delegate;
-        private final TableScanSplit split;
-        private final TableReadSchema schema;
-        private final int[] projection;
-
-        private SplitSession(
-                PhysicalTableReadSession delegate,
-                TableScanSplit split,
-                TableReadSchema schema,
-                int[] projection) {
-            this.delegate = delegate;
-            this.split = split;
-            this.schema = schema;
-            this.projection = projection;
-        }
-
-        @Override
-        public TableReadSchema schema() {
-            return schema;
-        }
-
-        @Override
-        public TableReadCapabilities capabilities() {
-            return delegate.capabilities();
-        }
-
-        @Override
-        public TableReadCursor<List<Value>> scan(TableReadRange range, TableReadPosition position)
-                throws Exception {
-            return TableReadProjection.cursor(
-                    delegate.scan(range, position, split.shardSnapshot().ranges), projection);
-        }
-
-        @Override
-        public java.util.Collection<TableReadEntry<List<Value>>> lookup(Void unused) {
-            throw new UnsupportedOperationException("scan assignments do not support lookup");
-        }
-
-        @Override
-        public void close() {
-            delegate.close();
-        }
-    }
-
     // Only the native factory uses this path, avoiding recursive format resolution.
     static TableScanPlan nativeForSnapshot(Config config, String tableName, long snapshotId) {
         NativeLoader.load();
@@ -476,20 +362,21 @@ public final class TableScanPlan implements Serializable {
         JsonObject response = JsonParser.parseString(json).getAsJsonObject();
         TableSchema schema = TableSchema.fromJson(response.getAsJsonObject("schema").toString());
         TableReadSchema readSchema = new TableReadSchema(schema.fields());
+        TableScanReadContext readContext =
+                new TableScanReadContext(schema, new TableReadProjection(readSchema, readSchema));
         JsonArray values =
                 JsonParser.parseString(splitsNative(response.get("plan").toString()))
                         .getAsJsonArray();
         List<TableScanSplit> splits = new ArrayList<TableScanSplit>();
-        for (JsonElement value : values) splits.add(new TableScanSplit(value.toString()));
+        for (JsonElement value : values)
+            splits.add(new TableScanSplit(value.toString(), readContext));
         return new TableScanPlan(
                 TableMetadata.FORMAT,
                 schema,
-                null,
-                null,
                 readSchema,
                 readSchema,
                 splits,
-                identityProjection(readSchema),
+                readContext,
                 response.get("snapshot_id").getAsLong(),
                 response.get("total_buckets").getAsInt(),
                 response.get("data_size_bytes").getAsLong());

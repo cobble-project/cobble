@@ -4,9 +4,16 @@ import io.cobble.table.CatalogTable;
 import io.cobble.table.DataField;
 import io.cobble.table.FileCatalog;
 import io.cobble.table.LogicalTypes;
+import io.cobble.table.RecordType;
 import io.cobble.table.Table;
 import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableKey;
+import io.cobble.table.TableReadCursor;
+import io.cobble.table.TableReadEntry;
+import io.cobble.table.TableReadProvider;
+import io.cobble.table.TableReadRange;
+import io.cobble.table.TableReadSchema;
+import io.cobble.table.TableReadSession;
 import io.cobble.table.TableReader;
 import io.cobble.table.TableScanCursor;
 import io.cobble.table.TableScanPlan;
@@ -56,6 +63,100 @@ public class TableCrossProcessTest {
 
     @TempDir Path root;
     private final List<Child> children = new ArrayList<Child>();
+
+    @Test
+    void standaloneProjectedSplitsCrossJvmWithoutTheirPlan() throws Exception {
+        Path shared = Files.createDirectories(root.resolve("projected-shared"));
+        Config config = new Config().addVolume(shared.toString()).totalBuckets(1);
+        DataField kept = new DataField(11, "kept", LogicalTypes.binary());
+        TableSchema schema =
+                new TableSchema(
+                        Arrays.asList(
+                                new DataField(1, "id", LogicalTypes.int64()),
+                                new DataField(
+                                        2,
+                                        "nested",
+                                        LogicalTypes.struct(
+                                                new RecordType(
+                                                        Arrays.asList(
+                                                                new DataField(
+                                                                        10,
+                                                                        "skip",
+                                                                        LogicalTypes.string()),
+                                                                kept))))),
+                        Collections.singletonList(1L),
+                        Collections.singletonList(1L));
+        GlobalSnapshot snapshot;
+        try (Db db = Db.open(config);
+                Table table = Table.create(db, "data", schema);
+                TableSnapshotCommitter committer = TableSnapshotCommitter.open(config, 1, 1)) {
+            for (int id = 1; id <= 2; id++)
+                table.put(
+                        Arrays.asList(
+                                Value.int64(id),
+                                Value.struct(
+                                        Arrays.asList(
+                                                Value.string("omitted"),
+                                                Value.binary(new byte[] {(byte) id})))));
+            snapshot = committer.commitBatch(1L, Collections.singletonList(db.snapshot()));
+        }
+        TableScanPlan source;
+        try (TableReader reader = TableReader.open(config, "data", snapshot.id)) {
+            source = reader.scanPlan();
+        }
+        TableScanPlan projected =
+                source.project(
+                        new TableReadSchema(
+                                Arrays.asList(
+                                        new DataField(
+                                                2,
+                                                "nested",
+                                                LogicalTypes.struct(
+                                                        new RecordType(
+                                                                Collections.singletonList(kept)))),
+                                        schema.fields().get(0))));
+        TableScanPlan.Partition partition =
+                projected.partitionAfter(
+                        projected.splits().get(0),
+                        0,
+                        io.cobble.table.KeyCodec.encode(
+                                Collections.singletonList(LogicalTypes.int64()),
+                                Collections.singletonList(Value.int64(1))));
+        ArrayList<TableScanSplit> assignments = new ArrayList<TableScanSplit>();
+        assignments.add(projected.splits().get(0));
+        assignments.add(projected.project(Collections.<String>emptyList()).splits().get(0));
+        assignments.add(partition.before.splits().get(0));
+        assignments.add(partition.after.splits().get(0));
+        Path splitFile = root.resolve("projected-splits.ser");
+        Path reportFile = root.resolve("projected-report.ser");
+        writeObject(splitFile, assignments);
+        try {
+            awaitChild(
+                    startChild(
+                            "projected-splits",
+                            shared.toString(),
+                            splitFile.toString(),
+                            reportFile.toString()),
+                    "standalone projected split scan");
+            List<Value> first =
+                    Arrays.asList(
+                            Value.struct(Collections.singletonList(Value.binary(new byte[] {1}))),
+                            Value.int64(1));
+            List<Value> second =
+                    Arrays.asList(
+                            Value.struct(Collections.singletonList(Value.binary(new byte[] {2}))),
+                            Value.int64(2));
+            assertEquals(
+                    Arrays.asList(
+                            Arrays.asList(first, second),
+                            Arrays.asList(Collections.emptyList(), Collections.emptyList()),
+                            Collections.singletonList(first),
+                            Collections.singletonList(second)),
+                    readObject(reportFile, ArrayList.class));
+        } finally {
+            terminateChildren();
+        }
+    }
 
     @Test
     void heapScanWorksInJvmWithoutModuleAccessFlags() throws Exception {
@@ -241,9 +342,38 @@ public class TableCrossProcessTest {
                 scanner(args);
             } else if ("heap-scan".equals(command)) {
                 heapScan(args);
+            } else if ("projected-splits".equals(command)) {
+                projectedSplits(args);
             } else {
                 throw new IllegalArgumentException("unknown worker command: " + command);
             }
+        }
+
+        private static void projectedSplits(String[] args) throws Exception {
+            Config config = new Config().addVolume(args[1]).totalBuckets(1);
+            List<?> assignments = readObject(path(args, 2), ArrayList.class);
+            ArrayList<List<List<Value>>> report = new ArrayList<List<List<Value>>>();
+            for (Object assignment : assignments) {
+                TableScanSplit split = (TableScanSplit) assignment;
+                List<List<Value>> typed = new ArrayList<List<Value>>();
+                try (TableScanCursor cursor = split.openTypedScanner(config, 4096)) {
+                    List<Value> row;
+                    while ((row = cursor.nextRow()) != null) typed.add(row);
+                }
+                List<List<Value>> neutral = new ArrayList<List<Value>>();
+                try (TableReadProvider<List<Value>, ?> provider = split.open(config);
+                        TableReadSession<List<Value>, ?> session = provider.open();
+                        TableReadCursor<List<Value>> cursor =
+                                session.scan(new TableReadRange(0, Integer.MAX_VALUE), null)) {
+                    if (!split.readSchema().fields().equals(session.schema().fields()))
+                        throw new AssertionError("split projection was lost");
+                    TableReadEntry<List<Value>> entry;
+                    while ((entry = cursor.next()) != null) neutral.add(entry.value());
+                }
+                if (!typed.equals(neutral)) throw new AssertionError("split readers disagree");
+                report.add(typed);
+            }
+            writeObject(path(args, 3), report);
         }
 
         private static void heapScan(String[] args) {

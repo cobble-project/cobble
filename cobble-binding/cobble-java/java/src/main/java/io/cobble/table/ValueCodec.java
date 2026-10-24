@@ -172,15 +172,21 @@ public final class ValueCodec {
     }
 
     private static Value decodeValue(LogicalType type, ByteBuffer input, boolean ownedBinary) {
-        if (!type.isNullable()) return decodeNonNull(type, input, ownedBinary);
+        return readNonNull(type, input)
+                ? decodeNonNull(type, input, ownedBinary)
+                : Value.nullValue();
+    }
+
+    static boolean readNonNull(LogicalType type, ByteBuffer input) {
+        if (!type.isNullable()) return true;
         KeyCodec.requireRemaining(input, 1);
         byte marker = input.get();
         if (marker == 0) {
             if (input.hasRemaining()) throw new IllegalArgumentException("null has trailing bytes");
-            return Value.nullValue();
+            return false;
         }
         if (marker != 1) throw new IllegalArgumentException("invalid nullable marker");
-        return decodeNonNull(type, input, ownedBinary);
+        return true;
     }
 
     private static Value decodeNonNull(LogicalType type, ByteBuffer input, boolean ownedBinary) {
@@ -312,7 +318,7 @@ public final class ValueCodec {
         }
     }
 
-    private static Value finish(ByteBuffer input, Value value) {
+    static Value finish(ByteBuffer input, Value value) {
         if (input.hasRemaining()) throw new IllegalArgumentException("trailing container bytes");
         return value;
     }
@@ -492,16 +498,31 @@ public final class ValueCodec {
     }
 
     private static Value readFramed(LogicalType type, ByteBuffer input, boolean ownedBinary) {
-        int length = getU32Le(input);
-        if (length < 0) throw new IllegalArgumentException("nested value length exceeds i32");
-        KeyCodec.requireRemaining(input, length);
-        ByteBuffer child = input.slice();
-        ((Buffer) child).limit(length);
-        ((Buffer) input).position(input.position() + length);
+        ByteBuffer child = readFrame(input);
         return ownedBinary ? decodeOwned(type, child) : decode(type, child);
     }
 
-    private static int getCount(ByteBuffer input) {
+    static ByteBuffer readFrame(ByteBuffer input) {
+        int length = frameLength(input);
+        ByteBuffer child = input.slice();
+        ((Buffer) child).limit(length);
+        ((Buffer) input).position(input.position() + length);
+        return child;
+    }
+
+    static void skipFrame(ByteBuffer input) {
+        int length = frameLength(input);
+        ((Buffer) input).position(input.position() + length);
+    }
+
+    private static int frameLength(ByteBuffer input) {
+        int length = getU32Le(input);
+        if (length < 0) throw new IllegalArgumentException("nested value length exceeds i32");
+        KeyCodec.requireRemaining(input, length);
+        return length;
+    }
+
+    static int getCount(ByteBuffer input) {
         int count = getU32Le(input);
         if (count < 0) throw new IllegalArgumentException("container count exceeds i32");
         return count;
