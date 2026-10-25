@@ -86,6 +86,32 @@ impl ReadOnlyDbBuilder {
         )
     }
 
+    /// Open a fixed snapshot directly from its manifest path, without a new database identity.
+    ///
+    /// The snapshot id is read from the manifest. Unless [`Self::db_id`] is supplied, the source
+    /// database id is inferred from the conventional `<db-id>/snapshot/<manifest>` path layout.
+    /// Configured storage routes and credentials must cover the manifest and its data files.
+    pub fn open_with_manifest_path(self, manifest_path: impl Into<String>) -> Result<ReadOnlyDb> {
+        let manifest_path = manifest_path.into();
+        let db_id = match self.db_id {
+            Some(db_id) => db_id,
+            None => crate::paths::snapshot_source_db_id(&manifest_path)?,
+        };
+        let metrics_manager = self
+            .metrics_manager
+            .unwrap_or_else(|| Arc::new(MetricsManager::new(&db_id)));
+        ReadOnlyDb::open_from_manifest_path_internal(
+            self.config,
+            None,
+            db_id,
+            &manifest_path,
+            self.block_cache,
+            metrics_manager,
+            self.resolver,
+            self.transforms,
+        )
+    }
+
     /// Opens the exact shard snapshot recorded by a global snapshot manifest.
     ///
     /// The manifest path is authoritative and may be under any subdirectory
@@ -111,7 +137,7 @@ impl ReadOnlyDbBuilder {
             .unwrap_or_else(|| Arc::new(MetricsManager::new(&shard.db_id)));
         ReadOnlyDb::open_from_manifest_path_internal(
             self.config,
-            shard.snapshot_id,
+            Some(shard.snapshot_id),
             shard.db_id.clone(),
             &shard.manifest_path,
             self.block_cache,

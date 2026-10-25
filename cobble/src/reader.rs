@@ -587,7 +587,7 @@ impl Reader {
         )));
         let db = Arc::new(ReadOnlyDb::open_from_manifest_path_internal(
             self.config.clone(),
-            key.snapshot_id,
+            Some(key.snapshot_id),
             key.db_id.clone(),
             &key.manifest_path,
             self.block_cache.clone(),

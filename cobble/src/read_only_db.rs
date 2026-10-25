@@ -185,7 +185,7 @@ impl ReadOnlyDb {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_from_manifest_path_internal(
         config: Config,
-        snapshot_id: u64,
+        expected_snapshot_id: Option<u64>,
         snapshot_db_id: String,
         manifest_path: &str,
         block_cache: Option<BlockCache>,
@@ -213,7 +213,9 @@ impl ReadOnlyDb {
             .ok_or_else(|| {
                 Error::IoError(format!("Snapshot manifest not found: {}", manifest_path))
             })?;
-        if manifest.id != snapshot_id {
+        if let Some(snapshot_id) = expected_snapshot_id
+            && manifest.id != snapshot_id
+        {
             return Err(Error::InvalidState(format!(
                 "Shard snapshot manifest {} has id {}, expected {}",
                 manifest_path, manifest.id, snapshot_id
