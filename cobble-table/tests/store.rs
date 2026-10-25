@@ -2,8 +2,244 @@ use cobble::{Config, ExpandStorageMode, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{
     Catalog, FileCatalog, FileCatalogConfig, SchemaChange, TableIdentifier,
 };
-use cobble_table::{LogicalType, Table, TableError, TableKey, TableSchema, TableStore, Value};
+use cobble_table::{
+    LogicalType, ReadOnlyTableStore, Table, TableError, TableKey, TableSchema, TableStore, Value,
+};
 use std::time::Duration;
+
+#[test]
+fn readonly_store_keeps_catalog_tables_and_derived_handles_at_a_fixed_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(format!(
+            "file://{}/source",
+            root.path().display()
+        )),
+        total_buckets: 1,
+        ..Config::default()
+    };
+    let catalog = FileCatalog::open(&config, FileCatalogConfig::new("catalog")).unwrap();
+    catalog.create_namespace(vec!["app".into()]).unwrap();
+    let left_id = TableIdentifier::new(["app"], "left");
+    let right_id = TableIdentifier::new(["app"], "right");
+    let left_definition = catalog
+        .create_table(left_id.clone(), schema(LogicalType::int32()))
+        .unwrap();
+    let right_definition = catalog
+        .create_table(right_id.clone(), schema(LogicalType::string()))
+        .unwrap();
+    let writer = TableStore::builder(config.clone())
+        .db_id("shared")
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+    let left = writer.materialize_table(&left_definition).unwrap();
+    let right = writer.materialize_table(&right_definition).unwrap();
+    let left_key = key(&left, 1);
+    let right_key = key(&right, 1);
+    left.put(&[Value::Int64(1), Value::Int32(10)]).unwrap();
+    right
+        .put(&[Value::Int64(1), Value::String("old".into())])
+        .unwrap();
+    let first = writer.snapshot_and_wait().unwrap();
+    assert!(writer.retain_snapshot(first.snapshot_id));
+
+    let newer_left = catalog
+        .evolve_schema(
+            &left_id,
+            vec![SchemaChange::AlterFieldType {
+                field_name: "value".into(),
+                logical_type: LogicalType::int64(),
+            }],
+        )
+        .unwrap();
+    let renamed_right = catalog.rename_table(&right_id, "renamed".into()).unwrap();
+    drop(left);
+    let left = writer.materialize_table(&newer_left).unwrap();
+    left.put(&[Value::Int64(1), Value::Int64(99)]).unwrap();
+    right
+        .put(&[Value::Int64(1), Value::String("new".into())])
+        .unwrap();
+    let later = catalog
+        .create_table(
+            TableIdentifier::new(["app"], "later"),
+            schema(LogicalType::int64()),
+        )
+        .unwrap();
+    drop(writer.materialize_table(&later).unwrap());
+    let latest = writer.snapshot_and_wait().unwrap();
+    writer.close().unwrap();
+    drop((left, right, writer));
+
+    assert!(
+        ReadOnlyTableStore::builder(config.clone())
+            .open(first.snapshot_id)
+            .is_err()
+    );
+    let historical = ReadOnlyTableStore::builder(config.clone())
+        .db_id("shared")
+        .open(first.snapshot_id)
+        .unwrap();
+    assert_eq!(historical.id(), "shared");
+    assert!(!historical.metrics().is_empty());
+    let left = historical.open_materialized_table(&newer_left).unwrap();
+    let right = historical.open_materialized_table(&renamed_right).unwrap();
+    assert_eq!(left.schema(), left_definition.schema());
+    assert_eq!(right.schema(), right_definition.schema());
+    assert!(historical.open_materialized_table(&later).is_err());
+    assert!(historical.open_table("missing").is_err());
+    let left_row = vec![Value::Int64(1), Value::Int32(10)];
+    let right_row = vec![Value::Int64(1), Value::String("old".into())];
+    assert_eq!(left.get(&left_key).unwrap(), Some(left_row.clone()));
+    let missing = {
+        let mut key = left.key_builder();
+        key.push(Value::Int64(2));
+        key.build().unwrap()
+    };
+    assert_eq!(
+        left.get_values(&left_key).unwrap(),
+        Some(vec![Value::Int32(10)])
+    );
+    assert_eq!(
+        left.multi_get_values(&[left_key.clone(), missing, left_key.clone()])
+            .unwrap(),
+        vec![
+            Some(vec![Value::Int32(10)]),
+            None,
+            Some(vec![Value::Int32(10)])
+        ]
+    );
+    assert_eq!(
+        left.scan_key_prefix(left_key.values())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![left_row.clone()]
+    );
+    assert_eq!(
+        right.multi_get(std::slice::from_ref(&right_key)).unwrap(),
+        vec![Some(right_row.clone())]
+    );
+    assert_eq!(
+        right
+            .scan(0)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![right_row.clone()]
+    );
+    let projection = left.project_by_names(&["value"]).unwrap();
+    let scanner = right.scan_key_prefix(right_key.values()).unwrap();
+    drop(historical);
+    assert_eq!(left.get(&left_key).unwrap(), Some(left_row));
+    assert_eq!(
+        projection.get(&left_key).unwrap(),
+        Some(vec![Value::Int32(10)])
+    );
+    drop((left, right));
+    assert_eq!(
+        projection
+            .scan(0)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![vec![Value::Int32(10)]]
+    );
+    drop(projection);
+    assert_eq!(
+        scanner.collect::<Result<Vec<_>, _>>().unwrap(),
+        vec![right_row]
+    );
+
+    let latest = ReadOnlyTableStore::builder(config.clone())
+        .db_id("shared")
+        .open(latest.snapshot_id)
+        .unwrap();
+    assert_eq!(
+        latest
+            .open_materialized_table(&newer_left)
+            .unwrap()
+            .get(&left_key)
+            .unwrap(),
+        Some(vec![Value::Int64(1), Value::Int64(99)])
+    );
+    assert!(latest.open_materialized_table(&later).is_ok());
+    let latest_left = latest.open_materialized_table(&newer_left).unwrap();
+    assert_eq!(
+        latest_left.get_values(&left_key).unwrap(),
+        Some(vec![Value::Int64(99)])
+    );
+    assert_eq!(
+        latest_left
+            .scan_key_prefix(left_key.values())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![vec![Value::Int64(1), Value::Int64(99)]]
+    );
+
+    // The manifest may be nested beneath the configured route instead of its conventional root.
+    let routed = Config {
+        volumes: VolumeDescriptor::single_volume(format!("file://{}", root.path().display())),
+        ..config
+    };
+    assert!(
+        ReadOnlyTableStore::builder(routed.clone())
+            .db_id("shared")
+            .open(first.snapshot_id)
+            .is_err()
+    );
+    let shard = cobble::ShardSnapshotRef {
+        column_family_ids: first.column_family_ids(),
+        timestamp_seconds: first.timestamp_seconds,
+        db_id: first.db_id,
+        snapshot_id: first.snapshot_id,
+        manifest_path: first.manifest_path,
+        ranges: first.ranges,
+        data_size_bytes: first.data_size_bytes,
+        incremental_data_size_bytes: first.incremental_data_size_bytes,
+    };
+    let explicit = ReadOnlyTableStore::builder(routed.clone())
+        .open_shard_snapshot(&shard)
+        .unwrap();
+    assert_eq!(
+        explicit
+            .open_materialized_table(&newer_left)
+            .unwrap()
+            .get(&left_key)
+            .unwrap(),
+        Some(vec![Value::Int64(1), Value::Int32(10)])
+    );
+    // The snapshot identity comes from the payload, not from a SNAPSHOT-N filename.
+    let original = url::Url::parse(&shard.manifest_path)
+        .unwrap()
+        .to_file_path()
+        .unwrap();
+    let selected = original.with_file_name("selected-manifest");
+    std::fs::copy(original, &selected).unwrap();
+    for source in [
+        ReadOnlyTableStore::builder(routed.clone()),
+        ReadOnlyTableStore::builder(routed.clone()).db_id("shared"),
+    ] {
+        let direct = source
+            .open_with_manifest_path(selected.to_str().unwrap())
+            .unwrap();
+        assert_eq!(direct.id(), "shared");
+        assert_eq!(
+            direct
+                .open_materialized_table(&newer_left)
+                .unwrap()
+                .get(&left_key)
+                .unwrap(),
+            Some(vec![Value::Int64(1), Value::Int32(10)])
+        );
+    }
+    let mut wrong_id = shard;
+    wrong_id.snapshot_id += 1;
+    assert!(
+        matches!(ReadOnlyTableStore::builder(routed).open_shard_snapshot(&wrong_id), Err(TableError::Storage(cobble::Error::InvalidState(message))) if message.contains("expected"))
+    );
+}
 
 #[test]
 fn store_snapshots_restore_all_tables_and_require_released_handles() {

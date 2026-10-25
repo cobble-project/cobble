@@ -913,7 +913,7 @@ fn lock_physical_reader(reader: &Mutex<Reader>) -> Result<std::sync::MutexGuard<
         .map_err(|_| TableError::internal("table reader core lock poisoned"))
 }
 
-fn validate_catalog_binding(
+pub(crate) fn validate_catalog_binding(
     metadata: &crate::metadata::TableMetadata,
     table_id: Option<TableId>,
 ) -> Result<()> {

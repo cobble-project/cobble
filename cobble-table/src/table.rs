@@ -360,27 +360,12 @@ impl Table {
 
     /// Read all non-key fields in schema order, without assembling the key fields.
     pub fn get_values(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
-        self.db
-            .get_with_options(key.bucket(), key.encoded(), &self.read_options)?
-            .map(|columns| decode_values(&self.compiled, &columns))
-            .transpose()
+        get_table_values(&self.read_backend, &self.compiled, &self.read_options, key)
     }
 
     /// Read non-key fields, preserving input order, duplicate keys and misses.
     pub fn multi_get_values(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
-        let requests = keys
-            .iter()
-            .map(|key| (key.bucket(), key.encoded()))
-            .collect::<Vec<_>>();
-        self.db
-            .multi_get_with_options(&requests, &self.read_options)?
-            .into_iter()
-            .map(|columns| {
-                columns
-                    .map(|columns| decode_values(&self.compiled, &columns))
-                    .transpose()
-            })
-            .collect()
+        multi_get_table_values(&self.read_backend, &self.compiled, &self.read_options, keys)
     }
 
     /// Decode a complete storage key using this table's schema.
@@ -464,38 +449,12 @@ impl Table {
     /// Scan complete leading primary-key fields, including the entire bucket key.
     /// Returns full rows from the single bucket selected by that prefix.
     pub fn scan_key_prefix(&self, values: &[Value]) -> Result<TableScan> {
-        if values.len() < self.compiled.bucket_key_fields
-            || values.len() > self.compiled.key_types.len()
-        {
-            return Err(TableError::codec(
-                "prefix must contain the bucket key and at most the full primary key",
-            ));
-        }
-        let mut prefix = Vec::new();
-        let bucket_end = KeyCodec::encode_row_with_prefix_validated(
-            &self.compiled.key_types[..values.len()],
+        scan_table_key_prefix(
+            &self.read_backend,
+            &self.compiled,
+            &self.scan_options,
             values,
-            self.compiled.bucket_key_fields,
-            &mut prefix,
-        )?;
-        let bucket = self.compiled.bucket_hash.bucket(&prefix[..bucket_end]);
-        let mut end = prefix.clone();
-        while end.last() == Some(&255) {
-            end.pop();
-        }
-        if let Some(last) = end.last_mut() {
-            *last += 1;
-        }
-        Ok(TableScan {
-            inner: self.read_backend.scan_with_options_bounds(
-                bucket,
-                Some(&prefix),
-                if end.is_empty() { None } else { Some(&end) },
-                &self.scan_options,
-            )?,
-            _read_backend: self.read_backend.clone(),
-            compiled: Arc::clone(&self.compiled),
-        })
+        )
     }
 
     /// Scan one bucket from an inclusive primary-key bound to an exclusive bound.
@@ -748,6 +707,16 @@ impl ReadOnlyTable {
         self.typed.get(key)
     }
 
+    /// Read all non-key fields in schema order, without assembling the key fields.
+    pub fn get_values(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
+        self.typed.get_values(key)
+    }
+
+    /// Read non-key fields, preserving input order, duplicate keys and misses.
+    pub fn multi_get_values(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        self.typed.multi_get_values(keys)
+    }
+
     /// Read many primary keys while preserving order and duplicates.
     pub fn multi_get(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
         self.typed.multi_get(keys)
@@ -756,6 +725,12 @@ impl ReadOnlyTable {
     /// Scan all rows in one bucket.
     pub fn scan(&self, bucket: u16) -> Result<TableScan> {
         self.typed.scan(bucket)
+    }
+
+    /// Scan complete leading primary-key fields, including the entire bucket key.
+    /// Returns full rows from the single bucket selected by that prefix.
+    pub fn scan_key_prefix(&self, values: &[Value]) -> Result<TableScan> {
+        self.typed.scan_key_prefix(values)
     }
 
     /// Scan one bucket from an inclusive primary-key bound to an exclusive bound.
@@ -771,6 +746,23 @@ impl ReadOnlyTable {
 }
 
 impl TypedRead {
+    fn get_values(&self, key: &TableKey) -> Result<Option<Vec<Value>>> {
+        get_table_values(&self.read_backend, &self.compiled, &self.read_options, key)
+    }
+
+    fn multi_get_values(&self, keys: &[TableKey]) -> Result<Vec<Option<Vec<Value>>>> {
+        multi_get_table_values(&self.read_backend, &self.compiled, &self.read_options, keys)
+    }
+
+    fn scan_key_prefix(&self, values: &[Value]) -> Result<TableScan> {
+        scan_table_key_prefix(
+            &self.read_backend,
+            &self.compiled,
+            &self.scan_options,
+            values,
+        )
+    }
+
     /// Compile a reusable nested read projection over this fixed view.
     pub fn project(&self, read_schema: &TableReadSchema) -> Result<TableProjection> {
         build_schema_projection(
@@ -1064,6 +1056,77 @@ fn decode_table_key(compiled: &Arc<CompiledTable>, encoded: &[u8]) -> Result<Tab
         values: KeyCodec::decode_row_validated(&compiled.key_types, encoded)?,
     }
     .build()
+}
+
+fn get_table_values(
+    backend: &ReadBackend,
+    compiled: &CompiledTable,
+    options: &ReadOptions,
+    key: &TableKey,
+) -> Result<Option<Vec<Value>>> {
+    backend
+        .get_with_options(key.bucket(), key.encoded(), options)?
+        .map(|columns| decode_values(compiled, &columns))
+        .transpose()
+}
+
+fn multi_get_table_values(
+    backend: &ReadBackend,
+    compiled: &CompiledTable,
+    options: &ReadOptions,
+    keys: &[TableKey],
+) -> Result<Vec<Option<Vec<Value>>>> {
+    let requests = keys
+        .iter()
+        .map(|key| (key.bucket(), key.encoded()))
+        .collect::<Vec<_>>();
+    backend
+        .multi_get_with_options(&requests, options)?
+        .into_iter()
+        .map(|columns| {
+            columns
+                .map(|columns| decode_values(compiled, &columns))
+                .transpose()
+        })
+        .collect()
+}
+
+fn scan_table_key_prefix(
+    backend: &ReadBackend,
+    compiled: &Arc<CompiledTable>,
+    options: &ScanOptions,
+    values: &[Value],
+) -> Result<TableScan> {
+    if values.len() < compiled.bucket_key_fields || values.len() > compiled.key_types.len() {
+        return Err(TableError::codec(
+            "prefix must contain the bucket key and at most the full primary key",
+        ));
+    }
+    let mut prefix = Vec::new();
+    let bucket_end = KeyCodec::encode_row_with_prefix_validated(
+        &compiled.key_types[..values.len()],
+        values,
+        compiled.bucket_key_fields,
+        &mut prefix,
+    )?;
+    let bucket = compiled.bucket_hash.bucket(&prefix[..bucket_end]);
+    let mut end = prefix.clone();
+    while end.last() == Some(&255) {
+        end.pop();
+    }
+    if let Some(last) = end.last_mut() {
+        *last += 1;
+    }
+    Ok(TableScan {
+        inner: backend.scan_with_options_bounds(
+            bucket,
+            Some(&prefix),
+            if end.is_empty() { None } else { Some(&end) },
+            options,
+        )?,
+        _read_backend: backend.clone(),
+        compiled: Arc::clone(compiled),
+    })
 }
 
 fn decode_values(compiled: &CompiledTable, columns: &[Option<Bytes>]) -> Result<Vec<Value>> {

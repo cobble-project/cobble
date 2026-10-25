@@ -13,6 +13,7 @@ mod layout;
 mod logical_type;
 mod metadata;
 mod projection;
+mod readonly_store;
 mod runtime;
 mod scan;
 mod schema;
@@ -43,6 +44,7 @@ pub use logical_type::{
     DataField, ExtensionType, FieldId, LogicalType, LogicalTypeKind, TimestampKind,
 };
 pub use projection::ValueProjection;
+pub use readonly_store::{ReadOnlyTableStore, ReadOnlyTableStoreBuilder};
 pub use runtime::{ReadOnlyTableBuilder, TableReader, TableReaderBuilder, TableWriterBuilder};
 pub use scan::{
     TableScanPlan, TableScanSplit, TableScanSplitScanner, TableScanSplitScannerBuilder,

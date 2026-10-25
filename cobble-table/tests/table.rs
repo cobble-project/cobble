@@ -146,6 +146,7 @@ fn table_runtime_create_open_and_typed_rows() {
         assert!(table.scan_key_prefix(&row1[..3]).is_err());
         assert_eq!(table.get(&key1).unwrap(), Some(row1.clone()));
         assert_eq!(table.get(&missing).unwrap(), None);
+        assert!(table.scan_key_prefix(&[Value::Int64(1)]).is_err());
         let multi_keys = vec![key2.clone(), key1.clone(), key2.clone(), missing.clone()];
         assert_eq!(
             table.multi_get(&multi_keys).unwrap(),
@@ -297,6 +298,8 @@ fn table_runtime_create_open_and_typed_rows() {
         assert_eq!(keys.get(&other_key_only_key).unwrap(), None);
         assert_eq!(key_only_projection.get(&key_only_key).unwrap(), None);
         keys.put(&[Value::Int64(42)]).unwrap();
+        // Keep the unbounded all-0xff prefix available to the fixed snapshot reader too.
+        keys.put(&[Value::Int64(i64::MAX)]).unwrap();
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let snapshot_id = db
@@ -330,6 +333,42 @@ fn table_runtime_create_open_and_typed_rows() {
         );
         assert_eq!(table.get(&key2).unwrap(), Some(row2.clone()));
         assert_eq!(table.get(&missing).unwrap(), None);
+        let deleted = build_read_only_key(&table, &row1[..2]);
+        assert_eq!(table.get_values(&key2).unwrap(), Some(row2[2..].to_vec()));
+        assert_eq!(table.get_values(&missing).unwrap(), None);
+        assert_eq!(table.get_values(&deleted).unwrap(), None);
+        assert_eq!(
+            table
+                .multi_get_values(&[key2.clone(), missing.clone(), deleted.clone(), key2.clone()])
+                .unwrap(),
+            vec![
+                Some(row2[2..].to_vec()),
+                None,
+                None,
+                Some(row2[2..].to_vec())
+            ]
+        );
+        assert!(table.multi_get_values(&[]).unwrap().is_empty());
+        for prefix in [&row2[..1], key2.values()] {
+            assert_eq!(
+                table
+                    .scan_key_prefix(prefix)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                vec![row2.clone()]
+            );
+        }
+        assert!(
+            table
+                .scan_key_prefix(missing.values())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(table.scan_key_prefix(&[]).is_err());
+        assert!(table.scan_key_prefix(&row2[..3]).is_err());
+        assert!(table.scan_key_prefix(&[Value::Int64(1)]).is_err());
         assert_eq!(
             table
                 .multi_get(&[key2.clone(), missing.clone(), key2.clone()])
@@ -386,6 +425,31 @@ fn table_runtime_create_open_and_typed_rows() {
         let keys = ReadOnlyTable::open(Arc::clone(&read_only), "keys").unwrap();
         let key = build_read_only_key(&keys, &[Value::Int64(42)]);
         assert_eq!(keys.get(&key).unwrap(), Some(vec![Value::Int64(42)]));
+        let max_key = build_read_only_key(&keys, &[Value::Int64(i64::MAX)]);
+        let missing = build_read_only_key(&keys, &[Value::Int64(100)]);
+        assert_eq!(keys.get_values(&key).unwrap(), Some(vec![]));
+        assert_eq!(keys.get_values(&max_key).unwrap(), Some(vec![]));
+        assert_eq!(keys.get_values(&missing).unwrap(), None);
+        assert_eq!(
+            keys.multi_get_values(&[key.clone(), missing, max_key.clone(), key.clone()])
+                .unwrap(),
+            vec![Some(vec![]), None, Some(vec![]), Some(vec![])]
+        );
+        assert!(keys.multi_get_values(&[]).unwrap().is_empty());
+        assert_eq!(
+            keys.scan_key_prefix(key.values())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![vec![Value::Int64(42)]]
+        );
+        assert_eq!(
+            keys.scan_key_prefix(max_key.values())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![vec![Value::Int64(i64::MAX)]]
+        );
         assert_eq!(
             keys.project_by_names(&["id"]).unwrap().get(&key).unwrap(),
             Some(vec![Value::Int64(42)])

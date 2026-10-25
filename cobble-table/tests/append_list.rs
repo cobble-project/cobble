@@ -5,9 +5,9 @@ use cobble_table::catalog::{
 };
 use cobble_table::snapshot::TableSnapshotCommitter;
 use cobble_table::{
-    DataField, LogicalType, ReadOnlyTableBuilder, Table, TableKey, TableReaderBuilder, TableSchema,
-    TableStore, Value, ValueCodec, list_element_transform, register_schema_transforms,
-    table_merge_operator_resolver,
+    DataField, LogicalType, ReadOnlyTableBuilder, ReadOnlyTableStore, Table, TableKey,
+    TableReaderBuilder, TableSchema, TableStore, Value, ValueCodec, list_element_transform,
+    register_schema_transforms, table_merge_operator_resolver,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -531,6 +531,34 @@ fn list_catalog_widening_custom_transform_and_dedicated_compaction_keep_common_e
     assert_eq!(table.get(&key).unwrap(), Some(expected.clone()));
     let latest = store.snapshot_and_wait().unwrap();
     drop(table);
+
+    // A fixed read-only store uses the same custom transforms, built-in widening and List
+    // resolver, including when old SST rows are combined with newer append operands.
+    let readonly = ReadOnlyTableStore::builder(config.clone())
+        .register_schema_transform("wrap-int", wrap_int_factory)
+        .unwrap()
+        .open_with_manifest_path(&latest.manifest_path)
+        .unwrap();
+    let readonly_table = readonly.open_materialized_table(&transformed).unwrap();
+    drop(readonly);
+    assert_eq!(readonly_table.get(&key).unwrap(), Some(expected.clone()));
+    assert_eq!(
+        readonly_table
+            .scan(0)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![expected.clone()]
+    );
+    assert_eq!(
+        readonly_table
+            .project_by_names(&["history"])
+            .unwrap()
+            .get(&key)
+            .unwrap(),
+        Some(vec![expected[1].clone()])
+    );
+    drop(readonly_table);
 
     // Importing into a new store must install both custom transforms and the List resolver.
     let imported = make_store()
