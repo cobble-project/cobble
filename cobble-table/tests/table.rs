@@ -85,6 +85,19 @@ fn table_runtime_create_open_and_typed_rows() {
         let key1 = build_key(&table, &key1);
         let key2 = build_key(&table, &key2);
         let missing = build_key(&table, &missing);
+        let encoded = table.encode_key(key1.values()).unwrap();
+        assert_eq!(encoded.encoded(), key1.encoded());
+        assert_eq!(encoded.values(), key1.values());
+        assert_eq!(encoded.bucket(), key1.bucket());
+        assert!(table.encode_key(&[]).is_err());
+        assert!(table.encode_key(&row1[..1]).is_err());
+        assert!(table.encode_key(&row1[..3]).is_err());
+        assert!(
+            table
+                .encode_key(&[Value::Int64(1), Value::Int64(2)])
+                .is_err()
+        );
+        assert!(table.encode_key(&[Value::Null, Value::Int64(2)]).is_err());
         table.put(&row1).unwrap();
         table
             .put_values(&key2, &row2[2..], &WriteOptions::default())
@@ -169,6 +182,38 @@ fn table_runtime_create_open_and_typed_rows() {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(rows, vec![row1.clone(), row2.clone()]);
+        assert_eq!(
+            table
+                .scan_encoded_bounds(bucket, Some(key1.encoded()), Some(key2.encoded()))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![row1.clone()]
+        );
+        assert!(
+            table
+                .scan_encoded_bounds(bucket, Some(key1.encoded()), Some(key1.encoded()))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        let partial = &key1.encoded()[..key1.encoded().len() - 1];
+        assert_eq!(
+            table
+                .scan_encoded_bounds(bucket, Some(partial), None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![row1.clone(), row2.clone()]
+        );
+        assert_eq!(
+            table
+                .scan_encoded_bounds(bucket, None, None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![row1.clone(), row2.clone()]
+        );
 
         let projection = table
             .project_by_names(&["attributes", "tenant", "name"])
@@ -327,6 +372,19 @@ fn table_runtime_create_open_and_typed_rows() {
         let decoded = table.key_from_encoded(key2.encoded()).unwrap();
         assert_eq!(decoded.values(), key2.values());
         assert_eq!(decoded.bucket(), key2.bucket());
+        let encoded = table.encode_key(key2.values()).unwrap();
+        assert_eq!(encoded.encoded(), key2.encoded());
+        assert_eq!(encoded.values(), key2.values());
+        assert_eq!(encoded.bucket(), key2.bucket());
+        assert_eq!(table.get(&encoded).unwrap(), Some(row2.clone()));
+        assert!(table.encode_key(&[]).is_err());
+        assert!(table.encode_key(&row2[..1]).is_err());
+        assert!(table.encode_key(&row2[..3]).is_err());
+        assert!(
+            table
+                .encode_key(&[Value::String("tenant-a".into()), Value::String("2".into())])
+                .is_err()
+        );
         let missing = build_read_only_key(
             &table,
             &[Value::String("tenant-a".to_string()), Value::Int64(9)],

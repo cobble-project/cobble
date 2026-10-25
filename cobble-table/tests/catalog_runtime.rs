@@ -264,6 +264,12 @@ fn catalog_tables_share_storage_routes_and_isolate_snapshots_across_restarts() {
         .open()
         .unwrap();
     assert_eq!(auto_reader.schema().as_ref(), &schema);
+    let encoded = reader.encode_key(keys[0].values()).unwrap();
+    assert_eq!(encoded.encoded(), keys[0].encoded());
+    assert_eq!(encoded.values(), keys[0].values());
+    assert_eq!(encoded.bucket(), keys[0].bucket());
+    assert_eq!(reader.get(&encoded).unwrap(), Some(rows[0].clone()));
+    assert!(reader.encode_key(&[]).is_err());
     assert_eq!(
         reader.multi_get(&keys).unwrap(),
         rows.iter().cloned().map(Some).collect::<Vec<_>>()

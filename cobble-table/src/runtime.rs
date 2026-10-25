@@ -483,6 +483,12 @@ impl TableReader {
         self.typed.load().key_builder()
     }
 
+    /// Validate and encode a complete primary key in the selected snapshot's primary-key order.
+    /// The returned key includes its bucket and can be reused for reads or scan bounds.
+    pub fn encode_key(&self, values: &[Value]) -> Result<TableKey> {
+        self.view_for_access()?.encode_key(values)
+    }
+
     /// Decode a complete storage key using the selected snapshot's table schema.
     pub fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
         self.view_for_access()?.key_from_encoded(encoded)

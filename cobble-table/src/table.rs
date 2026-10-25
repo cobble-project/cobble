@@ -153,21 +153,7 @@ impl TableKeyBuilder {
 
     /// Validate and encode the complete primary key.
     pub fn build(self) -> Result<TableKey> {
-        let mut encoded = Vec::new();
-        let prefix_end = KeyCodec::encode_row_with_prefix_validated(
-            &self.compiled.key_types,
-            &self.values,
-            self.compiled.bucket_key_fields,
-            &mut encoded,
-        )?;
-        let bucket = self.compiled.bucket_hash.bucket(&encoded[..prefix_end]);
-        Ok(TableKey {
-            inner: Arc::new(TableKeyData {
-                values: self.values,
-                bucket,
-                encoded,
-            }),
-        })
+        encode_table_key(&self.compiled, self.values)
     }
 }
 
@@ -230,6 +216,12 @@ impl Table {
             compiled: Arc::clone(&self.compiled),
             values: Vec::with_capacity(self.compiled.key_positions.len()),
         }
+    }
+
+    /// Validate and encode a complete primary key in schema primary-key order.
+    /// The returned key includes its bucket and can be reused for reads, writes or scan bounds.
+    pub fn encode_key(&self, values: &[Value]) -> Result<TableKey> {
+        encode_table_key(&self.compiled, values.to_vec())
     }
 
     /// Compile a reusable read projection from top-level field names.
@@ -466,16 +458,30 @@ impl Table {
     ) -> Result<TableScan> {
         validate_bound(bucket, start_key_inclusive)?;
         validate_bound(bucket, end_key_exclusive)?;
-        Ok(TableScan {
-            inner: self.read_backend.scan_with_options_bounds(
-                bucket,
-                start_key_inclusive.map(|key| key.inner.encoded.as_slice()),
-                end_key_exclusive.map(|key| key.inner.encoded.as_slice()),
-                &self.scan_options,
-            )?,
-            _read_backend: self.read_backend.clone(),
-            compiled: Arc::clone(&self.compiled),
-        })
+        self.scan_encoded_bounds(
+            bucket,
+            start_key_inclusive.map(TableKey::encoded),
+            end_key_exclusive.map(TableKey::encoded),
+        )
+    }
+
+    /// Scan one bucket using inclusive/exclusive storage-key bounds.
+    /// `start` is inclusive, `end` is exclusive, and `None` leaves that side unbounded.
+    /// Bounds may be complete encoded keys or partial encoded prefixes.
+    pub fn scan_encoded_bounds(
+        &self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<TableScan> {
+        scan_table_encoded_bounds(
+            &self.read_backend,
+            &self.compiled,
+            &self.scan_options,
+            bucket,
+            start,
+            end,
+        )
     }
 
     /// Start an asynchronous shard snapshot, returning its id immediately.
@@ -641,11 +647,6 @@ fn ensure_table_schema(db: &Db, name: &str, schema: TableSchema) -> Result<Table
 }
 
 impl ReadOnlyTable {
-    /// Decode a complete storage key using this snapshot's table schema.
-    pub fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
-        self.typed.key_from_encoded(encoded)
-    }
-
     /// Open a table from metadata stored in this snapshot's schema.
     pub fn open(db: Arc<ReadOnlyDb>, name: impl Into<String>) -> Result<Self> {
         let name = validate_name(name.into())?;
@@ -690,6 +691,17 @@ impl ReadOnlyTable {
     /// Start building one primary key in schema order.
     pub fn key_builder(&self) -> TableKeyBuilder {
         self.typed.key_builder()
+    }
+
+    /// Validate and encode a complete primary key in this snapshot's primary-key order.
+    /// The returned key includes its bucket and can be reused for reads or scan bounds.
+    pub fn encode_key(&self, values: &[Value]) -> Result<TableKey> {
+        self.typed.encode_key(values)
+    }
+
+    /// Decode a complete storage key using this snapshot's table schema.
+    pub fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
+        self.typed.key_from_encoded(encoded)
     }
 
     /// Compile a reusable read projection from top-level field names.
@@ -743,6 +755,18 @@ impl ReadOnlyTable {
         self.typed
             .scan_bounds(bucket, start_key_inclusive, end_key_exclusive)
     }
+
+    /// Scan one bucket using inclusive/exclusive storage-key bounds.
+    /// `start` is inclusive, `end` is exclusive, and `None` leaves that side unbounded.
+    /// Bounds may be complete encoded keys or partial encoded prefixes.
+    pub fn scan_encoded_bounds(
+        &self,
+        bucket: u16,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<TableScan> {
+        self.typed.scan_encoded_bounds(bucket, start, end)
+    }
 }
 
 impl TypedRead {
@@ -778,16 +802,18 @@ impl TypedRead {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<TableScan> {
-        Ok(TableScan {
-            inner: self.read_backend.scan_with_options_bounds(
-                bucket,
-                start,
-                end,
-                &self.scan_options,
-            )?,
-            _read_backend: self.read_backend.clone(),
-            compiled: Arc::clone(&self.compiled),
-        })
+        scan_table_encoded_bounds(
+            &self.read_backend,
+            &self.compiled,
+            &self.scan_options,
+            bucket,
+            start,
+            end,
+        )
+    }
+
+    pub(crate) fn encode_key(&self, values: &[Value]) -> Result<TableKey> {
+        encode_table_key(&self.compiled, values.to_vec())
     }
 
     pub(crate) fn key_from_encoded(&self, encoded: &[u8]) -> Result<TableKey> {
@@ -1050,6 +1076,24 @@ pub(crate) fn decode_table_scan_row(
     Ok(row)
 }
 
+fn encode_table_key(compiled: &CompiledTable, values: Vec<Value>) -> Result<TableKey> {
+    let mut encoded = Vec::new();
+    let prefix_end = KeyCodec::encode_row_with_prefix_validated(
+        &compiled.key_types,
+        &values,
+        compiled.bucket_key_fields,
+        &mut encoded,
+    )?;
+    let bucket = compiled.bucket_hash.bucket(&encoded[..prefix_end]);
+    Ok(TableKey {
+        inner: Arc::new(TableKeyData {
+            values,
+            bucket,
+            encoded,
+        }),
+    })
+}
+
 fn decode_table_key(compiled: &Arc<CompiledTable>, encoded: &[u8]) -> Result<TableKey> {
     TableKeyBuilder {
         compiled: Arc::clone(compiled),
@@ -1091,6 +1135,21 @@ fn multi_get_table_values(
         .collect()
 }
 
+fn scan_table_encoded_bounds(
+    backend: &ReadBackend,
+    compiled: &Arc<CompiledTable>,
+    options: &ScanOptions,
+    bucket: u16,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> Result<TableScan> {
+    Ok(TableScan {
+        inner: backend.scan_with_options_bounds(bucket, start, end, options)?,
+        _read_backend: backend.clone(),
+        compiled: Arc::clone(compiled),
+    })
+}
+
 fn scan_table_key_prefix(
     backend: &ReadBackend,
     compiled: &Arc<CompiledTable>,
@@ -1117,16 +1176,14 @@ fn scan_table_key_prefix(
     if let Some(last) = end.last_mut() {
         *last += 1;
     }
-    Ok(TableScan {
-        inner: backend.scan_with_options_bounds(
-            bucket,
-            Some(&prefix),
-            if end.is_empty() { None } else { Some(&end) },
-            options,
-        )?,
-        _read_backend: backend.clone(),
-        compiled: Arc::clone(compiled),
-    })
+    scan_table_encoded_bounds(
+        backend,
+        compiled,
+        options,
+        bucket,
+        Some(&prefix),
+        if end.is_empty() { None } else { Some(&end) },
+    )
 }
 
 fn decode_values(compiled: &CompiledTable, columns: &[Option<Bytes>]) -> Result<Vec<Value>> {

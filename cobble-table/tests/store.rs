@@ -129,6 +129,27 @@ fn readonly_store_keeps_catalog_tables_and_derived_handles_at_a_fixed_snapshot()
         vec![right_row.clone()]
     );
     let projection = left.project_by_names(&["value"]).unwrap();
+    assert_eq!(
+        left.scan_encoded_bounds(0, Some(left_key.encoded()), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![left_row.clone()]
+    );
+    assert!(
+        left.scan_encoded_bounds(0, None, Some(left_key.encoded()))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let prefix = &left_key.encoded()[..left_key.encoded().len() - 1];
+    assert_eq!(
+        left.scan_encoded_bounds(0, Some(prefix), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![left_row.clone()]
+    );
     let scanner = right.scan_key_prefix(right_key.values()).unwrap();
     drop(historical);
     assert_eq!(left.get(&left_key).unwrap(), Some(left_row));
