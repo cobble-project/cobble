@@ -231,6 +231,8 @@ fn tiering_runtime_executes_multiple_jobs_concurrently() {
     drop(state);
 
     assert!(fm.wait_for_offload_idle(Duration::from_secs(5)));
+    assert_eq!(fm.offload_runtime.semaphore.available_permits(), 2);
+    assert_eq!(source.projected_offload_bytes(), 0);
     assert!(
         ran_concurrently,
         "both workers should start before either job is released"

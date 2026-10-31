@@ -269,6 +269,8 @@ impl OffloadRuntime {
     }
 
     fn complete_job(&self, file_id: FileId) {
+        // Pair completion with wait_idle/stop so a waiter cannot miss the final notification.
+        let _idle = self.idle.lock().unwrap();
         if let Some((_, plan)) = self.planned_jobs.remove(&file_id) {
             plan.source_volume
                 .subtract_projected_offload_bytes(plan.projected_source_release_bytes);
@@ -394,24 +396,23 @@ impl OffloadRuntime {
             if let Err(err) = result {
                 warn!("primary tiering task failed for file_id={file_id}: {err}");
             }
-            runtime.complete_job(file_id);
+            // Idle means the completed job's worker slot is available to the next caller.
             drop(permit);
+            runtime.complete_job(file_id);
             drop(file_manager_keepalive);
         });
         Ok(true)
     }
 
     pub(crate) fn wait_idle(&self, timeout: Duration) -> bool {
-        if self.planned_jobs.is_empty() {
-            return true;
-        }
         let guard = self.idle.lock().unwrap();
         let (guard, _) = self
             .done
             .wait_timeout_while(guard, timeout, |_| !self.planned_jobs.is_empty())
             .unwrap();
+        let idle = self.planned_jobs.is_empty();
         drop(guard);
-        self.planned_jobs.is_empty()
+        idle
     }
 
     pub(crate) fn stop(&self) {
