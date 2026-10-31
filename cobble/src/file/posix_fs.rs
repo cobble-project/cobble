@@ -127,17 +127,20 @@ impl FileSystem for PosixFileSystem {
 
     fn delete(&self, path: &str) -> Result<()> {
         let resolved = self.resolve_path(path);
-        if !resolved.exists() {
-            return Ok(());
-        }
-        if resolved.is_dir() {
-            std::fs::remove_dir_all(&resolved).map_err(|e| {
-                Error::IoError(format!("Failed to delete {}: {}", resolved.display(), e))
-            })
+        let result = if resolved.is_dir() {
+            std::fs::remove_dir_all(&resolved)
         } else {
-            std::fs::remove_file(&resolved).map_err(|e| {
-                Error::IoError(format!("Failed to delete {}: {}", resolved.display(), e))
-            })
+            std::fs::remove_file(&resolved)
+        };
+        match result {
+            Ok(()) => Ok(()),
+            // Another cleanup path may have removed the file since the type check.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::IoError(format!(
+                "Failed to delete {}: {}",
+                resolved.display(),
+                error
+            ))),
         }
     }
 

@@ -1,7 +1,10 @@
 use crate::coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest};
 use crate::db_state::full_bucket_range;
 use crate::error::{Error, Result};
-use crate::{Config, Db, MemtableType, ReadOptions, RecoveryMode, WriteBatch, WriteOptions};
+use crate::{
+    Config, Db, DeletionStatus, DeletionWait, MemtableType, ReadOptions, RecoveryMode, WriteBatch,
+    WriteOptions,
+};
 use bytes::Bytes;
 use log::error;
 use std::ops::Deref;
@@ -336,11 +339,24 @@ impl SingleDb {
     }
 
     pub fn close(&self) -> Result<()> {
+        self.close_with_deletion_wait(DeletionWait::Forever)
+            .map(|_| ())
+    }
+
+    /// Finish single-node snapshots before applying the DB's deletion wait policy.
+    pub fn close_with_deletion_wait(&self, wait: DeletionWait) -> Result<DeletionStatus> {
+        if let Err(error) = self.finish_snapshots_for_close() {
+            self.db.force_close();
+            let _ = self.db.close_with_deletion_wait(wait);
+            return Err(error);
+        }
+        self.db.close_with_deletion_wait(wait)
+    }
+
+    fn finish_snapshots_for_close(&self) -> Result<()> {
         let mut state = self.snapshot_state.lock().unwrap();
         state.closing = true;
         if let Some(err) = self.db.lifecycle_error() {
-            drop(state);
-            self.db.force_close();
             return Err(err);
         }
         let (state, _) = self
@@ -348,19 +364,14 @@ impl SingleDb {
             .wait_timeout_while(state, CLOSE_WAIT_TIMEOUT, |state| state.in_flight > 0)
             .unwrap();
         if let Some(err) = self.db.lifecycle_error() {
-            drop(state);
-            self.db.force_close();
             return Err(err);
         }
         if state.in_flight > 0 {
-            drop(state);
-            self.db.force_close();
             return Err(Error::IoError(
                 "Timed out waiting for in-flight single-node snapshots during close".to_string(),
             ));
         }
-        drop(state);
-        self.db.close()
+        Ok(())
     }
 }
 

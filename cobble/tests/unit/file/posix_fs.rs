@@ -5,6 +5,37 @@ use std::os::unix::fs::MetadataExt;
 
 static TEST_ROOT: &str = "file:///tmp/posix_fs_test";
 
+#[test]
+fn concurrent_delete_is_idempotent_but_preserves_other_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let fs = PosixFileSystem::init(
+        &Url::from_directory_path(root.path()).unwrap(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    for _ in 0..64 {
+        fs.open_write("retired").unwrap().close().unwrap();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                start.wait();
+                fs.delete("retired")
+            });
+            let b = scope.spawn(|| {
+                start.wait();
+                fs.delete("retired")
+            });
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+        });
+        fs.delete("retired").unwrap();
+    }
+    fs.open_write("not-a-directory").unwrap().close().unwrap();
+    assert!(fs.delete("not-a-directory/child").is_err());
+}
+
 fn cleanup_test_root() {
     let _ = std::fs::remove_dir_all("/tmp/posix_fs_test");
 }

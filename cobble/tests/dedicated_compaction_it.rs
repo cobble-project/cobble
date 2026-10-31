@@ -1036,6 +1036,14 @@ fn dedicated_compactor_runtime_missing_corrupt_and_inaccessible_fail_loud() {
         Duration::from_millis(10),
         || { count_data_files(root) > 0 && runtime_current_exists(root) }
     ));
+    // Close releases runtime-only files. Retain the SST through a snapshot so this test
+    // removes a live referenced file, rather than relying on delayed close cleanup.
+    let snapshot = db.snapshot().unwrap();
+    assert!(wait_for(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || snapshot_exists(root, snapshot)
+    ));
     db.close().unwrap();
     let data_file = find_file(root, |path| {
         path.extension().and_then(|ext| ext.to_str()) == Some("sst")

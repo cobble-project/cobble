@@ -1226,9 +1226,9 @@ fn snapshot_to_and_queued_flushes_finish_after_close_starts() {
     });
 
     let exported = bounded_result(handle).unwrap();
-    let flushes = db.memtable_manager.wait_for_flushes();
-    assert_eq!(flushes.len(), 2);
-    assert!(flushes.iter().all(Result::is_ok));
+    // Graceful close finishes queued flushes, then releases their file-owning results.
+    // Keeping these results until Drop would allow deletions after the close barrier.
+    assert!(db.memtable_manager.wait_for_flushes().is_empty());
     let restored =
         Db::open_new_with_manifest_path(config(&destination), exported.manifest_path).unwrap();
     assert_value(&restored, b"captured", b"snapshot value");

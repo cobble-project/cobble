@@ -216,8 +216,18 @@ impl TableStore {
 
     /// Close the shared database. Release scanners first: close waits for their active reads
     /// to finish. Table and projection handles may remain, but future operations fail afterwards.
+    /// Success also waits for DB-owned file deletions, so its local directories can be reopened.
     pub fn close(&self) -> Result<()> {
         Ok(self.db.close()?)
+    }
+
+    /// Close with a bounded deletion wait. A cancelled result with in-flight I/O is not
+    /// a safe directory handoff; wait again before reopening the same storage.
+    pub fn close_with_deletion_wait(
+        &self,
+        wait: cobble::DeletionWait,
+    ) -> Result<cobble::DeletionStatus> {
+        Ok(self.db.close_with_deletion_wait(wait)?)
     }
 
     fn exclusive_db(&mut self) -> Result<&mut Db> {

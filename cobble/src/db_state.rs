@@ -531,6 +531,25 @@ impl DbStateHandle {
         self.current.load_full()
     }
 
+    /// Drop live SST, vlog and memtable references after all DB accesses and workers stopped.
+    /// Keep descriptive state (identity/ranges/cursors); no read can enter the closed DB.
+    pub(crate) fn release_closed_state(&self) {
+        let state = self.load();
+        self.current.store(Arc::new(DbState {
+            seq_id: state.seq_id,
+            topology_epoch: state.topology_epoch,
+            bucket_ranges: state.bucket_ranges.clone(),
+            multi_lsm_version: MultiLSMTreeVersion::new(LSMTreeVersion { levels: vec![] }),
+            vlog_version: VlogVersion::new(),
+            active: None,
+            active_schema: None,
+            immutables: VecDeque::new(),
+            min_source_schema_by_cf: Vec::new(),
+            truncation_cursors: state.truncation_cursors.clone(),
+            suggested_base_snapshot_id: state.suggested_base_snapshot_id,
+        }));
+    }
+
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lock.lock().unwrap()
     }

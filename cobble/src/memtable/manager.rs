@@ -988,6 +988,15 @@ impl ImmutableMemtable {
 }
 
 impl MemtableManager {
+    pub(crate) fn release_closed_state(&self) {
+        let results = {
+            let mut state = self.state.lock().unwrap();
+            state.allow_make_active_buffer_in_reclaimer = false;
+            std::mem::take(&mut state.flush_results)
+        };
+        drop(results);
+    }
+
     pub(crate) fn force_close(&self) {
         self.flush_tx.lock().unwrap().take();
         let _ = self.worker.lock().unwrap().take();

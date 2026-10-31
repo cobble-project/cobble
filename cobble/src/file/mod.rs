@@ -1,4 +1,8 @@
 pub mod atomic_replace;
+pub(crate) mod deletion;
+#[cfg(test)]
+#[path = "../../tests/unit/file/deletion_probe.rs"]
+pub(crate) mod deletion_probe;
 mod file_manager;
 mod file_system;
 mod files;

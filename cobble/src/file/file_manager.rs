@@ -13,6 +13,7 @@
 use crate::Config;
 use crate::config::{PrimaryVolumeOffloadPolicyKind, VolumeUsageKind};
 use crate::error::{Error, Result};
+use crate::file::deletion::{DeletionStatus, DeletionWait, FileDeletionQueue};
 use crate::file::file_system::{FastCopyDestination, FileSystem, FileSystemRegistry};
 use crate::file::files::{
     File, RandomAccessFile, SequentialWriteFile, copy_file_contents_and_close,
@@ -135,6 +136,8 @@ impl Clone for VolumeUsage {
 
 pub(crate) struct DataVolume {
     pub(crate) fs: Arc<dyn FileSystem>,
+    /// Shared across this DB's volumes, independently of filesystem instance sharing.
+    pub(crate) deletions: Arc<FileDeletionQueue>,
     pub(crate) base_dir: Option<String>,
     pub(crate) size_limit: Option<u64>,
     pub(crate) used_bytes: Arc<AtomicU64>,
@@ -158,6 +161,7 @@ impl Clone for DataVolume {
     fn clone(&self) -> Self {
         Self {
             fs: Arc::clone(&self.fs),
+            deletions: Arc::clone(&self.deletions),
             base_dir: self.base_dir.clone(),
             size_limit: self.size_limit,
             used_bytes: Arc::clone(&self.used_bytes),
@@ -357,7 +361,7 @@ pub struct TrackedFile {
     pub(crate) path: String,
     /// The underlying file system (needed for deletion on drop).
     pub(crate) fs: Arc<dyn FileSystem>,
-    /// Optional volume usage tracker.
+    /// Optional volume usage and deletion owner.
     pub(crate) volume: Option<Arc<DataVolume>>,
     /// Whether this file's bytes belong to this DB's managed volume usage.
     accounted_on_volume: bool,
@@ -560,8 +564,13 @@ impl Drop for TrackedFile {
         if self.physical_delete_policy() == PhysicalDeletePolicy::ManagedDelete
             && self.explicit_refs.load(Ordering::SeqCst) == 0
         {
-            // Attempt to delete the file, ignore errors
-            let _ = self.fs.delete_async(&self.path);
+            if let Some(volume) = &self.volume {
+                volume
+                    .deletions
+                    .submit(Arc::clone(&self.fs), self.path.clone());
+            } else {
+                let _ = self.fs.delete_async(&self.path);
+            }
         }
         if self.accounted_on_volume
             && let Some(volume) = &self.volume
@@ -1070,7 +1079,14 @@ impl FileManager {
                 "No volume configured for primary data storage".to_string(),
             ));
         }
-        let data_volumes = data_volumes.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let deletions = Arc::new(FileDeletionQueue::default());
+        let data_volumes = data_volumes
+            .into_iter()
+            .map(|mut volume| {
+                volume.deletions = Arc::clone(&deletions);
+                Arc::new(volume)
+            })
+            .collect::<Vec<_>>();
         let meta_volume = Self::choose_meta_volume(&data_volumes)?;
         let data_volumes = Self::sort_data_volumes(data_volumes);
         if create_directories {
@@ -1107,6 +1123,7 @@ impl FileManager {
     ) -> Result<Self> {
         let volume = DataVolume {
             fs,
+            deletions: Default::default(),
             base_dir: None,
             size_limit: None,
             used_bytes: Arc::new(AtomicU64::new(0)),
@@ -1224,6 +1241,7 @@ impl FileManager {
                 let normalized_base_dir = normalize_storage_path_to_url(&volume.base_dir)?;
                 data_volumes.push(DataVolume {
                     fs,
+                    deletions: Default::default(),
                     base_dir: Some(normalized_base_dir),
                     size_limit: volume.size_limit_bytes()?,
                     used_bytes: Arc::new(AtomicU64::new(0)),
@@ -3115,7 +3133,29 @@ impl FileManager {
 
 impl Drop for FileManager {
     fn drop(&mut self) {
+        self.release_closed_files();
+        if let Err(error) = self.wait_for_deletions(self.deletion_wait_on_drop()) {
+            log::warn!("FileManager cleanup failed: {error}");
+        }
+    }
+}
+
+impl FileManager {
+    /// Release manager-owned references before waiting. In particular, do not defer map
+    /// destruction to Drop, which would schedule new deletes after Db::close had returned.
+    pub(crate) fn release_closed_files(&self) {
         self.stop_offload_worker();
+        self.reader_cache.lock().unwrap().clear();
+        self.logical_files.clear();
+        self.metadata_files.clear();
+    }
+
+    pub(crate) fn wait_for_deletions(&self, wait: DeletionWait) -> Result<DeletionStatus> {
+        self.meta_volume.deletions.wait(wait)
+    }
+
+    pub(crate) fn deletion_wait_on_drop(&self) -> DeletionWait {
+        self.meta_volume.deletions.wait_on_drop()
     }
 }
 

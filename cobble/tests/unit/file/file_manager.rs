@@ -676,6 +676,7 @@ fn data_volume_clones_share_usage_and_saturate_removal() {
         .unwrap();
     let volume = DataVolume {
         fs,
+        deletions: Default::default(),
         base_dir: None,
         size_limit: None,
         used_bytes: Arc::new(AtomicU64::new(0)),
@@ -949,6 +950,7 @@ fn test_file_manager_volume_priority_selection() {
         .get_or_register(format!("file://{}/low", root))
         .unwrap();
     let high_volume = DataVolume {
+        deletions: Default::default(),
         fs: Arc::clone(&high_fs),
         base_dir: Some(format!("{}/high", root)),
         size_limit: Some(128),
@@ -962,6 +964,7 @@ fn test_file_manager_volume_priority_selection() {
         readonly_source: false,
     };
     let low_volume = DataVolume {
+        deletions: Default::default(),
         fs: Arc::clone(&low_fs),
         base_dir: Some(format!("{}/low", root)),
         size_limit: None,

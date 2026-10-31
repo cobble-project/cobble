@@ -2,7 +2,7 @@ use crate::cache::new_block_cache_with_config;
 use crate::db_builder::DbBuilder;
 use crate::db_iter::{DbIterator, DbIteratorOptions};
 use crate::db_state::{DbStateHandle, LSMTreeScope, bucket_range_fits_total};
-use crate::db_status::{CloseTransition, DbAccessGuard, DbLifecycle};
+use crate::db_status::{DbAccessGuard, DbLifecycle};
 use crate::error::{Error, Result};
 use crate::file::FileManager;
 use crate::iterator::selects_all_columns;
@@ -28,7 +28,7 @@ use crate::write_batch::{WriteBatch, WriteOp};
 use crate::writer_options::WriterOptions;
 use crate::{Config, ReadOptions, ScanOptions, TimeProvider, WriteOptions};
 use bytes::Bytes;
-use log::{error, info, warn};
+use log::{info, warn};
 use std::collections::HashMap;
 use std::ops::{ControlFlow, Range, RangeInclusive};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +41,8 @@ use crate::metrics_registry;
 use crate::read_only_db::ReadOnlyDb;
 use crate::ttl::{TTLProvider, TtlConfig};
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
+#[path = "db_close.rs"]
+mod close;
 #[path = "db_rescale.rs"]
 mod rescale;
 #[path = "db_restore.rs"]
@@ -59,6 +61,8 @@ struct RecoveredWalCheckpoint {
 /// Public database interface.
 pub struct Db {
     id: String,
+    // Serialize DB shutdown; deletion waiting is separate so callers can cancel or drain it.
+    shutdown_result: Mutex<Option<Result<()>>>,
     db_governance: Option<Arc<dyn crate::governance::DbGovernance>>,
     db_lifecycle: Arc<DbLifecycle>,
     db_state: Arc<DbStateHandle>,
@@ -1114,101 +1118,6 @@ impl Db {
         self.db_lifecycle.error()
     }
 
-    pub(crate) fn force_close(&self) {
-        if let Some(wal_writer) = &self.wal_writer {
-            wal_writer.force_close();
-        }
-        if let Some(worker) = &self.primary_tiering_worker {
-            worker.stop();
-            worker.join();
-        }
-        if let Some(publisher) = &self.runtime_manifest_publisher {
-            publisher.stop();
-            publisher.join();
-        }
-        if let Some(poller) = &self.dedicated_poller {
-            poller.stop();
-        }
-        self.memtable_manager.force_close();
-        self.lsm_tree.shutdown_compaction();
-        self.snapshot_manager.force_close();
-        if let Err(err) = self.unregister_governance() {
-            warn!(
-                "failed to unregister db {} during force close: {}",
-                self.id, err
-            );
-        }
-        self.db_lifecycle.mark_closed();
-    }
-
-    /// Close the database and flush pending state.
-    pub fn close(&self) -> Result<()> {
-        match self.db_lifecycle.begin_close() {
-            Ok(CloseTransition::AlreadyClosingOrClosed) => return Ok(()),
-            Ok(CloseTransition::Transitioned) => {}
-            Err(err) => {
-                self.force_close();
-                return Err(err);
-            }
-        }
-        self.db_lifecycle.wait_for_accesses_to_drain();
-        if let Some(err) = self.lifecycle_error() {
-            self.force_close();
-            return Err(err);
-        }
-        if let Some(wal_writer) = &self.wal_writer
-            && let Err(err) = wal_writer.close()
-        {
-            self.force_close();
-            return Err(err);
-        }
-        if let Some(worker) = &self.primary_tiering_worker {
-            worker.stop();
-            worker.join();
-        }
-        if let Err(err) = self.memtable_manager.close() {
-            self.force_close();
-            return Err(err);
-        }
-        if let Some(err) = self.lifecycle_error() {
-            self.force_close();
-            return Err(err);
-        }
-        self.lsm_tree.shutdown_compaction();
-        // Stop the dedicated compaction poller before closing the snapshot manager so the
-        // poller does not race with snapshot shutdown (e.g. trying to materialize a snapshot
-        // while the materializer worker is being torn down).
-        if let Some(poller) = &self.dedicated_poller {
-            poller.stop();
-            poller.join();
-        }
-        if let Some(publisher) = &self.runtime_manifest_publisher
-            && let Err(err) = publisher.publish_current()
-        {
-            self.db_lifecycle.mark_error(err.clone());
-            self.force_close();
-            return Err(err);
-        }
-        if let Some(publisher) = &self.runtime_manifest_publisher {
-            publisher.stop();
-            publisher.join();
-        }
-        if let Err(err) = self.snapshot_manager.close() {
-            self.force_close();
-            return Err(err);
-        }
-        if let Some(err) = self.lifecycle_error() {
-            self.force_close();
-            return Err(err);
-        }
-        if let Err(err) = self.unregister_governance() {
-            self.force_close();
-            return Err(err);
-        }
-        self.db_lifecycle.mark_closed();
-        Ok(())
-    }
-
     /// Flush the active memtable and capture an LSM snapshot with a manifest.
     /// The manifest is materialized asynchronously after the flush completes.
     pub fn snapshot(&self) -> Result<u64> {
@@ -1781,6 +1690,7 @@ impl Db {
 
         Ok(Self {
             id,
+            shutdown_result: Mutex::new(None),
             db_governance,
             db_lifecycle,
             db_state,
@@ -2472,15 +2382,6 @@ impl crate::SchemaTransformRegistrar for Db {
         T: Fn(Option<Bytes>) -> Result<Option<Bytes>> + Send + Sync + 'static,
     {
         Db::register_schema_transform(self, transform_type, factory)
-    }
-}
-
-impl Drop for Db {
-    fn drop(&mut self) {
-        if let Err(err) = self.close() {
-            error!("db drop forced close after error: {}", err);
-            self.force_close();
-        }
     }
 }
 
