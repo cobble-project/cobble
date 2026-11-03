@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -64,16 +65,16 @@ struct COBBLE_CPP_API GlobalSnapshot {
 };
 
 struct SnapshotCleanupOptions {
-  // Disabling this can make surviving snapshots unrecoverable.
-  bool preserve_dependencies = true;
   // Select IDs at or below the requested ID (global IDs for global cleanup).
   bool include_older_snapshots = false;
 };
 
-struct ShardSnapshotIdentity {
-  std::string db_id;
+struct PreservedSnapshot {
+  // Empty optional denotes a global snapshot.
+  std::optional<std::string> db_id;
   SnapshotId snapshot_id;
   std::string manifest_path;
+  std::vector<std::string> reasons;
 };
 
 struct SnapshotCleanupResult {
@@ -81,7 +82,7 @@ struct SnapshotCleanupResult {
   std::size_t deleted_files;
   std::size_t deleted_shard_snapshots;
   std::size_t deleted_global_snapshots;
-  std::vector<ShardSnapshotIdentity> preserved_snapshots;
+  std::vector<PreservedSnapshot> preserved_snapshots;
 };
 
 // Offline maintenance: no readers, writers, compactors, or snapshot publication
@@ -89,8 +90,8 @@ struct SnapshotCleanupResult {
 // volumes is a JSON array supplying routes and credentials ("[]" is allowed).
 // The shard metadata base is the parent of db_id/snapshot, or an export's
 // shards directory. Only this shard's snapshots are roots: account for global
-// refs or use CleanupGlobalSnapshot instead. See options for destructive
-// consequences.
+// refs or use CleanupGlobalSnapshot instead. Export leases and incremental
+// dependencies are always protected.
 [[nodiscard]] COBBLE_CPP_API SnapshotCleanupResult CleanupShardSnapshot(
     std::string_view metadata_volume_json, std::string_view other_volumes_json,
     std::string_view db_id, SnapshotId snapshot_id,

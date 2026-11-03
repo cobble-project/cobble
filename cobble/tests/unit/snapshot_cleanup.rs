@@ -272,137 +272,131 @@ fn cleanup_shard_option_matrix_preserves_incremental_chains_and_shared_files() {
     use crate::snapshot::manifest::{
         ManifestPayload, load_manifest_chain, load_manifest_chain_from_path, load_manifest_entry,
     };
-    for preserve_dependencies in [true, false] {
-        for include_older_snapshots in [true, false] {
-            // The full-survivor case shares SST/VLOG/schema files without depending on
-            // selected manifests. The incremental case also needs their complete chain.
-            for incremental_survivor in [true, false] {
-                let root = tempfile::tempdir().unwrap();
-                let config = cleanup_config(root.path());
-                let db = open_single_bucket_db(config.clone());
-                let db_id = db.id().to_string();
-                let value = vec![42; 128];
-                let a = create_materialized_snapshot(&db, b"a", &value);
-                let mut schema = db.update_schema();
-                schema.add_column(1, None, None, None).unwrap();
-                schema.commit();
-                let b = create_materialized_snapshot(&db, b"b", &value);
-                let c = create_materialized_snapshot(&db, b"c", &value);
-                assert!(
-                    matches!(cleanup_manifest(root.path(), &db_id, b), ManifestPayload::IncrementalSnapshot(m) if m.base_snapshot_id == a)
-                );
-                assert!(
-                    matches!(cleanup_manifest(root.path(), &db_id, c), ManifestPayload::IncrementalSnapshot(m) if m.base_snapshot_id == b)
-                );
-                let resolved = cleanup_resolved(&config, &db_id, c);
-                // All loading paths must reconstruct the same complete metadata, not just files.
-                let manager = Arc::new(
-                    crate::file::FileManager::from_config(
-                        &config.normalize_volume_paths().unwrap(),
-                        &db_id,
-                        Arc::new(MetricsManager::new(&db_id)),
-                    )
-                    .unwrap(),
-                );
-                let by_id = load_manifest_chain(&manager, c).unwrap();
-                let by_path = load_manifest_chain_from_path(
-                    &manager,
-                    &db.shard_snapshot_metadata(c).unwrap().manifest_path,
+
+    for include_older_snapshots in [true, false] {
+        // The full-survivor case shares SST/VLOG/schema files without depending on
+        // selected manifests. The incremental case also needs their complete chain.
+        for incremental_survivor in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let config = cleanup_config(root.path());
+            let db = open_single_bucket_db(config.clone());
+            let db_id = db.id().to_string();
+            let value = vec![42; 128];
+            let a = create_materialized_snapshot(&db, b"a", &value);
+            let mut schema = db.update_schema();
+            schema.add_column(1, None, None, None).unwrap();
+            schema.commit();
+            let b = create_materialized_snapshot(&db, b"b", &value);
+            let c = create_materialized_snapshot(&db, b"c", &value);
+            assert!(
+                matches!(cleanup_manifest(root.path(), &db_id, b), ManifestPayload::IncrementalSnapshot(m) if m.base_snapshot_id == a)
+            );
+            assert!(
+                matches!(cleanup_manifest(root.path(), &db_id, c), ManifestPayload::IncrementalSnapshot(m) if m.base_snapshot_id == b)
+            );
+            let resolved = cleanup_resolved(&config, &db_id, c);
+            // All loading paths must reconstruct the same complete metadata, not just files.
+            let manager = Arc::new(
+                crate::file::FileManager::from_config(
+                    &config.normalize_volume_paths().unwrap(),
+                    &db_id,
+                    Arc::new(MetricsManager::new(&db_id)),
                 )
-                .unwrap();
-                let storage = super::Storage::new(&config.volumes[0], &[]).unwrap();
-                let shard = super::Shard::load(
-                    &storage,
-                    db_id.clone(),
-                    super::FileKey::new(0, format!("{db_id}/snapshot")),
-                )
-                .unwrap();
-                let mut loaded = std::collections::HashMap::new();
-                assert_eq!(by_id.len(), by_path.len());
-                for (entry, path_entry) in by_id.iter().zip(&by_path) {
-                    let cached = load_manifest_entry(&manager, entry.snapshot_id, &loaded).unwrap();
-                    let cleaned = shard.resolved(entry.snapshot_id).unwrap().unwrap();
-                    let expected = serde_json::to_value(&entry.manifest).unwrap();
-                    for actual in [&path_entry.manifest, &cached.manifest, &cleaned] {
-                        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
-                    }
-                    if let ManifestPayload::IncrementalSnapshot(delta) =
-                        cleanup_manifest(root.path(), &db_id, entry.snapshot_id)
-                    {
-                        assert_eq!(entry.manifest.data_size_bytes, delta.data_size_bytes);
-                        assert_eq!(
-                            entry.manifest.incremental_data_size_bytes,
-                            delta.incremental_data_size_bytes
-                        );
-                    }
-                    loaded.insert(entry.snapshot_id, cached);
+                .unwrap(),
+            );
+            let by_id = load_manifest_chain(&manager, c).unwrap();
+            let by_path = load_manifest_chain_from_path(
+                &manager,
+                &db.shard_snapshot_metadata(c).unwrap().manifest_path,
+            )
+            .unwrap();
+            let storage = super::Storage::new(&config.volumes[0], &[]).unwrap();
+            let shard = super::Shard::load(
+                &storage,
+                db_id.clone(),
+                super::FileKey::new(0, format!("{db_id}/snapshot")),
+            )
+            .unwrap();
+            let mut loaded = std::collections::HashMap::new();
+            assert_eq!(by_id.len(), by_path.len());
+            for (entry, path_entry) in by_id.iter().zip(&by_path) {
+                let cached = load_manifest_entry(&manager, entry.snapshot_id, &loaded).unwrap();
+                let cleaned = shard.resolved(entry.snapshot_id).unwrap();
+                let expected = serde_json::to_value(&entry.manifest).unwrap();
+                for actual in [&path_entry.manifest, &cached.manifest, &cleaned] {
+                    assert_eq!(serde_json::to_value(actual).unwrap(), expected);
                 }
-                let paths = referenced_data_paths(&resolved);
-                assert!(!resolved.vlog_files.is_empty());
-                db.close().unwrap();
-                drop(db);
-                if !incremental_survivor {
-                    write_cleanup_manifest(
-                        root.path(),
-                        &db_id,
-                        c,
-                        &ManifestPayload::Snapshot(resolved),
+                if let ManifestPayload::IncrementalSnapshot(delta) =
+                    cleanup_manifest(root.path(), &db_id, entry.snapshot_id)
+                {
+                    assert_eq!(entry.manifest.data_size_bytes, delta.data_size_bytes);
+                    assert_eq!(
+                        entry.manifest.incremental_data_size_bytes,
+                        delta.incremental_data_size_bytes
                     );
                 }
-                let pointer = cleanup_pointer(root.path(), &db_id, c);
-                let options = SnapshotCleanupOptions {
-                    preserve_dependencies,
-                    include_older_snapshots,
-                };
-                let result =
-                    cleanup_shard_snapshot(&config.volumes[0], &[], &db_id, b, options).unwrap();
-                let retained_chain = preserve_dependencies && incremental_survivor;
-                assert_eq!(
-                    result.preserved_snapshots.len(),
-                    if retained_chain {
-                        if include_older_snapshots { 2 } else { 1 }
-                    } else {
-                        0
-                    }
-                );
-                assert_eq!(
-                    result.deleted_shard_snapshots,
-                    if retained_chain {
-                        0
-                    } else if include_older_snapshots {
-                        2
-                    } else {
-                        1
-                    }
-                );
-                assert_eq!(pointer.exists(), preserve_dependencies);
-                for path in &paths {
-                    if preserve_dependencies {
-                        assert!(
-                            url::Url::parse(path)
-                                .unwrap()
-                                .to_file_path()
-                                .unwrap()
-                                .exists()
-                        );
-                    }
-                }
-                if preserve_dependencies {
-                    let restored = Db::open_from_snapshot(config.clone(), c, &db_id).unwrap();
-                    for key in [b"a", b"b", b"c"] {
-                        assert_eq!(
-                            restored.get(0, key).unwrap().unwrap()[0].as_deref(),
-                            Some(value.as_slice())
-                        );
-                    }
-                    restored.close().unwrap();
-                } else {
-                    assert!(Db::open_from_snapshot(config.clone(), c, &db_id).is_err());
-                }
-                let retry =
-                    cleanup_shard_snapshot(&config.volumes[0], &[], &db_id, b, options).unwrap();
-                assert_eq!(retry.deleted_files + retry.deleted_shard_snapshots, 0);
+                loaded.insert(entry.snapshot_id, cached);
             }
+            let paths = referenced_data_paths(&resolved);
+            assert!(!resolved.vlog_files.is_empty());
+            db.close().unwrap();
+            drop(db);
+            if !incremental_survivor {
+                write_cleanup_manifest(
+                    root.path(),
+                    &db_id,
+                    c,
+                    &ManifestPayload::Snapshot(resolved),
+                );
+            }
+            let pointer = cleanup_pointer(root.path(), &db_id, c);
+            let options = SnapshotCleanupOptions {
+                include_older_snapshots,
+            };
+            let result =
+                cleanup_shard_snapshot(&config.volumes[0], &[], &db_id, b, options).unwrap();
+            let retained_chain = incremental_survivor;
+            assert_eq!(
+                result.preserved_snapshots.len(),
+                if retained_chain {
+                    if include_older_snapshots { 2 } else { 1 }
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                result.deleted_shard_snapshots,
+                if retained_chain {
+                    0
+                } else if include_older_snapshots {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert!(pointer.exists());
+            for path in &paths {
+                assert!(
+                    url::Url::parse(path)
+                        .unwrap()
+                        .to_file_path()
+                        .unwrap()
+                        .exists()
+                );
+            }
+
+            let restored = Db::open_from_snapshot(config.clone(), c, &db_id).unwrap();
+            for key in [b"a", b"b", b"c"] {
+                assert_eq!(
+                    restored.get(0, key).unwrap().unwrap()[0].as_deref(),
+                    Some(value.as_slice())
+                );
+            }
+            restored.close().unwrap();
+
+            let retry =
+                cleanup_shard_snapshot(&config.volumes[0], &[], &db_id, b, options).unwrap();
+            assert_eq!(retry.deleted_files + retry.deleted_shard_snapshots, 0);
         }
     }
 }
@@ -412,215 +406,205 @@ fn cleanup_global_protects_other_shards_and_never_deletes_external_origins() {
     use crate::file::logical_file::ReplicaOrigin;
     use crate::snapshot::manifest::{ManifestPayload, ManifestVlogFile};
     use crate::{CoordinatorConfig, DbCoordinator};
-    for preserve_dependencies in [true, false] {
-        let root = tempfile::tempdir().unwrap();
-        let config = cleanup_config(root.path());
-        let db = open_single_bucket_db(config.clone());
-        let id = create_materialized_snapshot(&db, b"key", &[42; 128]);
-        let db_id = db.id().to_string();
-        let first = db.shard_snapshot_metadata(id).unwrap();
-        let mut manifest = cleanup_resolved(&config, &db_id, id);
-        db.close().unwrap();
-        drop(db);
-        let owned = &mut manifest.tree_levels[0][0].files[0];
-        let original = url::Url::parse(&owned.path)
-            .unwrap()
-            .to_file_path()
-            .unwrap();
-        let job_path = root
-            .path()
-            .join(&db_id)
-            .join("compaction/jobs/job/data/owned.sst");
-        std::fs::create_dir_all(job_path.parent().unwrap()).unwrap();
-        std::fs::rename(original, &job_path).unwrap();
-        owned.path = url::Url::from_file_path(&job_path).unwrap().to_string();
-        let persistent = root
-            .path()
-            .join(&db_id)
-            .join("data/external-persistent.vlog");
-        let leased = root.path().join(&db_id).join("data/external-leased.vlog");
-        std::fs::write(&persistent, b"external").unwrap();
-        std::fs::write(&leased, b"external").unwrap();
-        for (index, (path, origin)) in [
-            (
-                &persistent,
-                ReplicaOrigin::ExternalPersistent {
-                    source_id: "source".into(),
-                },
-            ),
-            (
-                &leased,
-                ReplicaOrigin::ExternalLeased {
-                    export_id: "export".into(),
-                },
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            manifest.vlog_files.push(ManifestVlogFile {
-                file_seq: 99 + index as u32,
-                file_id: 999 + index as u64,
-                path: url::Url::from_file_path(path).unwrap().to_string(),
-                valid_entries: 1,
-                origin,
-            });
-        }
-        // A second shard references the first shard's physical files, but not its manifest.
-        let mut second_manifest = manifest.clone();
-        second_manifest.id = 42;
-        for levels in &mut second_manifest.tree_levels {
-            for level in levels {
-                for file in &mut level.files {
-                    file.origin = ReplicaOrigin::ExternalPersistent {
-                        source_id: db_id.clone(),
-                    };
-                }
+
+    let root = tempfile::tempdir().unwrap();
+    let config = cleanup_config(root.path());
+    let db = open_single_bucket_db(config.clone());
+    let id = create_materialized_snapshot(&db, b"key", &[42; 128]);
+    let db_id = db.id().to_string();
+    let first = db.shard_snapshot_metadata(id).unwrap();
+    let mut manifest = cleanup_resolved(&config, &db_id, id);
+    db.close().unwrap();
+    drop(db);
+    let owned = &mut manifest.tree_levels[0][0].files[0];
+    let original = url::Url::parse(&owned.path)
+        .unwrap()
+        .to_file_path()
+        .unwrap();
+    let job_path = root
+        .path()
+        .join(&db_id)
+        .join("compaction/jobs/job/data/owned.sst");
+    std::fs::create_dir_all(job_path.parent().unwrap()).unwrap();
+    std::fs::rename(original, &job_path).unwrap();
+    owned.path = url::Url::from_file_path(&job_path).unwrap().to_string();
+    let persistent = root
+        .path()
+        .join(&db_id)
+        .join("data/external-persistent.vlog");
+    let leased = root.path().join(&db_id).join("data/external-leased.vlog");
+    std::fs::write(&persistent, b"external").unwrap();
+    std::fs::write(&leased, b"external").unwrap();
+    for (index, (path, origin)) in [
+        (
+            &persistent,
+            ReplicaOrigin::ExternalPersistent {
+                source_id: "source".into(),
+            },
+        ),
+        (
+            &leased,
+            ReplicaOrigin::ExternalLeased {
+                export_id: "export".into(),
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        manifest.vlog_files.push(ManifestVlogFile {
+            file_seq: 99 + index as u32,
+            file_id: 999 + index as u64,
+            path: url::Url::from_file_path(path).unwrap().to_string(),
+            valid_entries: 1,
+            origin,
+        });
+    }
+    // A second shard references the first shard's physical files, but not its manifest.
+    let mut second_manifest = manifest.clone();
+    second_manifest.id = 42;
+    for levels in &mut second_manifest.tree_levels {
+        for level in levels {
+            for file in &mut level.files {
+                file.origin = ReplicaOrigin::ExternalPersistent {
+                    source_id: db_id.clone(),
+                };
             }
         }
-        write_cleanup_manifest(
-            root.path(),
-            &db_id,
-            id,
-            &ManifestPayload::Snapshot(manifest.clone()),
-        );
-        write_cleanup_manifest(
-            root.path(),
-            "other",
-            42,
-            &ManifestPayload::Snapshot(second_manifest),
-        );
-        let mut second = first.clone();
-        second.db_id = "other".into();
-        second.snapshot_id = 42;
-        second.manifest_path =
-            url::Url::from_file_path(root.path().join("other/snapshot/SNAPSHOT-42"))
-                .unwrap()
-                .to_string();
-        let coordinator = DbCoordinator::open(CoordinatorConfig::from_config(&config)).unwrap();
-        coordinator
-            .materialize_global_snapshot(
-                &coordinator
-                    .take_global_snapshot_with_id(1, vec![first], 10)
-                    .unwrap(),
-            )
-            .unwrap();
-        coordinator
-            .materialize_global_snapshot(
-                &coordinator
-                    .take_global_snapshot_with_id(1, vec![second], 20)
-                    .unwrap(),
-            )
-            .unwrap();
-        let pointer = root.path().join("snapshot/CURRENT");
-        let options = SnapshotCleanupOptions {
-            preserve_dependencies,
-            include_older_snapshots: false,
-        };
-        let selected_manifest = root
-            .path()
-            .join(&db_id)
-            .join(format!("snapshot/SNAPSHOT-{id}"));
-        std::fs::write(&selected_manifest, b"bad checksum").unwrap();
-        assert!(cleanup_global_snapshot(&config.volumes[0], &[], 10, options).is_err());
-        assert!(job_path.exists() && root.path().join("snapshot/SNAPSHOT-10").exists());
-        let other_volume = tempfile::tempdir().unwrap();
-        let missing_file = other_volume.path().join("data.sst");
-        std::fs::copy(&job_path, &missing_file).unwrap();
-        let mut missing_route = manifest.clone();
-        missing_route.tree_levels[0][0].files[0].path =
-            url::Url::from_file_path(&missing_file).unwrap().to_string();
-        write_cleanup_manifest(
-            root.path(),
-            &db_id,
-            id,
-            &ManifestPayload::Snapshot(missing_route),
-        );
-        assert!(cleanup_global_snapshot(&config.volumes[0], &[], 10, options).is_err());
-        assert!(
-            missing_file.exists()
-                && job_path.exists()
-                && root.path().join("snapshot/SNAPSHOT-10").exists()
-        );
-        write_cleanup_manifest(
-            root.path(),
-            &db_id,
-            id,
-            &ManifestPayload::Snapshot(manifest),
-        );
-        let result = cleanup_global_snapshot(&config.volumes[0], &[], 10, options).unwrap();
-        assert_eq!(result.deleted_global_snapshots, 1);
-        assert_eq!(result.deleted_shard_snapshots, 1);
-        assert_eq!(job_path.exists(), preserve_dependencies);
-        assert!(persistent.exists() && leased.exists());
-        assert_eq!(pointer.exists(), preserve_dependencies);
-        // Force-cleanup retry tolerates its removed selected shard and never rereads data.
-        assert_eq!(
-            cleanup_global_snapshot(&config.volumes[0], &[], 10, options)
-                .unwrap()
-                .deleted_files,
-            0
-        );
     }
+    write_cleanup_manifest(
+        root.path(),
+        &db_id,
+        id,
+        &ManifestPayload::Snapshot(manifest.clone()),
+    );
+    write_cleanup_manifest(
+        root.path(),
+        "other",
+        42,
+        &ManifestPayload::Snapshot(second_manifest),
+    );
+    let mut second = first.clone();
+    second.db_id = "other".into();
+    second.snapshot_id = 42;
+    second.manifest_path = url::Url::from_file_path(root.path().join("other/snapshot/SNAPSHOT-42"))
+        .unwrap()
+        .to_string();
+    let coordinator = DbCoordinator::open(CoordinatorConfig::from_config(&config)).unwrap();
+    coordinator
+        .materialize_global_snapshot(
+            &coordinator
+                .take_global_snapshot_with_id(1, vec![first], 10)
+                .unwrap(),
+        )
+        .unwrap();
+    coordinator
+        .materialize_global_snapshot(
+            &coordinator
+                .take_global_snapshot_with_id(1, vec![second], 20)
+                .unwrap(),
+        )
+        .unwrap();
+    let pointer = root.path().join("snapshot/CURRENT");
+    let options = SnapshotCleanupOptions {
+        include_older_snapshots: false,
+    };
+    let selected_manifest = root
+        .path()
+        .join(&db_id)
+        .join(format!("snapshot/SNAPSHOT-{id}"));
+    std::fs::write(&selected_manifest, b"bad checksum").unwrap();
+    assert!(cleanup_global_snapshot(&config.volumes[0], &[], 10, options).is_err());
+    assert!(job_path.exists() && root.path().join("snapshot/SNAPSHOT-10").exists());
+    let other_volume = tempfile::tempdir().unwrap();
+    let missing_file = other_volume.path().join("data.sst");
+    std::fs::copy(&job_path, &missing_file).unwrap();
+    let mut missing_route = manifest.clone();
+    missing_route.tree_levels[0][0].files[0].path =
+        url::Url::from_file_path(&missing_file).unwrap().to_string();
+    write_cleanup_manifest(
+        root.path(),
+        &db_id,
+        id,
+        &ManifestPayload::Snapshot(missing_route),
+    );
+    assert!(cleanup_global_snapshot(&config.volumes[0], &[], 10, options).is_err());
+    assert!(
+        missing_file.exists()
+            && job_path.exists()
+            && root.path().join("snapshot/SNAPSHOT-10").exists()
+    );
+    write_cleanup_manifest(
+        root.path(),
+        &db_id,
+        id,
+        &ManifestPayload::Snapshot(manifest),
+    );
+    let result = cleanup_global_snapshot(&config.volumes[0], &[], 10, options).unwrap();
+    assert_eq!(result.deleted_global_snapshots, 1);
+    assert_eq!(result.deleted_shard_snapshots, 1);
+    assert!(job_path.exists());
+    assert!(persistent.exists() && leased.exists());
+    assert!(pointer.exists());
+    // Force-cleanup retry tolerates its removed selected shard and never rereads data.
+    assert_eq!(
+        cleanup_global_snapshot(&config.volumes[0], &[], 10, options)
+            .unwrap()
+            .deleted_files,
+        0
+    );
 }
 
 #[test]
 fn cleanup_preserves_shared_relative_active_segments() {
-    for preserve_dependencies in [true, false] {
-        for include_older_snapshots in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let mut config = cleanup_config(root.path());
-            config.active_memtable_incremental_snapshot_ratio = 1.0;
-            let db = open_single_bucket_db(config.clone());
-            let db_id = db.id().to_string();
-            let _a = create_materialized_snapshot(&db, b"a", b"first");
-            let b = create_materialized_snapshot(&db, b"b", b"second");
-            let c = create_materialized_snapshot(&db, b"c", b"third");
-            let before = cleanup_resolved(&config, &db_id, b);
-            let surviving = cleanup_resolved(&config, &db_id, c);
-            assert!(!before.active_memtable_data.is_empty());
-            let shared = before
-                .active_memtable_data
-                .iter()
-                .map(|segment| {
-                    assert!(segment.path.starts_with("snapshot/SNAPSHOT-ACTIVE-DATA-"));
-                    assert!(
-                        surviving
-                            .active_memtable_data
-                            .iter()
-                            .any(|other| other.path == segment.path)
-                    );
-                    root.path().join(&db_id).join(&segment.path)
-                })
-                .collect::<Vec<_>>();
-            db.close().unwrap();
-            drop(db);
-            let options = SnapshotCleanupOptions {
-                preserve_dependencies,
-                include_older_snapshots,
-            };
-            let result =
-                cleanup_shard_snapshot(&config.volumes[0], &[], &db_id, b, options).unwrap();
-            assert!(result.deleted_shard_snapshots > 0);
-            for path in shared {
-                assert_eq!(path.exists(), preserve_dependencies);
-            }
-            if preserve_dependencies {
-                let restored = Db::open_from_snapshot(config.clone(), c, &db_id).unwrap();
-                for (key, value) in [
-                    (b"a", b"first".as_slice()),
-                    (b"b", b"second".as_slice()),
-                    (b"c", b"third".as_slice()),
-                ] {
-                    assert_eq!(
-                        restored.get(0, key).unwrap().unwrap()[0].as_deref(),
-                        Some(value)
-                    );
-                }
-                restored.close().unwrap();
-            } else {
-                assert!(Db::open_from_snapshot(config.clone(), c, &db_id).is_err());
-            }
+    for include_older_snapshots in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = cleanup_config(root.path());
+        config.active_memtable_incremental_snapshot_ratio = 1.0;
+        let db = open_single_bucket_db(config.clone());
+        let db_id = db.id().to_string();
+        let _a = create_materialized_snapshot(&db, b"a", b"first");
+        let b = create_materialized_snapshot(&db, b"b", b"second");
+        let c = create_materialized_snapshot(&db, b"c", b"third");
+        let before = cleanup_resolved(&config, &db_id, b);
+        let surviving = cleanup_resolved(&config, &db_id, c);
+        assert!(!before.active_memtable_data.is_empty());
+        let shared = before
+            .active_memtable_data
+            .iter()
+            .map(|segment| {
+                assert!(segment.path.starts_with("snapshot/SNAPSHOT-ACTIVE-DATA-"));
+                assert!(
+                    surviving
+                        .active_memtable_data
+                        .iter()
+                        .any(|other| other.path == segment.path)
+                );
+                root.path().join(&db_id).join(&segment.path)
+            })
+            .collect::<Vec<_>>();
+        db.close().unwrap();
+        drop(db);
+        let options = SnapshotCleanupOptions {
+            include_older_snapshots,
+        };
+        let result = cleanup_shard_snapshot(&config.volumes[0], &[], &db_id, b, options).unwrap();
+        assert!(result.deleted_shard_snapshots > 0);
+        for path in shared {
+            assert!(path.exists());
         }
+
+        let restored = Db::open_from_snapshot(config.clone(), c, &db_id).unwrap();
+        for (key, value) in [
+            (b"a", b"first".as_slice()),
+            (b"b", b"second".as_slice()),
+            (b"c", b"third".as_slice()),
+        ] {
+            assert_eq!(
+                restored.get(0, key).unwrap().unwrap()[0].as_deref(),
+                Some(value)
+            );
+        }
+        restored.close().unwrap();
     }
 }

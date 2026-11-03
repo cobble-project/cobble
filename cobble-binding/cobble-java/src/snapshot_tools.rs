@@ -20,7 +20,6 @@ pub extern "system" fn Java_io_cobble_SnapshotTools_cleanupShardSnapshotFromJson
     other_volumes_json: JString,
     db_id: JString,
     snapshot_id: jlong,
-    preserve_dependencies: jboolean,
     include_older_snapshots: jboolean,
 ) -> jstring {
     let db_id = match decode_java_string(&mut env, db_id) {
@@ -36,7 +35,6 @@ pub extern "system" fn Java_io_cobble_SnapshotTools_cleanupShardSnapshotFromJson
         Some(&db_id),
         snapshot_id,
         SnapshotCleanupOptions {
-            preserve_dependencies: preserve_dependencies != JNI_FALSE,
             include_older_snapshots: include_older_snapshots != JNI_FALSE,
         },
     )
@@ -49,7 +47,6 @@ pub extern "system" fn Java_io_cobble_SnapshotTools_cleanupGlobalSnapshotFromJso
     metadata_volume_json: JString,
     other_volumes_json: JString,
     snapshot_id: jlong,
-    preserve_dependencies: jboolean,
     include_older_snapshots: jboolean,
 ) -> jstring {
     cleanup_snapshot_from_json(
@@ -58,7 +55,6 @@ pub extern "system" fn Java_io_cobble_SnapshotTools_cleanupGlobalSnapshotFromJso
         None,
         snapshot_id,
         SnapshotCleanupOptions {
-            preserve_dependencies: preserve_dependencies != JNI_FALSE,
             include_older_snapshots: include_older_snapshots != JNI_FALSE,
         },
     )
@@ -93,29 +89,10 @@ fn cleanup_snapshot_from_json(
         None => cleanup_global_snapshot(&metadata, &others, snapshot_id, options),
     };
     match result {
-        Ok(result) => {
-            let preserved: Vec<_> = result
-                .preserved_snapshots
-                .iter()
-                .map(|snapshot| {
-                    serde_json::json!({
-                        "db_id": snapshot.db_id,
-                        "snapshot_id": snapshot.snapshot_id,
-                        "manifest_path": snapshot.manifest_path,
-                    })
-                })
-                .collect();
-            to_java_string_or_throw(
-                env,
-                serde_json::json!({
-                    "deleted_files": result.deleted_files,
-                    "deleted_shard_snapshots": result.deleted_shard_snapshots,
-                    "deleted_global_snapshots": result.deleted_global_snapshots,
-                    "preserved_snapshots": preserved,
-                })
-                .to_string(),
-            )
-        }
+        Ok(result) => to_java_string_or_throw(
+            env,
+            serde_json::to_string(&result).expect("cleanup result JSON"),
+        ),
         Err(err) => {
             throw_illegal_state(env, err.to_string());
             std::ptr::null_mut()

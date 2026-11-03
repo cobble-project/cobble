@@ -48,6 +48,59 @@ fn list(values: &[i32]) -> Value {
     Value::List(values.iter().copied().map(Value::Int32).collect())
 }
 
+#[test]
+fn offline_cleanup_preserves_native_list_data_without_opening_a_store() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.snapshot_disable_incremental_base_link = true;
+    config.snapshot_only_track = true;
+    let store = TableStore::builder(config.clone())
+        .db_id("lists")
+        .bucket_ranges(vec![0..=0])
+        .open()
+        .unwrap();
+    let table = store.create_table("events", schema()).unwrap();
+    let key = key(&table, 1);
+    table.put(&row(list(&[1]))).unwrap();
+    let old = store.snapshot_and_wait().unwrap();
+    table.append(&key, "items", &[Value::Int32(2)]).unwrap();
+    let latest = store.snapshot_and_wait().unwrap();
+    drop(table);
+    store.close().unwrap();
+    drop(store);
+
+    // Cleanup needs neither Table/List merge operators nor an opened DB.
+    let result = cobble::cleanup_shard_snapshot(
+        &config.volumes[0],
+        &[],
+        "lists",
+        old.snapshot_id,
+        cobble::SnapshotCleanupOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(result.deleted_shard_snapshots, 1);
+    assert!(result.preserved_snapshots.is_empty());
+    {
+        let reader = ReadOnlyTableBuilder::new(config.clone())
+            .table_name("events")
+            .shard_snapshot("lists", latest.snapshot_id)
+            .open()
+            .unwrap();
+        assert_eq!(reader.get(&key).unwrap(), Some(row(list(&[1, 2]))));
+    }
+    let result = cobble::cleanup_shard_snapshot(
+        &config.volumes[0],
+        &[],
+        "lists",
+        latest.snapshot_id,
+        cobble::SnapshotCleanupOptions {
+            include_older_snapshots: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(result.deleted_shard_snapshots, 1);
+}
+
 fn stored_column(
     config: &Config,
     snapshot: &cobble::ShardSnapshotMetadata,

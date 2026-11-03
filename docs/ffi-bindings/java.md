@@ -592,8 +592,9 @@ SnapshotCleanupResult result = SnapshotTools.cleanupGlobalSnapshot(
 
 For one shard, use `SnapshotTools.cleanupShardSnapshot(metadataVolume, otherVolumes,
 dbId, snapshotId, options)`. Volumes use `Config.VolumeDescriptor`, including any
-required credentials. Omitting `options` preserves dependencies and selects only
-the requested snapshot. Results include deletion counts and `preservedSnapshots`.
+required credentials. Omitting `options` selects only the requested snapshot;
+dependencies and export leases are always protected. Results include deletion counts
+and `preservedSnapshots`, with `reasons` and a null `dbId` for retained globals.
 See [Snapshot Cleanup](../reference/tools#snapshot-cleanup) for directory layout,
 options, and dependency safety.
 

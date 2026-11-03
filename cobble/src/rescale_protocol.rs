@@ -15,6 +15,20 @@ pub(crate) struct ExportLease {
     pub(crate) ranges: Vec<RangeInclusive<u16>>,
 }
 
+impl ExportLease {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        let lease: Self = serde_json::from_slice(bytes)
+            .map_err(|err| Error::InvalidState(format!("decode export lease: {err}")))?;
+        if lease.version != 1 {
+            return Err(Error::InvalidState(format!(
+                "unsupported export lease version {}",
+                lease.version
+            )));
+        }
+        Ok(lease)
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ImportStart {
     pub(crate) version: u32,
@@ -95,14 +109,7 @@ pub(crate) fn snapshot_has_export_lease(
         }
         let reader = file_manager
             .open_metadata_file_reader_untracked(&format!("{EXPORT_LEASE_DIR}/{name}"))?;
-        let lease: ExportLease = serde_json::from_slice(reader.read_all()?.as_ref())
-            .map_err(|err| Error::InvalidState(format!("decode export lease {name}: {err}")))?;
-        if lease.version != 1 {
-            return Err(Error::InvalidState(format!(
-                "unsupported export lease version {} in {name}",
-                lease.version
-            )));
-        }
+        let lease = ExportLease::decode(reader.read_all()?.as_ref())?;
         if lease.snapshot_id == snapshot_id {
             return Ok(true);
         }

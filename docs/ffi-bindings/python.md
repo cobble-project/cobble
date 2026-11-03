@@ -169,10 +169,10 @@ result = pycobble.cleanup_global_snapshot(
 ```
 
 For one shard, use `pycobble.cleanup_shard_snapshot(metadata_volume_json,
-other_volumes_json, db_id, snapshot_id)`. Both accept keyword options
-`preserve_dependencies=True` and `include_older_snapshots=False`. Volume arguments
+other_volumes_json, db_id, snapshot_id)`. Both accept the keyword option
+`include_older_snapshots=False`; dependency protection is always enabled. Volume arguments
 are a single descriptor JSON and an array of additional descriptors. Results include
-deletion counts and `preserved_snapshots`, and support pickle.
+deletion counts and `preserved_snapshots` with reasons (a null `db_id` denotes a global), and support pickle.
 See [Snapshot Cleanup](../reference/tools#snapshot-cleanup) for directory layout
 and dependency safety.
 

@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class SnapshotCleanupTest {
     @Test
-    void shardDefaultsPreserveIncrementalBaseAndOptionsAllowBreakingIt(@TempDir Path root)
+    void shardPreservesIncrementalBaseUntilDependentsAreRemoved(@TempDir Path root)
             throws Exception {
         Config config = config(root);
         ShardSnapshot base;
@@ -47,23 +47,24 @@ class SnapshotCleanupTest {
         assertEquals(0, preserved.deletedShardSnapshots);
         assertEquals(0, preserved.deletedGlobalSnapshots);
         assertEquals(1, preserved.preservedSnapshots.size());
-        SnapshotCleanupResult.ShardSnapshotIdentity identity = preserved.preservedSnapshots.get(0);
+        SnapshotCleanupResult.PreservedSnapshot identity = preserved.preservedSnapshots.get(0);
         assertEquals(base.dbId, identity.dbId);
         assertEquals(base.snapshotId, identity.snapshotId);
         assertEquals(path(base.manifestPath), path(identity.manifestPath));
         assertTrue(Files.exists(path(base.manifestPath)));
+        assertTrue(identity.reasons.contains("incremental_dependency"));
 
-        SnapshotCleanupOptions options = new SnapshotCleanupOptions();
-        options.preserveDependencies = false;
+        SnapshotTools.cleanupShardSnapshot(
+                metadata, Collections.emptyList(), next.dbId, next.snapshotId);
         SnapshotCleanupResult removed =
                 SnapshotTools.cleanupShardSnapshot(
-                        metadata, Collections.emptyList(), base.dbId, base.snapshotId, options);
+                        metadata, Collections.emptyList(), base.dbId, base.snapshotId);
         assertEquals(1, removed.deletedShardSnapshots);
         assertEquals(0, removed.deletedGlobalSnapshots);
         assertTrue(removed.deletedFiles > 0);
         assertTrue(removed.preservedSnapshots.isEmpty());
         assertFalse(Files.exists(path(base.manifestPath)));
-        assertTrue(Files.exists(path(next.manifestPath)));
+        assertFalse(Files.exists(path(next.manifestPath)));
     }
 
     @Test
@@ -185,7 +186,6 @@ class SnapshotCleanupTest {
                 "test-endpoint",
                 listed.getAsJsonObject("custom_options").get("endpoint").getAsString());
         assertFalse(listed.has("accessId"));
-        assertTrue(new SnapshotCleanupOptions().preserveDependencies);
         assertFalse(new SnapshotCleanupOptions().includeOlderSnapshots);
         assertThrows(
                 IllegalArgumentException.class,

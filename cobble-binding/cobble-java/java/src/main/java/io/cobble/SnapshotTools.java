@@ -32,7 +32,7 @@ public final class SnapshotTools {
      * list is allowed). Only this shard's snapshots are preservation roots: callers must account
      * for global references, or use {@link #cleanupGlobalSnapshot} instead.
      *
-     * <p>Disabling dependency preservation can break surviving snapshots. Older-snapshot selection
+     * <p>Export leases and snapshot dependencies are always protected. Older-snapshot selection
      * includes all shard IDs at or below {@code snapshotId}.
      */
     public static SnapshotCleanupResult cleanupShardSnapshot(
@@ -51,7 +51,6 @@ public final class SnapshotTools {
                         Config.VolumeDescriptor.listToJson(otherVolumes),
                         dbId,
                         snapshotId,
-                        options.preserveDependencies,
                         options.includeOlderSnapshots));
     }
 
@@ -72,7 +71,7 @@ public final class SnapshotTools {
      * the export root, not its {@code shards} directory. Other volumes supply routes and
      * credentials (an empty list is allowed).
      *
-     * <p>Disabling dependency preservation can break surviving snapshots. Older-snapshot selection
+     * <p>Export leases and snapshot dependencies are always protected. Older-snapshot selection
      * compares global IDs at or below {@code snapshotId}, never shard IDs.
      */
     public static SnapshotCleanupResult cleanupGlobalSnapshot(
@@ -86,7 +85,6 @@ public final class SnapshotTools {
                         metadataVolume.toJson(),
                         Config.VolumeDescriptor.listToJson(otherVolumes),
                         snapshotId,
-                        options.preserveDependencies,
                         options.includeOlderSnapshots));
     }
 
@@ -220,14 +218,12 @@ public final class SnapshotTools {
             String otherVolumesJson,
             String dbId,
             long snapshotId,
-            boolean preserveDependencies,
             boolean includeOlderSnapshots);
 
     private static native String cleanupGlobalSnapshotFromJson(
             String metadataVolumeJson,
             String otherVolumesJson,
             long snapshotId,
-            boolean preserveDependencies,
             boolean includeOlderSnapshots);
 
     private static native String loadShardSnapshotFromJson(

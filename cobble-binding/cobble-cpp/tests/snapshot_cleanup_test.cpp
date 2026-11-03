@@ -51,13 +51,16 @@ void ShardCleanup(const std::filesystem::path& root) {
   COBBLE_CHECK(identity.manifest_path == base.manifest_path);
   COBBLE_CHECK(std::filesystem::exists(Manifest(root, base)));
 
-  const auto forced = cobble::CleanupShardSnapshot(
-      Volume(root), "[]", base.db_id, base.snapshot_id, {false, false});
-  COBBLE_CHECK(forced.deleted_shard_snapshots == 1);
-  COBBLE_CHECK(forced.deleted_files > 0);
-  COBBLE_CHECK(forced.preserved_snapshots.empty());
+  COBBLE_CHECK(identity.reasons.size() > 0);
+  (void)cobble::CleanupShardSnapshot(Volume(root), "[]", next.db_id,
+                                     next.snapshot_id);
+  const auto removed = cobble::CleanupShardSnapshot(
+      Volume(root), "[]", base.db_id, base.snapshot_id);
+  COBBLE_CHECK(removed.deleted_shard_snapshots == 1);
+  COBBLE_CHECK(removed.deleted_files > 0);
+  COBBLE_CHECK(removed.preserved_snapshots.empty());
   COBBLE_CHECK(!std::filesystem::exists(Manifest(root, base)));
-  COBBLE_CHECK(std::filesystem::exists(Manifest(root, next)));
+  COBBLE_CHECK(!std::filesystem::exists(Manifest(root, next)));
 }
 
 void GlobalCleanup(const std::filesystem::path& root) {
@@ -76,7 +79,7 @@ void GlobalCleanup(const std::filesystem::path& root) {
   }
   COBBLE_CHECK(shards.back().snapshot_id < 8);
   const auto result = cobble::CleanupGlobalSnapshot(
-      Volume(metadata), "[" + Volume(shards_root) + "]", 8, {true, true});
+      Volume(metadata), "[" + Volume(shards_root) + "]", 8, {true});
   COBBLE_CHECK(result.deleted_global_snapshots == 2);
   COBBLE_CHECK(result.deleted_shard_snapshots == 2);
   COBBLE_CHECK(result.preserved_snapshots.empty());

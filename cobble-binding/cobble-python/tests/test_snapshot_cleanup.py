@@ -50,7 +50,7 @@ def snapshot(db: pycobble.Db, key: bytes) -> pycobble.ShardSnapshot:
     return db.take_snapshot()
 
 
-def test_shard_preservation_forcing_results_pickle_and_errors(tmp_path: Path) -> None:
+def test_shard_preservation_retry_results_pickle_and_errors(tmp_path: Path) -> None:
     with pycobble.Db.open(config(tmp_path)) as db:
         base = snapshot(db, b"base")
         next_snapshot = snapshot(db, b"next")
@@ -65,7 +65,7 @@ def test_shard_preservation_forcing_results_pickle_and_errors(tmp_path: Path) ->
     assert restored.deleted_files == restored.deleted_shard_snapshots == 0
     assert restored.deleted_global_snapshots == 0
     identity = restored.preserved_snapshots[0]
-    assert isinstance(identity, pycobble.ShardSnapshotIdentity)
+    assert isinstance(identity, pycobble.PreservedSnapshot)
     assert identity.db_id == base.db_id
     assert identity.snapshot_id == base.snapshot_id
     assert path(identity.manifest_path) == path(base.manifest_path)
@@ -77,16 +77,21 @@ def test_shard_preservation_forcing_results_pickle_and_errors(tmp_path: Path) ->
     with pytest.raises(AttributeError):
         identity.snapshot_id = 3
     assert path(base.manifest_path).exists()
+    assert "incremental_dependency" in identity.reasons
+    assert pickle.loads(pickle.dumps(identity)).reasons == identity.reasons
 
-    forced = pycobble.cleanup_shard_snapshot(
-        volume(tmp_path), "[]", base.db_id, base.snapshot_id, preserve_dependencies=False
+    pycobble.cleanup_shard_snapshot(
+        volume(tmp_path), "[]", next_snapshot.db_id, next_snapshot.snapshot_id
     )
-    assert forced.deleted_shard_snapshots == 1
-    assert forced.deleted_global_snapshots == 0
-    assert forced.deleted_files > 0
-    assert forced.preserved_snapshots == []
+    removed = pycobble.cleanup_shard_snapshot(
+        volume(tmp_path), "[]", base.db_id, base.snapshot_id
+    )
+    assert removed.deleted_shard_snapshots == 1
+    assert removed.deleted_global_snapshots == 0
+    assert removed.deleted_files > 0
+    assert removed.preserved_snapshots == []
     assert not path(base.manifest_path).exists()
-    assert path(next_snapshot.manifest_path).exists()
+    assert not path(next_snapshot.manifest_path).exists()
 
     for bad in ("{", "null", "{}"):
         with pytest.raises(pycobble.InputError):

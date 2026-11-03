@@ -61,19 +61,19 @@ directory). For global cleanup, it contains `snapshot/SNAPSHOT-<global-id>`
 (the export root). Supply additional volume descriptors with paths and credentials
 when files are stored elsewhere.
 
-Two options control removal:
+`include_older_snapshots` (default `false`) also selects IDs below the requested ID;
+global cleanup compares global IDs. Incremental dependencies and export leases
+are always protected.
 
-- `preserve_dependencies` defaults to `true`: retain selected shard snapshots and
-  files needed by surviving snapshots. Setting it to `false` can make surviving
-  snapshots unrecoverable.
-- `include_older_snapshots` defaults to `false`: when enabled, also select all
-  snapshots with IDs below the requested ID. Global cleanup compares global IDs,
-  not shard IDs.
+Results contain deletion counts and `preserved_snapshots` with identities and
+reasons (`db_id` is null for globals). Partial cleanup is normal and retryable.
+Blocked globals retain their shard set unless another retained global directly
+references the protected shards. After an I/O failure, retry cleanup rather than
+restoring selected targets, which may already be partially deleted.
 
-The result reports deleted file and snapshot counts, plus `preserved_snapshots`.
 Shard cleanup only accounts for that shard's snapshots; use global cleanup when
 global references must be protected. References outside the cleanup scope remain
-the caller's responsibility.
+the caller's responsibility; cross-DB borrowing must establish export leases.
 
 See the [Java](../ffi-bindings/java#snapshot-cleanup),
 [C++](../ffi-bindings/cpp#snapshot-cleanup), and

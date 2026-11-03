@@ -313,7 +313,7 @@ def test_pickle_public_value_inventory_and_errors() -> None:
         "MetricSample", "OwnedBytes", "OwnedBatch", "OwnedRow", "OwnedMultiGetResult",
         "ReadOptions", "ReaderMode", "RecoveryMode", "ScanOptions", "ScanPlan",
         "ScanSplit", "ScanSplitBoundary", "ScanSplitPartition", "ScanRow", "Schema",
-        "ShardSnapshot", "ShardSnapshotIdentity", "SnapshotCleanupResult",
+        "ShardSnapshot", "PreservedSnapshot", "SnapshotCleanupResult",
         "ListConfig", "ListRetainMode", "PriorityQueueBatch",
         "PriorityQueueEntry", "StructuredBatch", "StructuredColumn",
         "StructuredColumnKind", "StructuredMultiGetResult", "StructuredReadOptions",

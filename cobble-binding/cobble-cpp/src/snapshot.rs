@@ -18,10 +18,16 @@ fn cleanup_result(value: SnapshotCleanupResult) -> ffi::NativeSnapshotCleanupRes
         preserved_snapshots: value
             .preserved_snapshots
             .into_iter()
-            .map(|snapshot| ffi::NativeShardSnapshotIdentity {
-                db_id: snapshot.db_id,
+            .map(|snapshot| ffi::NativePreservedSnapshot {
+                has_db_id: snapshot.db_id.is_some(),
+                db_id: snapshot.db_id.unwrap_or_default(),
                 snapshot_id: snapshot.snapshot_id,
                 manifest_path: snapshot.manifest_path,
+                reasons: snapshot
+                    .reasons
+                    .into_iter()
+                    .map(|reason| reason.as_str().to_owned())
+                    .collect(),
             })
             .collect(),
     }
@@ -44,7 +50,6 @@ pub(crate) fn native_cleanup_shard_snapshot(
     other_volumes_json: &str,
     db_id: &str,
     snapshot_id: u64,
-    preserve_dependencies: bool,
     include_older_snapshots: bool,
 ) -> BridgeResult<ffi::NativeSnapshotCleanupResult> {
     let (metadata, others) = cleanup_volumes(metadata_volume_json, other_volumes_json)?;
@@ -54,7 +59,6 @@ pub(crate) fn native_cleanup_shard_snapshot(
         db_id,
         snapshot_id,
         SnapshotCleanupOptions {
-            preserve_dependencies,
             include_older_snapshots,
         },
     )
@@ -66,7 +70,6 @@ pub(crate) fn native_cleanup_global_snapshot(
     metadata_volume_json: &str,
     other_volumes_json: &str,
     snapshot_id: u64,
-    preserve_dependencies: bool,
     include_older_snapshots: bool,
 ) -> BridgeResult<ffi::NativeSnapshotCleanupResult> {
     let (metadata, others) = cleanup_volumes(metadata_volume_json, other_volumes_json)?;
@@ -75,7 +78,6 @@ pub(crate) fn native_cleanup_global_snapshot(
         &others,
         snapshot_id,
         SnapshotCleanupOptions {
-            preserve_dependencies,
             include_older_snapshots,
         },
     )

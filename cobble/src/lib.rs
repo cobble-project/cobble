@@ -193,8 +193,8 @@ pub use snapshot::{
 pub use sst::SstCompressionAlgorithm;
 pub use time::{ManualTimeProvider, SystemTimeProvider, TimeProvider, TimeProviderKind};
 pub use tool::{
-    ShardSnapshotIdentity, SnapshotCleanupOptions, SnapshotCleanupResult, cleanup_global_snapshot,
-    cleanup_shard_snapshot, prune_shard_snapshot,
+    PreservedSnapshot, SnapshotCleanupOptions, SnapshotCleanupResult, SnapshotPreservationReason,
+    cleanup_global_snapshot, cleanup_shard_snapshot, prune_shard_snapshot,
 };
 pub use r#type::ValueType;
 pub use url::Url;

@@ -23,6 +23,9 @@ use crate::{Config, Error, Result, VolumeDescriptor};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+mod protection;
+pub use protection::{PreservedSnapshot, SnapshotPreservationReason};
+
 /// Prune a shard snapshot as an external maintenance operation.
 ///
 /// This helper always runs with noop governance to avoid affecting runtime
@@ -78,40 +81,21 @@ pub fn prune_shard_snapshot(
 }
 
 /// Options for offline snapshot removal. No writer, reader, or compactor may be active.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SnapshotCleanupOptions {
-    /// Preserve selected snapshots and files required by surviving snapshots.
-    /// Disabling this deliberately allows survivors to become unrecoverable.
-    pub preserve_dependencies: bool,
     /// Select all snapshot IDs at or below the requested ID, instead of only that ID.
     /// For global cleanup this compares global IDs, never shard IDs.
     pub include_older_snapshots: bool,
 }
 
-impl Default for SnapshotCleanupOptions {
-    fn default() -> Self {
-        Self {
-            preserve_dependencies: true,
-            include_older_snapshots: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShardSnapshotIdentity {
-    pub db_id: String,
-    pub snapshot_id: u64,
-    pub manifest_path: String,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct SnapshotCleanupResult {
     /// Removed SST, VLOG, schema, and active-memtable files (not manifests or CURRENT).
     pub deleted_files: usize,
     pub deleted_shard_snapshots: usize,
     pub deleted_global_snapshots: usize,
-    /// Selected shard snapshots retained because surviving roots depend on them.
-    pub preserved_snapshots: Vec<ShardSnapshotIdentity>,
+    /// Selected shard/global snapshots kept for dependencies or pending shard cleanup.
+    pub preserved_snapshots: Vec<PreservedSnapshot>,
 }
 
 /// Remove selected snapshots from one shard without opening a database.
@@ -119,8 +103,10 @@ pub struct SnapshotCleanupResult {
 /// `metadata_volume` is the shard's parent volume: `<base>/<db_id>/snapshot/...`.
 /// For exported shards use the export's `shards` directory as the base. Other volume
 /// descriptors supply additional filesystem routes and credentials. Only this shard's
-/// snapshots are preservation roots; callers must account for references from other roots.
-/// This is offline maintenance and must not overlap a writer, reader, or compactor.
+/// snapshots and export leases are preservation roots. Other global roots are not discovered;
+/// use global cleanup when those references must participate in the decision.
+/// This is offline maintenance: callers must exclude concurrent readers, writers, compactors,
+/// restore/import operations, and snapshot or export-lease publication for the affected storage.
 pub fn cleanup_shard_snapshot(
     metadata_volume: &VolumeDescriptor,
     other_volumes: &[VolumeDescriptor],
@@ -152,7 +138,7 @@ pub fn cleanup_shard_snapshot(
         globals: None,
         selected_globals: BTreeSet::new(),
     }
-    .plan(&storage, options)?
+    .plan(&storage)?
     .execute(&storage)
 }
 
@@ -162,7 +148,11 @@ pub fn cleanup_shard_snapshot(
 /// and all unselected snapshots in referenced shard directories are preservation roots.
 /// Filesystem routes retain the descriptors' URL options and credentials. No recursive
 /// volume sweep is performed, and external-origin data files are never removed.
-/// This is offline maintenance and must not overlap a writer, reader, or compactor.
+/// Export leases protect their source snapshots and incremental bases. A blocked global is
+/// retained with its shard inventory unless the protected shard has an exact reference from
+/// an unselected global. Partial preservation is reported as success, not an error.
+/// This is offline maintenance: callers must exclude concurrent readers, writers, compactors,
+/// restore/import operations, and snapshot or export-lease publication for the affected storage.
 pub fn cleanup_global_snapshot(
     metadata_volume: &VolumeDescriptor,
     other_volumes: &[VolumeDescriptor],
@@ -228,7 +218,7 @@ pub fn cleanup_global_snapshot(
         globals: Some(globals),
         selected_globals,
     }
-    .plan(&storage, options)?
+    .plan(&storage)?
     .execute(&storage)
 }
 
@@ -388,22 +378,21 @@ impl Shard {
         chain.reverse();
         Ok(chain)
     }
-    // None means the base is absent; corrupt metadata and invalid edits still return errors.
-    fn resolved(&self, id: u64) -> Result<Option<ManifestSnapshot>> {
-        let chain = self.chain(id, true)?;
+    fn resolved(&self, id: u64) -> Result<ManifestSnapshot> {
+        let chain = self.chain(id, false)?;
         let mut resolved = None;
         for id in chain {
             match &self.snapshots[&id] {
                 ManifestPayload::Snapshot(m) => resolved = Some(m.clone()),
                 ManifestPayload::IncrementalSnapshot(m) => {
                     let Some(base) = resolved.as_mut() else {
-                        return Ok(None);
+                        return Err(Error::IoError("missing full snapshot base".into()));
                     };
                     apply_incremental_manifest(base, m)?;
                 }
             }
         }
-        Ok(resolved)
+        resolved.ok_or_else(|| Error::IoError("empty snapshot dependency chain".into()))
     }
     fn contents(&self, storage: &Storage, id: u64, owned_only: bool) -> Result<BTreeSet<FileKey>> {
         let root = self
@@ -421,48 +410,19 @@ impl Shard {
             )
             .collect::<Vec<_>>();
         let mut refs = Vec::new();
-        let mut schemas = BTreeSet::new();
-        if let Some(manifest) = self.resolved(id)? {
-            schemas = manifest_schema_ids(manifest.latest_schema_id, &manifest.tree_levels);
-            refs.extend(
-                manifest_data_file_refs(&manifest)
-                    .filter(|(_, _, origin)| !owned_only || *origin == ReplicaOrigin::Owned)
-                    .map(|(_, path, _)| path),
-            );
-            refs.extend(
-                manifest
-                    .active_memtable_data
-                    .into_iter()
-                    .map(|segment| append_storage_path(&absolute_root, &segment.path)),
-            );
-        } else if let Some(ManifestPayload::IncrementalSnapshot(m)) = self.snapshots.get(&id) {
-            // A prior forced cleanup may have removed the base. Direct references are still
-            // actionable on retry; never treat a checksum or decoding failure as absence.
-            schemas.insert(m.latest_schema_id);
-            for file in m
-                .tree_level_edits
-                .iter()
-                .flat_map(|t| &t.level_edits)
-                .flat_map(|l| &l.new_files)
-            {
-                schemas.insert(file.schema_id);
-                schemas.extend(file.schema_id..=m.latest_schema_id);
-                if !owned_only || file.origin == ReplicaOrigin::Owned {
-                    refs.push(file.path.clone());
-                }
-            }
-            refs.extend(
-                m.vlog_files
-                    .iter()
-                    .filter(|f| !owned_only || f.origin == ReplicaOrigin::Owned)
-                    .map(|f| f.path.clone()),
-            );
-            refs.extend(
-                m.active_memtable_data
-                    .iter()
-                    .map(|segment| append_storage_path(&absolute_root, &segment.path)),
-            );
-        }
+        let manifest = self.resolved(id)?;
+        let schemas = manifest_schema_ids(manifest.latest_schema_id, &manifest.tree_levels);
+        refs.extend(
+            manifest_data_file_refs(&manifest)
+                .filter(|(_, _, origin)| !owned_only || *origin == ReplicaOrigin::Owned)
+                .map(|(_, path, _)| path),
+        );
+        refs.extend(
+            manifest
+                .active_memtable_data
+                .into_iter()
+                .map(|segment| append_storage_path(&absolute_root, &segment.path)),
+        );
         let manifest_path = storage.absolute(&self.key(id));
         for schema in schemas {
             refs.push(schema_file_path_from_snapshot_manifest_path(
@@ -507,52 +467,44 @@ impl Shard {
     }
 }
 
+/// Scope-local shard snapshot identity:
+///
+/// - `.0`: index into `CleanupScope::shards`, not a DB ID or bucket ID.
+/// - `.1`: snapshot ID within that shard, not a global snapshot ID.
+///
+/// Different shard entries may route to the same physical manifest; protection
+/// compares normalized storage locations when that distinction matters.
 type SnapshotKey = (usize, u64);
 
 struct CleanupScope {
+    /// Loaded shard directories and their available manifests. Contains one shard
+    /// for shard cleanup, or all shards referenced by selected and retained globals.
     shards: Vec<Shard>,
+    /// Candidate shard snapshots before dependency protection. Global cleanup
+    /// selects the union of shard references from `selected_globals`; shard cleanup
+    /// selects by the requested shard snapshot ID and `include_older_snapshots` option.
     selected: BTreeSet<SnapshotKey>,
-    // Some(empty) still identifies global maintenance, including a dangling CURRENT retry.
+    /// All discovered global IDs mapped to their exact shard snapshot references,
+    /// including unselected globals whose dependencies must survive. `None` means
+    /// shard-only cleanup; `Some(empty)` still means global cleanup, allowing a
+    /// retry to remove a dangling global CURRENT after its manifests are gone.
     globals: Option<BTreeMap<u64, Vec<SnapshotKey>>>,
+    /// Candidate global snapshot IDs selected by the request, before protection.
+    /// Empty for shard-only cleanup. A blocked global can remain even when selected.
     selected_globals: BTreeSet<u64>,
 }
 
 impl CleanupScope {
-    fn preserved_snapshots(&self, enabled: bool) -> Result<BTreeSet<SnapshotKey>> {
-        let mut preserved = BTreeSet::new();
-        if !enabled {
-            return Ok(preserved);
-        }
-        let roots = self
-            .shards
-            .iter()
-            .enumerate()
-            .flat_map(|(i, shard)| shard.snapshots.keys().map(move |id| (i, *id)))
-            .filter(|key| !self.selected.contains(key))
-            .chain(
-                self.globals
-                    .iter()
-                    .flat_map(|globals| globals.iter())
-                    .filter(|(id, _)| !self.selected_globals.contains(id))
-                    .flat_map(|(_, refs)| refs.iter().copied()),
-            );
-        for (index, id) in roots {
-            preserved.extend(
-                self.shards[index]
-                    .chain(id, false)?
-                    .into_iter()
-                    .map(|id| (index, id)),
-            );
-        }
-        Ok(preserved)
-    }
-
-    fn plan(&self, storage: &Storage, options: SnapshotCleanupOptions) -> Result<CleanupPlan> {
-        let preserved = self.preserved_snapshots(options.preserve_dependencies)?;
+    fn plan(&self, storage: &Storage) -> Result<CleanupPlan> {
+        let protection = self.protection(storage)?;
+        let preserved = protection.shards.keys().copied().collect::<BTreeSet<_>>();
         let mut protected_locations = BTreeSet::new();
-        let mut preserved_manifests = BTreeSet::new();
+        let mut preserved_manifests = BTreeMap::<_, BTreeSet<_>>::new();
         for &(index, id) in &preserved {
-            preserved_manifests.insert(storage.location(&self.shards[index].key(id))?);
+            preserved_manifests
+                .entry(storage.location(&self.shards[index].key(id))?)
+                .or_default()
+                .extend(&protection.shards[&(index, id)]);
             for key in self.shards[index].contents(storage, id, false)? {
                 protected_locations.insert(storage.location(&key)?);
             }
@@ -566,16 +518,17 @@ impl CleanupScope {
             if !shard.snapshots.contains_key(&id) {
                 continue;
             }
-            let depth = shard.chain(id, !options.preserve_dependencies)?.len();
             let key = shard.key(id);
             let location = storage.location(&key)?;
-            if preserved_manifests.contains(&location) {
-                result.preserved_snapshots.push(ShardSnapshotIdentity {
-                    db_id: shard.db_id.clone(),
+            if let Some(reasons) = preserved_manifests.get(&location) {
+                result.preserved_snapshots.push(PreservedSnapshot {
+                    db_id: Some(shard.db_id.clone()),
                     snapshot_id: id,
-                    manifest_path: storage.absolute(&shard.key(id)),
+                    manifest_path: storage.absolute(&key),
+                    reasons: reasons.iter().copied().collect(),
                 });
             } else {
+                let depth = shard.chain(id, false)?.len();
                 files.extend(shard.contents(storage, id, true)?);
                 manifests.push((depth, key));
                 removed_manifests.insert(location);
@@ -595,13 +548,31 @@ impl CleanupScope {
         manifests.sort_unstable_by(|(a_depth, a_key), (b_depth, b_key)| {
             b_depth.cmp(a_depth).then_with(|| a_key.cmp(b_key))
         });
-        let pointers =
-            self.current_pointers(storage, &removed_manifests, &removed_locations, &preserved)?;
+        let removed_globals = self
+            .selected_globals
+            .difference(&protection.globals)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for &id in &protection.globals {
+            result.preserved_snapshots.push(PreservedSnapshot {
+                db_id: None,
+                snapshot_id: id,
+                manifest_path: storage
+                    .absolute(&FileKey::new(0, global_snapshot_manifest_path(id))),
+                reasons: vec![SnapshotPreservationReason::PendingShardCleanup],
+            });
+        }
+        let pointers = self.current_pointers(
+            storage,
+            &removed_manifests,
+            &removed_locations,
+            &preserved,
+            &removed_globals,
+        )?;
         Ok(CleanupPlan {
             files: deletions,
             shard_manifests: manifests.into_iter().map(|(_, key)| key).collect(),
-            global_manifests: self
-                .selected_globals
+            global_manifests: removed_globals
                 .iter()
                 .map(|id| FileKey::new(0, global_snapshot_manifest_path(*id)))
                 .collect(),
@@ -616,6 +587,7 @@ impl CleanupScope {
         removed_manifests: &BTreeSet<String>,
         removed_locations: &BTreeSet<String>,
         preserved: &BTreeSet<SnapshotKey>,
+        removed_globals: &BTreeSet<u64>,
     ) -> Result<BTreeSet<FileKey>> {
         // Resolve CURRENT before any deletion. No fallback is published for an invalidated pointer.
         let recoverable = |index: usize, id: u64| -> Result<bool> {
@@ -661,7 +633,7 @@ impl CleanupScope {
         if let Some(globals) = &self.globals {
             let pointer = FileKey::new(0, "snapshot/CURRENT");
             if let Some(id) = current_id(storage, &pointer)? {
-                let mut valid = !self.selected_globals.contains(&id);
+                let mut valid = !removed_globals.contains(&id);
                 if let Some(refs) = globals.get(&id) {
                     for &(index, id) in refs {
                         valid &= recoverable(index, id)?;
@@ -728,3 +700,7 @@ mod fault_tests;
 #[cfg(test)]
 #[path = "../../tests/unit/snapshot_cleanup.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/snapshot_cleanup_leases.rs"]
+mod lease_tests;

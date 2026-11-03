@@ -14,41 +14,51 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
 type PickledSnapshotColumnFamily = (String, u8, usize, bool, Option<String>);
+type PickledPreservedSnapshot = (Option<String>, u64, String, Vec<String>);
 
 #[pyclass(
-    name = "ShardSnapshotIdentity",
+    name = "PreservedSnapshot",
     module = "pycobble._native",
     frozen,
     from_py_object
 )]
 #[derive(Clone)]
-pub(crate) struct PyShardSnapshotIdentity {
+pub(crate) struct PyPreservedSnapshot {
     #[pyo3(get)]
-    db_id: String,
+    db_id: Option<String>,
     #[pyo3(get)]
     snapshot_id: u64,
     #[pyo3(get)]
     manifest_path: String,
+    #[pyo3(get)]
+    reasons: Vec<String>,
 }
 
 #[pymethods]
-impl PyShardSnapshotIdentity {
+impl PyPreservedSnapshot {
     #[new]
-    fn new(db_id: String, snapshot_id: u64, manifest_path: String) -> Self {
+    fn new(
+        db_id: Option<String>,
+        snapshot_id: u64,
+        manifest_path: String,
+        reasons: Vec<String>,
+    ) -> Self {
         Self {
             db_id,
             snapshot_id,
             manifest_path,
+            reasons,
         }
     }
 
-    fn __reduce__(&self, py: Python<'_>) -> PickleReduction<(String, u64, String)> {
+    fn __reduce__(&self, py: Python<'_>) -> PickleReduction<PickledPreservedSnapshot> {
         (
             py.get_type::<Self>().into_any().unbind(),
             (
                 self.db_id.clone(),
                 self.snapshot_id,
                 self.manifest_path.clone(),
+                self.reasons.clone(),
             ),
         )
     }
@@ -68,7 +78,7 @@ pub(crate) struct PySnapshotCleanupResult {
     deleted_shard_snapshots: usize,
     #[pyo3(get)]
     deleted_global_snapshots: usize,
-    preserved_snapshots: Vec<PyShardSnapshotIdentity>,
+    preserved_snapshots: Vec<PyPreservedSnapshot>,
 }
 
 #[pymethods]
@@ -78,7 +88,7 @@ impl PySnapshotCleanupResult {
         deleted_files: usize,
         deleted_shard_snapshots: usize,
         deleted_global_snapshots: usize,
-        preserved_snapshots: Vec<PyShardSnapshotIdentity>,
+        preserved_snapshots: Vec<PyPreservedSnapshot>,
     ) -> Self {
         Self {
             deleted_files,
@@ -89,14 +99,14 @@ impl PySnapshotCleanupResult {
     }
 
     #[getter]
-    fn preserved_snapshots(&self) -> Vec<PyShardSnapshotIdentity> {
+    fn preserved_snapshots(&self) -> Vec<PyPreservedSnapshot> {
         self.preserved_snapshots.clone()
     }
 
     fn __reduce__(
         &self,
         py: Python<'_>,
-    ) -> PickleReduction<(usize, usize, usize, Vec<PyShardSnapshotIdentity>)> {
+    ) -> PickleReduction<(usize, usize, usize, Vec<PyPreservedSnapshot>)> {
         (
             py.get_type::<Self>().into_any().unbind(),
             (
@@ -117,10 +127,15 @@ fn cleanup_result(value: SnapshotCleanupResult) -> PySnapshotCleanupResult {
         preserved_snapshots: value
             .preserved_snapshots
             .into_iter()
-            .map(|snapshot| PyShardSnapshotIdentity {
+            .map(|snapshot| PyPreservedSnapshot {
                 db_id: snapshot.db_id,
                 snapshot_id: snapshot.snapshot_id,
                 manifest_path: snapshot.manifest_path,
+                reasons: snapshot
+                    .reasons
+                    .into_iter()
+                    .map(|reason| reason.as_str().to_owned())
+                    .collect(),
             })
             .collect(),
     }
@@ -144,17 +159,16 @@ fn cleanup_volumes(
 /// db_id/snapshot (an export's shards directory). other_volumes_json is a JSON
 /// array of descriptors supplying additional routes and credentials; use "[]" if empty.
 /// Only this shard's snapshots are preservation roots: account for global references
-/// or use cleanup_global_snapshot. Disabling preserve_dependencies can make surviving
-/// snapshots unrecoverable. include_older_snapshots selects shard IDs <= snapshot_id.
+/// or use cleanup_global_snapshot. Export leases and incremental dependencies are always
+/// protected. include_older_snapshots selects shard IDs <= snapshot_id.
 #[pyfunction]
-#[pyo3(signature = (metadata_volume_json, other_volumes_json, db_id, snapshot_id, *, preserve_dependencies=true, include_older_snapshots=false))]
+#[pyo3(signature = (metadata_volume_json, other_volumes_json, db_id, snapshot_id, *, include_older_snapshots=false))]
 fn cleanup_shard_snapshot(
     py: Python<'_>,
     metadata_volume_json: String,
     other_volumes_json: String,
     db_id: String,
     snapshot_id: u64,
-    preserve_dependencies: bool,
     include_older_snapshots: bool,
 ) -> PyResult<PySnapshotCleanupResult> {
     py.detach(move || {
@@ -166,7 +180,6 @@ fn cleanup_shard_snapshot(
             &db_id,
             snapshot_id,
             SnapshotCleanupOptions {
-                preserve_dependencies,
                 include_older_snapshots,
             },
         )
@@ -181,16 +194,15 @@ fn cleanup_shard_snapshot(
 /// metadata_volume_json is a VolumeDescriptor with snapshot/SNAPSHOT-<global-id>
 /// under its base (the export root, not its shards directory). other_volumes_json
 /// is a JSON array of additional descriptors with routes and credentials; "[]" is allowed.
-/// Disabling preserve_dependencies can make surviving snapshots unrecoverable.
+/// Export leases and surviving snapshot dependencies are always protected.
 /// include_older_snapshots selects global IDs <= snapshot_id, never shard IDs.
 #[pyfunction]
-#[pyo3(signature = (metadata_volume_json, other_volumes_json, snapshot_id, *, preserve_dependencies=true, include_older_snapshots=false))]
+#[pyo3(signature = (metadata_volume_json, other_volumes_json, snapshot_id, *, include_older_snapshots=false))]
 fn cleanup_global_snapshot(
     py: Python<'_>,
     metadata_volume_json: String,
     other_volumes_json: String,
     snapshot_id: u64,
-    preserve_dependencies: bool,
     include_older_snapshots: bool,
 ) -> PyResult<PySnapshotCleanupResult> {
     py.detach(move || {
@@ -201,7 +213,6 @@ fn cleanup_global_snapshot(
             &others,
             snapshot_id,
             SnapshotCleanupOptions {
-                preserve_dependencies,
                 include_older_snapshots,
             },
         )
@@ -971,7 +982,7 @@ impl PyPendingSnapshot {
 }
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyShardSnapshotIdentity>()?;
+    module.add_class::<PyPreservedSnapshot>()?;
     module.add_class::<PySnapshotCleanupResult>()?;
     module.add_function(wrap_pyfunction!(cleanup_shard_snapshot, module)?)?;
     module.add_function(wrap_pyfunction!(cleanup_global_snapshot, module)?)?;

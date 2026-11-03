@@ -6,7 +6,7 @@ import com.google.gson.annotations.SerializedName;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Counts and dependency-preserved shard snapshots from offline cleanup. */
+/** Counts and dependency-preserved shard/global snapshots from offline cleanup. */
 public final class SnapshotCleanupResult {
     private static final Gson GSON = new Gson();
 
@@ -20,16 +20,16 @@ public final class SnapshotCleanupResult {
     @SerializedName("deleted_global_snapshots")
     public long deletedGlobalSnapshots;
 
-    /** Selected shard snapshots retained because surviving snapshots depend on them. */
+    /** Selected snapshots retained for dependencies or pending shard cleanup. */
     @SerializedName("preserved_snapshots")
-    public List<ShardSnapshotIdentity> preservedSnapshots = new ArrayList<>();
+    public List<PreservedSnapshot> preservedSnapshots = new ArrayList<>();
 
     static SnapshotCleanupResult fromJson(String json) {
         return GSON.fromJson(json, SnapshotCleanupResult.class);
     }
 
-    /** Identity of one dependency-preserved shard snapshot. */
-    public static final class ShardSnapshotIdentity {
+    /** Identity and reasons for a preserved snapshot; null dbId denotes a global snapshot. */
+    public static final class PreservedSnapshot {
         @SerializedName("db_id")
         public String dbId;
 
@@ -38,5 +38,7 @@ public final class SnapshotCleanupResult {
 
         @SerializedName("manifest_path")
         public String manifestPath;
+
+        public List<String> reasons = new ArrayList<>();
     }
 }

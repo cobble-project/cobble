@@ -21,9 +21,15 @@ SnapshotCleanupResult ToCleanupResult(
                                {}};
   result.preserved_snapshots.reserve(native.preserved_snapshots.size());
   for (const auto& snapshot : native.preserved_snapshots) {
-    result.preserved_snapshots.push_back({std::string(snapshot.db_id),
-                                          snapshot.snapshot_id,
-                                          std::string(snapshot.manifest_path)});
+    PreservedSnapshot preserved{std::nullopt,
+                                snapshot.snapshot_id,
+                                std::string(snapshot.manifest_path),
+                                {}};
+    if (snapshot.has_db_id) preserved.db_id = std::string(snapshot.db_id);
+    for (const auto& reason : snapshot.reasons) {
+      preserved.reasons.emplace_back(reason);
+    }
+    result.preserved_snapshots.push_back(std::move(preserved));
   }
   return result;
 }
@@ -81,8 +87,7 @@ SnapshotCleanupResult CleanupShardSnapshot(
     return ffi::native_cleanup_shard_snapshot(
         detail::RustStr(metadata_volume_json),
         detail::RustStr(other_volumes_json), detail::RustStr(db_id),
-        snapshot_id, options.preserve_dependencies,
-        options.include_older_snapshots);
+        snapshot_id, options.include_older_snapshots);
   }));
 }
 
@@ -93,7 +98,7 @@ SnapshotCleanupResult CleanupGlobalSnapshot(
     return ffi::native_cleanup_global_snapshot(
         detail::RustStr(metadata_volume_json),
         detail::RustStr(other_volumes_json), snapshot_id,
-        options.preserve_dependencies, options.include_older_snapshots);
+        options.include_older_snapshots);
   }));
 }
 

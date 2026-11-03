@@ -142,13 +142,7 @@ impl Fixture {
             globals: Some(globals),
             selected_globals,
         }
-        .plan(
-            &self.storage,
-            SnapshotCleanupOptions {
-                preserve_dependencies: true,
-                include_older_snapshots: true,
-            },
-        )?
+        .plan(&self.storage)?
         .execute(&self.storage)
     }
 
@@ -175,56 +169,65 @@ impl Fixture {
 
 #[test]
 fn cleanup_retries_every_delete_boundary_without_breaking_protected_survivors() {
-    for cutoff in [10, 30] {
-        let baseline = Fixture::new(cutoff);
-        baseline.run(cutoff).unwrap();
-        baseline.assert_survivors(cutoff);
-        let trace = baseline.fs.delete_trace.lock().unwrap().clone();
-        eprintln!(
-            "[snapshot-cleanup-faults] cutoff={cutoff}: {} delete boundaries, before/after failure + retry + survivor restore",
-            trace.len()
-        );
-        assert!(
-            trace
-                .iter()
-                .any(|path| path.starts_with("snapshot/SNAPSHOT-"))
-        );
-        assert!(trace.iter().any(|path| path.contains(".complete-")));
-        assert!(trace.iter().any(|path| path.ends_with(".data")));
-        if cutoff == 30 {
-            assert!(trace.iter().any(|path| path.contains("/data/")));
+    let cutoff = 30;
+    let baseline = Fixture::new(cutoff);
+    baseline.run(cutoff).unwrap();
+    baseline.assert_survivors(cutoff);
+    let trace = baseline.fs.delete_trace.lock().unwrap().clone();
+    eprintln!(
+        "[snapshot-cleanup-faults] cutoff={cutoff}: {} delete boundaries, before/after failure + retry + survivor restore",
+        trace.len()
+    );
+    assert!(
+        trace
+            .iter()
+            .any(|path| path.starts_with("snapshot/SNAPSHOT-"))
+    );
+    assert!(trace.iter().any(|path| path.contains(".complete-")));
+    assert!(trace.iter().any(|path| path.ends_with(".data")));
+    assert!(trace.iter().any(|path| path.contains("/data/")));
+    assert!(
+        trace
+            .iter()
+            .any(|path| path.starts_with("primary/snapshot/SNAPSHOT-"))
+    );
+    for fail_delete_after in [false, true] {
+        for (fail_at, failed_path) in trace.iter().enumerate() {
+            let fixture = Fixture::new(cutoff);
+            fixture.fs.fail_delete_at.store(fail_at, Ordering::SeqCst);
+            fixture
+                .fs
+                .fail_delete_after
+                .store(fail_delete_after, Ordering::SeqCst);
             assert!(
-                trace
-                    .iter()
-                    .any(|path| path.starts_with("primary/snapshot/SNAPSHOT-"))
+                fixture.run(cutoff).is_err(),
+                "delete {fail_at} did not fail"
             );
-        }
-        for fail_delete_after in [false, true] {
-            for (fail_at, failed_path) in trace.iter().enumerate() {
-                let fixture = Fixture::new(cutoff);
-                fixture.fs.fail_delete_at.store(fail_at, Ordering::SeqCst);
-                fixture
-                    .fs
-                    .fail_delete_after
-                    .store(fail_delete_after, Ordering::SeqCst);
-                assert!(
-                    fixture.run(cutoff).is_err(),
-                    "delete {fail_at} did not fail"
-                );
-                fixture.assert_survivors(cutoff);
-                fixture.run(cutoff).unwrap_or_else(|error| {
-                    panic!(
-                        "retry failed at delete {fail_at} ({}): {error}",
-                        failed_path
-                    )
-                });
-                fixture.assert_survivors(cutoff);
-                assert_eq!(fixture.run(cutoff).unwrap().deleted_files, 0);
-                assert!(!atomic_replace::exists(fixture.fs.as_ref(), "snapshot/CURRENT").unwrap());
-                assert!(!fixture.fs.exists("snapshot/CURRENT-ATOMIC/").unwrap());
-            }
+            fixture.assert_survivors(cutoff);
+            fixture.run(cutoff).unwrap_or_else(|error| {
+                panic!(
+                    "retry failed at delete {fail_at} ({}): {error}",
+                    failed_path
+                )
+            });
+            fixture.assert_survivors(cutoff);
+            assert_eq!(fixture.run(cutoff).unwrap().deleted_files, 0);
+            assert!(!atomic_replace::exists(fixture.fs.as_ref(), "snapshot/CURRENT").unwrap());
+            assert!(!fixture.fs.exists("snapshot/CURRENT-ATOMIC/").unwrap());
         }
     }
+}
+
+#[test]
+fn cleanup_keeps_global_inventory_when_incremental_descendants_survive() {
+    let fixture = Fixture::new(10);
+    let result = fixture.run(10).unwrap();
+    assert_eq!(result.deleted_files, 0);
+    assert_eq!(result.deleted_global_snapshots, 0);
+    assert_eq!(result.deleted_shard_snapshots, 0);
+    assert_eq!(result.preserved_snapshots.len(), 2);
+    fixture.assert_survivors(10);
+    assert_eq!(fixture.run(10).unwrap(), result);
 }
 
 #[test]
@@ -259,7 +262,6 @@ fn cleanup_empty_missing_target_and_cutoffs_do_not_select_unrelated_snapshots() 
     for include_older_snapshots in [false, true] {
         let options = SnapshotCleanupOptions {
             include_older_snapshots,
-            ..Default::default()
         };
         assert_eq!(
             cleanup_shard_snapshot(&config.volumes[0], &[], "absent", 123, options).unwrap(),
@@ -275,9 +277,9 @@ fn cleanup_empty_missing_target_and_cutoffs_do_not_select_unrelated_snapshots() 
     assert_eq!(fixture.run(5).unwrap(), SnapshotCleanupResult::default());
     assert!(fixture.fs.delete_trace.lock().unwrap().is_empty());
     let result = fixture.run(20).unwrap();
-    assert_eq!(result.deleted_global_snapshots, 2);
+    assert_eq!(result.deleted_global_snapshots, 0);
     assert_eq!(result.deleted_shard_snapshots, 0);
-    assert_eq!(result.preserved_snapshots.len(), 2);
+    assert_eq!(result.preserved_snapshots.len(), 4);
     assert!(fixture.fs.exists("snapshot/SNAPSHOT-30").unwrap());
     assert!(fixture.fs.exists("snapshot/SNAPSHOT-40").unwrap());
     fixture.assert_survivors(10);
@@ -317,11 +319,7 @@ fn cleanup_empty_missing_target_and_cutoffs_do_not_select_unrelated_snapshots() 
         globals: Some(BTreeMap::new()),
         selected_globals: BTreeSet::new(),
     };
-    scope
-        .plan(&storage, SnapshotCleanupOptions::default())
-        .unwrap()
-        .execute(&storage)
-        .unwrap();
+    scope.plan(&storage).unwrap().execute(&storage).unwrap();
     assert!(!fs.exists("snapshot/CURRENT-ATOMIC/").unwrap());
     fs.create_dir("snapshot/CURRENT-ATOMIC").unwrap();
     let mut orphan = fs
@@ -329,11 +327,7 @@ fn cleanup_empty_missing_target_and_cutoffs_do_not_select_unrelated_snapshots() 
         .unwrap();
     orphan.write(b"interrupted deletion").unwrap();
     orphan.close().unwrap();
-    scope
-        .plan(&storage, SnapshotCleanupOptions::default())
-        .unwrap()
-        .execute(&storage)
-        .unwrap();
+    scope.plan(&storage).unwrap().execute(&storage).unwrap();
     assert!(!fs.exists("snapshot/CURRENT-ATOMIC/").unwrap());
 }
 
@@ -364,7 +358,7 @@ fn cleanup_preserves_manifest_locations_referenced_through_another_route() {
         globals: Some(BTreeMap::from([(30, vec![(0, id)]), (40, vec![(1, id)])])),
         selected_globals: BTreeSet::from([30]),
     }
-    .plan(&fixture.storage, SnapshotCleanupOptions::default())
+    .plan(&fixture.storage)
     .unwrap()
     .execute(&fixture.storage)
     .unwrap();

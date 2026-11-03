@@ -201,7 +201,7 @@ See [Standalone Snapshots and Exports](../architecture/snapshot#standalone-snaps
 After stopping all readers, writers, compactors, and snapshot publication:
 
 ```cpp
-cobble::SnapshotCleanupOptions options; // Preserve dependencies by default.
+cobble::SnapshotCleanupOptions options; // Dependencies are always protected.
 options.include_older_snapshots = true;
 auto result = cobble::CleanupGlobalSnapshot(metadata_volume_json, "[]", snapshot_id, options);
 ```
@@ -209,7 +209,8 @@ auto result = cobble::CleanupGlobalSnapshot(metadata_volume_json, "[]", snapshot
 For one shard, use `CleanupShardSnapshot(metadata_volume_json, other_volumes_json,
 db_id, snapshot_id, options)`. The volume arguments are a single VolumeDescriptor
 JSON and an array of additional descriptors, respectively. Results include deletion
-counts and `preserved_snapshots`. See [Snapshot Cleanup](../reference/tools#snapshot-cleanup)
+counts and `preserved_snapshots`, with `reasons` and an empty optional `db_id` for
+retained globals. See [Snapshot Cleanup](../reference/tools#snapshot-cleanup)
 for directory layout, options, and dependency safety.
 
 ## Usage notes
