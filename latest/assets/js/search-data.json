@@ -351,7 +351,7 @@
   },"50": {
     "doc": "C++",
     "title": "Snapshot cleanup",
-    "content": "After stopping all readers, writers, compactors, and snapshot publication: . cobble::SnapshotCleanupOptions options; // Preserve dependencies by default. options.include_older_snapshots = true; auto result = cobble::CleanupGlobalSnapshot(metadata_volume_json, \"[]\", snapshot_id, options); . For one shard, use CleanupShardSnapshot(metadata_volume_json, other_volumes_json, db_id, snapshot_id, options). The volume arguments are a single VolumeDescriptor JSON and an array of additional descriptors, respectively. Results include deletion counts and preserved_snapshots. See Snapshot Cleanup for directory layout, options, and dependency safety. ",
+    "content": "After stopping all readers, writers, compactors, and snapshot publication: . cobble::SnapshotCleanupOptions options; // Dependencies are always protected. options.include_older_snapshots = true; auto result = cobble::CleanupGlobalSnapshot(metadata_volume_json, \"[]\", snapshot_id, options); . For one shard, use CleanupShardSnapshot(metadata_volume_json, other_volumes_json, db_id, snapshot_id, options). The volume arguments are a single VolumeDescriptor JSON and an array of additional descriptors, respectively. Results include deletion counts and preserved_snapshots, with reasons and an empty optional db_id for retained globals. See Snapshot Cleanup for directory layout, options, and dependency safety. ",
     "url": "/cobble/latest/ffi-bindings/cpp.html#snapshot-cleanup",
     
     "relUrl": "/ffi-bindings/cpp.html#snapshot-cleanup"
@@ -482,54 +482,54 @@
     
     "relUrl": "/architecture/file-management.html#volume-selection"
   },"69": {
-    "doc": "Tools",
-    "title": "Tools",
-    "content": "Operational tools that ship with Cobble. | Page | Description | . | CLI | cobble-cli command entries for tools, now includes remote compactor and web UI startup | . | Web Monitor | Read-only monitoring UI and HTTP APIs for snapshot inspection | . ",
-    "url": "/cobble/latest/tools/",
-    
-    "relUrl": "/tools/"
-  },"70": {
     "doc": "Reference",
     "title": "Reference",
     "content": "Complete reference documentation for Cobble configuration, APIs, and operational details. | Page | Description | . | Configuration Reference | All configuration parameters with types, defaults, and descriptions | . | API Overview | Public Rust API surface and module structure | . | Tools | Maintenance tools and snapshot pruning usage | . | Metrics | Native metric APIs, labels, and complete metric catalog | . | Monitoring | Web monitor dashboard | . ",
     "url": "/cobble/latest/reference/",
     
     "relUrl": "/reference/"
-  },"71": {
-    "doc": "Getting Started",
-    "title": "Getting Started",
-    "content": "This section guides you through setting up and using Cobble for different use cases — from a single-machine embedded store to a distributed cluster with snapshot-following reads and parallel scans. Start with Quick Start for runnable examples, then use the focused guides for deeper explanations: . | Guide | When to use | . | Quick Start | Runnable examples for the main Cobble usage patterns | . | Basic Concepts | Core components — Db, Coordinator, Reader, Scanner, snapshots | . | Configuration | Every deployment starts here — volumes, tuning, and storage layout | . | Single-Machine Embedded DB | Simple embedded key-value store on a single machine | . | Distributed DB | Multiple writer shards coordinated by a global snapshot system | . | Reader &amp; Distributed Scan | Serve snapshot-following reads or run parallel analytical scans across shards | . | Remote Compaction | Offload background compaction to dedicated worker nodes | . | Structured DB | Type-safe row-oriented wrappers for all of the above | . | Table | Named schemas, typed rows, Catalog management, and distributed table reads/writes | . ",
-    "url": "/cobble/latest/getting-started/",
-    
-    "relUrl": "/getting-started/"
-  },"72": {
-    "doc": "FFI Bindings",
-    "title": "FFI Bindings",
-    "content": "Cobble’s core engine is written in Rust, but its functionality is accessible from other languages through foreign function interface (FFI) bindings. | Binding | Language | Crate | . | Java | JVM (Java, Kotlin, Scala, …) | cobble-java | . | C++ | C++20 | cobble-cpp | . | Python | Python 3.11+ | cobble-python (PyPI: pycobble) | . ",
-    "url": "/cobble/latest/ffi-bindings/",
-    
-    "relUrl": "/ffi-bindings/"
-  },"73": {
+  },"70": {
     "doc": "Architecture",
     "title": "Architecture",
     "content": "This section explains the design principles behind Cobble and how its components work together. The goal is to help you understand why Cobble behaves the way it does, so you can make informed decisions about configuration and deployment. The whole architecture is described in above diagram. Data is split in buckets and each shard may contain multiple buckets. Each shard is managed by a Db instance (the read-write node in the diagram), which handles writes, compactions, and local snapshots. The Coordinator manages global snapshots across shards. The ReadonlyDb instances (the read-only node in diagram) can read from the materialized snapshots for consistent reads and scans. All those components can be embedded in any service or application, providing a lot of flexibility in how you build on top of Cobble. These components share loose consistency through shared file-based snapshots and manifest files, leaving the application to decide how to handle cross-shard consistency if needed. ",
     "url": "/cobble/latest/architecture/",
     
     "relUrl": "/architecture/"
-  },"74": {
+  },"71": {
     "doc": "Architecture",
     "title": "Design Philosophy",
     "content": "Cobble is built around a few core ideas: . | Focus on embedded key-value storage. Cobble is designed to be a high-performance embedded database that can be used as a building block for larger systems. It provides the primitives for key-value storage, snapshots, and distributed coordination, but leaves higher-level features (like SQL layers or distributed transactions) to be built on top. | Weak coordination among shards. In a distributed deployment, each Db shard operates mostly independently, with the Coordinator only involved in snapshot management. This minimizes cross-shard communication and allows for high write throughput without distributed locking. We leave it to the application to decide how to partition data and handle cross-shard consistency if needed. | Flexible with more options. Cobble provides multiple implementations for key components (memtable, file formats, compaction strategies) that can be configured based on workload needs. The architecture is designed to accommodate these options without sacrificing core performance. | Snapshots for consistency as well as read serving. The snapshot system is not just for backup and restore — it’s a fundamental part of how Cobble provides consistent read views in a distributed environment. This makes Cobble a good fit for analytical workloads that need to read from a consistent point-in-time view while writes are ongoing. | Concurrent access within a writer. A writer Db accepts concurrent reads, writes, scans, and snapshots while preserving a single ordered memtable write stream. | . ",
     "url": "/cobble/latest/architecture/#design-philosophy",
     
     "relUrl": "/architecture/#design-philosophy"
-  },"75": {
+  },"72": {
     "doc": "Architecture",
     "title": "Module Map",
     "content": "| Module | What it provides | . | LSM Tree | The core storage structure — how data is organized on disk | . | Memtable | In-memory write buffers — why there are three implementations | . | Compaction | Background merging — how Cobble keeps reads fast over time | . | Key-Value Separation | VLOG — when and why to store values separately | . | Read &amp; Write Paths | How data flows from writes to reads | . | Snapshot System | Point-in-time consistency for restore, reads, and scans | . | Write-Ahead Log | Optional recovery of durable writes newer than a snapshot | . | File Management | File lifecycle, volume selection, and storage backends | . | Block Cache | Multi-tier caching for read performance | . | Schema Evolution | Adding and removing columns without rewriting data | . | Merge Operators | Efficient read-modify-write without extra round trips | . | Online Rescale | Runtime shard rebalance using shrink-then-expand bucket migration | . ",
     "url": "/cobble/latest/architecture/#module-map",
     
     "relUrl": "/architecture/#module-map"
+  },"73": {
+    "doc": "FFI Bindings",
+    "title": "FFI Bindings",
+    "content": "Cobble’s core engine is written in Rust, but its functionality is accessible from other languages through foreign function interface (FFI) bindings. | Binding | Language | Crate | . | Java | JVM (Java, Kotlin, Scala, …) | cobble-java | . | C++ | C++20 | cobble-cpp | . | Python | Python 3.11+ | cobble-python (PyPI: pycobble) | . ",
+    "url": "/cobble/latest/ffi-bindings/",
+    
+    "relUrl": "/ffi-bindings/"
+  },"74": {
+    "doc": "Getting Started",
+    "title": "Getting Started",
+    "content": "This section guides you through setting up and using Cobble for different use cases — from a single-machine embedded store to a distributed cluster with snapshot-following reads and parallel scans. Start with Quick Start for runnable examples, then use the focused guides for deeper explanations: . | Guide | When to use | . | Quick Start | Runnable examples for the main Cobble usage patterns | . | Basic Concepts | Core components — Db, Coordinator, Reader, Scanner, snapshots | . | Configuration | Every deployment starts here — volumes, tuning, and storage layout | . | Single-Machine Embedded DB | Simple embedded key-value store on a single machine | . | Distributed DB | Multiple writer shards coordinated by a global snapshot system | . | Reader &amp; Distributed Scan | Serve snapshot-following reads or run parallel analytical scans across shards | . | Remote Compaction | Offload background compaction to dedicated worker nodes | . | Structured DB | Type-safe row-oriented wrappers for all of the above | . | Table | Named schemas, typed rows, Catalog management, and distributed table reads/writes | . ",
+    "url": "/cobble/latest/getting-started/",
+    
+    "relUrl": "/getting-started/"
+  },"75": {
+    "doc": "Tools",
+    "title": "Tools",
+    "content": "Operational tools that ship with Cobble. | Page | Description | . | CLI | cobble-cli command entries for tools, now includes remote compactor and web UI startup | . | Web Monitor | Read-only monitoring UI and HTTP APIs for snapshot inspection | . ",
+    "url": "/cobble/latest/tools/",
+    
+    "relUrl": "/tools/"
   },"76": {
     "doc": "Home",
     "title": "Key Features",
@@ -631,7 +631,7 @@
   },"90": {
     "doc": "Java",
     "title": "Snapshot Cleanup",
-    "content": "After stopping all readers, writers, compactors, and snapshot publication: . SnapshotCleanupOptions options = new SnapshotCleanupOptions(); options.includeOlderSnapshots = true; SnapshotCleanupResult result = SnapshotTools.cleanupGlobalSnapshot( metadataVolume, Collections.emptyList(), snapshotId, options); . For one shard, use SnapshotTools.cleanupShardSnapshot(metadataVolume, otherVolumes, dbId, snapshotId, options). Volumes use Config.VolumeDescriptor, including any required credentials. Omitting options preserves dependencies and selects only the requested snapshot. Results include deletion counts and preservedSnapshots. See Snapshot Cleanup for directory layout, options, and dependency safety. ",
+    "content": "After stopping all readers, writers, compactors, and snapshot publication: . SnapshotCleanupOptions options = new SnapshotCleanupOptions(); options.includeOlderSnapshots = true; SnapshotCleanupResult result = SnapshotTools.cleanupGlobalSnapshot( metadataVolume, Collections.emptyList(), snapshotId, options); . For one shard, use SnapshotTools.cleanupShardSnapshot(metadataVolume, otherVolumes, dbId, snapshotId, options). Volumes use Config.VolumeDescriptor, including any required credentials. Omitting options selects only the requested snapshot; dependencies and export leases are always protected. Results include deletion counts and preservedSnapshots, with reasons and a null dbId for retained globals. See Snapshot Cleanup for directory layout, options, and dependency safety. ",
     "url": "/cobble/latest/ffi-bindings/java.html#snapshot-cleanup",
     
     "relUrl": "/ffi-bindings/java.html#snapshot-cleanup"
@@ -1037,7 +1037,7 @@
   },"148": {
     "doc": "Python",
     "title": "Snapshot cleanup",
-    "content": "After stopping all readers, writers, compactors, and snapshot publication: . result = pycobble.cleanup_global_snapshot( metadata_volume_json, \"[]\", snapshot_id, include_older_snapshots=True ) . For one shard, use pycobble.cleanup_shard_snapshot(metadata_volume_json, other_volumes_json, db_id, snapshot_id). Both accept keyword options preserve_dependencies=True and include_older_snapshots=False. Volume arguments are a single descriptor JSON and an array of additional descriptors. Results include deletion counts and preserved_snapshots, and support pickle. See Snapshot Cleanup for directory layout and dependency safety. ",
+    "content": "After stopping all readers, writers, compactors, and snapshot publication: . result = pycobble.cleanup_global_snapshot( metadata_volume_json, \"[]\", snapshot_id, include_older_snapshots=True ) . For one shard, use pycobble.cleanup_shard_snapshot(metadata_volume_json, other_volumes_json, db_id, snapshot_id). Both accept the keyword option include_older_snapshots=False; dependency protection is always enabled. Volume arguments are a single descriptor JSON and an array of additional descriptors. Results include deletion counts and preserved_snapshots with reasons (a null db_id denotes a global), and support pickle. See Snapshot Cleanup for directory layout and dependency safety. ",
     "url": "/cobble/latest/ffi-bindings/python.html#snapshot-cleanup",
     
     "relUrl": "/ffi-bindings/python.html#snapshot-cleanup"
@@ -1576,7 +1576,7 @@
   },"225": {
     "doc": "Tools",
     "title": "Snapshot Cleanup",
-    "content": "Use cleanup_shard_snapshot or cleanup_global_snapshot to remove saved snapshots, including standalone snapshots and exports, without opening a database. Stop all readers, writers, compactors, and snapshot publication before cleanup. use cobble::{SnapshotCleanupOptions, VolumeDescriptor, VolumeUsageKind, cleanup_global_snapshot}; let metadata = VolumeDescriptor::new( \"file:///backups/run-001\", vec![VolumeUsageKind::Snapshot]); let result = cleanup_global_snapshot( &amp;metadata, &amp;[], snapshot_id, SnapshotCleanupOptions::default())?; . For one shard, call cleanup_shard_snapshot(&amp;metadata, &amp;other_volumes, db_id, snapshot_id, options). The metadata base is the parent of &lt;db_id&gt;/snapshot/ (an export’s shards/ directory). For global cleanup, it contains snapshot/SNAPSHOT-&lt;global-id&gt; (the export root). Supply additional volume descriptors with paths and credentials when files are stored elsewhere. Two options control removal: . | preserve_dependencies defaults to true: retain selected shard snapshots and files needed by surviving snapshots. Setting it to false can make surviving snapshots unrecoverable. | include_older_snapshots defaults to false: when enabled, also select all snapshots with IDs below the requested ID. Global cleanup compares global IDs, not shard IDs. | . The result reports deleted file and snapshot counts, plus preserved_snapshots. Shard cleanup only accounts for that shard’s snapshots; use global cleanup when global references must be protected. References outside the cleanup scope remain the caller’s responsibility. See the Java, C++, and Python examples. ",
+    "content": "Use cleanup_shard_snapshot or cleanup_global_snapshot to remove saved snapshots, including standalone snapshots and exports, without opening a database. Stop all readers, writers, compactors, and snapshot publication before cleanup. use cobble::{SnapshotCleanupOptions, VolumeDescriptor, VolumeUsageKind, cleanup_global_snapshot}; let metadata = VolumeDescriptor::new( \"file:///backups/run-001\", vec![VolumeUsageKind::Snapshot]); let result = cleanup_global_snapshot( &amp;metadata, &amp;[], snapshot_id, SnapshotCleanupOptions::default())?; . For one shard, call cleanup_shard_snapshot(&amp;metadata, &amp;other_volumes, db_id, snapshot_id, options). The metadata base is the parent of &lt;db_id&gt;/snapshot/ (an export’s shards/ directory). For global cleanup, it contains snapshot/SNAPSHOT-&lt;global-id&gt; (the export root). Supply additional volume descriptors with paths and credentials when files are stored elsewhere. include_older_snapshots (default false) also selects IDs below the requested ID; global cleanup compares global IDs. Incremental dependencies and export leases are always protected. Results contain deletion counts and preserved_snapshots with identities and reasons (db_id is null for globals). Partial cleanup is normal and retryable. Blocked globals retain their shard set unless another retained global directly references the protected shards. After an I/O failure, retry cleanup rather than restoring selected targets, which may already be partially deleted. Shard cleanup only accounts for that shard’s snapshots; use global cleanup when global references must be protected. References outside the cleanup scope remain the caller’s responsibility; cross-DB borrowing must establish export leases. See the Java, C++, and Python examples. ",
     "url": "/cobble/latest/reference/tools.html#snapshot-cleanup",
     
     "relUrl": "/reference/tools.html#snapshot-cleanup"
