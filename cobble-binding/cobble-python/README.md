@@ -67,11 +67,26 @@ db.close()
 ```
 
 `Db.expand_bucket_from_manifest(source_db_id, source_manifest_path, *,
-ranges=None, storage_mode=ExpandStorageMode.ADOPT_ASYNC)` and the equivalent
+ranges=None, storage_mode=ImportStorageMode.ADOPT_ASYNC)` and the equivalent
 `StructuredDb` method import an exact source manifest across metadata roots.
 The target configuration must include the source volume (READONLY is allowed),
 with credentials supplied by that current configuration. Omitted ranges import
 all source ranges; native work runs with the GIL released.
+
+New-identity imports require an explicit ownership policy:
+
+```python
+fresh = pycobble.Db.restore_new(config_json, source_db_id, snapshot_id,
+    ranges=[pycobble.BucketRange(2, 3)],
+    storage_mode=pycobble.ImportStorageMode.ADOPT_ASYNC)
+fresh.wait_for_import_adoption(10.0)
+# Or restore_new_from_manifest(config_json, manifest_path, ranges=None, storage_mode=...).
+```
+
+Both raw and structured APIs create a fresh DB identity without replaying source WAL.
+Omitted ranges import all source buckets; explicit ranges must be nonempty and fully covered.
+Persistent modes create no adoption lease and require the caller to retain source files,
+including when using a local cache. Same-identity recovery uses resume_from_snapshot.
 
 For snapshot reads, `StructuredReader.open_current(config)` follows the latest
 global snapshot on access and also supports explicit `refresh()`, while

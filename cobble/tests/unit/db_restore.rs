@@ -51,12 +51,6 @@ fn restore_ref_order_priority_policy() {
         )
     });
     assert_eq!(ids(refs), vec![1, 2, 3]);
-    assert_eq!(
-        restore_source_origin(&ReplicaOrigin::Owned, Some("snapshot:source:7")),
-        ReplicaOrigin::ExternalPersistent {
-            source_id: "snapshot:source:7".to_string(),
-        }
-    );
 }
 
 #[test]

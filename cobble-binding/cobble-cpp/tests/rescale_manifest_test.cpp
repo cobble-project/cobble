@@ -35,9 +35,9 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
   COBBLE_CHECK(source.RetainSnapshot(snapshot.snapshot_id));
 
   const std::array modes = {
-      cobble::ExpandStorageMode::kAdoptAsync,
-      cobble::ExpandStorageMode::kReferencePersistent,
-      cobble::ExpandStorageMode::kReferencePersistentWithCache};
+      cobble::ImportStorageMode::kAdoptAsync,
+      cobble::ImportStorageMode::kReferencePersistent,
+      cobble::ImportStorageMode::kReferencePersistentWithCache};
   for (const auto mode : modes) {
     auto target = Database::Open(target_config, target_ranges);
     bool invalid_manifest = false;
@@ -61,13 +61,13 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
 
     // Exercise both the inferred and explicit source ranges.
     const auto ranges =
-        mode == cobble::ExpandStorageMode::kReferencePersistent
+        mode == cobble::ImportStorageMode::kReferencePersistent
             ? std::optional<std::span<const cobble::BucketRange>>{}
             : std::optional<std::span<const cobble::BucketRange>>{
                   source_ranges};
     (void)target.ExpandBucketFromManifest(source.Id(), snapshot.manifest_path,
                                           ranges, mode);
-    target.WaitForExpandAdoption(std::chrono::seconds(10));
+    target.WaitForImportAdoption(std::chrono::seconds(10));
     COBBLE_CHECK(get(target));
     const auto imported = target.TakeSnapshot();
     COBBLE_CHECK(imported.manifest_path.starts_with(
@@ -78,6 +78,20 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
         Database::ResumeFromSnapshot(target_config, imported.snapshot_id, id);
     COBBLE_CHECK(get(resumed));
     resumed.Close();
+    const std::array imported_ranges = {cobble::BucketRange{2, 2}};
+    for (bool from_manifest : {false, true}) {
+      auto fresh =
+          from_manifest
+              ? Database::RestoreNewFromManifest(target_config,
+                                                 snapshot.manifest_path,
+                                                 imported_ranges, mode)
+              : Database::RestoreNew(Config(old_root), snapshot.snapshot_id,
+                                     source.Id(), imported_ranges, mode);
+      COBBLE_CHECK(fresh.Id() != source.Id());
+      fresh.WaitForImportAdoption(std::chrono::seconds(10));
+      COBBLE_CHECK(get(fresh));
+      fresh.Close();
+    }
   }
   source.Close();
 }

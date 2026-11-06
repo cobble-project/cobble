@@ -3,7 +3,7 @@ use crate::transform::TableSchemaTransformFactories;
 use crate::{Result, Table, TableSchema};
 use bytes::Bytes;
 use cobble::{
-    Config, Db, DbBuilder, ExpandStorageMode, MergeOperatorResolver, MetricSample,
+    Config, Db, DbBuilder, ImportStorageMode, MergeOperatorResolver, MetricSample,
     ShardSnapshotMetadata,
 };
 use std::ops::RangeInclusive;
@@ -74,6 +74,8 @@ impl TableStoreBuilder {
     ///
     /// A fresh DB identity and snapshot chain are created; the builder's DB ID is ignored.
     /// Bucket ranges come from the source manifest, not the builder. The source WAL is not replayed.
+    /// Import all source ranges using persistent references. The caller must retain source files.
+    /// TableStore import policy is unchanged; explicit policies are provided by the DB API.
     pub fn open_new_with_manifest_path(
         self,
         manifest_path: impl Into<String>,
@@ -82,7 +84,11 @@ impl TableStoreBuilder {
             db: Arc::new(
                 self.transforms
                     .apply_to(self.builder)?
-                    .open_new_with_manifest_path(manifest_path)?,
+                    .open_new_with_manifest_path(
+                        manifest_path,
+                        None,
+                        ImportStorageMode::ReferencePersistent,
+                    )?,
             ),
         })
     }
@@ -194,7 +200,7 @@ impl TableStore {
         source_db_id: impl Into<String>,
         source_manifest_path: impl Into<String>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
-        storage_mode: ExpandStorageMode,
+        storage_mode: ImportStorageMode,
     ) -> Result<u64> {
         Ok(self.exclusive_db()?.expand_bucket_from_manifest(
             source_db_id,
@@ -210,8 +216,8 @@ impl TableStore {
         Ok(self.exclusive_db()?.shrink_bucket(ranges)?)
     }
 
-    pub fn wait_for_expand_adoption(&self, timeout: Duration) -> Result<()> {
-        Ok(self.db.wait_for_expand_adoption(timeout)?)
+    pub fn wait_for_import_adoption(&self, timeout: Duration) -> Result<()> {
+        Ok(self.db.wait_for_import_adoption(timeout)?)
     }
 
     /// Close the shared database. Release scanners first: close waits for their active reads

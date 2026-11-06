@@ -519,7 +519,7 @@ fn table_runtime_create_open_and_typed_rows() {
         DbBuilder::new(config)
             .db_id("table-runtime")
             .merge_operator_resolver(cobble_table::table_merge_operator_resolver(None))
-            .open_from_snapshot(snapshot_id)
+            .resume_from_snapshot(snapshot_id)
             .unwrap(),
     );
     {

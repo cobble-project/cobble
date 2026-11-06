@@ -39,6 +39,14 @@ Public operations use PascalCase (for example, `Get`, `ColumnCount`, and
 `PendingSnapshot::Id`); container-style `size`/`empty` and standard iterator
 `begin`/`end` retain their usual C++ spelling.
 
+New-identity imports use `Db::RestoreNew(config, snapshot, source_db_id, ranges, mode)`
+or `RestoreNewFromManifest(config, manifest_path, ranges, mode)`, also on structured DBs.
+Pass `std::nullopt` for all source buckets; explicit ranges must be nonempty and fully covered.
+An explicit `ImportStorageMode` is required. `kAdoptAsync` protects source files while adopting;
+`WaitForImportAdoption(timeout)` waits for adoption. Persistent modes create no adoption lease:
+the caller must retain source data, including in the cached mode. Same-identity recovery uses
+`ResumeFromSnapshot`. Read-only DB and Reader APIs are unchanged.
+
 ## Requirements
 
 - Rust toolchain compatible with the Cobble workspace

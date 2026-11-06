@@ -588,7 +588,8 @@ fn test_schema_persisted_and_restored_across_open_modes() {
         expected
     );
 
-    let from_snapshot = Db::open_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
+    let from_snapshot =
+        Db::resume_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
     assert_eq!(
         read_counter(from_snapshot.get(0, b"counter").unwrap()),
         expected
@@ -1264,8 +1265,8 @@ fn test_single_db_close_waits_snapshot_global_materialization() {
 
 #[test]
 #[serial_test::serial(file)]
-fn test_db_open_from_snapshot_ignores_config_num_columns_after_initialization() {
-    let root = "/tmp/db_open_from_snapshot_ignore_num_columns";
+fn test_db_resume_from_snapshot_ignores_config_num_columns_after_initialization() {
+    let root = "/tmp/db_resume_from_snapshot_ignore_num_columns";
     cleanup_test_root(root);
     let config = Config {
         volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
@@ -1286,7 +1287,7 @@ fn test_db_open_from_snapshot_ignores_config_num_columns_after_initialization() 
         num_columns: 1,
         ..config.clone()
     };
-    let reopened = Db::open_from_snapshot(reopen_config, snapshot_id, db_id).unwrap();
+    let reopened = Db::resume_from_snapshot(reopen_config, snapshot_id, db_id).unwrap();
     let value = reopened.get(0, b"k1").unwrap().expect("value present");
     assert_eq!(value.len(), 2);
     assert_eq!(value[0].as_deref(), Some(&b"v1"[..]));
@@ -1793,7 +1794,7 @@ fn test_db_incremental_snapshot_restore() {
     assert_eq!(value2[0].as_ref().unwrap().as_ref(), b"v2");
 
     let writable =
-        Db::open_from_snapshot(config.clone(), incremental_snapshot_id, db.id()).unwrap();
+        Db::resume_from_snapshot(config.clone(), incremental_snapshot_id, db.id()).unwrap();
     let value1 = writable.get(0, b"k1").unwrap().expect("k1 value present");
     assert_eq!(value1[0].as_ref().unwrap().as_ref(), b"v1");
     let value2 = writable.get(0, b"k2").unwrap().expect("k2 value present");
@@ -2262,7 +2263,7 @@ fn test_db_restore_from_readonly_snapshot_volume_migrates_files_and_disables_fir
         sst_bloom_filter_enabled: true,
         ..Config::default()
     };
-    let restored = Db::open_from_snapshot(restore_config, snapshot_id, db_id.clone()).unwrap();
+    let restored = Db::resume_from_snapshot(restore_config, snapshot_id, db_id.clone()).unwrap();
     let restored_value = restored.get(0, b"k0001").unwrap().expect("restored value");
     assert_eq!(restored_value[0].as_ref().unwrap().as_ref(), b"value");
     let new_primary_data_dir = format!("{}/{}/data", new_primary_root, db_id);
@@ -2417,7 +2418,7 @@ fn test_db_incremental_snapshot_keeps_base_manifest_live() {
 
 #[test]
 #[serial_test::serial(file)]
-fn test_db_open_from_snapshot_allows_writes() {
+fn test_db_resume_from_snapshot_allows_writes() {
     let root = "/tmp/db_snapshot_write";
     cleanup_test_root(root);
     let config = Config {
@@ -2439,7 +2440,7 @@ fn test_db_open_from_snapshot_allows_writes() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let writable = Db::open_from_snapshot(config, snapshot_id, db.id()).unwrap();
+    let writable = Db::resume_from_snapshot(config, snapshot_id, db.id()).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(0, b"k2", 0, b"v2");
     writable.write_batch(batch).unwrap();
@@ -2486,7 +2487,7 @@ fn test_same_id_snapshot_restore_close_preserves_source_ssts() {
     let db_id = db.id().to_string();
     db.close().unwrap();
 
-    let restored = Db::open_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
+    let restored = Db::resume_from_snapshot(config.clone(), snapshot_id, db_id.clone()).unwrap();
     assert!(restored.get(0, b"key-000").unwrap().is_some());
     restored.close().unwrap();
 
@@ -2517,7 +2518,14 @@ fn test_db_open_new_with_snapshot_uses_fresh_db_id_and_starts_new_snapshot_chain
     let source_db_id = db.id().to_string();
     db.close().unwrap();
 
-    let restored = Db::open_new_with_snapshot(config.clone(), snapshot_id, &source_db_id).unwrap();
+    let restored = Db::open_new_with_snapshot(
+        config.clone(),
+        &source_db_id,
+        snapshot_id,
+        None,
+        cobble::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_ne!(restored.id(), source_db_id);
     let value = restored
         .get(0, b"k1")
@@ -2525,13 +2533,13 @@ fn test_db_open_new_with_snapshot_uses_fresh_db_id_and_starts_new_snapshot_chain
         .expect("restored value present");
     assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
 
-    let first_new_snapshot_id = restored.snapshot().unwrap();
-    let first_new_manifest = wait_for_manifest_in_db(root, restored.id(), first_new_snapshot_id);
+    let first_new_manifest = wait_for_manifest_in_db(root, restored.id(), 0);
     let manifest_json: JsonValue = serde_json::from_str(&first_new_manifest).unwrap();
     assert!(
         manifest_json.get("base_snapshot_id").is_none(),
-        "first snapshot after open_new_with_snapshot should start a new chain"
+        "the imported baseline must start the target's independent chain"
     );
+    assert!(restored.snapshot().unwrap() > 0);
 
     restored.close().unwrap();
     cleanup_test_root(root);
@@ -2563,7 +2571,13 @@ fn test_db_open_new_with_manifest_path_uses_fresh_db_id_and_starts_new_snapshot_
     );
     db.close().unwrap();
 
-    let restored = Db::open_new_with_manifest_path(config.clone(), manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config.clone(),
+        manifest_path,
+        None,
+        cobble::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_ne!(restored.id(), source_db_id);
     let value = restored
         .get(0, b"k1")
@@ -2571,13 +2585,13 @@ fn test_db_open_new_with_manifest_path_uses_fresh_db_id_and_starts_new_snapshot_
         .expect("restored value present");
     assert_eq!(value[0].as_ref().unwrap().as_ref(), b"v1");
 
-    let first_new_snapshot_id = restored.snapshot().unwrap();
-    let first_new_manifest = wait_for_manifest_in_db(root, restored.id(), first_new_snapshot_id);
+    let first_new_manifest = wait_for_manifest_in_db(root, restored.id(), 0);
     let manifest_json: JsonValue = serde_json::from_str(&first_new_manifest).unwrap();
     assert!(
         manifest_json.get("base_snapshot_id").is_none(),
-        "first snapshot after open_new_with_manifest_path should start a new chain"
+        "the imported baseline must start the target's independent chain"
     );
+    assert!(restored.snapshot().unwrap() > 0);
 
     restored.close().unwrap();
     cleanup_test_root(root);
@@ -2605,8 +2619,19 @@ fn test_db_resume_takes_over_snapshot_lifecycle() {
     let _ = wait_for_manifest_in_db(root, db.id(), snapshot_id);
     db.close().unwrap();
 
-    let writable = Db::open_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
-    assert!(!writable.expire_snapshot(snapshot_id).unwrap());
+    let writable = Db::resume_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
+    assert_eq!(writable.id(), db.id());
+    assert_eq!(
+        writable
+            .shard_snapshot_metadata(snapshot_id)
+            .unwrap()
+            .snapshot_id,
+        snapshot_id
+    );
+    assert_eq!(
+        writable.get(0, b"k1").unwrap().unwrap()[0].as_deref(),
+        Some(b"v1".as_slice())
+    );
     writable.close().unwrap();
 
     let resume_config = config;
@@ -3026,7 +3051,7 @@ fn test_db_multi_lsm_snapshot_restore_and_resume() {
     );
     db.close().unwrap();
 
-    let restored = Db::open_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
+    let restored = Db::resume_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
     let left = restored.get(0, b"k-left").unwrap().expect("left value");
     assert_eq!(left[0].as_ref().unwrap().as_ref(), b"v-left");
     let right = restored.get(3, b"k-right").unwrap().expect("right value");
@@ -3088,7 +3113,7 @@ fn test_db_parquet_snapshot_restore_and_read_only() {
     let right = read_only.get(3, b"k-right").unwrap().expect("right value");
     assert_eq!(right[0].as_ref().unwrap().as_ref(), b"v-right");
 
-    let restored = Db::open_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
+    let restored = Db::resume_from_snapshot(config.clone(), snapshot_id, db.id()).unwrap();
     let left = restored
         .get(0, b"k-left")
         .unwrap()
@@ -3441,7 +3466,7 @@ fn test_db_snapshot_active_incremental_flushes_vlog_entries() {
     let db_id = db.id().to_string();
     db.close().unwrap();
 
-    let from_snapshot = Db::open_from_snapshot(config.clone(), second_snapshot, db_id.clone())
+    let from_snapshot = Db::resume_from_snapshot(config.clone(), second_snapshot, db_id.clone())
         .expect("open from snapshot with active memtable replay");
     let restored_v1 = from_snapshot.get(0, b"k1").unwrap().expect("restored k1");
     assert_eq!(restored_v1[0].as_ref().unwrap().as_ref(), v1.as_slice());

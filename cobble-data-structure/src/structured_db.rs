@@ -715,19 +715,34 @@ impl StructuredDbBuilder {
         StructuredDb::from_db(self.inner.open()?)
     }
 
-    pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<StructuredDb> {
-        StructuredDb::from_db(self.inner.open_from_snapshot(snapshot_id)?)
+    /// Always creates a fresh identity, ignoring builder db_id and ordinary bucket_ranges.
+    pub fn open_new_with_snapshot(
+        self,
+        source_db_id: impl AsRef<str>,
+        snapshot_id: u64,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ImportStorageMode,
+    ) -> Result<StructuredDb> {
+        StructuredDb::from_db(self.inner.open_new_with_snapshot(
+            source_db_id,
+            snapshot_id,
+            ranges,
+            storage_mode,
+        )?)
     }
 
-    pub fn open_from_snapshot_with_recovery_mode(
+    /// Always creates a fresh identity, ignoring builder db_id and ordinary bucket_ranges.
+    pub fn open_new_with_manifest_path(
         self,
-        snapshot_id: u64,
-        recovery_mode: RecoveryMode,
+        manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ImportStorageMode,
     ) -> Result<StructuredDb> {
-        StructuredDb::from_db(
-            self.inner
-                .open_from_snapshot_with_recovery_mode(snapshot_id, recovery_mode)?,
-        )
+        StructuredDb::from_db(self.inner.open_new_with_manifest_path(
+            manifest_path,
+            ranges,
+            storage_mode,
+        )?)
     }
 
     pub fn resume(self) -> Result<StructuredDb> {
@@ -1342,63 +1357,38 @@ impl StructuredDb {
         Self::from_db(Db::open(config, bucket_ranges)?)
     }
 
-    pub fn open_from_snapshot(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-    ) -> Result<Self> {
-        Self::open_from_snapshot_with_resolver(config, snapshot_id, db_id, None)
-    }
-
-    pub fn open_from_snapshot_with_resolver(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
-    ) -> Result<Self> {
-        Self::from_db(Db::open_from_snapshot_with_resolver(
-            config,
-            snapshot_id,
-            db_id,
-            Some(combined_resolver(resolver)),
-        )?)
-    }
-
-    /// Open a selected snapshot using the requested WAL recovery behavior.
-    pub fn open_from_snapshot_with_recovery_mode(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-        recovery_mode: RecoveryMode,
-    ) -> Result<Self> {
-        Self::from_db(Db::open_from_snapshot_with_recovery_mode_and_resolver(
-            config,
-            snapshot_id,
-            db_id,
-            recovery_mode,
-            Some(combined_resolver(None)),
-        )?)
-    }
-
+    /// Import into a fresh DB identity; ranges do not come from ordinary bucket_ranges.
     pub fn open_new_with_snapshot(
         config: Config,
+        source_db_id: impl AsRef<str>,
         snapshot_id: u64,
-        db_id: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ImportStorageMode,
     ) -> Result<Self> {
-        Self::open_new_with_snapshot_with_resolver(config, snapshot_id, db_id, None)
+        Self::open_new_with_snapshot_with_resolver(
+            config,
+            source_db_id,
+            snapshot_id,
+            ranges,
+            storage_mode,
+            None,
+        )
     }
 
     pub fn open_new_with_snapshot_with_resolver(
         config: Config,
+        source_db_id: impl AsRef<str>,
         snapshot_id: u64,
-        db_id: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ImportStorageMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let db_id = db_id.into();
         Self::from_db(Db::open_new_with_snapshot_with_resolver(
             config,
+            source_db_id,
             snapshot_id,
-            &db_id,
+            ranges,
+            storage_mode,
             Some(combined_resolver(resolver)),
         )?)
     }
@@ -1406,18 +1396,30 @@ impl StructuredDb {
     pub fn open_new_with_manifest_path(
         config: Config,
         manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ImportStorageMode,
     ) -> Result<Self> {
-        Self::open_new_with_manifest_path_with_resolver(config, manifest_path, None)
+        Self::open_new_with_manifest_path_with_resolver(
+            config,
+            manifest_path,
+            ranges,
+            storage_mode,
+            None,
+        )
     }
 
     pub fn open_new_with_manifest_path_with_resolver(
         config: Config,
         manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: cobble::ImportStorageMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
         Self::from_db(Db::open_new_with_manifest_path_with_resolver(
             config,
             manifest_path,
+            ranges,
+            storage_mode,
             Some(combined_resolver(resolver)),
         )?)
     }
@@ -1506,14 +1508,14 @@ impl StructuredDb {
         source_db_id: impl Into<String>,
         snapshot_id: Option<u64>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
-        storage_mode: cobble::ExpandStorageMode,
+        storage_mode: cobble::ImportStorageMode,
     ) -> Result<u64> {
         self.db
             .expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode)
     }
 
-    pub fn wait_for_expand_adoption(&self, timeout: std::time::Duration) -> Result<()> {
-        self.db.wait_for_expand_adoption(timeout)
+    pub fn wait_for_import_adoption(&self, timeout: std::time::Duration) -> Result<()> {
+        self.db.wait_for_import_adoption(timeout)
     }
 
     pub fn expand_bucket_from_manifest(
@@ -1521,7 +1523,7 @@ impl StructuredDb {
         source_db_id: impl Into<String>,
         source_manifest_path: impl Into<String>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
-        storage_mode: cobble::ExpandStorageMode,
+        storage_mode: cobble::ImportStorageMode,
     ) -> Result<u64> {
         self.db.expand_bucket_from_manifest(
             source_db_id,

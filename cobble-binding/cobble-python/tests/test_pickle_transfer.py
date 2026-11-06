@@ -308,7 +308,7 @@ def test_pickle_public_value_inventory_and_errors() -> None:
     value_types = public_classes - live - errors
     assert value_types == {
         "BucketRange", "ColumnFamily", "ColumnFamilyId", "SnapshotColumnFamily",
-        "CounterValue", "ExpandStorageMode", "GaugeValue", "GlobalSnapshot",
+        "CounterValue", "ImportStorageMode", "GaugeValue", "GlobalSnapshot",
         "HistogramValue", "MemtableType", "MergeOperatorSpec", "MetricLabel",
         "MetricSample", "OwnedBytes", "OwnedBatch", "OwnedRow", "OwnedMultiGetResult",
         "ReadOptions", "ReaderMode", "RecoveryMode", "ScanOptions", "ScanPlan",
@@ -333,7 +333,7 @@ def test_pickle_public_value_inventory_and_errors() -> None:
     for value in (
         pycobble.RecoveryMode.LATEST_WITH_WAL,
         pycobble.MemtableType.ADAPTIVE,
-        pycobble.ExpandStorageMode.ADOPT_ASYNC,
+        pycobble.ImportStorageMode.ADOPT_ASYNC,
         pycobble.ReaderMode.CURRENT,
         pycobble.BufferStatus.BUFFER_TOO_SMALL,
         pycobble.StructuredColumnKind.LIST,

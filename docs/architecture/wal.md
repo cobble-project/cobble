@@ -61,7 +61,7 @@ at that snapshot or also replays its durable WAL tail:
 The illustrated WAL tail assumes WAL was enabled for those writes. Selecting a historical snapshot never replays forward to the latest state, even with `LatestWithWal`.
 
 ```rust
-let db = Db::open_from_snapshot_with_recovery_mode(
+let db = Db::resume_from_snapshot_with_recovery_mode(
     config,
     snapshot_id,
     db_id,
@@ -69,8 +69,8 @@ let db = Db::open_from_snapshot_with_recovery_mode(
 )?;
 ```
 
-`Db::resume` defaults to `LatestWithWal`, while `Db::resume_from_snapshot`,
-`Db::open_from_snapshot`, and `SingleDb::resume` default to `SnapshotOnly`. Their
+`Db::resume` defaults to `LatestWithWal`, while `Db::resume_from_snapshot`
+and `SingleDb::resume` default to `SnapshotOnly`. Their
 `*_with_recovery_mode` variants let the caller choose explicitly. This choice is independent of
 whether WAL is enabled for new writes in the current configuration.
 

@@ -4,8 +4,8 @@ use crate::scan::{ScanCursorHandle, decode_scan_open_bounds_args};
 use crate::util::{
     complete_future_exceptionally, complete_future_with_cobble_error, complete_future_with_string,
     decode_bucket_ranges, decode_java_bytes, decode_java_string, decode_multi_get_keys,
-    decode_packed_multi_get_keys, decode_recovery_mode, decode_u16, decode_u32,
-    decode_u64_from_jlong, expand_storage_mode, parse_config_json,
+    decode_optional_bucket_ranges, decode_packed_multi_get_keys, decode_recovery_mode, decode_u16,
+    decode_u32, decode_u64_from_jlong, import_storage_mode, parse_config_json,
     take_last_overflow_direct_buffer, take_owned_overflow_direct_buffer, throw_illegal_argument,
     throw_illegal_state, to_java_optional_bytes_2d, to_java_optional_bytes_3d,
     to_java_string_or_throw, write_payload_to_io_or_cached_overflow,
@@ -108,248 +108,154 @@ pub extern "system" fn Java_io_cobble_Db_openHandleFromJsonWithRange(
     open_db_with_range(&mut env, config, range_start, range_end)
 }
 
-fn restore_db(
-    env: &mut JNIEnv,
-    config: Config,
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_openNewWithSnapshotHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_input: JString,
+    source_db_id: JString,
     snapshot_id: jlong,
-    db_id: JString,
-    new_db_id: jboolean,
-    recovery_mode: RecoveryMode,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    storage_mode: jint,
 ) -> jlong {
-    let snapshot_id = match decode_u64_from_jlong("snapshotId", snapshot_id) {
-        Ok(v) => v,
+    let decoded = (|| -> Result<_, String> {
+        let input = decode_java_string(&mut env, config_input)?;
+        let config = Config::from_path(input).map_err(|err| err.to_string())?;
+        let source = decode_java_string(&mut env, source_db_id)?;
+        let snapshot_id = decode_u64_from_jlong("snapshotId", snapshot_id)?;
+        let ranges = decode_optional_bucket_ranges(&mut env, range_starts, range_ends)?;
+        let storage_mode = import_storage_mode(storage_mode)?;
+        Ok((config, source, snapshot_id, ranges, storage_mode))
+    })();
+    let (config, source, snapshot_id, ranges, storage_mode) = match decoded {
+        Ok(value) => value,
         Err(err) => {
-            throw_illegal_argument(env, err);
-            return 0;
-        }
-    };
-    let db_id = match decode_java_string(env, db_id) {
-        Ok(v) => v,
-        Err(err) => {
-            throw_illegal_argument(env, err);
+            throw_illegal_argument(&mut env, err);
             return 0;
         }
     };
     match table_db_builder(config).and_then(|builder| {
-        if new_db_id == JNI_TRUE {
-            builder.open_new_with_snapshot(snapshot_id, &db_id)
-        } else {
-            builder
-                .db_id(db_id)
-                .open_from_snapshot_with_recovery_mode(snapshot_id, recovery_mode)
-        }
+        builder.open_new_with_snapshot(source, snapshot_id, ranges, storage_mode)
     }) {
-        Ok(v) => Box::into_raw(Box::new(Arc::new(v))) as jlong,
+        Ok(db) => Box::into_raw(Box::new(Arc::new(db))) as jlong,
         Err(err) => {
-            throw_illegal_state(env, err.to_string());
+            throw_illegal_state(&mut env, err.to_string());
             0
         }
     }
 }
 
-fn restore_db_from_manifest_path(
-    env: &mut JNIEnv,
-    config: Config,
-    manifest_path: JString,
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_openNewWithSnapshotHandleFromJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_input: JString,
+    source_db_id: JString,
+    snapshot_id: jlong,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    storage_mode: jint,
 ) -> jlong {
-    let manifest_path = match decode_java_string(env, manifest_path) {
-        Ok(v) => v,
+    let decoded = (|| -> Result<_, String> {
+        let input = decode_java_string(&mut env, config_input)?;
+        let config = Config::from_json_str(&input).map_err(|err| err.to_string())?;
+        let source = decode_java_string(&mut env, source_db_id)?;
+        let snapshot_id = decode_u64_from_jlong("snapshotId", snapshot_id)?;
+        let ranges = decode_optional_bucket_ranges(&mut env, range_starts, range_ends)?;
+        let storage_mode = import_storage_mode(storage_mode)?;
+        Ok((config, source, snapshot_id, ranges, storage_mode))
+    })();
+    let (config, source, snapshot_id, ranges, storage_mode) = match decoded {
+        Ok(value) => value,
         Err(err) => {
-            throw_illegal_argument(env, err);
+            throw_illegal_argument(&mut env, err);
+            return 0;
+        }
+    };
+    match table_db_builder(config).and_then(|builder| {
+        builder.open_new_with_snapshot(source, snapshot_id, ranges, storage_mode)
+    }) {
+        Ok(db) => Box::into_raw(Box::new(Arc::new(db))) as jlong,
+        Err(err) => {
+            throw_illegal_state(&mut env, err.to_string());
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_cobble_Db_openNewWithManifestPathHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_input: JString,
+    manifest_path: JString,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    storage_mode: jint,
+) -> jlong {
+    let decoded = (|| -> Result<_, String> {
+        let input = decode_java_string(&mut env, config_input)?;
+        let config = Config::from_path(input).map_err(|err| err.to_string())?;
+        let source = decode_java_string(&mut env, manifest_path)?;
+
+        let ranges = decode_optional_bucket_ranges(&mut env, range_starts, range_ends)?;
+        let storage_mode = import_storage_mode(storage_mode)?;
+        Ok((config, source, ranges, storage_mode))
+    })();
+    let (config, source, ranges, storage_mode) = match decoded {
+        Ok(value) => value,
+        Err(err) => {
+            throw_illegal_argument(&mut env, err);
             return 0;
         }
     };
     match table_db_builder(config)
-        .and_then(|builder| builder.open_new_with_manifest_path(manifest_path))
+        .and_then(|builder| builder.open_new_with_manifest_path(source, ranges, storage_mode))
     {
-        Ok(v) => Box::into_raw(Box::new(Arc::new(v))) as jlong,
+        Ok(db) => Box::into_raw(Box::new(Arc::new(db))) as jlong,
         Err(err) => {
-            throw_illegal_state(env, err.to_string());
+            throw_illegal_state(&mut env, err.to_string());
             0
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_restoreHandle(
+pub extern "system" fn Java_io_cobble_Db_openNewWithManifestPathHandleFromJson(
     mut env: JNIEnv,
     _class: JClass,
-    config_path: JString,
-    snapshot_id: jlong,
-    db_id: JString,
-    new_db_id: jboolean,
-) -> jlong {
-    let path = match decode_java_string(&mut env, config_path) {
-        Ok(path) => path,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let config = match Config::from_path(path) {
-        Ok(config) => config,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
-    };
-    restore_db(
-        &mut env,
-        config,
-        snapshot_id,
-        db_id,
-        new_db_id,
-        RecoveryMode::SnapshotOnly,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_restoreHandleFromJson(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
-    snapshot_id: jlong,
-    db_id: JString,
-    new_db_id: jboolean,
-) -> jlong {
-    let json = match decode_java_string(&mut env, config_json) {
-        Ok(json) => json,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let Some(config) = parse_config_json(&mut env, &json) else {
-        return 0;
-    };
-    restore_db(
-        &mut env,
-        config,
-        snapshot_id,
-        db_id,
-        new_db_id,
-        RecoveryMode::SnapshotOnly,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_restoreHandleWithRecoveryMode(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_path: JString,
-    snapshot_id: jlong,
-    db_id: JString,
-    recovery_mode_value: jint,
-) -> jlong {
-    let path = match decode_java_string(&mut env, config_path) {
-        Ok(path) => path,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let config = match Config::from_path(path) {
-        Ok(config) => config,
-        Err(err) => {
-            throw_illegal_state(&mut env, err.to_string());
-            return 0;
-        }
-    };
-    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
-        Ok(mode) => mode,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    restore_db(
-        &mut env,
-        config,
-        snapshot_id,
-        db_id,
-        JNI_FALSE,
-        recovery_mode,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_restoreHandleFromJsonWithRecoveryMode(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
-    snapshot_id: jlong,
-    db_id: JString,
-    recovery_mode_value: jint,
-) -> jlong {
-    let json = match decode_java_string(&mut env, config_json) {
-        Ok(json) => json,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let Some(config) = parse_config_json(&mut env, &json) else {
-        return 0;
-    };
-    let recovery_mode = match decode_recovery_mode(recovery_mode_value) {
-        Ok(mode) => mode,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    restore_db(
-        &mut env,
-        config,
-        snapshot_id,
-        db_id,
-        JNI_FALSE,
-        recovery_mode,
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_restoreWithManifestHandle(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_path: JString,
+    config_input: JString,
     manifest_path: JString,
+    range_starts: JIntArray,
+    range_ends: JIntArray,
+    storage_mode: jint,
 ) -> jlong {
-    let path = match decode_java_string(&mut env, config_path) {
-        Ok(path) => path,
+    let decoded = (|| -> Result<_, String> {
+        let input = decode_java_string(&mut env, config_input)?;
+        let config = Config::from_json_str(&input).map_err(|err| err.to_string())?;
+        let source = decode_java_string(&mut env, manifest_path)?;
+
+        let ranges = decode_optional_bucket_ranges(&mut env, range_starts, range_ends)?;
+        let storage_mode = import_storage_mode(storage_mode)?;
+        Ok((config, source, ranges, storage_mode))
+    })();
+    let (config, source, ranges, storage_mode) = match decoded {
+        Ok(value) => value,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
             return 0;
         }
     };
-    let config = match Config::from_path(path) {
-        Ok(config) => config,
+    match table_db_builder(config)
+        .and_then(|builder| builder.open_new_with_manifest_path(source, ranges, storage_mode))
+    {
+        Ok(db) => Box::into_raw(Box::new(Arc::new(db))) as jlong,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
-            return 0;
+            0
         }
-    };
-    restore_db_from_manifest_path(&mut env, config, manifest_path)
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_restoreWithManifestHandleFromJson(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
-    manifest_path: JString,
-) -> jlong {
-    let json = match decode_java_string(&mut env, config_json) {
-        Ok(json) => json,
-        Err(err) => {
-            throw_illegal_argument(&mut env, err);
-            return 0;
-        }
-    };
-    let Some(config) = parse_config_json(&mut env, &json) else {
-        return 0;
-    };
-    restore_db_from_manifest_path(&mut env, config, manifest_path)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2085,7 +1991,7 @@ pub extern "system" fn Java_io_cobble_Db_expandBucket(
     } else {
         Some(ranges)
     };
-    let storage_mode = match expand_storage_mode(storage_mode) {
+    let storage_mode = match import_storage_mode(storage_mode) {
         Ok(mode) => mode,
         Err(err) => {
             throw_illegal_argument(&mut env, err);
@@ -2119,7 +2025,7 @@ pub extern "system" fn Java_io_cobble_Db_expandBucketFromManifest(
         let source_db_id = decode_java_string(&mut env, source_db_id)?;
         let source_manifest_path = decode_java_string(&mut env, source_manifest_path)?;
         let ranges = decode_bucket_ranges(&mut env, range_starts, range_ends)?;
-        let storage_mode = expand_storage_mode(storage_mode)?;
+        let storage_mode = import_storage_mode(storage_mode)?;
         Ok::<_, String>((source_db_id, source_manifest_path, ranges, storage_mode))
     })();
     let (source_db_id, source_manifest_path, ranges, storage_mode) = match args {
@@ -2144,7 +2050,7 @@ pub extern "system" fn Java_io_cobble_Db_expandBucketFromManifest(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_cobble_Db_waitForExpandAdoption(
+pub extern "system" fn Java_io_cobble_Db_waitForImportAdoption(
     mut env: JNIEnv,
     _class: JClass,
     native_handle: jlong,
@@ -2160,7 +2066,7 @@ pub extern "system" fn Java_io_cobble_Db_waitForExpandAdoption(
             return;
         }
     };
-    match db.wait_for_expand_adoption(std::time::Duration::from_millis(timeout_millis)) {
+    match db.wait_for_import_adoption(std::time::Duration::from_millis(timeout_millis)) {
         Ok(()) => {}
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());

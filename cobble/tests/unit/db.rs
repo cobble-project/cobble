@@ -1958,6 +1958,46 @@ impl MergeOperator for PipeMergeOperator {
     }
 }
 
+#[test]
+fn new_import_preserves_custom_merge_resolver() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        volumes: VolumeDescriptor::single_volume(root.path().to_str().unwrap()),
+        num_columns: 1,
+        snapshot_on_flush: false,
+        ..Config::default()
+    };
+    let source = Db::open(config.clone(), vec![0..=0]).unwrap();
+    let mut schema = source.update_schema();
+    schema
+        .set_column_operator(None, 0, Arc::new(PipeMergeOperator))
+        .unwrap();
+    schema.commit();
+    source.put(0, b"key", 0, b"base").unwrap();
+    source.merge(0, b"key", 0, b"operand").unwrap();
+    let snapshot = source.create_snapshot_and_wait("custom operator").unwrap();
+    let resolver = Arc::new(|id: &str, _: Option<&serde_json::Value>| {
+        (id == PipeMergeOperator.id())
+            .then(|| Arc::new(PipeMergeOperator) as Arc<dyn MergeOperator>)
+    });
+    let imported = DbBuilder::new(config)
+        .merge_operator_resolver(resolver)
+        .open_new_with_snapshot(
+            source.id(),
+            snapshot,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
+    imported.merge(0, b"key", 0, b"after").unwrap();
+    assert_eq!(
+        imported.get(0, b"key").unwrap().unwrap()[0].as_deref(),
+        Some(b"base|operand|after".as_slice())
+    );
+    imported.close().unwrap();
+    source.close().unwrap();
+}
+
 #[derive(Default)]
 struct BatchCountingMergeOperator {
     merge_calls: AtomicUsize,
@@ -3345,7 +3385,12 @@ fn test_transform_specs_available_during_restore_and_snapshot_switch() {
         let db = if resume_chain {
             builder.resume_from_snapshot(snapshot_id)
         } else {
-            builder.open_from_snapshot(snapshot_id)
+            builder.open_new_with_snapshot(
+                db_id,
+                snapshot_id,
+                None,
+                crate::ImportStorageMode::ReferencePersistent,
+            )
         }
         .unwrap();
         assert_eq!(
@@ -3408,7 +3453,7 @@ fn restore_v1_noop_schema_and_persist_v2_without_changing_source() {
 
     let source = DbBuilder::new(config.clone())
         .db_id(source_id)
-        .open_from_snapshot(snapshot)
+        .resume_from_snapshot(snapshot)
         .unwrap();
     assert_eq!(
         source.get(0, b"old").unwrap().unwrap()[0].as_deref(),
@@ -3420,7 +3465,12 @@ fn restore_v1_noop_schema_and_persist_v2_without_changing_source() {
 
     // Restoring into a new DB persists the loaded schema as v2 at a new path.
     let restored = DbBuilder::new(config.clone())
-        .open_new_with_snapshot(snapshot, source_id)
+        .open_new_with_snapshot(
+            source_id,
+            snapshot,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
         .unwrap();
     let restored_id = restored.id().to_string();
     let restored_schema = root.path().join(&restored_id).join("schema/schema-0");
@@ -3438,7 +3488,7 @@ fn restore_v1_noop_schema_and_persist_v2_without_changing_source() {
     drop(restored);
     let reopened = DbBuilder::new(config)
         .db_id(restored_id)
-        .open_from_snapshot(next)
+        .resume_from_snapshot(next)
         .unwrap();
     for (key, value) in [(b"old", b"old-value"), (b"new", b"new-value")] {
         assert_eq!(

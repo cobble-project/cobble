@@ -9,7 +9,7 @@ use crate::schema::{PySchema, PySchemaBuilder, schema};
 use crate::snapshot::{
     PyBucketRange, PyExportSnapshotHandle, PyPendingShardSnapshot, PyShardSnapshot, shard_metadata,
 };
-use crate::types::{PyBufferResult, PyExpandStorageMode, PyMemtableType, PyRecoveryMode};
+use crate::types::{PyBufferResult, PyImportStorageMode, PyMemtableType, PyRecoveryMode};
 use crate::write_batch::PyWriteBatch;
 use cobble_binding::{Config, Db, ReadOptions, VolumeDescriptor, WriteOptions};
 use pyo3::prelude::*;
@@ -145,104 +145,106 @@ impl PyDb {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (config_json, snapshot_id, db_id, recovery_mode=PyRecoveryMode::SnapshotOnly))]
-    fn open_from_snapshot(
-        py: Python<'_>,
-        config_json: String,
-        snapshot_id: u64,
-        db_id: String,
-        recovery_mode: PyRecoveryMode,
-    ) -> PyResult<Self> {
-        py.detach(move || {
-            opendal::install_default();
-            Db::open_from_snapshot_with_recovery_mode(
-                Self::parse_json(&config_json)?,
-                snapshot_id,
-                db_id,
-                recovery_mode.into(),
-            )
-            .map(Self::from_db)
-            .map_err(map_error)
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (config_path, snapshot_id, db_id, recovery_mode=PyRecoveryMode::SnapshotOnly))]
-    fn open_from_snapshot_file(
-        py: Python<'_>,
-        config_path: PathBuf,
-        snapshot_id: u64,
-        db_id: String,
-        recovery_mode: PyRecoveryMode,
-    ) -> PyResult<Self> {
-        py.detach(move || {
-            opendal::install_default();
-            Db::open_from_snapshot_with_recovery_mode(
-                Self::parse_file(config_path)?,
-                snapshot_id,
-                db_id,
-                recovery_mode.into(),
-            )
-            .map(Self::from_db)
-            .map_err(map_error)
-        })
-    }
-
-    #[staticmethod]
+    #[pyo3(signature = (config_json, source_db_id, snapshot_id, *, ranges=None, storage_mode))]
     fn restore_new(
         py: Python<'_>,
         config_json: String,
-        snapshot_id: u64,
         source_db_id: String,
+        snapshot_id: u64,
+        ranges: Option<Vec<PyBucketRange>>,
+        storage_mode: PyImportStorageMode,
     ) -> PyResult<Self> {
         py.detach(move || {
             opendal::install_default();
-            Db::open_new_with_snapshot(Self::parse_json(&config_json)?, snapshot_id, source_db_id)
-                .map(Self::from_db)
-                .map_err(map_error)
+            let ranges = ranges
+                .map(|ranges| Self::unchecked_ranges(ranges, "import"))
+                .transpose()?;
+            Db::open_new_with_snapshot(
+                Self::parse_json(&config_json)?,
+                source_db_id,
+                snapshot_id,
+                ranges,
+                storage_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
         })
     }
 
     #[staticmethod]
+    #[pyo3(signature = (config_path, source_db_id, snapshot_id, *, ranges=None, storage_mode))]
     fn restore_new_file(
         py: Python<'_>,
         config_path: PathBuf,
-        snapshot_id: u64,
         source_db_id: String,
+        snapshot_id: u64,
+        ranges: Option<Vec<PyBucketRange>>,
+        storage_mode: PyImportStorageMode,
     ) -> PyResult<Self> {
         py.detach(move || {
             opendal::install_default();
-            Db::open_new_with_snapshot(Self::parse_file(config_path)?, snapshot_id, source_db_id)
-                .map(Self::from_db)
-                .map_err(map_error)
+            let ranges = ranges
+                .map(|ranges| Self::unchecked_ranges(ranges, "import"))
+                .transpose()?;
+            Db::open_new_with_snapshot(
+                Self::parse_file(config_path)?,
+                source_db_id,
+                snapshot_id,
+                ranges,
+                storage_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
         })
     }
 
     #[staticmethod]
+    #[pyo3(signature = (config_json, manifest_path, *, ranges=None, storage_mode))]
     fn restore_new_from_manifest(
         py: Python<'_>,
         config_json: String,
         manifest_path: String,
+        ranges: Option<Vec<PyBucketRange>>,
+        storage_mode: PyImportStorageMode,
     ) -> PyResult<Self> {
         py.detach(move || {
             opendal::install_default();
-            Db::open_new_with_manifest_path(Self::parse_json(&config_json)?, manifest_path)
-                .map(Self::from_db)
-                .map_err(map_error)
+            let ranges = ranges
+                .map(|ranges| Self::unchecked_ranges(ranges, "import"))
+                .transpose()?;
+            Db::open_new_with_manifest_path(
+                Self::parse_json(&config_json)?,
+                manifest_path,
+                ranges,
+                storage_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
         })
     }
 
     #[staticmethod]
+    #[pyo3(signature = (config_path, manifest_path, *, ranges=None, storage_mode))]
     fn restore_new_from_manifest_file(
         py: Python<'_>,
         config_path: PathBuf,
         manifest_path: String,
+        ranges: Option<Vec<PyBucketRange>>,
+        storage_mode: PyImportStorageMode,
     ) -> PyResult<Self> {
         py.detach(move || {
             opendal::install_default();
-            Db::open_new_with_manifest_path(Self::parse_file(config_path)?, manifest_path)
-                .map(Self::from_db)
-                .map_err(map_error)
+            let ranges = ranges
+                .map(|ranges| Self::unchecked_ranges(ranges, "import"))
+                .transpose()?;
+            Db::open_new_with_manifest_path(
+                Self::parse_file(config_path)?,
+                manifest_path,
+                ranges,
+                storage_mode.into(),
+            )
+            .map(Self::from_db)
+            .map_err(map_error)
         })
     }
 
@@ -586,14 +588,14 @@ impl PyDb {
         py.detach(move || db.switch_to_snapshot(snapshot_id).map_err(map_error))
     }
 
-    #[pyo3(signature = (source_db_id, *, source_snapshot=None, ranges=None, storage_mode=PyExpandStorageMode::AdoptAsync))]
+    #[pyo3(signature = (source_db_id, *, source_snapshot=None, ranges=None, storage_mode=PyImportStorageMode::AdoptAsync))]
     fn expand_bucket(
         &self,
         py: Python<'_>,
         source_db_id: String,
         source_snapshot: Option<u64>,
         ranges: Option<Vec<PyBucketRange>>,
-        storage_mode: PyExpandStorageMode,
+        storage_mode: PyImportStorageMode,
     ) -> PyResult<u64> {
         self.ensure_open()?;
         let ranges = ranges
@@ -612,14 +614,14 @@ impl PyDb {
     }
 
     /// Import an exact source manifest; its root must be configured (READONLY is allowed).
-    #[pyo3(signature = (source_db_id, source_manifest_path, *, ranges=None, storage_mode=PyExpandStorageMode::AdoptAsync))]
+    #[pyo3(signature = (source_db_id, source_manifest_path, *, ranges=None, storage_mode=PyImportStorageMode::AdoptAsync))]
     fn expand_bucket_from_manifest(
         &self,
         py: Python<'_>,
         source_db_id: String,
         source_manifest_path: String,
         ranges: Option<Vec<PyBucketRange>>,
-        storage_mode: PyExpandStorageMode,
+        storage_mode: PyImportStorageMode,
     ) -> PyResult<u64> {
         self.ensure_open()?;
         let ranges = ranges
@@ -637,17 +639,17 @@ impl PyDb {
         })
     }
 
-    fn wait_for_expand_adoption(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
+    fn wait_for_import_adoption(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
         self.ensure_open()?;
         if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
             return Err(input_error(
-                "expand adoption timeout must be finite and non-negative",
+                "import adoption timeout must be finite and non-negative",
             ));
         }
         let timeout = Duration::try_from_secs_f64(timeout_seconds)
-            .map_err(|_| input_error("expand adoption timeout is too large"))?;
+            .map_err(|_| input_error("import adoption timeout is too large"))?;
         let db = Arc::clone(&self.db);
-        py.detach(move || db.wait_for_expand_adoption(timeout).map_err(map_error))
+        py.detach(move || db.wait_for_import_adoption(timeout).map_err(map_error))
     }
 
     fn shrink_bucket(&self, py: Python<'_>, ranges: Vec<PyBucketRange>) -> PyResult<u64> {

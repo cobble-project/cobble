@@ -76,7 +76,13 @@ class ExportSnapshotHandleTest {
         deleteTree(source);
         Config restoredConfig =
                 new Config().addVolume(destination.toString()).numColumns(1).totalBuckets(1);
-        try (Db restored = Db.restoreWithManifest(restoredConfig, exported.manifestPath)) {
+        try (Db restored =
+                Db.openNewWithManifestPath(
+                        restoredConfig,
+                        exported.manifestPath,
+                        null,
+                        null,
+                        io.cobble.ImportStorageMode.REFERENCE_PERSISTENT)) {
             for (int key = 1; key <= 3; key++)
                 assertArrayEquals(value, restored.get(0, new byte[] {(byte) key}, 0));
             assertNull(restored.get(0, new byte[] {4}, 0));
@@ -386,7 +392,13 @@ class ExportSnapshotHandleTest {
         Config restoredConfig =
                 new Config().addVolume(destination.toString()).numColumns(1).totalBuckets(1);
         for (int attempt = 0; attempt < 2; attempt++) {
-            try (Db restored = Db.restoreWithManifest(restoredConfig, exported.manifestPath)) {
+            try (Db restored =
+                    Db.openNewWithManifestPath(
+                            restoredConfig,
+                            exported.manifestPath,
+                            null,
+                            null,
+                            io.cobble.ImportStorageMode.REFERENCE_PERSISTENT)) {
                 for (int index = 0; index < 64; index++)
                     assertArrayEquals(value, restored.get(0, new byte[] {(byte) index}, 0));
                 ShardSnapshot checkpoint = restored.snapshot();
@@ -437,7 +449,12 @@ class ExportSnapshotHandleTest {
                         .numColumns(1)
                         .totalBuckets(1);
         try (io.cobble.structured.Db db =
-                io.cobble.structured.Db.restoreWithManifest(restored, exported.manifestPath)) {
+                io.cobble.structured.Db.openNewWithManifestPath(
+                        restored,
+                        exported.manifestPath,
+                        null,
+                        null,
+                        io.cobble.structured.ImportStorageMode.REFERENCE_PERSISTENT)) {
             assertArrayEquals(new byte[] {2}, db.get(0, new byte[] {1}).getBytes(0));
             assertArrayEquals(new byte[] {3}, db.get(0, new byte[] {2}).getBytes(0));
             assertNull(db.get(0, new byte[] {3}));

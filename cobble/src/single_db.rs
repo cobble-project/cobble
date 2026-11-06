@@ -92,7 +92,7 @@ impl SingleDb {
             )));
         }
         let shard = &global.shard_snapshots[0];
-        let db = Arc::new(Db::open_from_snapshot_with_recovery_mode(
+        let db = Arc::new(Db::resume_from_snapshot_with_recovery_mode(
             config,
             shard.snapshot_id,
             shard.db_id.clone(),

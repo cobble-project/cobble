@@ -420,16 +420,16 @@ pub(crate) fn native_structured_db_metrics(db: &NativeStructuredDb) -> Vec<ffi::
         .collect()
 }
 
-fn expand_storage_mode(value: u8) -> BridgeResult<cobble_binding::ExpandStorageMode> {
+pub(super) fn import_storage_mode(value: u8) -> BridgeResult<cobble_binding::ImportStorageMode> {
     match value {
-        0 => Ok(cobble_binding::ExpandStorageMode::AdoptAsync),
-        1 => Ok(cobble_binding::ExpandStorageMode::ReferencePersistent),
-        2 => Ok(cobble_binding::ExpandStorageMode::ReferencePersistentWithCache),
-        _ => Err(input_error("unknown expand storage mode")),
+        0 => Ok(cobble_binding::ImportStorageMode::AdoptAsync),
+        1 => Ok(cobble_binding::ImportStorageMode::ReferencePersistent),
+        2 => Ok(cobble_binding::ImportStorageMode::ReferencePersistentWithCache),
+        _ => Err(input_error("unknown import storage mode")),
     }
 }
 
-fn unchecked_ranges(
+pub(super) fn unchecked_ranges(
     values: Vec<ffi::NativeBucketRange>,
     operation: &str,
 ) -> BridgeResult<Vec<RangeInclusive<u16>>> {
@@ -464,7 +464,7 @@ pub(crate) fn native_structured_db_expand_bucket(
             source_db_id,
             has_snapshot_id.then_some(snapshot_id),
             ranges,
-            expand_storage_mode(storage_mode)?,
+            import_storage_mode(storage_mode)?,
         )
         .map_err(format_error)
 }
@@ -484,19 +484,19 @@ pub(crate) fn native_structured_db_expand_bucket_from_manifest(
             source_db_id,
             source_manifest_path,
             ranges,
-            expand_storage_mode(storage_mode)?,
+            import_storage_mode(storage_mode)?,
         )
         .map_err(format_error)
 }
 
-pub(crate) fn native_structured_db_wait_for_expand_adoption(
+pub(crate) fn native_structured_db_wait_for_import_adoption(
     db: &NativeStructuredDb,
     timeout_millis: i64,
 ) -> BridgeResult<()> {
     let millis =
         u64::try_from(timeout_millis).map_err(|_| input_error("timeout must not be negative"))?;
     db.db
-        .wait_for_expand_adoption(Duration::from_millis(millis))
+        .wait_for_import_adoption(Duration::from_millis(millis))
         .map_err(format_error)
 }
 pub(crate) fn native_structured_db_shrink_bucket(

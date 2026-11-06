@@ -1,4 +1,4 @@
-use cobble::{Config, ExpandStorageMode, VolumeDescriptor, VolumeUsageKind};
+use cobble::{Config, ImportStorageMode, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{
     Catalog, FileCatalog, FileCatalogConfig, SchemaChange, TableIdentifier,
 };
@@ -510,7 +510,7 @@ fn store_bucket_migration_moves_both_tables_from_selected_source_snapshots() {
         source.id(),
         &old.manifest_path,
         Some(vec![4..=7]),
-        ExpandStorageMode::AdoptAsync,
+        ImportStorageMode::AdoptAsync,
     ));
     assert_handles_live(target.shrink_bucket(vec![0..=1]));
     drop(target_tables);
@@ -521,11 +521,11 @@ fn store_bucket_migration_moves_both_tables_from_selected_source_snapshots() {
                 source.id(),
                 &snapshot.manifest_path,
                 Some(vec![4..=7]),
-                ExpandStorageMode::AdoptAsync,
+                ImportStorageMode::AdoptAsync,
             )
             .unwrap();
         target
-            .wait_for_expand_adoption(Duration::from_secs(10))
+            .wait_for_import_adoption(Duration::from_secs(10))
             .unwrap();
         for name in names {
             let table = target.open_table(name).unwrap();

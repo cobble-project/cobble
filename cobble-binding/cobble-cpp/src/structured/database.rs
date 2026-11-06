@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::structured_bridge::ffi;
 
 use super::conversion::*;
+use super::lifecycle::{import_storage_mode, unchecked_ranges};
 use super::{BridgeResult, NativeStructuredDb, NativeStructuredReadOptions, NativeStructuredRow};
 
 pub(crate) fn native_structured_db_open(
@@ -58,46 +59,24 @@ fn boxed_db(result: cobble_binding::Result<StructuredDb>) -> BridgeResult<Box<Na
         .map_err(format_error)
 }
 
-pub(crate) fn native_structured_db_open_from_snapshot(
-    config_json: &str,
-    snapshot_id: u64,
-    db_id: &str,
-    mode: u8,
-) -> BridgeResult<Box<NativeStructuredDb>> {
-    opendal::install_default();
-    boxed_db(StructuredDb::open_from_snapshot_with_recovery_mode(
-        parse_config_json(config_json)?,
-        snapshot_id,
-        db_id,
-        recovery_mode(mode)?,
-    ))
-}
-
-pub(crate) fn native_structured_db_open_from_snapshot_file(
-    config_path: &str,
-    snapshot_id: u64,
-    db_id: &str,
-    mode: u8,
-) -> BridgeResult<Box<NativeStructuredDb>> {
-    opendal::install_default();
-    boxed_db(StructuredDb::open_from_snapshot_with_recovery_mode(
-        parse_config_file(config_path)?,
-        snapshot_id,
-        db_id,
-        recovery_mode(mode)?,
-    ))
-}
-
 pub(crate) fn native_structured_db_restore_new(
     config_json: &str,
     snapshot_id: u64,
     db_id: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeBucketRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeStructuredDb>> {
     opendal::install_default();
+    let ranges = has_ranges
+        .then(|| unchecked_ranges(ranges, "import"))
+        .transpose()?;
     boxed_db(StructuredDb::open_new_with_snapshot(
         parse_config_json(config_json)?,
-        snapshot_id,
         db_id,
+        snapshot_id,
+        ranges,
+        import_storage_mode(storage_mode)?,
     ))
 }
 
@@ -105,34 +84,58 @@ pub(crate) fn native_structured_db_restore_new_file(
     config_path: &str,
     snapshot_id: u64,
     db_id: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeBucketRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeStructuredDb>> {
     opendal::install_default();
+    let ranges = has_ranges
+        .then(|| unchecked_ranges(ranges, "import"))
+        .transpose()?;
     boxed_db(StructuredDb::open_new_with_snapshot(
         parse_config_file(config_path)?,
-        snapshot_id,
         db_id,
+        snapshot_id,
+        ranges,
+        import_storage_mode(storage_mode)?,
     ))
 }
 
 pub(crate) fn native_structured_db_restore_new_from_manifest(
     config_json: &str,
     manifest_path: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeBucketRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeStructuredDb>> {
     opendal::install_default();
+    let ranges = has_ranges
+        .then(|| unchecked_ranges(ranges, "import"))
+        .transpose()?;
     boxed_db(StructuredDb::open_new_with_manifest_path(
         parse_config_json(config_json)?,
         manifest_path,
+        ranges,
+        import_storage_mode(storage_mode)?,
     ))
 }
 
 pub(crate) fn native_structured_db_restore_new_from_manifest_file(
     config_path: &str,
     manifest_path: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeBucketRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeStructuredDb>> {
     opendal::install_default();
+    let ranges = has_ranges
+        .then(|| unchecked_ranges(ranges, "import"))
+        .transpose()?;
     boxed_db(StructuredDb::open_new_with_manifest_path(
         parse_config_file(config_path)?,
         manifest_path,
+        ranges,
+        import_storage_mode(storage_mode)?,
     ))
 }
 

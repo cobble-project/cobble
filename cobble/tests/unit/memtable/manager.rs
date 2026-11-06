@@ -380,9 +380,12 @@ fn active_snapshot_capture_end_excludes_later_tail_and_restores() {
     )
     .unwrap();
     assert_eq!(snapshot_write.active_data[0].end_offset, capture_end as u64);
-    let restored =
-        decode_active_snapshot_segments_into_memtable(&file_manager, &snapshot_write.active_data)
-            .unwrap();
+    let restored = decode_active_snapshot_segments_into_memtable(
+        &file_manager,
+        &snapshot_write.active_data,
+        None,
+    )
+    .unwrap();
     let mut restored_value = Bytes::copy_from_slice(
         restored
             .get(&encode_scan_key(0, 0, b"first"))
@@ -1661,7 +1664,11 @@ fn test_restore_active_memtable_snapshot_to_l0_stays_in_matching_column_family_s
     target_manager.open().unwrap();
 
     let restored = target_manager
-        .restore_active_memtable_snapshot_to_l0(&source_file_manager, &snapshot_write.active_data)
+        .restore_active_memtable_snapshot_to_l0(
+            &source_file_manager,
+            &snapshot_write.active_data,
+            None,
+        )
         .unwrap();
 
     assert!(restored);
@@ -1822,7 +1829,11 @@ fn test_restore_active_memtable_snapshot_to_l0_preserves_shared_vlog_across_scop
     target_manager.open().unwrap();
 
     let restored = target_manager
-        .restore_active_memtable_snapshot_to_l0(&source_file_manager, &snapshot_write.active_data)
+        .restore_active_memtable_snapshot_to_l0(
+            &source_file_manager,
+            &snapshot_write.active_data,
+            None,
+        )
         .unwrap();
 
     assert!(restored);

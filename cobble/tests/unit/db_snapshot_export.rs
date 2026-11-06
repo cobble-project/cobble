@@ -1,7 +1,7 @@
 use super::*;
 use crate::file::{RandomAccessFile, SequentialWriteFile};
 use crate::snapshot::manifest::{ManifestSnapshot, decode_manifest};
-use crate::{Config, DbBuilder, ExpandStorageMode};
+use crate::{Config, DbBuilder, ImportStorageMode};
 use size::Size;
 use std::any::Any;
 use std::collections::HashMap;
@@ -306,8 +306,13 @@ fn snapshot_export_restores_vlog_and_schema_after_source_deletion() {
     db.close().unwrap();
     std::fs::remove_dir_all(&source).unwrap();
     for _ in 0..2 {
-        let restored =
-            Db::open_new_with_manifest_path(config(&destination), &exported.manifest_path).unwrap();
+        let restored = Db::open_new_with_manifest_path(
+            config(&destination),
+            &exported.manifest_path,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
         assert_value(&restored, b"first", &payload);
         assert_value(&restored, b"second", b"second-value");
         assert!(restored.get(0, b"later").unwrap().is_none());
@@ -435,8 +440,13 @@ fn snapshot_to_is_full_and_isolated_from_online_snapshots_and_wal() {
     );
     db.close().unwrap();
     std::fs::remove_dir_all(&source).unwrap();
-    let restored =
-        Db::open_new_with_manifest_path(config(&destination), &exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config(&destination),
+        &exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     for i in 0..128 {
         assert_value(&restored, format!("key-{i:03}").as_bytes(), &payload);
     }
@@ -579,8 +589,13 @@ fn snapshot_to_preserves_recovered_wal_until_an_online_snapshot() {
     assert!(store.list().unwrap().is_empty());
     recovered.close().unwrap();
     std::fs::remove_dir_all(&source).unwrap();
-    let restored =
-        Db::open_new_with_manifest_path(config(&destination), exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config(&destination),
+        exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_value(&restored, b"base", b"base value");
     assert_value(&restored, b"tail", b"recovered value");
     assert_eq!(
@@ -639,8 +654,13 @@ fn snapshot_export_pins_expired_snapshot_and_parallel_exports_independently() {
             .unwrap()
             .parent()
             .unwrap();
-        let restored =
-            Db::open_new_with_manifest_path(config(base), exported.manifest_path).unwrap();
+        let restored = Db::open_new_with_manifest_path(
+            config(base),
+            exported.manifest_path,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
         assert_value(&restored, b"key", b"value");
         restored.close().unwrap();
     }
@@ -705,8 +725,13 @@ fn snapshot_export_commit_wins_cancellation_and_short_writes_restore() {
     gate.release();
     let exported = handle.wait().unwrap();
     assert!(fs.cancel_on_commit.load(Ordering::Acquire));
-    let restored =
-        Db::open_new_with_manifest_path(config(&destination_path), exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config(&destination_path),
+        exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_value(&restored, b"key", b"value");
     restored.close().unwrap();
     db.close().unwrap();
@@ -783,8 +808,13 @@ fn snapshot_export_active_incremental_chain_survives_source_deletion() {
     assert!(!manifest.active_memtable_data.is_empty());
     db.close().unwrap();
     std::fs::remove_dir_all(source).unwrap();
-    let restored =
-        Db::open_new_with_manifest_path(config(&destination), exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config(&destination),
+        exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_value(&restored, b"first", b"one");
     assert_value(&restored, b"second", b"two");
     restored.close().unwrap();
@@ -849,7 +879,7 @@ fn snapshot_export_materializes_imported_files_without_donor_dependencies() {
             "donor",
             Some(donor_snapshot),
             None,
-            ExpandStorageMode::ReferencePersistent,
+            ImportStorageMode::ReferencePersistent,
         )
         .unwrap();
     let snapshot = source.create_snapshot_and_wait("imported export").unwrap();
@@ -894,8 +924,13 @@ fn snapshot_export_materializes_imported_files_without_donor_dependencies() {
     std::fs::remove_dir_all(source_volume).unwrap();
     let mut restored_options = config(&destination);
     restored_options.total_buckets = 2;
-    let restored =
-        Db::open_new_with_manifest_path(restored_options, exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        restored_options,
+        exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_value(&restored, b"local-key", b"local-value");
     assert_eq!(
         restored.get(1, b"donor-key").unwrap().unwrap()[0].as_deref(),
@@ -956,8 +991,13 @@ fn snapshot_export_pins_incremental_manifest_base_during_expiration() {
     }
     db.close().unwrap();
     std::fs::remove_dir_all(source).unwrap();
-    let restored =
-        Db::open_new_with_manifest_path(config(&destination_path), exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config(&destination_path),
+        exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_value(&restored, b"first", b"one");
     assert_value(&restored, b"second", b"two");
     restored.close().unwrap();
@@ -1229,8 +1269,13 @@ fn snapshot_to_and_queued_flushes_finish_after_close_starts() {
     // Graceful close finishes queued flushes, then releases their file-owning results.
     // Keeping these results until Drop would allow deletions after the close barrier.
     assert!(db.memtable_manager.wait_for_flushes().is_empty());
-    let restored =
-        Db::open_new_with_manifest_path(config(&destination), exported.manifest_path).unwrap();
+    let restored = Db::open_new_with_manifest_path(
+        config(&destination),
+        exported.manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_value(&restored, b"captured", b"snapshot value");
     assert!(restored.get(0, b"later").unwrap().is_none());
     restored.close().unwrap();
@@ -1266,9 +1311,13 @@ fn export_keeps_database_access_until_io_finishes_and_handles_forced_close() {
             thread.join().unwrap();
         }
         let exported = bounded_result(handle).unwrap();
-        let restored =
-            Db::open_new_with_manifest_path(config(&destination_path), exported.manifest_path)
-                .unwrap();
+        let restored = Db::open_new_with_manifest_path(
+            config(&destination_path),
+            exported.manifest_path,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
         assert_value(&restored, b"key", b"value");
         restored.close().unwrap();
     }

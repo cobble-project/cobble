@@ -50,7 +50,7 @@ struct PublicationState {
 }
 
 impl RuntimeManifestPublisherHandle {
-    /// Loads any existing runtime-manifest chain and publishes the initial state synchronously.
+    /// Loads any existing runtime-manifest chain and, unless suspended, publishes initial state.
     /// A corrupt existing chain is intentionally fatal: replacing it would hide durable state from
     /// an external observer.
     pub(crate) fn open(
@@ -60,7 +60,9 @@ impl RuntimeManifestPublisherHandle {
         lifecycle: Arc<DbLifecycle>,
         compaction_mode: CompactionMode,
         time_provider: Arc<dyn TimeProvider>,
+        suspended_owner: Option<String>,
     ) -> Result<Self> {
+        let initially_suspended = suspended_owner.is_some();
         let store = RuntimeManifestStore::new(Arc::clone(&file_manager));
         let current = store.load_current()?;
         let next_generation = store.allocate_next_generation()?;
@@ -75,11 +77,13 @@ impl RuntimeManifestPublisherHandle {
             publication: Mutex::new(PublicationState {
                 current,
                 next_generation,
-                suspended_owner: None,
+                suspended_owner,
             }),
             stop: AtomicBool::new(false),
         });
-        publisher.publish_initial()?;
+        if !initially_suspended {
+            publisher.publish_initial()?;
+        }
         Ok(Self {
             publisher,
             worker: Mutex::new(None),

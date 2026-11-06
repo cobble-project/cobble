@@ -265,8 +265,8 @@ MainSnapshotState VerifySnapshotsAndRecovery(
 
   {
     auto opened =
-        cobble::Db::OpenFromSnapshot(config, recovery.snapshot_id, db_id,
-                                     cobble::RecoveryMode::kSnapshotOnly);
+        cobble::Db::ResumeFromSnapshot(config, recovery.snapshot_id, db_id,
+                                       cobble::RecoveryMode::kSnapshotOnly);
     COBBLE_CHECK(!opened.Get(5, Bytes("wal-tail")).Found());
     opened.Close();
   }
@@ -277,15 +277,17 @@ MainSnapshotState VerifySnapshotsAndRecovery(
 void VerifyRestoreNew(std::string_view config,
                       const MainSnapshotState& source) {
   {
-    auto restored = cobble::Db::RestoreNew(config, source.recovery.snapshot_id,
-                                           source.db_id);
+    auto restored = cobble::Db::RestoreNew(
+        config, source.recovery.snapshot_id, source.db_id, std::nullopt,
+        cobble::ImportStorageMode::kReferencePersistent);
     COBBLE_CHECK(restored.Id() != source.db_id);
     COBBLE_CHECK(restored.Get(4, Bytes("batch-four")).Found());
     restored.Close();
   }
   {
     auto restored = cobble::Db::RestoreNewFromManifest(
-        config, source.recovery.manifest_path);
+        config, source.recovery.manifest_path, std::nullopt,
+        cobble::ImportStorageMode::kReferencePersistent);
     COBBLE_CHECK(restored.Id() != source.db_id);
     COBBLE_CHECK(restored.Get(2, Bytes("batch-two")).Found());
     restored.Close();
@@ -310,15 +312,15 @@ void VerifyRescale(const std::filesystem::path& directory) {
   const std::array persistent_ranges = {cobble::BucketRange{2, 3}};
   (void)target.ExpandBucket(source.Id(), source_snapshot.snapshot_id,
                             persistent_ranges,
-                            cobble::ExpandStorageMode::kReferencePersistent);
+                            cobble::ImportStorageMode::kReferencePersistent);
   COBBLE_CHECK(String(target.Get(2, Bytes("source-two")).Column(0)) == "two");
-  target.WaitForExpandAdoption(std::chrono::seconds(1));
+  target.WaitForImportAdoption(std::chrono::seconds(1));
 
   const std::array adopted_ranges = {cobble::BucketRange{4, 5}};
   (void)target.ExpandBucket(source.Id(), source_snapshot.snapshot_id,
                             adopted_ranges,
-                            cobble::ExpandStorageMode::kAdoptAsync);
-  target.WaitForExpandAdoption(std::chrono::seconds(10));
+                            cobble::ImportStorageMode::kAdoptAsync);
+  target.WaitForImportAdoption(std::chrono::seconds(10));
   source.Close();
   COBBLE_CHECK(String(target.Get(4, Bytes("source-four")).Column(0)) == "four");
 
@@ -497,7 +499,8 @@ void VerifySnapshotTo(const std::filesystem::path& directory) {
   db.Close();
   std::filesystem::remove_all(source);
   auto restored = cobble::Db::RestoreNewFromManifest(
-      Config(destination, 4, false), exported.manifest_path);
+      Config(destination, 4, false), exported.manifest_path, std::nullopt,
+      cobble::ImportStorageMode::kReferencePersistent);
   for (const auto key : {"a", "b", "c"}) {
     COBBLE_CHECK(String(restored.Get(0, Bytes(key)).Column(0)) == value);
   }

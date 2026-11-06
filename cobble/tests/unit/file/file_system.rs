@@ -131,6 +131,7 @@ fn test_filesystem_registry_normalizes_absolute_local_path() {
 }
 
 #[test]
+#[serial_test::serial(process_file_system_registry)]
 fn test_filesystem_registry_falls_back_to_process_registry_on_builtin_failure() {
     clear_process_custom_file_system_registry();
     let process_registry = Arc::new(NoopProcessRegistry {

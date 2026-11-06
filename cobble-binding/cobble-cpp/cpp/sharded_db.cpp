@@ -44,61 +44,62 @@ Db Db::OpenFile(std::string_view config_path,
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::OpenFromSnapshot(std::string_view config_json, SnapshotId snapshot,
-                        std::string_view existing_db_id, RecoveryMode mode) {
-  auto native = detail::Translate([&] {
-    return ffi::native_sharded_database_open_from_snapshot(
-        detail::RustStr(config_json), snapshot, detail::RustStr(existing_db_id),
-        static_cast<std::uint8_t>(mode));
-  });
-  return Db(std::make_unique<Impl>(std::move(native)));
-}
-
-Db Db::OpenFromSnapshotFile(std::string_view config_path, SnapshotId snapshot,
-                            std::string_view existing_db_id,
-                            RecoveryMode mode) {
-  auto native = detail::Translate([&] {
-    return ffi::native_sharded_database_open_from_snapshot_file(
-        detail::RustStr(config_path), snapshot, detail::RustStr(existing_db_id),
-        static_cast<std::uint8_t>(mode));
-  });
-  return Db(std::make_unique<Impl>(std::move(native)));
-}
-
 Db Db::RestoreNew(std::string_view config_json, SnapshotId source_snapshot,
-                  std::string_view source_db_id) {
+                  std::string_view source_db_id,
+                  std::optional<std::span<const BucketRange>> ranges,
+                  ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_restore_new(
         detail::RustStr(config_json), source_snapshot,
-        detail::RustStr(source_db_id));
+        detail::RustStr(source_db_id), ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<ffi::NativeRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
 Db Db::RestoreNewFile(std::string_view config_path, SnapshotId source_snapshot,
-                      std::string_view source_db_id) {
+                      std::string_view source_db_id,
+                      std::optional<std::span<const BucketRange>> ranges,
+                      ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_restore_new_file(
         detail::RustStr(config_path), source_snapshot,
-        detail::RustStr(source_db_id));
+        detail::RustStr(source_db_id), ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<ffi::NativeRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::RestoreNewFromManifest(std::string_view config_json,
-                              std::string_view manifest_path) {
+Db Db::RestoreNewFromManifest(
+    std::string_view config_json, std::string_view manifest_path,
+    std::optional<std::span<const BucketRange>> ranges,
+    ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_restore_new_from_manifest(
-        detail::RustStr(config_json), detail::RustStr(manifest_path));
+        detail::RustStr(config_json), detail::RustStr(manifest_path),
+        ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<ffi::NativeRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }
 
-Db Db::RestoreNewFromManifestFile(std::string_view config_path,
-                                  std::string_view manifest_path) {
+Db Db::RestoreNewFromManifestFile(
+    std::string_view config_path, std::string_view manifest_path,
+    std::optional<std::span<const BucketRange>> ranges,
+    ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return ffi::native_sharded_database_restore_new_from_manifest_file(
-        detail::RustStr(config_path), detail::RustStr(manifest_path));
+        detail::RustStr(config_path), detail::RustStr(manifest_path),
+        ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<ffi::NativeRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_unique<Impl>(std::move(native)));
 }

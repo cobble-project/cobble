@@ -17,6 +17,7 @@ pub(crate) struct TestFileSystem {
     rename_calls: AtomicUsize,
     before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(crate) fail_rename_to: Mutex<Option<String>>,
+    pub(crate) fail_rename_containing: Mutex<Option<String>>,
 }
 
 impl TestFileSystem {
@@ -32,6 +33,7 @@ impl TestFileSystem {
             rename_calls: AtomicUsize::new(0),
             before_read: Mutex::new(None),
             fail_rename_to: Mutex::new(None),
+            fail_rename_containing: Mutex::new(None),
         }
     }
 }
@@ -82,7 +84,14 @@ impl FileSystem for TestFileSystem {
     }
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.rename_calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_rename_to.lock().unwrap().as_deref() == Some(to) {
+        if self.fail_rename_to.lock().unwrap().as_deref() == Some(to)
+            || self
+                .fail_rename_containing
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|fragment| to.contains(fragment))
+        {
             return Err(Error::IoError("injected publication failure".to_string()));
         }
         if !self.supports_atomic_replace() && self.inner.exists(to)? {

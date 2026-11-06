@@ -1218,7 +1218,8 @@ class DbBindingTest {
                                         .push(oldRow.get(1))
                                         .build()));
             }
-            try (Db restored = Db.restore(config, evolvedSnapshot.snapshotId, sourceDbId);
+            try (Db restored =
+                            Db.resumeFromSnapshot(config, evolvedSnapshot.snapshotId, sourceDbId);
                     Table restoredTable = Table.open(restored, physicalName)) {
                 assertEquals(
                         widenedRow,
@@ -1229,7 +1230,14 @@ class DbBindingTest {
                                         .push(oldRow.get(1))
                                         .build()));
             }
-            try (Db restored = Db.restore(config, evolvedSnapshot.snapshotId, sourceDbId, true);
+            try (Db restored =
+                            Db.openNewWithSnapshot(
+                                    config,
+                                    sourceDbId,
+                                    evolvedSnapshot.snapshotId,
+                                    null,
+                                    null,
+                                    io.cobble.ImportStorageMode.REFERENCE_PERSISTENT);
                     Table restoredTable = Table.open(restored, physicalName)) {
                 assertEquals(
                         widenedRow,
@@ -1240,7 +1248,13 @@ class DbBindingTest {
                                         .push(oldRow.get(1))
                                         .build()));
             }
-            try (Db restored = Db.restoreWithManifest(config, evolvedSnapshot.manifestPath);
+            try (Db restored =
+                            Db.openNewWithManifestPath(
+                                    config,
+                                    evolvedSnapshot.manifestPath,
+                                    null,
+                                    null,
+                                    io.cobble.ImportStorageMode.REFERENCE_PERSISTENT);
                     Table restoredTable = Table.open(restored, physicalName)) {
                 assertEquals(
                         widenedRow,
@@ -1794,7 +1808,7 @@ class DbBindingTest {
 
             // restore
             try (io.cobble.structured.Db restored =
-                    io.cobble.structured.Db.restore(
+                    io.cobble.structured.Db.resumeFromSnapshot(
                             configPath.toString(),
                             shardSnapshot.snapshotId,
                             dbId,
@@ -1807,8 +1821,13 @@ class DbBindingTest {
             }
 
             try (io.cobble.structured.Db restoredNew =
-                    io.cobble.structured.Db.restore(
-                            configPath.toString(), shardSnapshot.snapshotId, dbId, true)) {
+                    io.cobble.structured.Db.openNewWithSnapshot(
+                            configPath.toString(),
+                            dbId,
+                            shardSnapshot.snapshotId,
+                            null,
+                            null,
+                            io.cobble.structured.ImportStorageMode.REFERENCE_PERSISTENT)) {
                 assertNotEquals(dbId, restoredNew.id());
                 for (int i = 0; i < count; i++) {
                     assertArrayEquals(
@@ -2121,7 +2140,7 @@ class DbBindingTest {
             assertTrue(shardSnapshot.dataSizeBytes > 0L);
             assertTrue(shardSnapshot.incrementalDataSizeBytes > 0L);
             try (Db restored =
-                    Db.restore(
+                    Db.resumeFromSnapshot(
                             configPath.toString(),
                             shardSnapshot.snapshotId,
                             dbId,
@@ -2132,7 +2151,13 @@ class DbBindingTest {
                 }
             }
             try (Db restoredNew =
-                    Db.restore(configPath.toString(), shardSnapshot.snapshotId, dbId, true)) {
+                    Db.openNewWithSnapshot(
+                            configPath.toString(),
+                            dbId,
+                            shardSnapshot.snapshotId,
+                            null,
+                            null,
+                            io.cobble.ImportStorageMode.REFERENCE_PERSISTENT)) {
                 assertNotEquals(dbId, restoredNew.id());
                 for (int i = 0; i < 180; i++) {
                     assertArrayEquals(
@@ -2141,7 +2166,12 @@ class DbBindingTest {
                 }
             }
             try (Db restoredFromManifest =
-                    Db.restoreWithManifest(configPath.toString(), shardSnapshot.manifestPath)) {
+                    Db.openNewWithManifestPath(
+                            configPath.toString(),
+                            shardSnapshot.manifestPath,
+                            null,
+                            null,
+                            io.cobble.ImportStorageMode.REFERENCE_PERSISTENT)) {
                 assertNotEquals(dbId, restoredFromManifest.id());
                 for (int i = 0; i < 180; i++) {
                     assertArrayEquals(
@@ -2234,9 +2264,34 @@ class DbBindingTest {
                                         shardSnapshot.snapshotId,
                                         new int[] {2},
                                         new int[] {3},
-                                        ExpandStorageMode.ADOPT_ASYNC)
+                                        ImportStorageMode.ADOPT_ASYNC)
                                 >= 0L);
-                target.waitForExpandAdoption(10_000L);
+                target.waitForImportAdoption(10_000L);
+                for (ImportStorageMode mode : ImportStorageMode.values()) {
+                    try (Db fresh =
+                                    Db.openNewWithSnapshot(
+                                            config,
+                                            source.id(),
+                                            shardSnapshot.snapshotId,
+                                            new int[] {2},
+                                            new int[] {2},
+                                            mode);
+                            Db manifest =
+                                    Db.openNewWithManifestPath(
+                                            config,
+                                            shardSnapshot.manifestPath,
+                                            new int[] {2},
+                                            new int[] {2},
+                                            mode)) {
+                        assertNotEquals(source.id(), fresh.id());
+                        assertNotEquals(source.id(), manifest.id());
+                        fresh.waitForImportAdoption(10_000L);
+                        manifest.waitForImportAdoption(10_000L);
+                        assertNotNull(fresh.get(2, keyBytes("rescale-source", 2), 0));
+                        assertNotNull(manifest.get(2, keyBytes("rescale-source", 2), 0));
+                    }
+                }
+
                 assertArrayEquals(
                         valueBytes("rescale-source-v", 2),
                         target.get(2, keyBytes("rescale-source", 2), 0));

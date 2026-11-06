@@ -200,9 +200,9 @@ void VerifyRescale(const std::filesystem::path &root) {
 
   const std::array expanded = {cobble::BucketRange{2, 3}};
   (void)target.ExpandBucket(source.Id(), snapshot.snapshot_id, expanded,
-                            cobble::ExpandStorageMode::kReferencePersistent);
+                            cobble::ImportStorageMode::kReferencePersistent);
   COBBLE_CHECK(String(target.Get(2, Bytes("rescale")).Bytes(0)) == "value");
-  target.WaitForExpandAdoption(std::chrono::seconds(1));
+  target.WaitForImportAdoption(std::chrono::seconds(1));
 
   (void)target.ShrinkBucket(expanded);
   bool removed = false;

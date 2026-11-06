@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use cobble_binding::{Config, ExpandStorageMode, RecoveryMode};
+use cobble_binding::{Config, ImportStorageMode, RecoveryMode};
 use jni::JNIEnv;
 use jni::descriptors::Desc;
 use jni::objects::{
@@ -98,12 +98,12 @@ pub(crate) fn decode_u32(name: &str, value: jint) -> Result<u32, String> {
     Ok(value as u32)
 }
 
-pub(crate) fn expand_storage_mode(value: jint) -> Result<ExpandStorageMode, String> {
+pub(crate) fn import_storage_mode(value: jint) -> Result<ImportStorageMode, String> {
     match value {
-        0 => Ok(ExpandStorageMode::AdoptAsync),
-        1 => Ok(ExpandStorageMode::ReferencePersistent),
-        2 => Ok(ExpandStorageMode::ReferencePersistentWithCache),
-        _ => Err(format!("unknown expand storage mode {value}")),
+        0 => Ok(ImportStorageMode::AdoptAsync),
+        1 => Ok(ImportStorageMode::ReferencePersistent),
+        2 => Ok(ImportStorageMode::ReferencePersistentWithCache),
+        _ => Err(format!("unknown import storage mode {value}")),
     }
 }
 
@@ -127,6 +127,21 @@ pub(crate) fn decode_column_index(value: jint) -> Result<usize, String> {
         return Err(format!("column out of range: {}", value));
     }
     Ok(value as usize)
+}
+
+/// Null pairs mean all source ranges; empty arrays remain an explicit invalid request.
+pub(crate) fn decode_optional_bucket_ranges(
+    env: &mut JNIEnv,
+    starts: JIntArray,
+    ends: JIntArray,
+) -> Result<Option<Vec<RangeInclusive<u16>>>, String> {
+    if starts.is_null() && ends.is_null() {
+        return Ok(None);
+    }
+    if starts.is_null() || ends.is_null() {
+        return Err("both import range arrays must be null or non-null".to_string());
+    }
+    decode_bucket_ranges(env, starts, ends).map(Some)
 }
 
 pub(crate) fn decode_bucket_ranges(

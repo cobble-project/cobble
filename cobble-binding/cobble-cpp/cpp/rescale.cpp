@@ -11,7 +11,7 @@ namespace cobble {
 SnapshotId Db::ExpandBucket(std::string_view source_db_id,
                             std::optional<SnapshotId> source_snapshot,
                             std::optional<std::span<const BucketRange>> ranges,
-                            ExpandStorageMode storage_mode) const {
+                            ImportStorageMode storage_mode) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
@@ -29,7 +29,7 @@ SnapshotId Db::ExpandBucket(std::string_view source_db_id,
 SnapshotId Db::ExpandBucketFromManifest(
     std::string_view source_db_id, std::string_view source_manifest_path,
     std::optional<std::span<const BucketRange>> ranges,
-    ExpandStorageMode storage_mode) const {
+    ImportStorageMode storage_mode) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
@@ -43,7 +43,7 @@ SnapshotId Db::ExpandBucketFromManifest(
   });
 }
 
-void Db::WaitForExpandAdoption(std::chrono::milliseconds timeout) const {
+void Db::WaitForImportAdoption(std::chrono::milliseconds timeout) const {
   if (!impl_) {
     throw Error(ErrorCode::kInvalidState, "Db has been moved from");
   }
@@ -51,10 +51,10 @@ void Db::WaitForExpandAdoption(std::chrono::milliseconds timeout) const {
   if (count > std::numeric_limits<std::int64_t>::max() ||
       count < std::numeric_limits<std::int64_t>::min()) {
     throw Error(ErrorCode::kInput,
-                "expand adoption timeout does not fit in int64 milliseconds");
+                "import adoption timeout does not fit in int64 milliseconds");
   }
   detail::Translate([&] {
-    ffi::native_sharded_database_wait_for_expand_adoption(
+    ffi::native_sharded_database_wait_for_import_adoption(
         *impl_->native, static_cast<std::int64_t>(count));
   });
 }

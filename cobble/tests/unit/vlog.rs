@@ -185,8 +185,11 @@ fn test_vlog_writer_reader() {
 
 #[test]
 fn test_vlog_file_seq_wraps() {
+    let root = tempfile::tempdir().unwrap();
     let registry = FileSystemRegistry::new();
-    let fs = registry.get_or_register(TEST_ROOT).unwrap();
+    let fs = registry
+        .get_or_register(root.path().to_str().unwrap())
+        .unwrap();
     let metrics_manager = Arc::new(MetricsManager::new("vlog-test"));
     let file_manager = Arc::new(FileManager::with_defaults(fs, metrics_manager).unwrap());
     let store = VlogStore::with_start_seq(Arc::clone(&file_manager), 64, usize::MAX, u32::MAX);

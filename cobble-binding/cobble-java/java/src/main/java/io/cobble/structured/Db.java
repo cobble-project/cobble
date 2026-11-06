@@ -190,124 +190,102 @@ public final class Db extends NativeObject {
         return new PriorityQueue(this, getOrNewPriorityQueue(nativeHandle, name));
     }
 
-    /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
-    public static Db restore(String configPath, long snapshotId, String dbId) {
-        return restore(configPath, snapshotId, dbId, false);
-    }
-
-    /** Restore a structured DB from a snapshot with explicit WAL recovery behavior. */
-    public static Db restore(
-            String configPath, long snapshotId, String dbId, RecoveryMode recoveryMode) {
-        if (recoveryMode == null) {
-            throw new IllegalArgumentException("recoveryMode must not be null");
-        }
+    /**
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
+     */
+    public static Db openNewWithSnapshot(
+            String configPath,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long h =
-                restoreHandleWithRecoveryMode(configPath, snapshotId, dbId, recoveryMode.ordinal());
-        if (h == 0L) {
-            throw new IllegalStateException("failed to restore structured db with recovery mode");
-        }
-        return wrapOpenedDb(h);
+        long handle =
+                openNewWithSnapshotHandle(
+                        configPath,
+                        sourceDbId,
+                        snapshotId,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
-     * Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot.
-     *
-     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
-     * identity and start a new snapshot chain.
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restore(String configPath, long snapshotId, String dbId, boolean newDbId) {
+    public static Db openNewWithSnapshot(
+            Config config,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (config == null) throw new IllegalArgumentException("config must not be null");
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long h = restoreHandle(configPath, snapshotId, dbId, newDbId);
-        if (h == 0L) {
-            throw new IllegalStateException(
-                    newDbId
-                            ? "failed to restore structured db from snapshot with fresh db id"
-                            : "failed to restore structured db from snapshot");
-        }
-        return wrapOpenedDb(h);
-    }
-
-    /** Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot. */
-    public static Db restore(Config config, long snapshotId, String dbId) {
-        return restore(config, snapshotId, dbId, false);
-    }
-
-    /** Restore a structured DB from a snapshot with explicit WAL recovery behavior. */
-    public static Db restore(
-            Config config, long snapshotId, String dbId, RecoveryMode recoveryMode) {
-        if (config == null) {
-            throw new IllegalArgumentException("config must not be null");
-        }
-        if (recoveryMode == null) {
-            throw new IllegalArgumentException("recoveryMode must not be null");
-        }
-        NativeLoader.load();
-        long h =
-                restoreHandleFromJsonWithRecoveryMode(
-                        config.toJson(), snapshotId, dbId, recoveryMode.ordinal());
-        if (h == 0L) {
-            throw new IllegalStateException(
-                    "failed to restore structured db from config json with recovery mode");
-        }
-        return wrapOpenedDb(h);
+        long handle =
+                openNewWithSnapshotHandleFromJson(
+                        config.toJson(),
+                        sourceDbId,
+                        snapshotId,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
-     * Restore a structured DB from a snapshot. Schema is auto-loaded from the snapshot.
-     *
-     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
-     * identity and start a new snapshot chain.
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restore(Config config, long snapshotId, String dbId, boolean newDbId) {
-        if (config == null) {
-            throw new IllegalArgumentException("config must not be null");
-        }
+    public static Db openNewWithManifestPath(
+            String configPath,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        String configJson = config.toJson();
-        long h = restoreHandleFromJson(configJson, snapshotId, dbId, newDbId);
-        if (h == 0L) {
-            throw new IllegalStateException(
-                    newDbId
-                            ? "failed to restore structured db from snapshot config json with fresh db id"
-                            : "failed to restore structured db from snapshot config json");
-        }
-        return wrapOpenedDb(h);
+        long handle =
+                openNewWithManifestPathHandle(
+                        configPath,
+                        manifestPath,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
-     * Restore a structured DB from an explicit source manifest path. Schema is auto-loaded from
-     * that source manifest.
-     *
-     * <p>The returned DB always gets a fresh db id and starts a new snapshot chain.
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restoreWithManifest(String configPath, String manifestPath) {
+    public static Db openNewWithManifestPath(
+            Config config,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (config == null) throw new IllegalArgumentException("config must not be null");
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long h = restoreWithManifestHandle(configPath, manifestPath);
-        if (h == 0L) {
-            throw new IllegalStateException("failed to restore structured db from manifest path");
-        }
-        return wrapOpenedDb(h);
-    }
-
-    /**
-     * Restore a structured DB from an explicit source manifest path. Schema is auto-loaded from
-     * that source manifest.
-     *
-     * <p>The returned DB always gets a fresh db id and starts a new snapshot chain.
-     */
-    public static Db restoreWithManifest(Config config, String manifestPath) {
-        if (config == null) {
-            throw new IllegalArgumentException("config must not be null");
-        }
-        NativeLoader.load();
-        String configJson = config.toJson();
-        long h = restoreWithManifestHandleFromJson(configJson, manifestPath);
-        if (h == 0L) {
-            throw new IllegalStateException(
-                    "failed to restore structured db from manifest path config json");
-        }
-        return wrapOpenedDb(h);
+        long handle =
+                openNewWithManifestPathHandleFromJson(
+                        config.toJson(),
+                        manifestPath,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /** Resume a structured DB from existing folder state. Schema is auto-loaded. */
@@ -437,7 +415,7 @@ public final class Db extends NativeObject {
                 snapshotId,
                 rangeStartsInclusive,
                 rangeEndsInclusive,
-                ExpandStorageMode.ADOPT_ASYNC);
+                ImportStorageMode.ADOPT_ASYNC);
     }
 
     /** Expand bucket ownership with an explicit imported-file storage policy. */
@@ -446,7 +424,7 @@ public final class Db extends NativeObject {
             long snapshotId,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
-            ExpandStorageMode storageMode) {
+            ImportStorageMode storageMode) {
         if (storageMode == null) {
             throw new IllegalArgumentException("storageMode must not be null");
         }
@@ -467,7 +445,7 @@ public final class Db extends NativeObject {
                 -1L,
                 rangeStartsInclusive,
                 rangeEndsInclusive,
-                ExpandStorageMode.ADOPT_ASYNC);
+                ImportStorageMode.ADOPT_ASYNC);
     }
 
     /**
@@ -479,7 +457,7 @@ public final class Db extends NativeObject {
             String sourceManifestPath,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
-            ExpandStorageMode storageMode) {
+            ImportStorageMode storageMode) {
         if (storageMode == null) {
             throw new IllegalArgumentException("storageMode must not be null");
         }
@@ -492,9 +470,9 @@ public final class Db extends NativeObject {
                 storageMode.ordinal());
     }
 
-    /** Wait for asynchronous expansion adoption to finish. */
-    public void waitForExpandAdoption(long timeoutMillis) {
-        waitForExpandAdoption(nativeHandle, timeoutMillis);
+    /** Wait for asynchronous import adoption to finish, for both new DBs and expansion. */
+    public void waitForImportAdoption(long timeoutMillis) {
+        waitForImportAdoption(nativeHandle, timeoutMillis);
     }
 
     /** Shrink bucket ownership by removing the given ranges from the current DB. */
@@ -1450,22 +1428,35 @@ public final class Db extends NativeObject {
 
     private static native long getOrNewPriorityQueue(long nativeHandle, String name);
 
-    private static native long restoreHandle(
-            String configPath, long snapshotId, String dbId, boolean newDbId);
+    private static native long openNewWithSnapshotHandle(
+            String config,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
-    private static native long restoreHandleFromJson(
-            String configJson, long snapshotId, String dbId, boolean newDbId);
+    private static native long openNewWithSnapshotHandleFromJson(
+            String config,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
-    private static native long restoreHandleWithRecoveryMode(
-            String configPath, long snapshotId, String dbId, int recoveryMode);
+    private static native long openNewWithManifestPathHandle(
+            String config,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
-    private static native long restoreHandleFromJsonWithRecoveryMode(
-            String configJson, long snapshotId, String dbId, int recoveryMode);
-
-    private static native long restoreWithManifestHandle(String configPath, String manifestPath);
-
-    private static native long restoreWithManifestHandleFromJson(
-            String configJson, String manifestPath);
+    private static native long openNewWithManifestPathHandleFromJson(
+            String config,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
     private static native long resumeHandle(String configPath, String dbId);
 
@@ -1718,7 +1709,7 @@ public final class Db extends NativeObject {
             int[] rangeEndsInclusive,
             int storageMode);
 
-    private static native void waitForExpandAdoption(long nativeHandle, long timeoutMillis);
+    private static native void waitForImportAdoption(long nativeHandle, long timeoutMillis);
 
     private static native long shrinkBucket(
             long nativeHandle, int[] rangeStartsInclusive, int[] rangeEndsInclusive);

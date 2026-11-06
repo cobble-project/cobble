@@ -117,11 +117,9 @@ Db::open(config, bucket_ranges) -> Result<Db>
 Db::resume(config, db_id) -> Result<Db>
 Db::resume_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
 Db::resume_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode) -> Result<Db>
-Db::open_from_snapshot(config, snapshot_id, db_id) -> Result<Db>
-Db::open_from_snapshot_with_recovery_mode(config, snapshot_id, db_id, recovery_mode) -> Result<Db>
 Db::resume_with_recovery_mode(config, db_id, recovery_mode) -> Result<Db>
-Db::open_new_with_snapshot(config, snapshot_id, source_db_id) -> Result<Db>
-Db::open_new_with_manifest_path(config, manifest_path) -> Result<Db>
+Db::open_new_with_snapshot(config, source_db_id, snapshot_id, ranges, storage_mode) -> Result<Db>
+Db::open_new_with_manifest_path(config, manifest_path, ranges, storage_mode) -> Result<Db>
 ReadOnlyDb::open_with_db_id(config, snapshot_id, db_id) -> Result<ReadOnlyDb>
 db.current_schema() -> Arc<Schema>
 db.update_schema() -> SchemaBuilder
@@ -147,21 +145,27 @@ db.expire_snapshot(snapshot_id) -> Result<bool>
 db.retain_snapshot(snapshot_id) -> bool
 db.shard_snapshot_metadata(snapshot_id) -> Result<ShardSnapshotMetadata>
 db.expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode) -> Result<u64>
-db.wait_for_expand_adoption(timeout) -> Result<()>
+db.wait_for_import_adoption(timeout) -> Result<()>
 db.load_readonly_files_to_primary() -> Result<usize>
 ```
 
-`open_from_snapshot` preserves the source db identity and snapshot directory. `open_new_with_snapshot`
-restores from the source snapshot but assigns a fresh db id and starts a new snapshot chain.
+`resume_from_snapshot` preserves the DB identity and takes over its snapshot chain.
+`open_new_with_snapshot` imports into a fresh DB identity and its own snapshot chain.
 `open_new_with_manifest_path` does the same thing when your checkpoint metadata already stores the
-exact source manifest path.
+exact source manifest path. Both require an explicit `ImportStorageMode` and accept optional import
+ranges: `None` selects all source buckets; explicit ranges must be nonempty and fully covered.
+Builder `db_id` and ordinary `bucket_ranges` do not select the new identity or imported ranges.
+`AdoptAsync` establishes durable protection and adopts files in the background; wait with
+`wait_for_import_adoption`. Persistent modes create no adoption lease and require the caller
+to retain source data; local caching does not remove that dependency. Read-only APIs are unchanged.
+The existing import protocol does not fence arbitrary concurrent offline cleanup.
 
 Use `RecoveryMode::SnapshotOnly` for an exact snapshot restore or `RecoveryMode::LatestWithWal` to
 replay the latest snapshot's durable WAL tail. See [Write-Ahead Log](../architecture/wal).
 
 For custom column transforms, call
 `DbBuilder::register_schema_transform(transform_type, factory) -> Result<DbBuilder>` before `open()`,
-`resume()`, `open_from_snapshot(...)`, or `resume_from_snapshot(...)`. Use the DB registration
+`resume()`, `resume_from_snapshot(...)`, or `open_new_*`. Use the DB registration
 method for subsequent runtime updates. See [Custom Column Transforms](../architecture/schema-evolution#custom-column-transforms)
 for examples, recovery requirements, and current support limits.
 
@@ -294,10 +298,11 @@ schema evolution, global snapshots, and distributed write/scan plans.
 
 The Java API mirrors the Rust API. See [Java Bindings](../ffi-bindings/java) for usage details.
 On the Java side, raw and structured `Db` plus `SingleDb` accept `RecoveryMode` overloads. Restore
-flows also expose `Db.restore(..., boolean newDbId)` and `Db.restoreWithManifest(...)`.
+flows expose `Db.openNewWithSnapshot(config, sourceDbId, snapshotId, rangeStarts, rangeEnds, storageMode)`
+and `Db.openNewWithManifestPath(config, manifestPath, rangeStarts, rangeEnds, storageMode)`.
 Raw and structured `Db` / `SingleDb` classes also expose `loadReadonlyFilesToPrimary()`. See
 [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
-Raw and structured `Db` expose `ExpandStorageMode` and `waitForExpandAdoption(...)`; see
+Raw and structured `Db` expose `ImportStorageMode` and `waitForImportAdoption(...)`; see
 [Rescale](../architecture/rescale).
 
 ### Java Classes

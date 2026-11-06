@@ -1,7 +1,7 @@
 package io.cobble.structured;
 
-/** Storage policy used when importing files during bucket expansion. */
-public enum ExpandStorageMode {
+/** File ownership policy for new-database and bucket-expansion imports. */
+public enum ImportStorageMode {
     ADOPT_ASYNC,
     REFERENCE_PERSISTENT,
     REFERENCE_PERSISTENT_WITH_CACHE

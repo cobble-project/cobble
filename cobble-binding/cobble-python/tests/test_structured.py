@@ -118,9 +118,9 @@ def test_python_api_names_are_consistent() -> None:
         (pycobble.MemtableType, "Skiplist", "SKIPLIST"),
         (pycobble.MemtableType, "Vec", "VEC"),
         (pycobble.MemtableType, "Adaptive", "ADAPTIVE"),
-        (pycobble.ExpandStorageMode, "AdoptAsync", "ADOPT_ASYNC"),
-        (pycobble.ExpandStorageMode, "ReferencePersistent", "REFERENCE_PERSISTENT"),
-        (pycobble.ExpandStorageMode, "ReferencePersistentWithCache", "REFERENCE_PERSISTENT_WITH_CACHE"),
+        (pycobble.ImportStorageMode, "AdoptAsync", "ADOPT_ASYNC"),
+        (pycobble.ImportStorageMode, "ReferencePersistent", "REFERENCE_PERSISTENT"),
+        (pycobble.ImportStorageMode, "ReferencePersistentWithCache", "REFERENCE_PERSISTENT_WITH_CACHE"),
         (pycobble.ReaderMode, "Current", "CURRENT"),
         (pycobble.ReaderMode, "Snapshot", "SNAPSHOT"),
         (pycobble.BufferStatus, "Ok", "OK"),
@@ -344,9 +344,7 @@ def test_structured_snapshot_recovery_and_lifecycle(tmp_path: Path) -> None:
     assert bytes(latest.get(0, b"versioned").bytes(0)) == b"v1"
     latest.close()
 
-    restored = pycobble.StructuredDb.restore_new(
-        config_json, first_snapshot.snapshot_id, db_id
-    )
+    restored = pycobble.StructuredDb.restore_new(config_json, db_id, first_snapshot.snapshot_id, storage_mode=pycobble.ImportStorageMode.REFERENCE_PERSISTENT)
     assert restored.id != db_id
     assert bytes(restored.get(0, b"versioned").bytes(0)) == b"v1"
     restored.close()

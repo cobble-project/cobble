@@ -158,7 +158,7 @@ pub use config::{
     ScanOptions, SstReadMetadataCacheMode, VolumeDescriptor, VolumeUsageKind, WriteOptions,
 };
 pub use coordinator::{CoordinatorConfig, DbCoordinator, GlobalSnapshotManifest, ShardSnapshotRef};
-pub use db::{Db, ExpandStorageMode, ExportSnapshotHandle, RecoveryMode};
+pub use db::{Db, ExportSnapshotHandle, ImportStorageMode, RecoveryMode};
 pub use db_builder::DbBuilder;
 pub use db_iter::{BucketedRow, DbIterator};
 pub use error::{Error, Result};

@@ -99,9 +99,9 @@ pub struct Db {
     recovered_wal_checkpoint: Arc<Mutex<Option<RecoveredWalCheckpoint>>>,
 }
 
-/// Storage ownership policy for files imported by [`Db::expand_bucket_with_storage_mode`].
+/// Storage ownership policy for cross-database snapshot imports and bucket expansion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExpandStorageMode {
+pub enum ImportStorageMode {
     /// Reference the source snapshot until its files are copied into this DB's owned storage.
     AdoptAsync,
     /// Keep a durable external reference to the source snapshot without copying it.
@@ -176,6 +176,32 @@ impl Db {
 
     pub(crate) fn open_with_builder(builder: DbBuilder) -> Result<Self> {
         let (config, bucket_ranges, db_id, governance, resolver, transforms) = builder.into_parts();
+        let schema_manager = Arc::new(SchemaManager::new_with_runtime_wiring(
+            config.num_columns,
+            resolver,
+            transforms,
+        ));
+        Self::open_empty_with_runtime(
+            config,
+            bucket_ranges,
+            db_id,
+            governance,
+            schema_manager,
+            false,
+        )
+    }
+
+    /// Construct an empty DB runtime for ordinary creation or a private initial import target.
+    /// Imports use their real requested ownership and defer the WAL baseline and runtime
+    /// publication until the shared import cutover commits.
+    pub(super) fn open_empty_with_runtime(
+        config: Config,
+        bucket_ranges: Vec<RangeInclusive<u16>>,
+        db_id: Option<String>,
+        governance: Option<Arc<dyn crate::governance::DbGovernance>>,
+        schema_manager: Arc<SchemaManager>,
+        initial_import: bool,
+    ) -> Result<Self> {
         if config.total_buckets == 0 || config.total_buckets > (u16::MAX as u32) + 1 {
             return Err(Error::ConfigError(
                 "total_buckets must be in range 1..=65536".to_string(),
@@ -212,20 +238,24 @@ impl Db {
             config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
 
         let db_governance = match governance {
-            Some(governance) => governance,
-            None => create_default_db_governance(&config)?,
+            Some(governance) => Some(governance),
+            None if initial_import => None,
+            None => Some(create_default_db_governance(&config)?),
         };
-        db_governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
+        if let Some(governance) = &db_governance {
+            governance.register_db(&id, &bucket_ranges, config.total_buckets)?;
+        }
 
         let file_manager =
             FileManager::from_config(&file_manager_config, &id, Arc::clone(&metrics_manager))?;
         let file_manager = Arc::new(file_manager);
         let db_state = Arc::new(DbStateHandle::new());
-        let schema_manager = Arc::new(SchemaManager::new_with_runtime_wiring(
-            config.num_columns,
-            resolver,
-            transforms,
-        ));
+        if initial_import && let Err(err) = schema_manager.persist_loaded_schemas(&file_manager) {
+            if let Some(governance) = &db_governance {
+                let _ = governance.unregister_db(&id);
+            }
+            return Err(err);
+        }
         let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
         // Fresh open starts from an empty DbState, so bucket-range layout must be initialized here.
         db_state.configure_multi_lsm(config.total_buckets, &bucket_ranges)?;
@@ -235,29 +265,36 @@ impl Db {
             db_state,
             Arc::clone(&db_lifecycle),
             id.clone(),
-            Some(Arc::clone(&db_governance)),
+            db_governance.as_ref().map(Arc::clone),
             bucket_ranges,
             0,
             0,
             hybrid_cache_plan,
             metrics_manager,
             schema_manager,
+            initial_import,
         ) {
             Ok(db) => db,
             Err(err) => {
-                let _ = db_governance.unregister_db(&id);
+                if let Some(governance) = &db_governance {
+                    let _ = governance.unregister_db(&id);
+                }
                 return Err(err);
             }
         };
         db.memtable_manager.open()?;
         db.db_lifecycle.mark_open()?;
-        if db.config.wal_enabled
+        if !initial_import
+            && db.config.wal_enabled
             && let Err(err) = db.create_snapshot_and_wait("initial WAL snapshot")
         {
             db.force_close();
             return Err(err);
         }
-        db.start_dedicated_poller();
+        if !initial_import {
+            db.adoption_coordinator.enable();
+            db.start_dedicated_poller();
+        }
         Ok(db)
     }
 
@@ -1430,6 +1467,7 @@ impl Db {
         hybrid_cache_plan: Option<crate::config::HybridCacheVolumePlan>,
         metrics_manager: Arc<MetricsManager>,
         schema_manager: Arc<SchemaManager>,
+        initial_import: bool,
     ) -> Result<Self> {
         if config.wal_enabled
             && (config.snapshot_on_flush
@@ -1616,6 +1654,7 @@ impl Db {
                     Arc::clone(&db_lifecycle),
                     config.compaction_mode,
                     Arc::clone(&time_provider),
+                    initial_import.then(|| rescale::INITIAL_IMPORT_PUBLICATION_OWNER.to_string()),
                 )?,
             ))
         } else {
@@ -1741,23 +1780,7 @@ impl Db {
     ) -> Result<()> {
         let restored = self
             .memtable_manager
-            .restore_active_memtable_snapshot_to_l0(&self.file_manager, segments)?;
-        if !segments.is_empty() && !restored {
-            return Err(Error::InvalidState(
-                "active memtable snapshot restore did not flush".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn restore_active_memtable_snapshot_to_l0_with_source(
-        &self,
-        source_file_manager: &Arc<FileManager>,
-        segments: &[ActiveMemtableSnapshotData],
-    ) -> Result<()> {
-        let restored = self
-            .memtable_manager
-            .restore_active_memtable_snapshot_to_l0(source_file_manager, segments)?;
+            .restore_active_memtable_snapshot_to_l0(&self.file_manager, segments, None)?;
         if !segments.is_empty() && !restored {
             return Err(Error::InvalidState(
                 "active memtable snapshot restore did not flush".to_string(),

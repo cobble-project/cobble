@@ -47,61 +47,62 @@ Db Db::OpenFile(std::string_view config_path,
   return Db(std::make_shared<Impl>(std::move(native)));
 }
 
-Db Db::OpenFromSnapshot(std::string_view config_json, SnapshotId snapshot,
-                        std::string_view existing_db_id, RecoveryMode mode) {
-  auto native = detail::Translate([&] {
-    return structured_ffi::native_structured_db_open_from_snapshot(
-        detail::RustStr(config_json), snapshot, detail::RustStr(existing_db_id),
-        static_cast<std::uint8_t>(mode));
-  });
-  return Db(std::make_shared<Impl>(std::move(native)));
-}
-
-Db Db::OpenFromSnapshotFile(std::string_view config_path, SnapshotId snapshot,
-                            std::string_view existing_db_id,
-                            RecoveryMode mode) {
-  auto native = detail::Translate([&] {
-    return structured_ffi::native_structured_db_open_from_snapshot_file(
-        detail::RustStr(config_path), snapshot, detail::RustStr(existing_db_id),
-        static_cast<std::uint8_t>(mode));
-  });
-  return Db(std::make_shared<Impl>(std::move(native)));
-}
-
 Db Db::RestoreNew(std::string_view config_json, SnapshotId source_snapshot,
-                  std::string_view source_db_id) {
+                  std::string_view source_db_id,
+                  std::optional<std::span<const BucketRange>> ranges,
+                  ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return structured_ffi::native_structured_db_restore_new(
         detail::RustStr(config_json), source_snapshot,
-        detail::RustStr(source_db_id));
+        detail::RustStr(source_db_id), ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<structured_ffi::NativeBucketRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_shared<Impl>(std::move(native)));
 }
 
 Db Db::RestoreNewFile(std::string_view config_path, SnapshotId source_snapshot,
-                      std::string_view source_db_id) {
+                      std::string_view source_db_id,
+                      std::optional<std::span<const BucketRange>> ranges,
+                      ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return structured_ffi::native_structured_db_restore_new_file(
         detail::RustStr(config_path), source_snapshot,
-        detail::RustStr(source_db_id));
+        detail::RustStr(source_db_id), ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<structured_ffi::NativeBucketRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_shared<Impl>(std::move(native)));
 }
 
-Db Db::RestoreNewFromManifest(std::string_view config_json,
-                              std::string_view manifest_path) {
+Db Db::RestoreNewFromManifest(
+    std::string_view config_json, std::string_view manifest_path,
+    std::optional<std::span<const BucketRange>> ranges,
+    ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return structured_ffi::native_structured_db_restore_new_from_manifest(
-        detail::RustStr(config_json), detail::RustStr(manifest_path));
+        detail::RustStr(config_json), detail::RustStr(manifest_path),
+        ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<structured_ffi::NativeBucketRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_shared<Impl>(std::move(native)));
 }
 
-Db Db::RestoreNewFromManifestFile(std::string_view config_path,
-                                  std::string_view manifest_path) {
+Db Db::RestoreNewFromManifestFile(
+    std::string_view config_path, std::string_view manifest_path,
+    std::optional<std::span<const BucketRange>> ranges,
+    ImportStorageMode storage_mode) {
   auto native = detail::Translate([&] {
     return structured_ffi::native_structured_db_restore_new_from_manifest_file(
-        detail::RustStr(config_path), detail::RustStr(manifest_path));
+        detail::RustStr(config_path), detail::RustStr(manifest_path),
+        ranges.has_value(),
+        ranges ? detail::ToNativeRanges(*ranges)
+               : rust::Vec<structured_ffi::NativeBucketRange>{},
+        static_cast<std::uint8_t>(storage_mode));
   });
   return Db(std::make_shared<Impl>(std::move(native)));
 }
@@ -362,7 +363,7 @@ std::size_t Db::LoadReadonlyFilesToPrimary() const {
 SnapshotId Db::ExpandBucket(std::string_view source_db_id,
                             std::optional<SnapshotId> source_snapshot,
                             std::optional<std::span<const BucketRange>> ranges,
-                            ExpandStorageMode storage_mode) const {
+                            ImportStorageMode storage_mode) const {
   if (!impl_)
     throw Error(ErrorCode::kInvalidState, "structured Db has been moved from");
   return detail::Translate([&] {
@@ -379,7 +380,7 @@ SnapshotId Db::ExpandBucket(std::string_view source_db_id,
 SnapshotId Db::ExpandBucketFromManifest(
     std::string_view source_db_id, std::string_view source_manifest_path,
     std::optional<std::span<const BucketRange>> ranges,
-    ExpandStorageMode storage_mode) const {
+    ImportStorageMode storage_mode) const {
   if (!impl_)
     throw Error(ErrorCode::kInvalidState, "structured Db has been moved from");
   return detail::Translate([&] {
@@ -392,11 +393,11 @@ SnapshotId Db::ExpandBucketFromManifest(
   });
 }
 
-void Db::WaitForExpandAdoption(std::chrono::milliseconds timeout) const {
+void Db::WaitForImportAdoption(std::chrono::milliseconds timeout) const {
   if (!impl_)
     throw Error(ErrorCode::kInvalidState, "structured Db has been moved from");
   detail::Translate([&] {
-    structured_ffi::native_structured_db_wait_for_expand_adoption(
+    structured_ffi::native_structured_db_wait_for_import_adoption(
         *impl_->native, timeout.count());
   });
 }

@@ -83,7 +83,7 @@ let db = DbBuilder::new(config)
     .resume()?;
 ```
 
-Builder registration also works with `open()`, `open_from_snapshot(snapshot_id)`, and `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
+Builder registration also works with `open()`, `resume_from_snapshot(snapshot_id)`, including their recovery-mode variants. Restore methods require `db_id` and use the snapshot's bucket ranges. Missing required IDs fail recovery; duplicate registrations return an error. Keep each ID's meaning stable. `switch_to_snapshot` preserves the current DB's registrations, and `Db::register_schema_transform` remains available for new runtime schema updates.
 
 Custom transforms support `Db`, `ReadOnlyDb`, and `Reader` reads (`get`, multi-get, and scan), plus local, remote, and dedicated compaction. Scans merge older values with their original operators before applying transforms, then apply column selection and row limits. Higher-level binding registration is not yet available.
 

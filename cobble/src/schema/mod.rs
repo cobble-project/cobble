@@ -1081,22 +1081,25 @@ impl SchemaManager {
     }
 }
 
-fn collect_schema_ids_from_manifest(manifest: &ManifestSnapshot, schema_ids: &mut BTreeSet<u64>) {
+pub(crate) fn collect_schema_ids_from_manifest(
+    manifest: &ManifestSnapshot,
+    schema_ids: &mut BTreeSet<u64>,
+) {
     let latest_schema_id = manifest.latest_schema_id;
-    schema_ids.insert(latest_schema_id);
+    let mut min_schema_id = latest_schema_id;
     for tree_levels in &manifest.tree_levels {
         for level in tree_levels {
             for file in &level.files {
                 if file.schema_id <= latest_schema_id {
-                    for schema_id in file.schema_id..=latest_schema_id {
-                        schema_ids.insert(schema_id);
-                    }
+                    min_schema_id = min_schema_id.min(file.schema_id);
                 } else {
                     schema_ids.insert(file.schema_id);
                 }
             }
         }
     }
+    // Intermediate evolution steps are required even when no SST references them.
+    schema_ids.extend(min_schema_id..=latest_schema_id);
 }
 
 #[derive(Clone, Debug, Serialize)]

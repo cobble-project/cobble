@@ -4,7 +4,7 @@
 
 namespace cobble {
 
-enum class ExpandStorageMode : std::uint8_t {
+enum class ImportStorageMode : std::uint8_t {
   kAdoptAsync = 0,
   kReferencePersistent = 1,
   kReferencePersistentWithCache = 2,

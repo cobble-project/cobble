@@ -2636,6 +2636,7 @@ impl MemtableManager {
         &self,
         source_file_manager: &Arc<FileManager>,
         segments: &[ActiveMemtableSnapshotData],
+        ranges: Option<&[std::ops::RangeInclusive<u16>]>,
     ) -> Result<bool> {
         if segments.is_empty() {
             return Ok(false);
@@ -2648,8 +2649,11 @@ impl MemtableManager {
             state.restore_in_progress = true;
         }
         let result = (|| {
-            let memtable =
-                decode_active_snapshot_segments_into_memtable(source_file_manager, segments)?;
+            let memtable = decode_active_snapshot_segments_into_memtable(
+                source_file_manager,
+                segments,
+                ranges,
+            )?;
             if memtable.is_empty() {
                 return Ok(false);
             }
@@ -2943,6 +2947,7 @@ fn key_is_truncated_by_cursor_map(
 fn decode_active_snapshot_segments_into_memtable(
     file_manager: &Arc<FileManager>,
     segments: &[ActiveMemtableSnapshotData],
+    ranges: Option<&[std::ops::RangeInclusive<u16>]>,
 ) -> Result<VecMemtable> {
     if segments.is_empty() {
         return Ok(VecMemtable::with_capacity(1));
@@ -3024,6 +3029,15 @@ fn decode_active_snapshot_segments_into_memtable(
             }
             let key_start = kv_pos + 8;
             let value_start = key_start + key_len;
+            if let Some(ranges) = ranges {
+                let bucket = key_bucket(&kv_bytes[key_start..value_start]).ok_or_else(|| {
+                    Error::InvalidState("encoded key missing bucket prefix".into())
+                })?;
+                if !ranges.iter().any(|range| range.contains(&bucket)) {
+                    kv_pos = entry_end;
+                    continue;
+                }
+            }
             memtable.put(
                 &kv_bytes[key_start..value_start],
                 &kv_bytes[value_start..entry_end],

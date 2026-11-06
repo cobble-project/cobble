@@ -205,8 +205,13 @@ fn test_expand_bucket_from_changed_root_manifest() {
             volume.set_usage(crate::VolumeUsageKind::Readonly);
             target_config.volumes.push(volume);
         }
-        let target =
-            Db::open_new_with_manifest_path(target_config.clone(), base.manifest_path).unwrap();
+        let target = Db::open_new_with_manifest_path(
+            target_config.clone(),
+            base.manifest_path,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
         target.shrink_bucket(vec![0..=42]).unwrap();
         assert!(
             target
@@ -214,7 +219,7 @@ fn test_expand_bucket_from_changed_root_manifest() {
                     right.id(),
                     format!("{}?secret_key=secret", source.manifest_path),
                     Some(vec![64..=85]),
-                    ExpandStorageMode::AdoptAsync,
+                    ImportStorageMode::AdoptAsync,
                 )
                 .is_err()
         );
@@ -236,7 +241,7 @@ fn test_expand_bucket_from_changed_root_manifest() {
                 right.id(),
                 &source.manifest_path,
                 Some(vec![64..=85]),
-                ExpandStorageMode::AdoptAsync,
+                ImportStorageMode::AdoptAsync,
             )
             .unwrap();
         for (bucket, key) in [
@@ -251,7 +256,7 @@ fn test_expand_bucket_from_changed_root_manifest() {
             );
         }
         target
-            .wait_for_expand_adoption(Duration::from_secs(10))
+            .wait_for_import_adoption(Duration::from_secs(10))
             .unwrap();
         assert!(
             source_manager
@@ -264,7 +269,8 @@ fn test_expand_bucket_from_changed_root_manifest() {
         let target_id = target.id().to_string();
         drop(target);
         let reopened =
-            Db::open_from_snapshot(target_config, target_snapshot.snapshot_id, target_id).unwrap();
+            Db::resume_from_snapshot(target_config, target_snapshot.snapshot_id, target_id)
+                .unwrap();
         assert_eq!(
             reopened.get(65, b"second").unwrap().unwrap()[0].as_deref(),
             Some(value.as_slice())
@@ -467,9 +473,9 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
     .unwrap();
     drop(coordinator);
     drop(target);
-    let reopened = Db::open_from_snapshot(target_config, retry.snapshot_id, target_id).unwrap();
+    let reopened = Db::resume_from_snapshot(target_config, retry.snapshot_id, target_id).unwrap();
     reopened
-        .wait_for_expand_adoption(Duration::from_secs(10))
+        .wait_for_import_adoption(Duration::from_secs(10))
         .unwrap();
     assert!(
         source_manager
@@ -576,7 +582,7 @@ fn test_expand_bucket_from_latest_snapshot() {
             .all(|origin| { matches!(origin, ReplicaOrigin::ExternalLeased { .. }) })
     );
     target
-        .wait_for_expand_adoption(Duration::from_secs(10))
+        .wait_for_import_adoption(Duration::from_secs(10))
         .unwrap();
     let target_snapshot = *list_snapshot_manifest_ids(&target_file_manager)
         .unwrap()
@@ -634,7 +640,7 @@ fn test_expand_bucket_from_latest_snapshot() {
             source.id().to_string(),
             Some(source_snapshot),
             None,
-            ExpandStorageMode::ReferencePersistent,
+            ImportStorageMode::ReferencePersistent,
         )
         .unwrap();
     let persistent_file_manager = Arc::new(
@@ -687,7 +693,7 @@ fn test_expand_bucket_from_latest_snapshot() {
             source.id().to_string(),
             Some(source_snapshot),
             None,
-            ExpandStorageMode::ReferencePersistentWithCache,
+            ImportStorageMode::ReferencePersistentWithCache,
         )
         .unwrap();
     let cached_file_ids = cached
@@ -792,7 +798,7 @@ fn test_expand_bucket_from_latest_snapshot() {
     }));
     drop(cached);
     let reopened_cached =
-        Db::open_from_snapshot(config.clone(), cached_snapshot, cached_id).unwrap();
+        Db::resume_from_snapshot(config.clone(), cached_snapshot, cached_id).unwrap();
     // Cache requests are runtime policy. Reopening restores the durable external route;
     // the embedding runtime may request local loading again after startup.
     assert!(cached_file_ids.iter().all(|file_id| {
@@ -814,7 +820,7 @@ fn test_expand_bucket_from_latest_snapshot() {
     assert!(source.expire_snapshot(source_snapshot).unwrap());
     drop(source);
     drop(target);
-    let reopened = Db::open_from_snapshot(config.clone(), target_snapshot, target_id).unwrap();
+    let reopened = Db::resume_from_snapshot(config.clone(), target_snapshot, target_id).unwrap();
     assert_eq!(
         reopened.get(2, b"k1").unwrap().unwrap()[0].as_deref(),
         Some(&b"v1"[..])
@@ -999,7 +1005,7 @@ fn test_shrink_bucket_removes_data_from_kicked_range() {
     assert_eq!(post_shrink_manifest.bucket_ranges, vec![0u16..=1u16]);
     let db_id = db.id().to_string();
     drop(db);
-    let reopened = Db::open_from_snapshot(config.clone(), post_shrink_snapshot, db_id).unwrap();
+    let reopened = Db::resume_from_snapshot(config.clone(), post_shrink_snapshot, db_id).unwrap();
     assert_eq!(
         reopened.get(1, b"k1").unwrap().unwrap()[0].as_deref(),
         Some(&b"v1"[..])

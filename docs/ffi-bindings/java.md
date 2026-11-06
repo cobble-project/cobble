@@ -54,6 +54,7 @@ import io.cobble.Db;
 import io.cobble.Config;
 import io.cobble.PendingSnapshot;
 import io.cobble.RecoveryMode;
+import io.cobble.ImportStorageMode;
 import io.cobble.ShardSnapshot;
 
 Db db = Db.open("config.yaml");
@@ -63,17 +64,16 @@ db.put(0, "key".getBytes(), 0, "value".getBytes());
 ShardSnapshot input = db.snapshot();
 
 // Restore into the same db identity
-Db restored = Db.restore("config.yaml", input.snapshotId, db.id());
+Db restored = Db.resumeFromSnapshot("config.yaml", input.snapshotId, db.id());
 
 // Restore into a fresh db identity
-Db restoredFresh = Db.restore("config.yaml", input.snapshotId, db.id(), true);
+Db restoredFresh = Db.openNewWithSnapshot("config.yaml", db.id(), input.snapshotId, null, null, ImportStorageMode.ADOPT_ASYNC);
 
 // Restore from an explicit manifest path (always creates a fresh db identity)
-Db restoredFromManifest = Db.restoreWithManifest("config.yaml", input.manifestPath);
+Db restoredFromManifest = Db.openNewWithManifestPath("config.yaml", input.manifestPath, null, null, ImportStorageMode.ADOPT_ASYNC);
 
 // Restore the latest snapshot and replay its durable WAL tail
-Db recovered = Db.restore(
-        "config.yaml", input.snapshotId, db.id(), RecoveryMode.LATEST_WITH_WAL);
+Db recovered = Db.resumeFromSnapshot("config.yaml", input.snapshotId, db.id(), RecoveryMode.LATEST_WITH_WAL);
 
 // Resume this db identity from an exact historical snapshot without replaying WAL
 Db historical = Db.resumeFromSnapshot("config.yaml", input.snapshotId, db.id());
@@ -98,7 +98,7 @@ long marked = db.loadReadonlyFilesToPrimary();
 
 See [Loading Files from Readonly Volumes](../architecture/multi-volume#loading-files-from-readonly-volumes).
 
-Raw and structured `Db` also expose `ExpandStorageMode` and `waitForExpandAdoption(...)` for
+Raw and structured `Db` also expose `ImportStorageMode` and `waitForImportAdoption(...)` for
 bucket rescaling. See [Rescale](../architecture/rescale).
 
 Java uses `Config.MemtableType.ADAPTIVE` by default. `Db`, `SingleDb`, and their structured variants also expose `switchMemtableType(...)` for changing this choice at runtime. See [Memtable](../architecture/memtable#choosing-a-memtable-type).

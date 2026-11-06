@@ -385,7 +385,7 @@ fn cleanup_shard_option_matrix_preserves_incremental_chains_and_shared_files() {
                 );
             }
 
-            let restored = Db::open_from_snapshot(config.clone(), c, &db_id).unwrap();
+            let restored = Db::resume_from_snapshot(config.clone(), c, &db_id).unwrap();
             for key in [b"a", b"b", b"c"] {
                 assert_eq!(
                     restored.get(0, key).unwrap().unwrap()[0].as_deref(),
@@ -594,7 +594,7 @@ fn cleanup_preserves_shared_relative_active_segments() {
             assert!(path.exists());
         }
 
-        let restored = Db::open_from_snapshot(config.clone(), c, &db_id).unwrap();
+        let restored = Db::resume_from_snapshot(config.clone(), c, &db_id).unwrap();
         for (key, value) in [
             (b"a", b"first".as_slice()),
             (b"b", b"second".as_slice()),

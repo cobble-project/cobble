@@ -135,146 +135,101 @@ public final class Db extends NativeObject {
     }
 
     /**
-     * Restore a writable DB from one snapshot.
-     *
-     * @param configPath db config path
-     * @param snapshotId snapshot id
-     * @param dbId source db id
-     * @return restored writable db
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restore(String configPath, long snapshotId, String dbId) {
-        return restore(configPath, snapshotId, dbId, false);
-    }
-
-    /** Restore a writable DB from one snapshot with explicit WAL recovery behavior. */
-    public static Db restore(
-            String configPath, long snapshotId, String dbId, RecoveryMode recoveryMode) {
-        if (recoveryMode == null) {
-            throw new IllegalArgumentException("recoveryMode must not be null");
-        }
+    public static Db openNewWithSnapshot(
+            String configPath,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long nativeHandle =
-                restoreHandleWithRecoveryMode(configPath, snapshotId, dbId, recoveryMode.ordinal());
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException("failed to restore db with recovery mode");
-        }
-        return wrapOpenedDb(nativeHandle);
+        long handle =
+                openNewWithSnapshotHandle(
+                        configPath,
+                        sourceDbId,
+                        snapshotId,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
-     * Restore a writable DB from one snapshot.
-     *
-     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
-     * identity and start a new snapshot chain.
-     *
-     * @param configPath db config path
-     * @param snapshotId snapshot id
-     * @param dbId source db id
-     * @param newDbId whether to restore into a fresh db identity
-     * @return restored writable db
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restore(String configPath, long snapshotId, String dbId, boolean newDbId) {
+    public static Db openNewWithSnapshot(
+            Config config,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (config == null) throw new IllegalArgumentException("config must not be null");
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long nativeHandle = restoreHandle(configPath, snapshotId, dbId, newDbId);
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException(
-                    newDbId
-                            ? "failed to restore db from snapshot with fresh db id"
-                            : "failed to restore db from snapshot");
-        }
-        return wrapOpenedDb(nativeHandle);
+        long handle =
+                openNewWithSnapshotHandleFromJson(
+                        config.toJson(),
+                        sourceDbId,
+                        snapshotId,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
-     * Restore a writable DB from one snapshot.
-     *
-     * @param config Java config
-     * @param snapshotId snapshot id
-     * @param dbId source db id
-     * @return restored writable db
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restore(Config config, long snapshotId, String dbId) {
-        return restore(config, snapshotId, dbId, false);
-    }
-
-    /** Restore a writable DB from one snapshot with explicit WAL recovery behavior. */
-    public static Db restore(
-            Config config, long snapshotId, String dbId, RecoveryMode recoveryMode) {
-        if (config == null) {
-            throw new IllegalArgumentException("config must not be null");
-        }
-        if (recoveryMode == null) {
-            throw new IllegalArgumentException("recoveryMode must not be null");
-        }
+    public static Db openNewWithManifestPath(
+            String configPath,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long nativeHandle =
-                restoreHandleFromJsonWithRecoveryMode(
-                        config.toJson(), snapshotId, dbId, recoveryMode.ordinal());
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException(
-                    "failed to restore db from config json with recovery mode");
-        }
-        return wrapOpenedDb(nativeHandle);
+        long handle =
+                openNewWithManifestPathHandle(
+                        configPath,
+                        manifestPath,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
-     * Restore a writable DB from one snapshot.
-     *
-     * <p>Set {@code newDbId} to {@code true} to restore from the source snapshot into a fresh db
-     * identity and start a new snapshot chain.
-     *
-     * @param config Java config
-     * @param snapshotId snapshot id
-     * @param dbId source db id
-     * @param newDbId whether to restore into a fresh db identity
-     * @return restored writable db
+     * Import into a fresh DB identity. Null ranges select all source buckets. Persistent modes
+     * require the caller to retain source files.
      */
-    public static Db restore(Config config, long snapshotId, String dbId, boolean newDbId) {
-        if (config == null) {
-            throw new IllegalArgumentException("config must not be null");
-        }
+    public static Db openNewWithManifestPath(
+            Config config,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode) {
+        if (config == null) throw new IllegalArgumentException("config must not be null");
+        if (storageMode == null) throw new IllegalArgumentException("storageMode must not be null");
         NativeLoader.load();
-        long nativeHandle = restoreHandleFromJson(config.toJson(), snapshotId, dbId, newDbId);
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException(
-                    newDbId
-                            ? "failed to restore db from snapshot config json with fresh db id"
-                            : "failed to restore db from snapshot config json");
-        }
-        return wrapOpenedDb(nativeHandle);
-    }
-
-    /**
-     * Restore a writable DB from an explicit source manifest path.
-     *
-     * <p>The manifest path is treated as restore input, and the returned DB always gets a fresh db
-     * id and starts a new snapshot chain.
-     */
-    public static Db restoreWithManifest(String configPath, String manifestPath) {
-        NativeLoader.load();
-        long nativeHandle = restoreWithManifestHandle(configPath, manifestPath);
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException("failed to restore db from manifest path");
-        }
-        return wrapOpenedDb(nativeHandle);
-    }
-
-    /**
-     * Restore a writable DB from an explicit source manifest path.
-     *
-     * <p>The manifest path is treated as restore input, and the returned DB always gets a fresh db
-     * id and starts a new snapshot chain.
-     */
-    public static Db restoreWithManifest(Config config, String manifestPath) {
-        if (config == null) {
-            throw new IllegalArgumentException("config must not be null");
-        }
-        NativeLoader.load();
-        long nativeHandle = restoreWithManifestHandleFromJson(config.toJson(), manifestPath);
-        if (nativeHandle == 0L) {
-            throw new IllegalStateException("failed to restore db from manifest path config json");
-        }
-        return wrapOpenedDb(nativeHandle);
+        long handle =
+                openNewWithManifestPathHandleFromJson(
+                        config.toJson(),
+                        manifestPath,
+                        rangeStartsInclusive,
+                        rangeEndsInclusive,
+                        storageMode.ordinal());
+        if (handle == 0L) throw new IllegalStateException("failed to import db");
+        return wrapOpenedDb(handle);
     }
 
     /**
@@ -1159,7 +1114,7 @@ public final class Db extends NativeObject {
                 snapshotId,
                 rangeStartsInclusive,
                 rangeEndsInclusive,
-                ExpandStorageMode.ADOPT_ASYNC);
+                ImportStorageMode.ADOPT_ASYNC);
     }
 
     /** Expand bucket ownership with an explicit imported-file storage policy. */
@@ -1168,7 +1123,7 @@ public final class Db extends NativeObject {
             long snapshotId,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
-            ExpandStorageMode storageMode) {
+            ImportStorageMode storageMode) {
         if (storageMode == null) {
             throw new IllegalArgumentException("storageMode must not be null");
         }
@@ -1189,7 +1144,7 @@ public final class Db extends NativeObject {
                 -1L,
                 rangeStartsInclusive,
                 rangeEndsInclusive,
-                ExpandStorageMode.ADOPT_ASYNC);
+                ImportStorageMode.ADOPT_ASYNC);
     }
 
     /**
@@ -1201,7 +1156,7 @@ public final class Db extends NativeObject {
             String sourceManifestPath,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
-            ExpandStorageMode storageMode) {
+            ImportStorageMode storageMode) {
         if (storageMode == null) {
             throw new IllegalArgumentException("storageMode must not be null");
         }
@@ -1214,9 +1169,9 @@ public final class Db extends NativeObject {
                 storageMode.ordinal());
     }
 
-    /** Wait for asynchronous expansion adoption to finish. */
-    public void waitForExpandAdoption(long timeoutMillis) {
-        waitForExpandAdoption(nativeHandle, timeoutMillis);
+    /** Wait for asynchronous import adoption to finish, for both new DBs and expansion. */
+    public void waitForImportAdoption(long timeoutMillis) {
+        waitForImportAdoption(nativeHandle, timeoutMillis);
     }
 
     /** Shrink bucket ownership by removing the given ranges from the current DB. */
@@ -1369,22 +1324,35 @@ public final class Db extends NativeObject {
     private static native long openHandleFromJsonWithRange(
             String configJson, int rangeStartInclusive, int rangeEndInclusive);
 
-    private static native long restoreHandle(
-            String configPath, long snapshotId, String dbId, boolean newDbId);
+    private static native long openNewWithSnapshotHandle(
+            String config,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
-    private static native long restoreHandleFromJson(
-            String configJson, long snapshotId, String dbId, boolean newDbId);
+    private static native long openNewWithSnapshotHandleFromJson(
+            String config,
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
-    private static native long restoreHandleWithRecoveryMode(
-            String configPath, long snapshotId, String dbId, int recoveryMode);
+    private static native long openNewWithManifestPathHandle(
+            String config,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
-    private static native long restoreHandleFromJsonWithRecoveryMode(
-            String configJson, long snapshotId, String dbId, int recoveryMode);
-
-    private static native long restoreWithManifestHandle(String configPath, String manifestPath);
-
-    private static native long restoreWithManifestHandleFromJson(
-            String configJson, String manifestPath);
+    private static native long openNewWithManifestPathHandleFromJson(
+            String config,
+            String manifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            int storageMode);
 
     private static native long resumeHandle(String configPath, String dbId);
 
@@ -1560,7 +1528,7 @@ public final class Db extends NativeObject {
             int[] rangeEndsInclusive,
             int storageMode);
 
-    private static native void waitForExpandAdoption(long nativeHandle, long timeoutMillis);
+    private static native void waitForImportAdoption(long nativeHandle, long timeoutMillis);
 
     private static native long shrinkBucket(
             long nativeHandle, int[] rangeStartsInclusive, int[] rangeEndsInclusive);

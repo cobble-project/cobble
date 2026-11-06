@@ -244,8 +244,13 @@ fn write_snapshot_stage(db: &cobble::Db, stage: usize) {
 }
 
 fn verify_snapshot_cut(config: Config, metadata: &cobble::ShardSnapshotMetadata, stages: usize) {
-    let restored =
-        cobble::Db::open_new_with_manifest_path(config, &metadata.manifest_path).unwrap();
+    let restored = cobble::Db::open_new_with_manifest_path(
+        config,
+        &metadata.manifest_path,
+        None,
+        cobble::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     for index in 0..stages * 128 {
         assert_eq!(
             restored
@@ -820,8 +825,13 @@ fn s3_snapshot_to_preserves_incremental_chains_and_active_merge_cuts() {
         ("C", &c, 107, active_config.clone()),
         ("D", &d, 115, active_config.clone()),
     ] {
-        let restored =
-            cobble::Db::open_new_with_manifest_path(config, &snapshot.manifest_path).unwrap();
+        let restored = cobble::Db::open_new_with_manifest_path(
+            config,
+            &snapshot.manifest_path,
+            None,
+            cobble::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
         let value = restored.get(0, b"counter").unwrap().unwrap();
         assert_eq!(
             u64::from_le_bytes(value[0].as_deref().unwrap().try_into().unwrap()),
@@ -856,6 +866,8 @@ fn s3_snapshot_to_preserves_incremental_chains_and_active_merge_cuts() {
     let restored = cobble::Db::open_new_with_manifest_path(
         snapshot_config(export_volume, 1.0),
         &e.manifest_path,
+        None,
+        cobble::ImportStorageMode::ReferencePersistent,
     )
     .unwrap();
     assert_eq!(

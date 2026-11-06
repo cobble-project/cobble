@@ -88,7 +88,7 @@ def test_sharded_snapshot_exact_latest_restore_and_switch(tmp_path: Path) -> Non
     assert bytes(latest.get(0, b"wal-tail").column(0)) == b"latest"
     latest.close()
 
-    restored = pycobble.Db.restore_new_from_manifest(cfg, snapshot.manifest_path)
+    restored = pycobble.Db.restore_new_from_manifest(cfg, snapshot.manifest_path, storage_mode=pycobble.ImportStorageMode.REFERENCE_PERSISTENT)
     assert restored.id != source_id
     assert bytes(restored.get(0, b"stable").column(0)) == b"snapshot"
     restored.close()
@@ -121,9 +121,9 @@ def test_sharded_reference_expand_and_shrink(tmp_path: Path) -> None:
         source.id,
         source_snapshot=source_snapshot.snapshot_id,
         ranges=[pycobble.BucketRange(2, 3)],
-        storage_mode=pycobble.ExpandStorageMode.REFERENCE_PERSISTENT,
+        storage_mode=pycobble.ImportStorageMode.REFERENCE_PERSISTENT,
     )
-    target.wait_for_expand_adoption(1.0)
+    target.wait_for_import_adoption(1.0)
     assert bytes(target.get(2, b"moved").column(0)) == b"value"
     target.shrink_bucket([pycobble.BucketRange(2, 3)])
     try:

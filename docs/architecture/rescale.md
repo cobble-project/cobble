@@ -55,7 +55,13 @@ with a **fresh db id**:
 let shard_b_snapshot_id = /* manifest.shard_snapshots for db_b */ ;
 
 // C is a new shard process, bootstrapped from snapshot with a fresh db id
-let db_c = Db::open_new_with_snapshot(config_c, shard_b_snapshot_id, db_b.id())?;
+let db_c = Db::open_new_with_snapshot(
+    config_c,
+    db_b.id(),
+    shard_b_snapshot_id,
+    Some(vec![684..=1023]),
+    ImportStorageMode::AdoptAsync,
+)?;
 ```
 
 Keep read/write traffic paused while this migration is running.
@@ -72,8 +78,7 @@ let snap_a = db_a.shrink_bucket(vec![342..=511])?;
 // B gives out 684..=1023
 let snap_b = db_b.shrink_bucket(vec![684..=1023])?;
 
-// C keeps only 684..=1023 after bootstrapping from B snapshot
-let snap_c = db_c.shrink_bucket(vec![512..=683])?;
+// C already owns exactly 684..=1023 because its import requested that range.
 ```
 
 ### Phase 2: expand (import to targets)
@@ -84,9 +89,10 @@ db_b.expand_bucket(db_a.id(), Some(snap_a), Some(vec![342..=511]))?;
 ```
 
 Expansion defaults to asynchronous ownership adoption: the target reads the exported snapshot
-until its local copy is ready, and `wait_for_expand_adoption` is available when cleanup must wait.
-`ExpandStorageMode::ReferencePersistent` keeps the source files as durable references;
+until its local copy is ready, and `wait_for_import_adoption` is available when cleanup must wait.
+`ImportStorageMode::ReferencePersistent` keeps the source files as durable references;
 `ReferencePersistentWithCache` additionally maintains local read caches without changing that
-durable reference. Java exposes the same three modes through `ExpandStorageMode`.
+durable reference. These persistent modes create no adoption lease; the caller must retain source files.
+The import protocol does not fence arbitrary concurrent offline cleanup. Java exposes the same three modes through `ImportStorageMode`.
 
 After all expands are done, take new shard snapshots and materialize a new global snapshot with `DbCoordinator`.

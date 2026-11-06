@@ -72,7 +72,7 @@ fn shard_range_cleanup_is_partial_and_preserves_leased_incremental_chain() {
                     .contains(&SnapshotPreservationReason::IncrementalDependency)
             );
         }
-        let restored = Db::open_from_snapshot(config.clone(), b, &metadata.db_id).unwrap();
+        let restored = Db::resume_from_snapshot(config.clone(), b, &metadata.db_id).unwrap();
         assert!(restored.get(0, b"b").unwrap().is_some());
         restored.close().unwrap();
         drop(restored);
@@ -152,7 +152,7 @@ fn global_range_cleanup_keeps_blocked_global_intact_and_retries_after_lease_rele
     assert!(root.path().join("snapshot/SNAPSHOT-10").exists());
     // Blocking one shard must not leave a retained global with a half-deleted sibling.
     for s in [&a, &b] {
-        let restored = Db::open_from_snapshot(config.clone(), s.snapshot_id, &s.db_id).unwrap();
+        let restored = Db::resume_from_snapshot(config.clone(), s.snapshot_id, &s.db_id).unwrap();
         restored.close().unwrap();
     }
     std::fs::remove_file(lease_path).unwrap();

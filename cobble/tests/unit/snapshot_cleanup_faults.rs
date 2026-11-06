@@ -4,7 +4,7 @@ use crate::file::{File, SequentialWriteFile};
 use crate::tool::snapshot_cleanup::tests::{
     cleanup_config, cleanup_resolved, create_materialized_snapshot, write_cleanup_manifest,
 };
-use crate::{Config, CoordinatorConfig, Db, DbBuilder, DbCoordinator};
+use crate::{Config, CoordinatorConfig, DbBuilder, DbCoordinator, ReadOnlyDb};
 use std::sync::atomic::Ordering;
 
 struct Fixture {
@@ -147,22 +147,25 @@ impl Fixture {
     }
 
     fn assert_survivors(&self, cutoff: u64) {
-        let restored = Db::open_from_snapshot(self.config.clone(), self.ids[3], "primary").unwrap();
+        // Validate only each selected survivor. Other chains are deliberately corrupt or
+        // partially deleted, so this must not take over the database's full snapshot inventory.
+        let restored =
+            ReadOnlyDb::open_with_db_id(self.config.clone(), self.ids[3], "primary").unwrap();
         assert_eq!(
             restored.get(0, b"survivor").unwrap().unwrap()[0].as_deref(),
             Some(b"independent".as_slice())
         );
-        restored.close().unwrap();
+        drop(restored);
         if cutoff == 10 {
             let restored =
-                Db::open_from_snapshot(self.config.clone(), self.ids[2], "primary").unwrap();
+                ReadOnlyDb::open_with_db_id(self.config.clone(), self.ids[2], "primary").unwrap();
             for key in [b"a", b"b", b"c"] {
                 assert_eq!(
                     restored.get(0, key).unwrap().unwrap()[0].as_deref(),
                     Some([42; 128].as_slice())
                 );
             }
-            restored.close().unwrap();
+            drop(restored);
         }
     }
 }
@@ -366,12 +369,12 @@ fn cleanup_preserves_manifest_locations_referenced_through_another_route() {
     assert_eq!(result.deleted_global_snapshots, 1);
     assert_eq!(result.preserved_snapshots.len(), 1);
     assert!(atomic_replace::exists(fixture.fs.as_ref(), "snapshot/CURRENT").unwrap());
-    let restored = Db::open_from_snapshot(fixture.config.clone(), id, "primary").unwrap();
+    let restored = ReadOnlyDb::open_with_db_id(fixture.config.clone(), id, "primary").unwrap();
     for key in [b"a", b"b", b"c"] {
         assert_eq!(
             restored.get(0, key).unwrap().unwrap()[0].as_deref(),
             Some([42; 128].as_slice())
         );
     }
-    restored.close().unwrap();
+    drop(restored);
 }

@@ -440,35 +440,35 @@ mod ffi {
             config_path: &str,
             ranges: Vec<NativeRange>,
         ) -> Result<Box<NativeShardedDatabase>>;
-        fn native_sharded_database_open_from_snapshot(
-            config_json: &str,
-            snapshot_id: u64,
-            db_id: &str,
-            recovery_mode: u8,
-        ) -> Result<Box<NativeShardedDatabase>>;
-        fn native_sharded_database_open_from_snapshot_file(
-            config_path: &str,
-            snapshot_id: u64,
-            db_id: &str,
-            recovery_mode: u8,
-        ) -> Result<Box<NativeShardedDatabase>>;
         fn native_sharded_database_restore_new(
             config_json: &str,
             snapshot_id: u64,
             source_db_id: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeShardedDatabase>>;
         fn native_sharded_database_restore_new_file(
             config_path: &str,
             snapshot_id: u64,
             source_db_id: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeShardedDatabase>>;
         fn native_sharded_database_restore_new_from_manifest(
             config_json: &str,
             manifest_path: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeShardedDatabase>>;
         fn native_sharded_database_restore_new_from_manifest_file(
             config_path: &str,
             manifest_path: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeShardedDatabase>>;
         fn native_sharded_database_resume(
             config_json: &str,
@@ -621,7 +621,7 @@ mod ffi {
             ranges: Vec<NativeRange>,
             storage_mode: u8,
         ) -> Result<u64>;
-        fn native_sharded_database_wait_for_expand_adoption(
+        fn native_sharded_database_wait_for_import_adoption(
             db: &NativeShardedDatabase,
             timeout_millis: i64,
         ) -> Result<()>;

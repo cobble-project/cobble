@@ -1,8 +1,6 @@
-use super::Db;
+use super::{Db, ImportStorageMode};
 use crate::Config;
-use crate::config::{
-    PrimaryVolumeOffloadPolicyKind, VolumeDescriptor, resolve_volume_descriptor_credentials,
-};
+use crate::config::{PrimaryVolumeOffloadPolicyKind, resolve_volume_descriptor_credentials};
 use crate::db_builder::DbBuilder;
 use crate::db_state::{DbStateHandle, MultiLSMTreeVersion, new_truncation_cursors_with};
 use crate::db_status::DbLifecycle;
@@ -21,16 +19,15 @@ use crate::schema::{SchemaManager, SchemaTransformRegistry};
 use crate::snapshot::{
     ManifestSnapshot, build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
-    list_snapshot_manifest_ids, load_manifest_chain_from_path, load_manifest_entry,
-    load_manifest_for_snapshot,
+    list_snapshot_manifest_ids, load_manifest_entry, load_manifest_for_snapshot,
 };
 use crate::util::{build_commit_short_id, build_version_string, init_logging};
 use std::collections::{HashMap, VecDeque};
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
-use uuid::Uuid;
 
 /// Selects how a writable database is recovered from a snapshot.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -100,12 +97,10 @@ impl Drop for RestoreTempResourceRegistry {
 fn prepare_manifest_data_files_for_restore(
     file_manager: &Arc<FileManager>,
     manifest: &ManifestSnapshot,
-    retained_owned_source_id: Option<&str>,
 ) -> Result<Vec<u64>> {
     let refs = ordered_manifest_data_file_refs_for_restore(
         manifest,
         file_manager.options.primary_volume_offload_policy,
-        retained_owned_source_id,
     );
     if refs.is_empty() {
         return Ok(Vec::new());
@@ -161,7 +156,6 @@ fn register_scanned_primary_residuals(
     let refs = ordered_manifest_data_file_refs_for_restore(
         manifest,
         file_manager.options.primary_volume_offload_policy,
-        None,
     );
     for file in refs {
         let Some(file_name) = file.path.rsplit('/').next() else {
@@ -250,7 +244,6 @@ struct RestoreFileRef {
 fn ordered_manifest_data_file_refs_for_restore(
     manifest: &ManifestSnapshot,
     policy: PrimaryVolumeOffloadPolicyKind,
-    retained_owned_source_id: Option<&str>,
 ) -> Vec<RestoreFileRef> {
     let mut refs: HashMap<u64, RestoreFileRef> = HashMap::new();
     for tree_levels in &manifest.tree_levels {
@@ -260,7 +253,7 @@ fn ordered_manifest_data_file_refs_for_restore(
                 let entry = refs.entry(file.file_id).or_insert_with(|| RestoreFileRef {
                     file_id: file.file_id,
                     path: file.path.clone(),
-                    origin: restore_source_origin(&file.origin, retained_owned_source_id),
+                    origin: file.origin.clone(),
                     size_bytes: file.size as u64,
                     expected_size_bytes: Some(file.size as u64),
                     priority: level_priority,
@@ -285,7 +278,7 @@ fn ordered_manifest_data_file_refs_for_restore(
         let entry = refs.entry(file.file_id).or_insert_with(|| RestoreFileRef {
             file_id: file.file_id,
             path: file.path.clone(),
-            origin: restore_source_origin(&file.origin, retained_owned_source_id),
+            origin: file.origin.clone(),
             size_bytes: 0,
             expected_size_bytes: None,
             priority: VLOG_FILE_PRIORITY,
@@ -311,18 +304,6 @@ fn ordered_manifest_data_file_refs_for_restore(
     ordered
 }
 
-fn restore_source_origin(
-    origin: &ReplicaOrigin,
-    retained_owned_source_id: Option<&str>,
-) -> ReplicaOrigin {
-    match (origin, retained_owned_source_id) {
-        (ReplicaOrigin::Owned, Some(source_id)) => ReplicaOrigin::ExternalPersistent {
-            source_id: source_id.to_string(),
-        },
-        _ => origin.clone(),
-    }
-}
-
 fn can_incremental_snapshot_from_tree_versions(
     tree_versions: &[LSMTreeVersion],
     file_manager: &Arc<FileManager>,
@@ -334,440 +315,121 @@ fn can_incremental_snapshot_from_tree_versions(
         .all(|file| file_manager.is_data_file_on_snapshot_volume(file.file_id))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn open_restored_db_from_manifest(
-    config: Config,
-    file_manager: Arc<FileManager>,
-    db_id: String,
-    hybrid_cache_plan: Option<crate::config::HybridCacheVolumePlan>,
-    metrics_manager: Arc<MetricsManager>,
-    schema_manager: Arc<SchemaManager>,
-    manifest: ManifestSnapshot,
-    suggested_base_snapshot_id: Option<u64>,
-    advance_next_id_from_existing_manifests: bool,
-    retained_owned_source_id: Option<String>,
-    active_memtable_source: Option<Arc<FileManager>>,
-    recovery_wal_volume: Option<VolumeDescriptor>,
-    governance: Option<Arc<dyn crate::governance::DbGovernance>>,
-) -> Result<Db> {
-    let residual_primary_file_ids = prepare_manifest_data_files_for_restore(
-        &file_manager,
-        &manifest,
-        retained_owned_source_id.as_deref(),
-    )?;
-    let max_vlog_file_seq = manifest
-        .vlog_files
-        .iter()
-        .map(|file| file.file_seq as u64)
-        .max()
-        .unwrap_or(0);
-    let restored_seq_id = manifest.seq_id;
-    if manifest.bucket_ranges.is_empty() {
-        return Err(Error::InvalidState(
-            "Snapshot manifest missing bucket_ranges".to_string(),
-        ));
-    }
-    let bucket_ranges = manifest.bucket_ranges.clone();
-    let active_memtable_data = manifest.active_memtable_data.clone();
-    let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
-    let tree_versions = build_tree_versions_from_manifest(&file_manager, &manifest, false)?;
-    let vlog_version = build_vlog_version_from_manifest(&file_manager, &manifest, false)?;
-    let tree_scopes = build_tree_scopes_from_manifest(&manifest);
-    let can_incremental_base =
-        can_incremental_snapshot_from_tree_versions(&tree_versions, &file_manager);
-    let multi_lsm_version = MultiLSMTreeVersion::from_scopes_with_tree_versions(
-        config.total_buckets,
-        &tree_scopes,
-        tree_versions.into_iter().map(Arc::new).collect(),
-    )?;
-
-    let db_state = Arc::new(DbStateHandle::new());
-    let db_lifecycle = Arc::new(DbLifecycle::new_initializing());
-    db_state.store(crate::db_state::DbState {
-        seq_id: restored_seq_id,
-        topology_epoch: manifest.topology_epoch,
-        bucket_ranges: bucket_ranges.clone(),
-        multi_lsm_version,
-        vlog_version,
-        active: None,
-        active_schema: None,
-        immutables: VecDeque::new(),
-        min_source_schema_by_cf: Vec::new(),
-        truncation_cursors: new_truncation_cursors_with(truncation_cursors),
-        suggested_base_snapshot_id: suggested_base_snapshot_id.filter(|_| can_incremental_base),
-    });
-    if let Some(governance) = governance.as_ref() {
-        governance.register_db(&db_id, &bucket_ranges, config.total_buckets)?;
-    }
-    let mut db = match Db::open_with_state(
-        config,
-        Arc::clone(&file_manager),
-        db_state,
-        Arc::clone(&db_lifecycle),
-        db_id.clone(),
-        governance.as_ref().map(Arc::clone),
-        bucket_ranges,
-        max_vlog_file_seq.saturating_add(1).min(u32::MAX as u64) as u32,
-        manifest.wal_checkpoint_id,
-        hybrid_cache_plan,
-        metrics_manager,
-        schema_manager,
-    ) {
-        Ok(db) => db,
-        Err(err) => {
-            if let Some(governance) = governance.as_ref() {
-                let _ = governance.unregister_db(&db_id);
-            }
-            return Err(err);
-        }
-    };
-    if advance_next_id_from_existing_manifests
-        && let Some(max_snapshot_id) = list_snapshot_manifest_ids(&file_manager)?.into_iter().max()
-    {
-        db.snapshot_manager
-            .advance_next_id(max_snapshot_id.saturating_add(1));
-    }
-    if let Some(source) = active_memtable_source.as_ref() {
-        db.restore_active_memtable_snapshot_to_l0_with_source(source, &active_memtable_data)?;
-    } else {
-        db.restore_active_memtable_snapshot_to_l0(&active_memtable_data)?;
-    }
-    db.memtable_manager.open()?;
-    if let Some(recovery_wal_volume) = recovery_wal_volume.as_ref() {
-        db.replay_wal_after_checkpoint(manifest.wal_checkpoint_id, recovery_wal_volume)?;
-    }
-    file_manager.commit_logical_files(residual_primary_file_ids.iter().copied());
-    for file_id in residual_primary_file_ids {
-        file_manager.adopt_primary_residual_replicas(file_id);
-    }
-    db.db_lifecycle.mark_open()?;
-    db.start_dedicated_poller();
-    Ok(db)
-}
-
 impl Db {
-    /// Open a writable database at the exact state of a snapshot manifest.
+    /// Import an exact source snapshot into a new UUID and an independent snapshot chain.
     ///
-    /// Unlike [`Db::resume`], this does not replay WAL entries newer than the snapshot.
-    pub fn open_from_snapshot(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-    ) -> Result<Self> {
-        Self::open_from_snapshot_with_recovery_mode(
-            config,
-            snapshot_id,
-            db_id,
-            RecoveryMode::SnapshotOnly,
-        )
-    }
-
-    /// Open a writable database from a selected snapshot using the requested recovery mode.
-    ///
-    /// [`RecoveryMode::LatestWithWal`] replays a durable WAL tail only when `snapshot_id` is the
-    /// latest snapshot; for historical snapshots it behaves as [`RecoveryMode::SnapshotOnly`].
-    pub fn open_from_snapshot_with_recovery_mode(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-        recovery_mode: RecoveryMode,
-    ) -> Result<Self> {
-        Self::open_from_snapshot_with_recovery_mode_and_resolver(
-            config,
-            snapshot_id,
-            db_id,
-            recovery_mode,
-            None,
-        )
-    }
-
-    pub fn open_from_snapshot_with_resolver(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
-    ) -> Result<Self> {
-        Self::open_from_snapshot_with_recovery_mode_and_resolver(
-            config,
-            snapshot_id,
-            db_id,
-            RecoveryMode::SnapshotOnly,
-            resolver,
-        )
-    }
-
-    /// Like [`Db::open_from_snapshot_with_recovery_mode`], with custom merge operators.
-    pub fn open_from_snapshot_with_recovery_mode_and_resolver(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-        recovery_mode: RecoveryMode,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
-    ) -> Result<Self> {
-        Self::open_from_snapshot_internal(
-            config,
-            snapshot_id,
-            db_id,
-            recovery_mode,
-            resolver,
-            None,
-            Arc::new(SchemaTransformRegistry::default()),
-        )
-    }
-
-    pub(crate) fn open_from_snapshot_with_builder(
-        builder: DbBuilder,
-        snapshot_id: u64,
-        recovery_mode: RecoveryMode,
-    ) -> Result<Self> {
-        let (config, _bucket_ranges, db_id, governance, resolver, transforms) =
-            builder.into_parts();
-        let db_id = db_id.ok_or_else(|| {
-            Error::ConfigError("db_id must be set when opening from a snapshot".to_string())
-        })?;
-        Self::open_from_snapshot_internal(
-            config,
-            snapshot_id,
-            db_id,
-            recovery_mode,
-            resolver,
-            governance,
-            transforms,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn open_from_snapshot_internal(
-        config: Config,
-        snapshot_id: u64,
-        db_id: impl Into<String>,
-        recovery_mode: RecoveryMode,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
-        governance: Option<Arc<dyn crate::governance::DbGovernance>>,
-        transforms: Arc<SchemaTransformRegistry>,
-    ) -> Result<Self> {
-        let db_id = db_id.into();
-        let config = config.normalize_volume_paths()?;
-        let retained_owned_source_id = Some(format!("snapshot:{db_id}:{snapshot_id}"));
-        init_logging(&config);
-        log::info!(
-            "cobble=db runtime start version={} build_commit={}",
-            build_version_string(),
-            build_commit_short_id()
-        );
-        metrics_registry::init_metrics();
-        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let hybrid_cache_plan =
-            config.resolve_hybrid_cache_volume_plan(config.block_cache_size_bytes()?)?;
-        let file_manager_config =
-            config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
-        let file_manager =
-            FileManager::from_config(&file_manager_config, &db_id, Arc::clone(&metrics_manager))?;
-        let file_manager = Arc::new(file_manager);
-        let is_latest_snapshot = list_snapshot_manifest_ids(&file_manager)?
-            .last()
-            .is_some_and(|latest_id| *latest_id == snapshot_id);
-        let manifest = load_manifest_for_snapshot(&file_manager, snapshot_id)?;
-        let recovery_wal_volume = (recovery_mode == RecoveryMode::LatestWithWal
-            && is_latest_snapshot)
-            .then(|| {
-                manifest
-                    .wal_volume
-                    .as_ref()
-                    .map(|route| resolve_volume_descriptor_credentials(route, &config))
-            })
-            .flatten();
-        let schema_manager = Arc::new(
-            SchemaManager::from_manifest(&file_manager, &manifest, resolver)?
-                .with_transform_registry(transforms)?,
-        );
-        open_restored_db_from_manifest(
-            config,
-            file_manager,
-            db_id,
-            hybrid_cache_plan,
-            metrics_manager,
-            schema_manager,
-            manifest,
-            Some(snapshot_id),
-            true,
-            retained_owned_source_id,
-            None,
-            recovery_wal_volume,
-            governance,
-        )
-    }
-
-    /// Open a fresh writable database from the exact state of an existing source snapshot.
-    ///
-    /// WAL entries from the source database are never replayed.
-    ///
-    /// Unlike [`Db::open_from_snapshot`], this creates a new runtime db id and starts a new
-    /// snapshot chain in the target db directory. The source manifest is used only as restore
-    /// input.
+    /// `None` imports all source buckets. Explicit ranges must be nonempty and fully covered.
+    /// Source WAL is never replayed. AdoptAsync protects source data until copying and all
+    /// retained target snapshots have stopped depending on it.
     pub fn open_new_with_snapshot(
         config: Config,
-        snapshot_id: u64,
         source_db_id: impl AsRef<str>,
+        snapshot_id: u64,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
     ) -> Result<Self> {
-        Self::open_new_with_snapshot_with_resolver(config, snapshot_id, source_db_id, None)
+        DbBuilder::new(config).open_new_with_snapshot(
+            source_db_id,
+            snapshot_id,
+            ranges,
+            storage_mode,
+        )
     }
 
     pub fn open_new_with_snapshot_with_resolver(
         config: Config,
-        snapshot_id: u64,
         source_db_id: impl AsRef<str>,
+        snapshot_id: u64,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let source_db_id = source_db_id.as_ref();
-        let manifest_path = bucket_snapshot_manifest_path(source_db_id, snapshot_id);
-        Self::open_new_with_manifest_path_and_source_id_with_runtime(
-            config,
-            manifest_path,
-            format!("snapshot:{source_db_id}:{snapshot_id}"),
-            resolver,
-            Arc::new(SchemaTransformRegistry::default()),
-            None,
-        )
+        let mut builder = DbBuilder::new(config);
+        if let Some(resolver) = resolver {
+            builder = builder.merge_operator_resolver(resolver);
+        }
+        builder.open_new_with_snapshot(source_db_id, snapshot_id, ranges, storage_mode)
     }
 
     pub(crate) fn open_new_with_snapshot_with_builder(
         builder: DbBuilder,
-        snapshot_id: u64,
         source_db_id: impl AsRef<str>,
+        snapshot_id: u64,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
     ) -> Result<Self> {
-        let (config, _bucket_ranges, _db_id, governance, resolver, transforms) =
-            builder.into_parts();
-        let source_db_id = source_db_id.as_ref();
-        Self::open_new_with_manifest_path_and_source_id_with_runtime(
-            config,
-            bucket_snapshot_manifest_path(source_db_id, snapshot_id),
-            format!("snapshot:{source_db_id}:{snapshot_id}"),
-            resolver,
-            transforms,
-            governance,
+        Self::open_new_with_manifest_path_with_builder(
+            builder,
+            bucket_snapshot_manifest_path(source_db_id.as_ref(), snapshot_id),
+            ranges,
+            storage_mode,
         )
     }
 
+    /// Import an explicit source manifest. Identity, range, and ownership semantics match
+    /// [`Self::open_new_with_snapshot`].
     pub fn open_new_with_manifest_path(
         config: Config,
         manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
     ) -> Result<Self> {
-        Self::open_new_with_manifest_path_with_resolver(config, manifest_path, None)
+        DbBuilder::new(config).open_new_with_manifest_path(manifest_path, ranges, storage_mode)
     }
 
     pub fn open_new_with_manifest_path_with_resolver(
         config: Config,
         manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
         resolver: Option<Arc<dyn MergeOperatorResolver>>,
     ) -> Result<Self> {
-        let manifest_path = manifest_path.into();
-        Self::open_new_with_manifest_path_and_source_id_with_runtime(
-            config,
-            manifest_path.clone(),
-            format!("manifest:{manifest_path}"),
-            resolver,
-            Arc::new(SchemaTransformRegistry::default()),
-            None,
-        )
+        let mut builder = DbBuilder::new(config);
+        if let Some(resolver) = resolver {
+            builder = builder.merge_operator_resolver(resolver);
+        }
+        builder.open_new_with_manifest_path(manifest_path, ranges, storage_mode)
     }
 
     pub(crate) fn open_new_with_manifest_path_with_builder(
         builder: DbBuilder,
         manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
     ) -> Result<Self> {
         let (config, _bucket_ranges, _db_id, governance, resolver, transforms) =
             builder.into_parts();
-        let manifest_path = manifest_path.into();
-        Self::open_new_with_manifest_path_and_source_id_with_runtime(
-            config,
-            manifest_path.clone(),
-            format!("manifest:{manifest_path}"),
-            resolver,
-            transforms,
-            governance,
-        )
-    }
-
-    fn open_new_with_manifest_path_and_source_id_with_runtime(
-        config: Config,
-        manifest_path: String,
-        retained_owned_source_id: String,
-        resolver: Option<Arc<dyn MergeOperatorResolver>>,
-        transforms: Arc<SchemaTransformRegistry>,
-        governance: Option<Arc<dyn crate::governance::DbGovernance>>,
-    ) -> Result<Self> {
         let config = config.normalize_volume_paths()?;
-        init_logging(&config);
-        log::info!(
-            "cobble=db runtime start version={} build_commit={}",
-            build_version_string(),
-            build_commit_short_id()
-        );
-        metrics_registry::init_metrics();
-        let db_id = Uuid::new_v4().to_string();
-        let metrics_manager = Arc::new(MetricsManager::new(&db_id));
-        let hybrid_cache_plan =
-            config.resolve_hybrid_cache_volume_plan(config.block_cache_size_bytes()?)?;
-        let file_manager_config =
-            config.apply_hybrid_cache_primary_partition_with_plan(hybrid_cache_plan.as_ref())?;
-        let file_manager =
-            FileManager::from_config(&file_manager_config, &db_id, Arc::clone(&metrics_manager))?;
-        let file_manager = Arc::new(file_manager);
-        let manifest_chain = load_manifest_chain_from_path(&file_manager, &manifest_path)?;
-        let manifest = manifest_chain
-            .last()
-            .map(|entry| entry.manifest.clone())
-            .ok_or_else(|| {
-                Error::IoError(format!("Snapshot manifest not found: {}", manifest_path))
-            })?;
+        let import =
+            super::rescale::SnapshotImport::prepare(&config, manifest_path.into(), ranges)?;
         let schema_manager = Arc::new(
             SchemaManager::from_snapshot_source_manifests(
-                &file_manager,
-                &manifest_path,
-                manifest_chain.iter().map(|entry| &entry.manifest),
+                &import.source_file_manager,
+                &import.source_manifest_path,
+                std::iter::once(&import.manifest),
                 resolver,
             )?
             .with_transform_registry(transforms)?,
         );
-        schema_manager.persist_loaded_schemas(&file_manager)?;
-        let active_memtable_source = if manifest.active_memtable_data.is_empty() {
-            None
-        } else {
-            let source_db_id = crate::paths::snapshot_source_db_id(&manifest_path)?;
-            let source = if manifest_path.contains("://")
-                || std::path::Path::new(&manifest_path).is_absolute()
-            {
-                super::rescale::snapshot_source_file_manager(
-                    &config,
-                    &source_db_id,
-                    &manifest_path,
-                )?
-                .0
-            } else {
-                Arc::new(FileManager::from_config_readonly(
-                    &config,
-                    &source_db_id,
-                    Arc::clone(&metrics_manager),
-                )?)
-            };
-            Some(source)
-        };
-        open_restored_db_from_manifest(
+        schema_manager.select_latest_schema_for_restore(import.manifest.latest_schema_id)?;
+        // This target contains only empty owned trees. Source files are registered exclusively by
+        // the shared installer, after its export lease is durable. No source WAL route is opened.
+        // Publication and the initial WAL checkpoint stay deferred until that cutover succeeds.
+        let mut db = Self::open_empty_with_runtime(
             config,
-            file_manager,
-            db_id,
-            hybrid_cache_plan,
-            metrics_manager,
-            schema_manager,
-            manifest,
-            None,
-            false,
-            Some(retained_owned_source_id),
-            active_memtable_source,
+            import.ranges.clone(),
             None,
             governance,
-        )
+            schema_manager,
+            true,
+        )?;
+        if let Err(err) = db.install_snapshot_import(import, storage_mode, true) {
+            db.force_close();
+            return Err(err);
+        }
+        db.adoption_coordinator.enable();
+        db.start_dedicated_poller();
+        Ok(db)
     }
 
     /// Resume a writable database from its latest snapshot and replay newer durable WAL entries.
@@ -1144,13 +806,8 @@ impl Db {
             register_scanned_primary_residuals(&file_manager, &manifest);
         }
         let residual_primary_file_ids =
-            prepare_manifest_data_files_for_restore(&file_manager, &manifest, None)?;
+            prepare_manifest_data_files_for_restore(&file_manager, &manifest)?;
         let bucket_ranges = manifest.bucket_ranges.clone();
-        let _lsm_tree_bucket_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
-            manifest.bucket_ranges.clone()
-        } else {
-            manifest.lsm_tree_bucket_ranges.clone()
-        };
         let active_memtable_data = manifest.active_memtable_data.clone();
         let truncation_cursors = build_truncation_cursors_from_manifest(&manifest)?;
         let manifest_next_vlog_file_seq = loaded
@@ -1221,6 +878,7 @@ impl Db {
             hybrid_cache_plan,
             metrics_manager,
             schema_manager,
+            false,
         ) {
             Ok(db) => db,
             Err(err) => {
@@ -1242,6 +900,7 @@ impl Db {
             db.file_manager.adopt_primary_residual_replicas(file_id);
         }
         db.db_lifecycle.mark_open()?;
+        db.adoption_coordinator.enable();
         db.start_dedicated_poller();
         Ok(db)
     }

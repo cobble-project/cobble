@@ -217,9 +217,7 @@ def test_snapshot_to_preserves_online_incremental_chain(tmp_path: Path) -> None:
     db.put(0, b"d", 0, value)
     db.close()
     shutil.rmtree(source)
-    restored = pycobble.Db.restore_new_from_manifest(
-        config(destination), exported.manifest_path
-    )
+    restored = pycobble.Db.restore_new_from_manifest(config(destination), exported.manifest_path, storage_mode=pycobble.ImportStorageMode.REFERENCE_PERSISTENT)
     for key in (b"a", b"b", b"c"):
         assert bytes(restored.get(0, key).column(0)) == value
     assert not restored.get(0, b"d").found

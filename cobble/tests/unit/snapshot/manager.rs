@@ -113,7 +113,13 @@ fn schema_cleanup_after_new_capture(new_schema: bool) {
         .get_metadata_file_full_path(&snapshot_manifest_name(next.id))
         .unwrap();
     manager.close().unwrap();
-    let restored = crate::Db::open_new_with_manifest_path(config, manifest_path).unwrap();
+    let restored = crate::Db::open_new_with_manifest_path(
+        config,
+        manifest_path,
+        None,
+        crate::ImportStorageMode::ReferencePersistent,
+    )
+    .unwrap();
     assert_eq!(restored.current_schema().version(), u64::from(new_schema));
     restored.close().unwrap();
 }
@@ -258,7 +264,13 @@ fn schema_cleanup_and_materialization_preserve_sparse_restored_versions() {
             .get_metadata_file_full_path(&snapshot_manifest_name(next.id))
             .unwrap();
         manager.close().unwrap();
-        let restored = crate::Db::open_new_with_manifest_path(config, manifest_path).unwrap();
+        let restored = crate::Db::open_new_with_manifest_path(
+            config,
+            manifest_path,
+            None,
+            crate::ImportStorageMode::ReferencePersistent,
+        )
+        .unwrap();
         assert_eq!(
             restored.current_schema().version(),
             *versions.last().unwrap()

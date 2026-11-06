@@ -1,5 +1,5 @@
 use crate::Config;
-use crate::db::{Db, RecoveryMode};
+use crate::db::{Db, ImportStorageMode, RecoveryMode};
 use crate::error::Result;
 use crate::governance::DbGovernance;
 use crate::merge_operator::MergeOperatorResolver;
@@ -81,40 +81,37 @@ impl DbBuilder {
         Db::open_with_builder(self)
     }
 
-    /// Open this database at an exact selected snapshot boundary.
-    pub fn open_from_snapshot(self, snapshot_id: u64) -> Result<Db> {
-        self.open_from_snapshot_with_recovery_mode(snapshot_id, RecoveryMode::SnapshotOnly)
-    }
-
-    /// Open this database at a selected snapshot using the requested recovery mode.
-    pub fn open_from_snapshot_with_recovery_mode(
-        self,
-        snapshot_id: u64,
-        recovery_mode: RecoveryMode,
-    ) -> Result<Db> {
-        Db::open_from_snapshot_with_builder(self, snapshot_id, recovery_mode)
-    }
-
     /// Restore a fresh database from a source snapshot.
     ///
-    /// The source manifest supplies the bucket ranges and the returned database receives a fresh
-    /// identity. Registered schema transforms and other runtime wiring are retained. The source
-    /// WAL is never replayed.
+    /// `None` imports all source ranges; explicit ranges must be nonempty and fully covered.
+    /// The returned database always receives a fresh identity, ignoring this builder's `db_id`
+    /// and ordinary `bucket_ranges`. Runtime wiring is retained; source WAL is never replayed.
     pub fn open_new_with_snapshot(
         self,
-        snapshot_id: u64,
         source_db_id: impl AsRef<str>,
+        snapshot_id: u64,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
     ) -> Result<Db> {
-        Db::open_new_with_snapshot_with_builder(self, snapshot_id, source_db_id)
+        Db::open_new_with_snapshot_with_builder(
+            self,
+            source_db_id,
+            snapshot_id,
+            ranges,
+            storage_mode,
+        )
     }
 
     /// Restore a fresh database from an explicit source manifest path.
     ///
-    /// The source manifest supplies the bucket ranges and the returned database receives a fresh
-    /// identity. Registered schema transforms and other runtime wiring are retained. The source
-    /// WAL is never replayed.
-    pub fn open_new_with_manifest_path(self, manifest_path: impl Into<String>) -> Result<Db> {
-        Db::open_new_with_manifest_path_with_builder(self, manifest_path)
+    /// Range and identity semantics match [`Self::open_new_with_snapshot`].
+    pub fn open_new_with_manifest_path(
+        self,
+        manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
+    ) -> Result<Db> {
+        Db::open_new_with_manifest_path_with_builder(self, manifest_path, ranges, storage_mode)
     }
 
     /// Resume from the latest snapshot and replay the durable WAL tail when available.

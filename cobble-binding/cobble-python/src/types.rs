@@ -1,4 +1,4 @@
-use cobble_binding::{ExpandStorageMode, MemtableType, RecoveryMode};
+use cobble_binding::{ImportStorageMode, MemtableType, RecoveryMode};
 use pyo3::PyTypeInfo;
 use pyo3::prelude::*;
 
@@ -77,14 +77,14 @@ impl PyMemtableType {
 }
 
 #[pyclass(
-    name = "ExpandStorageMode",
+    name = "ImportStorageMode",
     module = "pycobble._native",
     eq,
     eq_int,
     from_py_object
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PyExpandStorageMode {
+pub(crate) enum PyImportStorageMode {
     #[pyo3(name = "ADOPT_ASYNC")]
     AdoptAsync = 0,
     #[pyo3(name = "REFERENCE_PERSISTENT")]
@@ -94,7 +94,7 @@ pub(crate) enum PyExpandStorageMode {
 }
 
 #[pymethods]
-impl PyExpandStorageMode {
+impl PyImportStorageMode {
     fn __reduce__(&self, py: Python<'_>) -> PyResult<PickleReduction<(Py<PyAny>, &'static str)>> {
         enum_reduce::<Self>(
             py,
@@ -248,12 +248,12 @@ impl From<PyMemtableType> for MemtableType {
     }
 }
 
-impl From<PyExpandStorageMode> for ExpandStorageMode {
-    fn from(value: PyExpandStorageMode) -> Self {
+impl From<PyImportStorageMode> for ImportStorageMode {
+    fn from(value: PyImportStorageMode) -> Self {
         match value {
-            PyExpandStorageMode::AdoptAsync => Self::AdoptAsync,
-            PyExpandStorageMode::ReferencePersistent => Self::ReferencePersistent,
-            PyExpandStorageMode::ReferencePersistentWithCache => Self::ReferencePersistentWithCache,
+            PyImportStorageMode::AdoptAsync => Self::AdoptAsync,
+            PyImportStorageMode::ReferencePersistent => Self::ReferencePersistent,
+            PyImportStorageMode::ReferencePersistentWithCache => Self::ReferencePersistentWithCache,
         }
     }
 }
@@ -261,7 +261,7 @@ impl From<PyExpandStorageMode> for ExpandStorageMode {
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRecoveryMode>()?;
     module.add_class::<PyMemtableType>()?;
-    module.add_class::<PyExpandStorageMode>()?;
+    module.add_class::<PyImportStorageMode>()?;
     module.add_class::<PyReaderMode>()?;
     module.add_class::<PyBufferStatus>()?;
     module.add_class::<PyBufferResult>()

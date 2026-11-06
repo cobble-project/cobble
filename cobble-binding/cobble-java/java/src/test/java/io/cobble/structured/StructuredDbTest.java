@@ -782,9 +782,42 @@ class StructuredDbTest {
                                         snapshot.snapshotId,
                                         new int[] {2},
                                         new int[] {3},
-                                        ExpandStorageMode.ADOPT_ASYNC)
+                                        ImportStorageMode.ADOPT_ASYNC)
                                 >= 0L);
-                target.waitForExpandAdoption(10_000L);
+                target.waitForImportAdoption(10_000L);
+                for (ImportStorageMode mode : ImportStorageMode.values()) {
+                    try (Db fresh =
+                                    Db.openNewWithSnapshot(
+                                            config,
+                                            source.id(),
+                                            snapshot.snapshotId,
+                                            new int[] {2},
+                                            new int[] {2},
+                                            mode);
+                            Db manifest =
+                                    Db.openNewWithManifestPath(
+                                            config,
+                                            snapshot.manifestPath,
+                                            new int[] {2},
+                                            new int[] {2},
+                                            mode)) {
+                        assertNotEquals(source.id(), fresh.id());
+                        assertNotEquals(source.id(), manifest.id());
+                        fresh.waitForImportAdoption(10_000L);
+                        manifest.waitForImportAdoption(10_000L);
+                        assertNotNull(
+                                fresh.get(
+                                        2,
+                                        "bucket-2".getBytes(StandardCharsets.UTF_8),
+                                        "value-state"));
+                        assertNotNull(
+                                manifest.get(
+                                        2,
+                                        "bucket-2".getBytes(StandardCharsets.UTF_8),
+                                        "value-state"));
+                    }
+                }
+
                 Row expanded =
                         target.get(2, "bucket-2".getBytes(StandardCharsets.UTF_8), "value-state");
                 assertNotNull(expanded);

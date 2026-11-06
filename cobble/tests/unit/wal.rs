@@ -404,7 +404,7 @@ fn wal_async_writes_snapshot_barriers_and_resume_replay() {
 
     let manifests_before_exact =
         crate::snapshot::list_snapshot_manifest_ids(&file_manager).unwrap();
-    let exact = crate::Db::open_from_snapshot(config, exact_snapshot_id, "wal-replay").unwrap();
+    let exact = crate::Db::resume_from_snapshot(config, exact_snapshot_id, "wal-replay").unwrap();
     assert!(exact.get(0, b"large").unwrap().is_some());
     assert!(
         exact
@@ -663,7 +663,7 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
         )],
         ..wal_config.clone()
     };
-    let latest_again = crate::Db::open_from_snapshot_with_recovery_mode(
+    let latest_again = crate::Db::resume_from_snapshot_with_recovery_mode(
         recovery_config.clone(),
         route_change_snapshot_id,
         db_id,
@@ -691,7 +691,7 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
     );
 
     // The checkpoint snapshot contains the recovered tail and leaves no WAL tail to replay.
-    let recovered_after_checkpoint = crate::Db::open_from_snapshot_with_recovery_mode(
+    let recovered_after_checkpoint = crate::Db::resume_from_snapshot_with_recovery_mode(
         recovery_config.clone(),
         recovery_checkpoint_snapshot_id,
         db_id,
@@ -706,7 +706,7 @@ fn recovery_modes_control_wal_replay_without_creating_snapshots() {
     );
     recovered_after_checkpoint.force_close();
 
-    let snapshot_only = crate::Db::open_from_snapshot_with_recovery_mode(
+    let snapshot_only = crate::Db::resume_from_snapshot_with_recovery_mode(
         wal_config,
         latest_snapshot_id,
         db_id,

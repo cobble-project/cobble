@@ -120,80 +120,92 @@ pub(crate) fn native_sharded_database_open_file_ranges(
     open(config, ranges)
 }
 
-pub(crate) fn native_sharded_database_open_from_snapshot(
-    config_json: &str,
-    snapshot_id: u64,
-    db_id: &str,
-    mode: u8,
-) -> BridgeResult<Box<NativeShardedDatabase>> {
-    opendal::install_default();
-    Db::open_from_snapshot_with_recovery_mode(
-        parse_config_json(config_json)?,
-        snapshot_id,
-        db_id,
-        recovery_mode(mode)?,
-    )
-    .map(owned)
-    .map_err(format_cobble_error)
-}
-
-pub(crate) fn native_sharded_database_open_from_snapshot_file(
-    config_path: &str,
-    snapshot_id: u64,
-    db_id: &str,
-    mode: u8,
-) -> BridgeResult<Box<NativeShardedDatabase>> {
-    opendal::install_default();
-    Db::open_from_snapshot_with_recovery_mode(
-        parse_config_file(config_path)?,
-        snapshot_id,
-        db_id,
-        recovery_mode(mode)?,
-    )
-    .map(owned)
-    .map_err(format_cobble_error)
-}
-
 pub(crate) fn native_sharded_database_restore_new(
     config_json: &str,
     snapshot_id: u64,
     source_db_id: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeShardedDatabase>> {
     opendal::install_default();
-    Db::open_new_with_snapshot(parse_config_json(config_json)?, snapshot_id, source_db_id)
-        .map(owned)
-        .map_err(format_cobble_error)
+    let ranges = has_ranges
+        .then(|| bucket_ranges_from_values(ranges, "import"))
+        .transpose()?;
+    Db::open_new_with_snapshot(
+        parse_config_json(config_json)?,
+        source_db_id,
+        snapshot_id,
+        ranges,
+        import_storage_mode(storage_mode)?,
+    )
+    .map(owned)
+    .map_err(format_cobble_error)
 }
 
 pub(crate) fn native_sharded_database_restore_new_file(
     config_path: &str,
     snapshot_id: u64,
     source_db_id: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeShardedDatabase>> {
     opendal::install_default();
-    Db::open_new_with_snapshot(parse_config_file(config_path)?, snapshot_id, source_db_id)
-        .map(owned)
-        .map_err(format_cobble_error)
+    let ranges = has_ranges
+        .then(|| bucket_ranges_from_values(ranges, "import"))
+        .transpose()?;
+    Db::open_new_with_snapshot(
+        parse_config_file(config_path)?,
+        source_db_id,
+        snapshot_id,
+        ranges,
+        import_storage_mode(storage_mode)?,
+    )
+    .map(owned)
+    .map_err(format_cobble_error)
 }
 
 pub(crate) fn native_sharded_database_restore_new_from_manifest(
     config_json: &str,
     manifest_path: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeShardedDatabase>> {
     opendal::install_default();
-    Db::open_new_with_manifest_path(parse_config_json(config_json)?, manifest_path)
-        .map(owned)
-        .map_err(format_cobble_error)
+    let ranges = has_ranges
+        .then(|| bucket_ranges_from_values(ranges, "import"))
+        .transpose()?;
+    Db::open_new_with_manifest_path(
+        parse_config_json(config_json)?,
+        manifest_path,
+        ranges,
+        import_storage_mode(storage_mode)?,
+    )
+    .map(owned)
+    .map_err(format_cobble_error)
 }
 
 pub(crate) fn native_sharded_database_restore_new_from_manifest_file(
     config_path: &str,
     manifest_path: &str,
+    has_ranges: bool,
+    ranges: Vec<ffi::NativeRange>,
+    storage_mode: u8,
 ) -> BridgeResult<Box<NativeShardedDatabase>> {
     opendal::install_default();
-    Db::open_new_with_manifest_path(parse_config_file(config_path)?, manifest_path)
-        .map(owned)
-        .map_err(format_cobble_error)
+    let ranges = has_ranges
+        .then(|| bucket_ranges_from_values(ranges, "import"))
+        .transpose()?;
+    Db::open_new_with_manifest_path(
+        parse_config_file(config_path)?,
+        manifest_path,
+        ranges,
+        import_storage_mode(storage_mode)?,
+    )
+    .map(owned)
+    .map_err(format_cobble_error)
 }
 
 pub(crate) fn native_sharded_database_resume(
@@ -363,12 +375,12 @@ pub(crate) fn native_sharded_database_switch_to_snapshot(
         .map_err(format_cobble_error)
 }
 
-fn expand_storage_mode(mode: u8) -> BridgeResult<cobble_binding::ExpandStorageMode> {
+fn import_storage_mode(mode: u8) -> BridgeResult<cobble_binding::ImportStorageMode> {
     match mode {
-        0 => Ok(cobble_binding::ExpandStorageMode::AdoptAsync),
-        1 => Ok(cobble_binding::ExpandStorageMode::ReferencePersistent),
-        2 => Ok(cobble_binding::ExpandStorageMode::ReferencePersistentWithCache),
-        _ => Err(input_error("unknown expand storage mode")),
+        0 => Ok(cobble_binding::ImportStorageMode::AdoptAsync),
+        1 => Ok(cobble_binding::ImportStorageMode::ReferencePersistent),
+        2 => Ok(cobble_binding::ImportStorageMode::ReferencePersistentWithCache),
+        _ => Err(input_error("unknown import storage mode")),
     }
 }
 
@@ -389,7 +401,7 @@ pub(crate) fn native_sharded_database_expand_bucket(
             source_db_id,
             has_snapshot_id.then_some(snapshot_id),
             ranges,
-            expand_storage_mode(storage_mode)?,
+            import_storage_mode(storage_mode)?,
         )
         .map_err(format_cobble_error)
 }
@@ -410,7 +422,7 @@ pub(crate) fn native_sharded_database_expand_bucket_from_manifest(
             source_db_id,
             source_manifest_path,
             ranges,
-            expand_storage_mode(storage_mode)?,
+            import_storage_mode(storage_mode)?,
         )
         .map_err(format_cobble_error)
 }
@@ -438,14 +450,14 @@ fn bucket_ranges_from_values(
         .collect()
 }
 
-pub(crate) fn native_sharded_database_wait_for_expand_adoption(
+pub(crate) fn native_sharded_database_wait_for_import_adoption(
     db: &NativeShardedDatabase,
     timeout_millis: i64,
 ) -> BridgeResult<()> {
     let timeout_millis = u64::try_from(timeout_millis)
-        .map_err(|_| input_error("expand adoption timeout must not be negative"))?;
+        .map_err(|_| input_error("import adoption timeout must not be negative"))?;
     db.db
-        .wait_for_expand_adoption(Duration::from_millis(timeout_millis))
+        .wait_for_import_adoption(Duration::from_millis(timeout_millis))
         .map_err(format_cobble_error)
 }
 

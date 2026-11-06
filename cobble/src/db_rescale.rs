@@ -1,5 +1,5 @@
-//! Functionality for expanding owned buckets by importing snapshot data from another db.
-use super::{Db, ExpandStorageMode};
+//! Shared snapshot import, asynchronous ownership adoption, and bucket rescaling.
+use super::{Db, ImportStorageMode};
 use crate::data_file::intersect_bucket_ranges;
 use crate::db_state::{
     DbState, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorMap, bucket_range_fits_total,
@@ -15,6 +15,7 @@ use crate::rescale_protocol::{
     import_end_name, import_start_name, load_import_end, load_import_starts, write_export_lease,
     write_import_end, write_import_start,
 };
+use crate::schema::collect_schema_ids_from_manifest;
 use crate::snapshot::{
     build_tree_scopes_from_manifest, build_tree_versions_from_manifest,
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
@@ -32,6 +33,98 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 const RESCALE_PUBLICATION_OWNER_PREFIX: &str = "rescale";
+pub(super) const INITIAL_IMPORT_PUBLICATION_OWNER: &str = "rescale:initial-import";
+
+/// A fully resolved import request, shared by fresh imports and bucket expansion.
+pub(super) struct SnapshotImport {
+    pub(super) source_db_id: String,
+    pub(super) source_manifest_path: String,
+    pub(super) source_file_manager: Arc<FileManager>,
+    pub(super) source_snapshot_id: u64,
+    pub(super) manifest: crate::snapshot::ManifestSnapshot,
+    pub(super) ranges: Vec<RangeInclusive<u16>>,
+    tree_ranges: Vec<RangeInclusive<u16>>,
+}
+
+impl SnapshotImport {
+    pub(super) fn prepare(
+        config: &crate::Config,
+        source_manifest_path: String,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+    ) -> Result<Self> {
+        let source_db_id = crate::paths::snapshot_source_db_id(&source_manifest_path)?;
+        let source_manifest_path = if !source_manifest_path.contains("://")
+            && !std::path::Path::new(&source_manifest_path).is_absolute()
+        {
+            let source = FileManager::from_config_readonly(
+                config,
+                &source_db_id,
+                Arc::new(MetricsManager::new(format!("{source_db_id}-import-source"))),
+            )?;
+            let relative = source_manifest_path
+                .strip_prefix(&format!("{source_db_id}/"))
+                .ok_or_else(|| {
+                    Error::ConfigError("Invalid relative source manifest path".into())
+                })?;
+            source.metadata_file_full_path(relative)
+        } else {
+            source_manifest_path
+        };
+        let (source_file_manager, source_snapshot_id) =
+            snapshot_source_file_manager(config, &source_db_id, &source_manifest_path)?;
+        let source_manifest_path = normalize_storage_path_to_url(source_manifest_path)?;
+        let manifest =
+            load_manifest_entry(&source_file_manager, source_snapshot_id, &HashMap::new())?
+                .manifest;
+        if manifest.bucket_ranges.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "Snapshot {source_snapshot_id} manifest missing bucket_ranges"
+            )));
+        }
+        let ranges = ranges.unwrap_or_else(|| manifest.bucket_ranges.clone());
+        if ranges.is_empty() {
+            return Err(Error::ConfigError("import ranges must not be empty".into()));
+        }
+        let tree_ranges = if manifest.lsm_tree_bucket_ranges.is_empty() {
+            manifest.bucket_ranges.clone()
+        } else {
+            manifest.lsm_tree_bucket_ranges.clone()
+        };
+        for range in &ranges {
+            if !bucket_range_fits_total(range, config.total_buckets) {
+                return Err(Error::ConfigError(format!(
+                    "Invalid import range {}..={} for total_buckets {}",
+                    range.start(),
+                    range.end(),
+                    config.total_buckets
+                )));
+            }
+            if !range_is_covered_by_ranges(range, &manifest.bucket_ranges) {
+                return Err(Error::ConfigError(format!(
+                    "Import range {}..={} is outside source snapshot bucket ranges",
+                    range.start(),
+                    range.end()
+                )));
+            }
+            if !range_is_covered_by_ranges(range, &tree_ranges) {
+                return Err(Error::InvalidState(format!(
+                    "Import range {}..={} is not fully covered by source LSM trees",
+                    range.start(),
+                    range.end()
+                )));
+            }
+        }
+        Ok(Self {
+            source_db_id,
+            source_manifest_path,
+            source_file_manager,
+            source_snapshot_id,
+            manifest,
+            ranges: normalize_bucket_ranges(ranges),
+            tree_ranges,
+        })
+    }
+}
 
 pub(super) fn snapshot_source_file_manager(
     config: &crate::Config,
@@ -178,6 +271,7 @@ pub(crate) struct AdoptionCoordinator {
     runtime_manifest_publisher:
         Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
     finalizing: AtomicBool,
+    ready: AtomicBool,
 }
 
 impl AdoptionCoordinator {
@@ -205,6 +299,7 @@ impl AdoptionCoordinator {
             snapshot_manager,
             runtime_manifest_publisher,
             finalizing: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
         }
     }
 
@@ -235,6 +330,11 @@ impl AdoptionCoordinator {
     }
 
     pub(crate) fn tick(self: &Arc<Self>) -> Result<()> {
+        // Restart must load the complete retained snapshot chain before END cleanup is allowed
+        // to decide that no historical snapshot depends on an import's source lease.
+        if !self.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if self.finalizing.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -243,6 +343,10 @@ impl AdoptionCoordinator {
             self.finalizing.store(false, Ordering::Release);
         }
         result.map(|_| ())
+    }
+
+    pub(crate) fn enable(&self) {
+        self.ready.store(true, Ordering::Release);
     }
 
     /// Returns true when a materialization callback owns finalization.
@@ -290,7 +394,7 @@ impl AdoptionCoordinator {
         let callback = Arc::new(
             move |result: Result<crate::snapshot::SnapshotManifestInfo>| {
                 if let Err(err) = coordinator.complete_adoption(&pending, result) {
-                    log::warn!("expand adoption finalization failed: {err}");
+                    log::warn!("import adoption finalization failed: {err}");
                 }
                 coordinator.finalizing.store(false, Ordering::Release);
             },
@@ -394,13 +498,13 @@ fn filter_truncation_cursors(
 }
 
 impl Db {
-    /// Wait until all current leased expand files are copied into this DB's owned storage.
-    pub fn wait_for_expand_adoption(&self, timeout: std::time::Duration) -> Result<()> {
+    /// Wait until imported files are owned and no retained target snapshot needs their leases.
+    pub fn wait_for_import_adoption(&self, timeout: std::time::Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         while !self.adoption_coordinator.is_complete()? {
             if std::time::Instant::now() >= deadline {
                 return Err(Error::IoError(
-                    "Timed out waiting for expand adoption".to_string(),
+                    "Timed out waiting for import adoption".to_string(),
                 ));
             }
             if let Some(worker) = &self.primary_tiering_worker {
@@ -434,7 +538,7 @@ impl Db {
 
     /// Expands owned bucket ranges by importing LSM tree and VLOG state from a snapshot of another db, while
     /// keeping source files read-only and remapping file IDs to avoid collisions in local tracking. The source
-    /// snapshot must have bucket ranges that are fully covered by the requested expand ranges, and the target db
+    /// snapshot must fully cover the requested expand ranges, and the target db
     /// must not have any existing owned ranges that overlap with the requested expand ranges. The source snapshot's
     /// active memtable segments will be replayed into L0 of the target after metadata-level merging,
     /// with a file-level VLOG seq offset to avoid conflicts with existing VLOG files.
@@ -450,7 +554,7 @@ impl Db {
             source_db_id,
             snapshot_id,
             ranges,
-            ExpandStorageMode::AdoptAsync,
+            ImportStorageMode::AdoptAsync,
         )
     }
 
@@ -460,7 +564,7 @@ impl Db {
         source_db_id: impl Into<String>,
         snapshot_id: Option<u64>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
-        storage_mode: ExpandStorageMode,
+        storage_mode: ImportStorageMode,
     ) -> Result<u64> {
         let source_db_id = source_db_id.into();
         if source_db_id == self.id {
@@ -468,7 +572,7 @@ impl Db {
                 "cannot expand bucket from the same db".to_string(),
             ));
         }
-        // Step 1: Build a read-only file manager for the source db and resolve snapshot.
+        // Build a read-only file manager for the source db and resolve its snapshot.
         let source_metrics = Arc::new(MetricsManager::new(format!(
             "{}-expand-source",
             source_db_id
@@ -501,12 +605,14 @@ impl Db {
 
     /// Expands buckets from an explicit source snapshot location using configured storage credentials.
     /// The source metadata volume must be configured, including when its role is read-only.
+    /// Source cleanup and lease publication must be externally serialized; export leases are
+    /// durable retention roots, not distributed fencing against arbitrary concurrent cleanup.
     pub fn expand_bucket_from_manifest(
         &self,
         source_db_id: impl Into<String>,
         source_manifest_path: impl Into<String>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
-        storage_mode: ExpandStorageMode,
+        storage_mode: ImportStorageMode,
     ) -> Result<u64> {
         let source_db_id = source_db_id.into();
         if source_db_id == self.id {
@@ -515,68 +621,67 @@ impl Db {
             ));
         }
         let source_manifest_path = source_manifest_path.into();
-        let (source_file_manager, source_snapshot_id) =
-            snapshot_source_file_manager(&self.config, &source_db_id, &source_manifest_path)?;
-        let source_manifest_path = normalize_storage_path_to_url(source_manifest_path)?;
-        let source_entry =
-            load_manifest_entry(&source_file_manager, source_snapshot_id, &HashMap::new())?;
-        let mut source_manifest = source_entry.manifest;
-        if source_manifest.bucket_ranges.is_empty() {
-            return Err(Error::InvalidState(format!(
-                "Snapshot {} manifest missing bucket_ranges",
-                source_snapshot_id
-            )));
-        }
-        let expand_ranges = ranges.unwrap_or_else(|| source_manifest.bucket_ranges.clone());
-        if expand_ranges.is_empty() {
+        // Verify the explicit identity independently from the path parser.
+        let import = SnapshotImport::prepare(&self.config, source_manifest_path, ranges)?;
+        if import.source_db_id != source_db_id {
             return Err(Error::ConfigError(
-                "expand ranges must not be empty".to_string(),
+                "Source manifest location does not match the source DB".into(),
             ));
         }
-        for range in &expand_ranges {
-            if !bucket_range_fits_total(range, self.config.total_buckets) {
-                return Err(Error::ConfigError(format!(
-                    "Invalid expand range {}..={} for total_buckets {}",
-                    range.start(),
-                    range.end(),
-                    self.config.total_buckets
-                )));
-            }
-            if !range_is_covered_by_ranges(range, &source_manifest.bucket_ranges) {
-                return Err(Error::ConfigError(format!(
-                    "Expand range {}..={} is outside source snapshot bucket ranges",
-                    range.start(),
-                    range.end()
-                )));
-            }
-        }
-        let source_tree_ranges = if source_manifest.lsm_tree_bucket_ranges.is_empty() {
-            source_manifest.bucket_ranges.clone()
-        } else {
-            source_manifest.lsm_tree_bucket_ranges.clone()
-        };
-        for range in &expand_ranges {
-            if !range_is_covered_by_ranges(range, &source_tree_ranges) {
-                return Err(Error::InvalidState(format!(
-                    "Expand range {}..={} is not fully covered by source LSM trees",
-                    range.start(),
-                    range.end()
-                )));
-            }
-        }
+        self.install_snapshot_import(import, storage_mode, false)
+    }
+
+    /// `initialize` replaces only a private fresh target's empty trees. Public expansion always
+    /// merges disjoint ownership. Both paths share file origins, leases, START/END, and cutover.
+    pub(super) fn install_snapshot_import(
+        &self,
+        import: SnapshotImport,
+        storage_mode: ImportStorageMode,
+        initialize: bool,
+    ) -> Result<u64> {
+        let SnapshotImport {
+            source_db_id,
+            source_manifest_path,
+            source_file_manager,
+            source_snapshot_id,
+            manifest: mut source_manifest,
+            ranges: import_ranges,
+            tree_ranges: source_tree_ranges,
+        } = import;
 
         let _access = self.db_lifecycle.begin_exclusive_access()?;
         let _topology_guard = self.lsm_topology_lock.lock().unwrap();
-        self.ensure_dedicated_rescale_can_start()?;
+        if !initialize {
+            for current_range in &self.db_state.load().bucket_ranges {
+                if import_ranges
+                    .iter()
+                    .any(|incoming| ranges_overlap(current_range, incoming))
+                {
+                    return Err(Error::ConfigError(format!(
+                        "Expand range overlaps existing owned range {}..={}",
+                        current_range.start(),
+                        current_range.end()
+                    )));
+                }
+            }
+            self.ensure_dedicated_rescale_can_start()?;
+        }
         let mut publication = RuntimePublicationSuspension::acquire(
             self,
-            format!(
-                "{RESCALE_PUBLICATION_OWNER_PREFIX}:expand:{}",
-                Uuid::new_v4()
-            ),
+            if initialize {
+                INITIAL_IMPORT_PUBLICATION_OWNER.to_string()
+            } else {
+                format!(
+                    "{RESCALE_PUBLICATION_OWNER_PREFIX}:expand:{}",
+                    Uuid::new_v4()
+                )
+            },
         )?;
+        if initialize {
+            publication.resume_on_drop = false;
+        }
         let export_id =
-            (storage_mode == ExpandStorageMode::AdoptAsync).then(|| Uuid::new_v4().to_string());
+            (storage_mode == ImportStorageMode::AdoptAsync).then(|| Uuid::new_v4().to_string());
         if let Some(export_id) = &export_id {
             let lease = ExportLease {
                 version: 1,
@@ -584,17 +689,19 @@ impl Db {
                 source_db_id: source_db_id.clone(),
                 snapshot_id: source_snapshot_id,
                 target_db_id: self.id.clone(),
-                ranges: expand_ranges.clone(),
+                ranges: import_ranges.clone(),
             };
             write_export_lease(&source_file_manager, &lease)?;
         }
         let mut original_state = None;
-        let mut original_ranges = None;
         let mut topology_installed = false;
         let mut snapshot_committed = false;
+        let mut import_started = false;
         let result = (|| {
-            self.create_snapshot_and_wait("bucket expand export")?;
-            // Step 2: Remap file IDs to avoid collisions in local tracking, while keeping source files read-only.
+            if !initialize {
+                self.create_snapshot_and_wait("bucket expand export")?;
+            }
+            // Remap file IDs to avoid local collisions while keeping source files read-only.
             let source_file_ids: BTreeSet<u64> = source_manifest
                 .tree_levels
                 .iter()
@@ -633,7 +740,7 @@ impl Db {
                 file.origin = source_origin.clone();
             }
 
-            // Step 3: Ensure target has all schema files required by source snapshot.
+            // Ensure the target has all schema files required by the source snapshot.
             let current_schema = self.schema_manager.latest_schema();
             if source_manifest.latest_schema_id > current_schema.version() {
                 return Err(Error::InvalidState(format!(
@@ -642,20 +749,8 @@ impl Db {
                     current_schema.version()
                 )));
             }
-            let mut required_schema_ids = BTreeSet::from([source_manifest.latest_schema_id]);
-            for levels in &source_manifest.tree_levels {
-                for level in levels {
-                    for file in &level.files {
-                        if file.schema_id <= source_manifest.latest_schema_id {
-                            for schema_id in file.schema_id..=source_manifest.latest_schema_id {
-                                required_schema_ids.insert(schema_id);
-                            }
-                        } else {
-                            required_schema_ids.insert(file.schema_id);
-                        }
-                    }
-                }
-            }
+            let mut required_schema_ids = BTreeSet::new();
+            collect_schema_ids_from_manifest(&source_manifest, &mut required_schema_ids);
             for schema_id in required_schema_ids {
                 if self.schema_manager.schema(schema_id).is_ok() {
                     continue;
@@ -671,23 +766,10 @@ impl Db {
                     .register_schema_from_file(&self.file_manager, schema_id)?;
             }
 
-            // Step 4: Validate ownership ranges and reserve a conflict-free VLOG seq window.
+            // Reserve a conflict-free VLOG seq window under the target state lock.
             let guard = self.db_state.lock();
             let current = self.db_state.load();
-            original_ranges = Some(current.bucket_ranges.clone());
             original_state = Some(Arc::clone(&current));
-            for current_range in &current.bucket_ranges {
-                if expand_ranges
-                    .iter()
-                    .any(|incoming| ranges_overlap(current_range, incoming))
-                {
-                    return Err(Error::ConfigError(format!(
-                        "Expand range overlaps existing owned range {}..={}",
-                        current_range.start(),
-                        current_range.end()
-                    )));
-                }
-            }
             let source_vlog_max_seq = source_manifest
                 .vlog_files
                 .iter()
@@ -702,7 +784,7 @@ impl Db {
                 0
             };
 
-            // Step 5: Shift source VLOG seqs at metadata level and apply per-file seq offset on imported SSTs.
+            // Shift source VLOG seqs and apply the same offset to imported SST metadata.
             for file in &mut source_manifest.vlog_files {
                 file.file_seq =
                     file.file_seq
@@ -730,7 +812,7 @@ impl Db {
                 }
             }
 
-            // Step 6: Build imported tree/vlog versions as read-only source files.
+            // Build imported tree/vlog versions as read-only source files.
             let source_tree_versions =
                 build_tree_versions_from_manifest(&self.file_manager, &source_manifest, true)?;
             let source_scopes = build_tree_scopes_from_manifest(&source_manifest);
@@ -746,13 +828,13 @@ impl Db {
             }
             let mut imported_scopes = Vec::new();
             let mut imported_versions = Vec::new();
-            for expand_range in &expand_ranges {
+            for import_range in &import_ranges {
                 for ((source_version, source_range), source_scope) in source_tree_versions
                     .iter()
                     .zip(source_tree_ranges.iter())
                     .zip(source_scopes.iter())
                 {
-                    let Some(intersection) = intersect_bucket_ranges(expand_range, source_range)
+                    let Some(intersection) = intersect_bucket_ranges(import_range, source_range)
                     else {
                         continue;
                     };
@@ -768,15 +850,23 @@ impl Db {
             }
             if imported_versions.is_empty() {
                 return Err(Error::InvalidState(
-                    "No source LSM trees matched requested expand ranges".to_string(),
+                    "No source LSM trees matched requested import ranges".to_string(),
                 ));
             }
             let source_vlog =
                 build_vlog_version_from_manifest(&self.file_manager, &source_manifest, true)?;
 
-            // Step 7: Merge source tree/vlog versions into target state.
-            let mut merged_scopes = current.multi_lsm_version.tree_scopes();
-            let mut merged_versions = current.multi_lsm_version.tree_versions_cloned();
+            // Install imported tree/vlog versions, preserving existing trees on expansion.
+            let mut merged_scopes = if initialize {
+                Vec::new()
+            } else {
+                current.multi_lsm_version.tree_scopes()
+            };
+            let mut merged_versions = if initialize {
+                Vec::new()
+            } else {
+                current.multi_lsm_version.tree_versions_cloned()
+            };
             merged_scopes.extend(imported_scopes);
             merged_versions.extend(imported_versions);
             let merged_multi_lsm = MultiLSMTreeVersion::from_scopes_with_tree_versions(
@@ -805,15 +895,15 @@ impl Db {
             let merged_vlog =
                 crate::vlog::VlogVersion::from_files_with_entries(merged_vlog_entries);
             let mut updated_ranges = current.bucket_ranges.clone();
-            updated_ranges.extend(expand_ranges.clone());
+            updated_ranges.extend(import_ranges.clone());
             let updated_ranges = normalize_bucket_ranges(updated_ranges);
             let mut truncation_cursors = current.truncation_cursors_snapshot();
             truncation_cursors.extend(filter_truncation_cursors(
                 &build_truncation_cursors_from_manifest(&source_manifest)?,
-                &updated_ranges,
+                &import_ranges,
             ));
             self.db_state.store(DbState {
-                seq_id: current.seq_id,
+                seq_id: current.seq_id.max(source_manifest.seq_id),
                 topology_epoch: current.topology_epoch.saturating_add(1),
                 bucket_ranges: updated_ranges.clone(),
                 multi_lsm_version: merged_multi_lsm,
@@ -830,14 +920,16 @@ impl Db {
             topology_installed = true;
             drop(guard);
 
-            // Step 8: Replay source active memtable snapshot segments into L0.
+            // Replay source active memtable snapshot segments into L0.
             self.snapshot_manager.set_bucket_ranges(updated_ranges);
-            self.restore_active_memtable_snapshot_to_l0_with_source(
-                &source_file_manager,
-                &source_manifest.active_memtable_data,
-            )?;
+            self.memtable_manager
+                .restore_active_memtable_snapshot_to_l0(
+                    &source_file_manager,
+                    &source_manifest.active_memtable_data,
+                    Some(&import_ranges),
+                )?;
             if let Some(export_id) = &export_id {
-                self.create_snapshot_and_wait_with_before_flush("bucket expand", |snapshot_id| {
+                self.create_snapshot_and_wait_with_before_flush("snapshot import", |snapshot_id| {
                     write_import_start(
                         &self.file_manager,
                         &ImportStart {
@@ -847,13 +939,15 @@ impl Db {
                             source_manifest_path: source_manifest_path.clone(),
                             snapshot_id: source_snapshot_id,
                             target_db_id: self.id.clone(),
-                            ranges: expand_ranges.clone(),
+                            ranges: import_ranges.clone(),
                             import_snapshot_id: snapshot_id,
                         },
-                    )
+                    )?;
+                    import_started = true;
+                    Ok(())
                 })?
             } else {
-                self.create_snapshot_and_wait("bucket expand")?
+                self.create_snapshot_and_wait("snapshot import")?
             };
             snapshot_committed = true;
             let seq_id = self.db_state.load().seq_id;
@@ -861,7 +955,7 @@ impl Db {
                 self.db_lifecycle.mark_error(err.clone());
                 return Err(err);
             }
-            if storage_mode == ExpandStorageMode::ReferencePersistentWithCache {
+            if storage_mode == ImportStorageMode::ReferencePersistentWithCache {
                 self.file_manager
                     .request_referenced_persistent_caches(imported_file_ids)?;
                 self.file_manager
@@ -871,15 +965,20 @@ impl Db {
         })();
         if let Err(err) = result {
             if topology_installed && !snapshot_committed {
-                self.db_state.store(copy_db_state(
-                    original_state
-                        .as_deref()
-                        .expect("topology has original state"),
-                ));
+                let original_state = original_state
+                    .as_deref()
+                    .expect("topology has original state");
+                self.db_state.store(copy_db_state(original_state));
                 self.snapshot_manager
-                    .set_bucket_ranges(original_ranges.expect("topology has original ranges"));
+                    .set_bucket_ranges(original_state.bucket_ranges.clone());
             }
-            if !snapshot_committed && let Some(export_id) = &export_id {
+            // Once START has been published, a failed materialization may still have durably
+            // installed a manifest. Keep its lease and recovery record; never infer that an
+            // error means no snapshot references escaped to durable storage.
+            if !snapshot_committed
+                && !import_started
+                && let Some(export_id) = &export_id
+            {
                 let _ = self
                     .file_manager
                     .remove_metadata_file(&import_start_name(export_id));
@@ -1052,3 +1151,7 @@ impl Db {
 #[cfg(test)]
 #[path = "../tests/unit/db_rescale.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/db_import.rs"]
+mod import_tests;

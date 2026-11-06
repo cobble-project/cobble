@@ -370,35 +370,35 @@ pub(crate) mod ffi {
             config_path: &str,
             ranges: Vec<NativeBucketRange>,
         ) -> Result<Box<NativeStructuredDb>>;
-        fn native_structured_db_open_from_snapshot(
-            config_json: &str,
-            snapshot_id: u64,
-            db_id: &str,
-            recovery_mode: u8,
-        ) -> Result<Box<NativeStructuredDb>>;
-        fn native_structured_db_open_from_snapshot_file(
-            config_path: &str,
-            snapshot_id: u64,
-            db_id: &str,
-            recovery_mode: u8,
-        ) -> Result<Box<NativeStructuredDb>>;
         fn native_structured_db_restore_new(
             config_json: &str,
             snapshot_id: u64,
             db_id: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeBucketRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeStructuredDb>>;
         fn native_structured_db_restore_new_file(
             config_path: &str,
             snapshot_id: u64,
             db_id: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeBucketRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeStructuredDb>>;
         fn native_structured_db_restore_new_from_manifest(
             config_json: &str,
             manifest_path: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeBucketRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeStructuredDb>>;
         fn native_structured_db_restore_new_from_manifest_file(
             config_path: &str,
             manifest_path: &str,
+            has_ranges: bool,
+            ranges: Vec<NativeBucketRange>,
+            storage_mode: u8,
         ) -> Result<Box<NativeStructuredDb>>;
         fn native_structured_db_resume(
             config_json: &str,
@@ -612,7 +612,7 @@ pub(crate) mod ffi {
             ranges: Vec<NativeBucketRange>,
             storage_mode: u8,
         ) -> Result<u64>;
-        fn native_structured_db_wait_for_expand_adoption(
+        fn native_structured_db_wait_for_import_adoption(
             db: &NativeStructuredDb,
             timeout_millis: i64,
         ) -> Result<()>;
