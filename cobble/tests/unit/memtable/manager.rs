@@ -1997,6 +1997,71 @@ fn test_memtable_reuses_buffer_after_flush() {
 }
 
 #[test]
+fn rescale_flush_wait_rechecks_lifecycle_without_notification() {
+    for outcome in ["complete", "close", "error"] {
+        let root = tempfile::tempdir().unwrap();
+        let fs = FileSystemRegistry::new()
+            .get_or_register(root.path().to_str().unwrap())
+            .unwrap();
+        let metrics = Arc::new(MetricsManager::new("memtable-rescale-wait-test"));
+        let file_manager = Arc::new(FileManager::with_defaults(fs, Arc::clone(&metrics)).unwrap());
+        let lsm_tree = Arc::new(LSMTree::with_state(Arc::new(DbStateHandle::new()), metrics));
+        let manager =
+            Arc::new(MemtableManager::new(file_manager, lsm_tree, Default::default()).unwrap());
+        manager.open().unwrap();
+        // A synthetic pending job has no worker to notify flush_done.
+        manager.state.lock().unwrap().in_flight = 1;
+        let state_guard = manager.db_state.lock();
+        let waiter = Arc::clone(&manager);
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(waiter.flush_and_wait_for_rescale()).unwrap();
+        });
+        // Holding DbState makes the waiter hold its state lock after the initial lifecycle
+        // check, so a transition below cannot be caught merely at function entry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while manager.state.try_lock().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "waiter did not start");
+            std::thread::yield_now();
+        }
+        drop(state_guard);
+        let still_pending = matches!(
+            rx.recv_timeout(Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        match outcome {
+            "complete" => {
+                manager.state.lock().unwrap().in_flight = 0;
+                manager.flush_done.notify_all();
+            }
+            "close" => {
+                manager.db_lifecycle.begin_close().unwrap();
+            }
+            "error" => manager
+                .db_lifecycle
+                .mark_error(Error::IoError("failed pending flush".into())),
+            _ => unreachable!(),
+        }
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Always release the synthetic job and join, so a regression fails instead of hanging.
+        manager.state.lock().unwrap().in_flight = 0;
+        manager.flush_done.notify_all();
+        thread.join().unwrap();
+        assert!(
+            still_pending,
+            "a timeout must not count as flush completion"
+        );
+        let result = result.expect("waiter did not observe completion/lifecycle transition");
+        match outcome {
+            "complete" => assert!(result.is_ok()),
+            "close" => assert!(matches!(result, Err(Error::InvalidState(_)))),
+            "error" => assert!(matches!(result, Err(Error::IoError(_)))),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 #[serial_test::serial(file)]
 fn test_vec_memtable_triggers_flush_on_full() {
     cleanup_test_root();

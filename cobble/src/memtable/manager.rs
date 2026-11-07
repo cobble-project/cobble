@@ -2321,6 +2321,24 @@ impl MemtableManager {
         self.flush_active_with_auto_snapshot(FlushCause::Manual)
     }
 
+    /// Drain pre-cutover memtables without allocating an automatic snapshot.
+    /// The caller must exclude writes until its topology change is complete.
+    pub(crate) fn flush_and_wait_for_rescale(&self) -> Result<()> {
+        let _rotation_guard = self.rotation_lock.lock().unwrap();
+        self.flush_active_internal(None, FlushCause::Manual)?;
+        let mut state = self.state.lock().unwrap();
+        while state.restore_in_progress || state.in_flight > 0 {
+            // Recheck close/errors even when no flush notification arrives.
+            self.db_lifecycle.ensure_open()?;
+            state = self
+                .flush_done
+                .wait_timeout(state, Duration::from_millis(100))
+                .unwrap()
+                .0;
+        }
+        self.db_lifecycle.ensure_open()
+    }
+
     fn flush_active_for_capacity_full(&self, active_id: Uuid) -> Result<Option<Uuid>> {
         self.flush_active_if_current(active_id, FlushCause::CapacityFull(active_id))
     }

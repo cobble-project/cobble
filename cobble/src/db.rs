@@ -110,6 +110,26 @@ pub enum ImportStorageMode {
     ReferencePersistentWithCache,
 }
 
+/// Controls the immediate snapshots around a bucket topology change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RescaleOptions {
+    /// Capture a pre-operation handoff/recovery point. Existing snapshots are unchanged.
+    pub snapshot_before: bool,
+    /// Create and wait for an immediate post-cutover snapshot. If disabled, snapshot recovery
+    /// sees the old topology until a later snapshot; WAL replay does not persist topology changes.
+    /// Automatic snapshots and asynchronous adoption's safety snapshot remain enabled.
+    pub snapshot_after: bool,
+}
+
+impl Default for RescaleOptions {
+    fn default() -> Self {
+        Self {
+            snapshot_before: true,
+            snapshot_after: true,
+        }
+    }
+}
+
 pub(crate) fn select_projected_columns<T>(
     mut columns: Vec<Option<T>>,
     selected_columns: &[usize],

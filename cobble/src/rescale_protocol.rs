@@ -38,7 +38,8 @@ pub(crate) struct ImportStart {
     pub(crate) snapshot_id: u64,
     pub(crate) target_db_id: String,
     pub(crate) ranges: Vec<RangeInclusive<u16>>,
-    pub(crate) import_snapshot_id: u64,
+    /// Only the import's immediate snapshot may be expired automatically after adoption.
+    pub(crate) import_snapshot_id: Option<u64>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]

@@ -1,4 +1,4 @@
-use cobble::{Config, ImportStorageMode, VolumeDescriptor, VolumeUsageKind};
+use cobble::{Config, ImportStorageMode, RescaleOptions, VolumeDescriptor, VolumeUsageKind};
 use cobble_table::catalog::{
     Catalog, FileCatalog, FileCatalogConfig, SchemaChange, TableIdentifier,
 };
@@ -513,17 +513,44 @@ fn store_bucket_migration_moves_both_tables_from_selected_source_snapshots() {
         ImportStorageMode::AdoptAsync,
     ));
     assert_handles_live(target.shrink_bucket(vec![0..=1]));
+    let skip_snapshots = RescaleOptions {
+        snapshot_before: false,
+        snapshot_after: false,
+    };
+    assert_handles_live(target.expand_bucket_from_manifest_with_options(
+        source.id(),
+        &old.manifest_path,
+        Some(vec![4..=7]),
+        ImportStorageMode::AdoptAsync,
+        skip_snapshots,
+    ));
+    assert_handles_live(target.shrink_bucket_with_options(vec![0..=1], skip_snapshots));
     drop(target_tables);
 
-    for (snapshot, expected) in [(&old, 10), (&new, 20)] {
-        target
-            .expand_bucket_from_manifest(
-                source.id(),
-                &snapshot.manifest_path,
-                Some(vec![4..=7]),
-                ImportStorageMode::AdoptAsync,
-            )
-            .unwrap();
+    for (snapshot, expected, options) in [
+        (&old, 10, RescaleOptions::default()),
+        (&new, 20, skip_snapshots),
+    ] {
+        if options == RescaleOptions::default() {
+            target
+                .expand_bucket_from_manifest(
+                    source.id(),
+                    &snapshot.manifest_path,
+                    Some(vec![4..=7]),
+                    ImportStorageMode::AdoptAsync,
+                )
+                .unwrap();
+        } else {
+            target
+                .expand_bucket_from_manifest_with_options(
+                    source.id(),
+                    &snapshot.manifest_path,
+                    Some(vec![4..=7]),
+                    ImportStorageMode::AdoptAsync,
+                    options,
+                )
+                .unwrap();
+        }
         target
             .wait_for_import_adoption(Duration::from_secs(10))
             .unwrap();
@@ -538,14 +565,24 @@ fn store_bucket_migration_moves_both_tables_from_selected_source_snapshots() {
                 );
             }
         }
-        let before_shrink = target.shrink_bucket(vec![4..=7]).unwrap();
-        assert_eq!(
+        let before_shrink = if options == RescaleOptions::default() {
+            Some(target.shrink_bucket(vec![4..=7]).unwrap())
+        } else {
             target
-                .shard_snapshot_metadata(before_shrink)
+                .shrink_bucket_with_options(vec![4..=7], options)
                 .unwrap()
-                .ranges,
-            vec![0..=7]
-        );
+        };
+        assert_eq!(before_shrink.is_some(), options.snapshot_before);
+        if let Some(before_shrink) = before_shrink {
+            assert_eq!(
+                target
+                    .shard_snapshot_metadata(before_shrink)
+                    .unwrap()
+                    .ranges,
+                vec![0..=7]
+            );
+        }
+        assert_eq!(target.snapshot_and_wait().unwrap().ranges, vec![0..=3]);
         let table = target.open_table("left").unwrap();
         let migrated_id = ids
             .iter()

@@ -423,7 +423,7 @@ impl Db {
             schema_manager,
             true,
         )?;
-        if let Err(err) = db.install_snapshot_import(import, storage_mode, true) {
+        if let Err(err) = db.install_snapshot_import(import, storage_mode, None) {
             db.force_close();
             return Err(err);
         }

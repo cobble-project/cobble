@@ -3,7 +3,7 @@ use crate::transform::TableSchemaTransformFactories;
 use crate::{Result, Table, TableSchema};
 use bytes::Bytes;
 use cobble::{
-    Config, Db, DbBuilder, ImportStorageMode, MergeOperatorResolver, MetricSample,
+    Config, Db, DbBuilder, ImportStorageMode, MergeOperatorResolver, MetricSample, RescaleOptions,
     ShardSnapshotMetadata,
 };
 use std::ops::RangeInclusive;
@@ -210,10 +210,41 @@ impl TableStore {
         )?)
     }
 
+    /// Import buckets with optional immediate snapshots after releasing table handles.
+    pub fn expand_bucket_from_manifest_with_options(
+        &mut self,
+        source_db_id: impl Into<String>,
+        source_manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
+        options: RescaleOptions,
+    ) -> Result<u64> {
+        Ok(self
+            .exclusive_db()?
+            .expand_bucket_from_manifest_with_options(
+                source_db_id,
+                source_manifest_path,
+                ranges,
+                storage_mode,
+                options,
+            )?)
+    }
+
     /// Remove owned buckets after releasing every table-derived handle.
     /// Returns the core snapshot of the state immediately before removal.
     pub fn shrink_bucket(&mut self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
         Ok(self.exclusive_db()?.shrink_bucket(ranges)?)
+    }
+
+    /// Remove buckets with optional immediate snapshots after releasing table handles.
+    pub fn shrink_bucket_with_options(
+        &mut self,
+        ranges: Vec<RangeInclusive<u16>>,
+        options: RescaleOptions,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .exclusive_db()?
+            .shrink_bucket_with_options(ranges, options)?)
     }
 
     pub fn wait_for_import_adoption(&self, timeout: Duration) -> Result<()> {

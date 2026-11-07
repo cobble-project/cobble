@@ -1,5 +1,5 @@
 //! Shared snapshot import, asynchronous ownership adoption, and bucket rescaling.
-use super::{Db, ImportStorageMode};
+use super::{Db, ImportStorageMode, RescaleOptions};
 use crate::data_file::intersect_bucket_ranges;
 use crate::db_state::{
     DbState, LSMTreeScope, MultiLSMTreeVersion, TruncationCursorMap, bucket_range_fits_total,
@@ -437,10 +437,10 @@ impl AdoptionCoordinator {
             return Ok(());
         }
         for record in records {
-            if !self.snapshot_manager.is_retained(record.import_snapshot_id) {
-                let _ = self
-                    .snapshot_manager
-                    .expire_snapshot(record.import_snapshot_id)?;
+            if let Some(import_snapshot_id) = record.import_snapshot_id
+                && !self.snapshot_manager.is_retained(import_snapshot_id)
+            {
+                let _ = self.snapshot_manager.expire_snapshot(import_snapshot_id)?;
             }
             if self
                 .snapshot_manager
@@ -566,6 +566,25 @@ impl Db {
         ranges: Option<Vec<RangeInclusive<u16>>>,
         storage_mode: ImportStorageMode,
     ) -> Result<u64> {
+        self.expand_bucket_with_options(
+            source_db_id,
+            snapshot_id,
+            ranges,
+            storage_mode,
+            RescaleOptions::default(),
+        )
+    }
+
+    /// Expands buckets with explicit storage and immediate snapshot policies.
+    /// The returned ID identifies the source snapshot, regardless of the snapshot options.
+    pub fn expand_bucket_with_options(
+        &self,
+        source_db_id: impl Into<String>,
+        snapshot_id: Option<u64>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
+        options: RescaleOptions,
+    ) -> Result<u64> {
         let source_db_id = source_db_id.into();
         if source_db_id == self.id {
             return Err(Error::ConfigError(
@@ -594,12 +613,13 @@ impl Db {
                 })?
             }
         };
-        self.expand_bucket_from_manifest(
+        self.expand_bucket_from_manifest_with_options(
             source_db_id,
             source_file_manager
                 .metadata_file_full_path(&snapshot_manifest_relative_path(source_snapshot_id)),
             ranges,
             storage_mode,
+            options,
         )
     }
 
@@ -613,6 +633,26 @@ impl Db {
         source_manifest_path: impl Into<String>,
         ranges: Option<Vec<RangeInclusive<u16>>>,
         storage_mode: ImportStorageMode,
+    ) -> Result<u64> {
+        self.expand_bucket_from_manifest_with_options(
+            source_db_id,
+            source_manifest_path,
+            ranges,
+            storage_mode,
+            RescaleOptions::default(),
+        )
+    }
+
+    /// Expands from an explicit manifest with optional immediate snapshots around cutover.
+    /// Skipping the post-cutover snapshot requires a later snapshot for durable recovery;
+    /// source retention and asynchronous adoption's safety snapshot remain unchanged.
+    pub fn expand_bucket_from_manifest_with_options(
+        &self,
+        source_db_id: impl Into<String>,
+        source_manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
+        options: RescaleOptions,
     ) -> Result<u64> {
         let source_db_id = source_db_id.into();
         if source_db_id == self.id {
@@ -628,17 +668,18 @@ impl Db {
                 "Source manifest location does not match the source DB".into(),
             ));
         }
-        self.install_snapshot_import(import, storage_mode, false)
+        self.install_snapshot_import(import, storage_mode, Some(options))
     }
 
-    /// `initialize` replaces only a private fresh target's empty trees. Public expansion always
+    /// `None` replaces only a private fresh target's empty trees. Public expansion always
     /// merges disjoint ownership. Both paths share file origins, leases, START/END, and cutover.
     pub(super) fn install_snapshot_import(
         &self,
         import: SnapshotImport,
         storage_mode: ImportStorageMode,
-        initialize: bool,
+        options: Option<RescaleOptions>,
     ) -> Result<u64> {
+        let initialize = options.is_none();
         let SnapshotImport {
             source_db_id,
             source_manifest_path,
@@ -695,11 +736,11 @@ impl Db {
         }
         let mut original_state = None;
         let mut topology_installed = false;
-        let mut snapshot_committed = false;
+        let mut cutover_committed = false;
         let mut import_started = false;
         let result = (|| {
-            if !initialize {
-                self.create_snapshot_and_wait("bucket expand export")?;
+            if let Some(options) = options {
+                self.prepare_rescale("bucket expand export", options)?;
             }
             // Remap file IDs to avoid local collisions while keeping source files read-only.
             let source_file_ids: BTreeSet<u64> = source_manifest
@@ -928,8 +969,8 @@ impl Db {
                     &source_manifest.active_memtable_data,
                     Some(&import_ranges),
                 )?;
-            if let Some(export_id) = &export_id {
-                self.create_snapshot_and_wait_with_before_flush("snapshot import", |snapshot_id| {
+            let mut start_import = |import_snapshot_id| {
+                if let Some(export_id) = &export_id {
                     write_import_start(
                         &self.file_manager,
                         &ImportStart {
@@ -940,16 +981,27 @@ impl Db {
                             snapshot_id: source_snapshot_id,
                             target_db_id: self.id.clone(),
                             ranges: import_ranges.clone(),
-                            import_snapshot_id: snapshot_id,
+                            import_snapshot_id,
                         },
                     )?;
                     import_started = true;
-                    Ok(())
-                })?
-            } else {
-                self.create_snapshot_and_wait("snapshot import")?
+                }
+                Ok(())
             };
-            snapshot_committed = true;
+            // Fresh imports always establish their first durable snapshot. Public expansion
+            // may defer that barrier, but START must precede runtime publication in both paths.
+            if options.is_none_or(|options| options.snapshot_after) {
+                if export_id.is_some() {
+                    self.create_snapshot_and_wait_with_before_flush("snapshot import", |id| {
+                        start_import(Some(id))
+                    })?;
+                } else {
+                    self.create_snapshot_and_wait("snapshot import")?;
+                }
+            } else {
+                start_import(None)?;
+            }
+            cutover_committed = true;
             let seq_id = self.db_state.load().seq_id;
             if let Err(err) = publication.publish_at_least_and_resume(seq_id) {
                 self.db_lifecycle.mark_error(err.clone());
@@ -964,7 +1016,7 @@ impl Db {
             Ok(source_snapshot_id)
         })();
         if let Err(err) = result {
-            if topology_installed && !snapshot_committed {
+            if topology_installed && !cutover_committed {
                 let original_state = original_state
                     .as_deref()
                     .expect("topology has original state");
@@ -975,7 +1027,7 @@ impl Db {
             // Once START has been published, a failed materialization may still have durably
             // installed a manifest. Keep its lease and recovery record; never infer that an
             // error means no snapshot references escaped to durable storage.
-            if !snapshot_committed
+            if !cutover_committed
                 && !import_started
                 && let Some(export_id) = &export_id
             {
@@ -996,6 +1048,18 @@ impl Db {
     /// which will be used as the base for future expand operations on the kicked-out ranges,
     /// and returns the snapshot ID of that snapshot.
     pub fn shrink_bucket(&self, ranges: Vec<RangeInclusive<u16>>) -> Result<u64> {
+        Ok(self
+            .shrink_bucket_with_options(ranges, RescaleOptions::default())?
+            .expect("default rescale options capture a pre-operation snapshot"))
+    }
+
+    /// Shrinks buckets and returns the pre-operation snapshot, or `None` when disabled.
+    /// Without `snapshot_after`, recovery uses the old topology until a later snapshot.
+    pub fn shrink_bucket_with_options(
+        &self,
+        ranges: Vec<RangeInclusive<u16>>,
+        options: RescaleOptions,
+    ) -> Result<Option<u64>> {
         if ranges.is_empty() {
             return Err(Error::ConfigError(
                 "shrink ranges must not be empty".to_string(),
@@ -1040,15 +1104,13 @@ impl Db {
             ),
         )?;
         let mut original_state = None;
-        let mut original_ranges = None;
         let mut topology_installed = false;
-        let mut snapshot_committed = false;
+        let mut cutover_committed = false;
         let result = (|| {
-            let snapshot_id = self.create_snapshot_and_wait("bucket shrink export")?;
+            let snapshot_id = self.prepare_rescale("bucket shrink export", options)?;
 
             let guard = self.db_state.lock();
             let current = self.db_state.load();
-            original_ranges = Some(current.bucket_ranges.clone());
             original_state = Some(Arc::clone(&current));
             for range in &shrink_ranges {
                 if !range_is_covered_by_ranges(range, &current.bucket_ranges) {
@@ -1123,8 +1185,10 @@ impl Db {
             topology_installed = true;
             drop(guard);
             self.snapshot_manager.set_bucket_ranges(updated_ranges);
-            self.create_snapshot_and_wait("bucket shrink")?;
-            snapshot_committed = true;
+            if options.snapshot_after {
+                self.create_snapshot_and_wait("bucket shrink")?;
+            }
+            cutover_committed = true;
             let seq_id = self.db_state.load().seq_id;
             if let Err(err) = publication.publish_at_least_and_resume(seq_id) {
                 self.db_lifecycle.mark_error(err.clone());
@@ -1133,18 +1197,30 @@ impl Db {
             Ok(snapshot_id)
         })();
         if let Err(err) = result {
-            if topology_installed && !snapshot_committed {
-                self.db_state.store(copy_db_state(
-                    original_state
-                        .as_deref()
-                        .expect("topology has original state"),
-                ));
+            if topology_installed && !cutover_committed {
+                let original_state = original_state
+                    .as_deref()
+                    .expect("topology has original state");
+                self.db_state.store(copy_db_state(original_state));
                 self.snapshot_manager
-                    .set_bucket_ranges(original_ranges.expect("topology has original ranges"));
+                    .set_bucket_ranges(original_state.bucket_ranges.clone());
             }
             return Err(err);
         }
         result
+    }
+
+    fn prepare_rescale(&self, operation: &str, options: RescaleOptions) -> Result<Option<u64>> {
+        let snapshot_id = if options.snapshot_before {
+            Some(self.create_snapshot_and_wait(operation)?)
+        } else {
+            None
+        };
+        // Even an incremental snapshot can leave active data behind. Flush it under the old
+        // schema/ranges before cutover: otherwise removed keys could reappear on re-expansion,
+        // or an outstanding flush could run against the imported topology. Do not auto-snapshot.
+        self.memtable_manager.flush_and_wait_for_rescale()?;
+        Ok(snapshot_id)
     }
 }
 

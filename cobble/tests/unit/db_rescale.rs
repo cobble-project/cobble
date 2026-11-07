@@ -35,15 +35,15 @@ fn non_atomic_import_start_end_are_immutable_and_idempotent() {
         snapshot_id: 1,
         target_db_id: "target".to_string(),
         ranges: vec![0..=0],
-        import_snapshot_id: 2,
+        import_snapshot_id: Some(2),
     };
     write_import_start(&manager, &record).unwrap();
     write_import_start(&manager, &record).unwrap();
-    record.import_snapshot_id = 3;
+    record.import_snapshot_id = Some(3);
     assert!(write_import_start(&manager, &record).is_err());
     let records = load_import_starts(&manager).unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].import_snapshot_id, 2);
+    assert_eq!(records[0].import_snapshot_id, Some(2));
     assert!(fs.inner.exists(&import_start_name("export")).unwrap());
     assert!(
         !fs.inner
@@ -363,7 +363,7 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
             snapshot_id: source_snapshot.snapshot_id,
             target_db_id: target_id.clone(),
             ranges: vec![4..=7],
-            import_snapshot_id: imported.snapshot_id,
+            import_snapshot_id: Some(imported.snapshot_id),
         };
         write_import_start(&import_manager, &record).unwrap();
         record
@@ -917,102 +917,234 @@ fn test_expand_bucket_accepts_full_range_with_empty_source() {
 #[serial(file)]
 fn test_expand_bucket_restores_active_memtable_segments() {
     let root = "/tmp/db_expand_bucket_active_segments";
-    cleanup_test_root(root);
-    let config = Config {
-        total_buckets: 8,
-        memtable_capacity: Size::from_kib(8),
-        memtable_buffer_count: 2,
-        num_columns: 1,
-        value_separation_threshold: Some(Size::from_const(1)),
-        active_memtable_incremental_snapshot_ratio: 1.0,
-        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        ..Config::default()
-    };
-    let source = Db::open(config.clone(), vec![4u16..=5u16]).unwrap();
-    source.put(4, b"k-sep", 0, b"payload-separated").unwrap();
-    let (tx, rx) = mpsc::channel();
-    let snapshot_id = source
-        .snapshot_with_callback(move |result| {
-            let _ = tx.send(result);
-        })
-        .unwrap();
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10))
-            .unwrap()
-            .unwrap()
-            .snapshot_id,
-        snapshot_id
-    );
-    let source_metrics = Arc::new(MetricsManager::new("rescale-source-manifest"));
-    let source_file_manager =
-        Arc::new(FileManager::from_config(&config, source.id(), source_metrics).unwrap());
-    let source_manifest =
-        crate::snapshot::load_manifest_for_snapshot(&source_file_manager, snapshot_id).unwrap();
-    assert!(!source_manifest.active_memtable_data.is_empty());
+    for (snapshot_before, snapshot_after) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        cleanup_test_root(root);
+        let config = Config {
+            total_buckets: 8,
+            memtable_capacity: Size::from_kib(8),
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            value_separation_threshold: Some(Size::from_const(1)),
+            active_memtable_incremental_snapshot_ratio: 1.0,
+            snapshot_on_flush: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        let source = Db::open(config.clone(), vec![4u16..=5u16]).unwrap();
+        source.put(4, b"k-sep", 0, b"payload-separated").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let snapshot_id = source
+            .snapshot_with_callback(move |result| {
+                let _ = tx.send(result);
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .snapshot_id,
+            snapshot_id
+        );
+        let source_metrics = Arc::new(MetricsManager::new("rescale-source-manifest"));
+        let source_file_manager =
+            Arc::new(FileManager::from_config(&config, source.id(), source_metrics).unwrap());
+        let source_manifest =
+            crate::snapshot::load_manifest_for_snapshot(&source_file_manager, snapshot_id).unwrap();
+        assert!(!source_manifest.active_memtable_data.is_empty());
 
-    let target = Db::open(config, vec![0u16..=1u16]).unwrap();
-    target
-        .expand_bucket(source.id().to_string(), Some(snapshot_id), None)
-        .unwrap();
-    let got = target.get(4, b"k-sep").unwrap().unwrap();
-    assert_eq!(got[0].as_deref(), Some(&b"payload-separated"[..]));
+        let target = Db::open(config.clone(), vec![0u16..=1u16]).unwrap();
+        target.put(1, b"local-active", 0, b"local").unwrap();
+        if snapshot_before && snapshot_after {
+            target
+                .expand_bucket_with_storage_mode(
+                    source.id(),
+                    Some(snapshot_id),
+                    None,
+                    ImportStorageMode::ReferencePersistent,
+                )
+                .unwrap();
+        } else {
+            target
+                .expand_bucket_with_options(
+                    source.id(),
+                    Some(snapshot_id),
+                    None,
+                    ImportStorageMode::ReferencePersistent,
+                    RescaleOptions {
+                        snapshot_before,
+                        snapshot_after,
+                    },
+                )
+                .unwrap();
+        }
+        let got = target.get(4, b"k-sep").unwrap().unwrap();
+        assert_eq!(got[0].as_deref(), Some(&b"payload-separated"[..]));
+        assert_eq!(
+            target.get(1, b"local-active").unwrap().unwrap()[0].as_deref(),
+            Some(&b"local"[..])
+        );
+        let snapshots = list_snapshot_manifest_ids(&target.file_manager).unwrap();
+        assert_eq!(
+            snapshots.len(),
+            usize::from(snapshot_before) + usize::from(snapshot_after)
+        );
+        if let Some(&latest) = snapshots.last() {
+            let metadata = target.shard_snapshot_metadata(latest).unwrap();
+            assert_eq!(
+                metadata.ranges,
+                if snapshot_after {
+                    vec![0..=1, 4..=5]
+                } else {
+                    vec![0..=1]
+                }
+            );
+        }
+        // A later explicit snapshot establishes durability even if the immediate barrier was skipped.
+        let post_snapshot = snapshot_for_rescale_test(&target).snapshot_id;
+        let target_id = target.id().to_string();
+        target.close().unwrap();
+        let reopened = Db::resume_from_snapshot(config, post_snapshot, target_id).unwrap();
+        assert_eq!(
+            reopened.get(4, b"k-sep").unwrap().unwrap()[0].as_deref(),
+            Some(&b"payload-separated"[..])
+        );
+        assert_eq!(
+            reopened.get(1, b"local-active").unwrap().unwrap()[0].as_deref(),
+            Some(&b"local"[..])
+        );
 
-    drop(target);
-    drop(source);
-    cleanup_test_root(root);
+        drop(reopened);
+        drop(target);
+        drop(source);
+        cleanup_test_root(root);
+    }
 }
 
 #[test]
 #[serial(file)]
 fn test_shrink_bucket_removes_data_from_kicked_range() {
     let root = "/tmp/db_shrink_bucket";
-    cleanup_test_root(root);
-    let config = Config {
-        total_buckets: 8,
-        memtable_capacity: Size::from_const(128),
-        memtable_buffer_count: 2,
-        num_columns: 1,
-        sst_bloom_filter_enabled: true,
-        volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
-        ..Config::default()
-    };
-    let db = Db::open(config.clone(), vec![0u16..=3u16]).unwrap();
-    db.put(1, b"k1", 0, b"v1").unwrap();
-    db.put(2, b"k2", 0, b"v2").unwrap();
+    for (snapshot_before, snapshot_after) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        cleanup_test_root(root);
+        let config = Config {
+            total_buckets: 8,
+            memtable_capacity: Size::from_kib(8),
+            memtable_buffer_count: 2,
+            num_columns: 1,
+            sst_bloom_filter_enabled: true,
+            active_memtable_incremental_snapshot_ratio: 1.0,
+            snapshot_on_flush: true,
+            volumes: VolumeDescriptor::single_volume(format!("file://{}", root)),
+            ..Config::default()
+        };
+        // Prepare an independent snapshot donor before target ownership is registered.
+        let source = Db::open(config.clone(), vec![2u16..=3u16]).unwrap();
+        let empty_source = snapshot_for_rescale_test(&source);
+        source.close().unwrap();
+        let db = Db::open(config.clone(), vec![0u16..=3u16]).unwrap();
+        db.put(1, b"k1", 0, b"v1").unwrap();
+        db.put(2, b"k2", 0, b"v2").unwrap();
 
-    let shrink_snapshot = db.shrink_bucket(vec![2u16..=3u16]).unwrap();
-    let snapshot_metadata = db.shard_snapshot_metadata(shrink_snapshot).unwrap();
-    // Shrink returns the pre-shrink snapshot, not the live database's remaining ranges.
-    assert_eq!(snapshot_metadata.ranges, vec![0u16..=3u16]);
+        let options = RescaleOptions {
+            snapshot_before,
+            snapshot_after,
+        };
+        let shrink_snapshot = if snapshot_before && snapshot_after {
+            Some(db.shrink_bucket(vec![2u16..=3u16]).unwrap())
+        } else {
+            db.shrink_bucket_with_options(vec![2u16..=3u16], options)
+                .unwrap()
+        };
+        assert_eq!(shrink_snapshot.is_some(), snapshot_before);
+        if let Some(shrink_snapshot) = shrink_snapshot {
+            let snapshot_metadata = db.shard_snapshot_metadata(shrink_snapshot).unwrap();
+            // The default still returns the pre-shrink handoff, not the remaining ranges.
+            assert_eq!(snapshot_metadata.ranges, vec![0u16..=3u16]);
+        }
 
-    let kept = db.get(1, b"k1").unwrap().unwrap();
-    assert_eq!(kept[0].as_deref(), Some(&b"v1"[..]));
-    let removed = db.get(2, b"k2").unwrap();
-    assert!(removed.is_none());
+        let kept = db.get(1, b"k1").unwrap().unwrap();
+        assert_eq!(kept[0].as_deref(), Some(&b"v1"[..]));
+        let removed = db.get(2, b"k2").unwrap();
+        assert!(removed.is_none());
 
-    let metrics = Arc::new(MetricsManager::new("shrink-manifest"));
-    let file_manager = Arc::new(FileManager::from_config(&config, db.id(), metrics).unwrap());
-    let manifest =
-        crate::snapshot::load_manifest_for_snapshot(&file_manager, shrink_snapshot).unwrap();
-    assert_eq!(manifest.bucket_ranges, vec![0u16..=3u16]);
+        let metrics = Arc::new(MetricsManager::new("shrink-manifest"));
+        let file_manager = Arc::new(FileManager::from_config(&config, db.id(), metrics).unwrap());
+        if let Some(shrink_snapshot) = shrink_snapshot {
+            let manifest =
+                crate::snapshot::load_manifest_for_snapshot(&file_manager, shrink_snapshot)
+                    .unwrap();
+            assert_eq!(manifest.bucket_ranges, vec![0u16..=3u16]);
+        }
 
-    let post_shrink_snapshot = *list_snapshot_manifest_ids(&file_manager)
-        .unwrap()
-        .last()
+        let snapshots = list_snapshot_manifest_ids(&file_manager).unwrap();
+        let immediate_snapshots = usize::from(snapshot_before) + usize::from(snapshot_after);
+        assert_eq!(snapshots.len(), immediate_snapshots);
+        if let Some(&latest) = snapshots.last() {
+            let manifest =
+                crate::snapshot::load_manifest_for_snapshot(&file_manager, latest).unwrap();
+            assert_eq!(
+                manifest.bucket_ranges,
+                if snapshot_after {
+                    vec![0..=1]
+                } else {
+                    vec![0..=3]
+                }
+            );
+        }
+        let post_shrink_snapshot = snapshot_for_rescale_test(&db).snapshot_id;
+        // Reacquiring an empty range must not expose data left in pre-cutover memtables.
+        db.expand_bucket_from_manifest_with_options(
+            source.id(),
+            empty_source.manifest_path,
+            None,
+            ImportStorageMode::ReferencePersistent,
+            options,
+        )
         .unwrap();
-    let post_shrink_manifest =
-        crate::snapshot::load_manifest_for_snapshot(&file_manager, post_shrink_snapshot).unwrap();
-    assert_eq!(post_shrink_manifest.bucket_ranges, vec![0u16..=1u16]);
-    let db_id = db.id().to_string();
-    drop(db);
-    let reopened = Db::resume_from_snapshot(config.clone(), post_shrink_snapshot, db_id).unwrap();
-    assert_eq!(
-        reopened.get(1, b"k1").unwrap().unwrap()[0].as_deref(),
-        Some(&b"v1"[..])
-    );
-    assert!(reopened.get(2, b"k2").unwrap().is_none());
-    drop(reopened);
-    cleanup_test_root(root);
+        assert!(db.get(2, b"k2").unwrap().is_none());
+        assert_eq!(
+            db.get(1, b"k1").unwrap().unwrap()[0].as_deref(),
+            Some(&b"v1"[..])
+        );
+        let snapshots = list_snapshot_manifest_ids(&file_manager).unwrap();
+        assert_eq!(snapshots.len(), 2 * immediate_snapshots + 1);
+        if let Some(&latest) = snapshots.last() {
+            let manifest =
+                crate::snapshot::load_manifest_for_snapshot(&file_manager, latest).unwrap();
+            assert_eq!(
+                manifest.bucket_ranges,
+                if snapshot_after {
+                    vec![0..=3]
+                } else {
+                    vec![0..=1]
+                }
+            );
+        }
+        let post_expand_snapshot = snapshot_for_rescale_test(&db).snapshot_id;
+        let db_id = db.id().to_string();
+        db.close().unwrap();
+        let restarted =
+            Db::resume_from_snapshot(config.clone(), post_expand_snapshot, &db_id).unwrap();
+        assert!(restarted.get(2, b"k2").unwrap().is_none());
+        assert_eq!(restarted.db_state.load().bucket_ranges, vec![0u16..=3u16]);
+        restarted.close().unwrap();
+        let post_shrink = Db::resume_from_snapshot(config, post_shrink_snapshot, db_id).unwrap();
+        assert_eq!(
+            post_shrink.get(1, b"k1").unwrap().unwrap()[0].as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert!(post_shrink.get(2, b"k2").unwrap().is_none());
+        assert_eq!(post_shrink.db_state.load().bucket_ranges, vec![0u16..=1u16]);
+        drop(post_shrink);
+        drop(restarted);
+        drop(source);
+        drop(db);
+        cleanup_test_root(root);
+    }
 }
 
 #[test]

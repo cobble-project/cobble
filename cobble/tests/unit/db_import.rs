@@ -412,104 +412,133 @@ fn new_import_failed_active_replay_does_not_publish_or_remove_source() {
 
 #[test]
 fn new_import_disk_restart_cleanup_and_transitive_snapshot_protection() {
-    let root = tempfile::tempdir().unwrap();
-    let a_root = root.path().join("a");
-    let b_root = root.path().join("b");
-    let c_root = root.path().join("c");
-    let a_config = config(&a_root);
-    let a = Db::open(a_config.clone(), vec![0..=7]).unwrap();
-    a.put(4, b"key", 0, vec![b'x'; 4096]).unwrap();
-    let a_snapshot = a.create_snapshot_and_wait("durable A").unwrap();
-    let a_id = a.id().to_string();
-    let a_manifest = a.shard_snapshot_metadata(a_snapshot).unwrap().manifest_path;
-    a.close().unwrap();
-    drop(a);
+    for snapshot_after in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let a_root = root.path().join("a");
+        let b_root = root.path().join("b");
+        let c_root = root.path().join("c");
+        let a_config = config(&a_root);
+        let a = Db::open(a_config.clone(), vec![0..=7]).unwrap();
+        a.put(4, b"key", 0, vec![b'x'; 4096]).unwrap();
+        let a_snapshot = a.create_snapshot_and_wait("durable A").unwrap();
+        let a_id = a.id().to_string();
+        let a_manifest = a.shard_snapshot_metadata(a_snapshot).unwrap().manifest_path;
+        a.close().unwrap();
+        drop(a);
 
-    let blocked_b = target_config(&b_root, &[&a_root], true);
-    let b = Db::open_new_with_manifest_path(
-        blocked_b.clone(),
-        a_manifest,
-        Some(vec![4..=5]),
-        ImportStorageMode::AdoptAsync,
-    )
-    .unwrap();
-    stop_tiering(&b);
-    assert!(!load_import_starts(&b.file_manager).unwrap().is_empty());
-    let b_snapshot = b.create_snapshot_and_wait("retained dependent B").unwrap();
-    let b_id = b.id().to_string();
-    let b_manifest = b.shard_snapshot_metadata(b_snapshot).unwrap().manifest_path;
-    b.close().unwrap();
-    drop(b);
-
-    let blocked_c = target_config(&c_root, &[&a_root, &b_root], true);
-    let c = Db::open_new_with_manifest_path(
-        blocked_c.clone(),
-        b_manifest,
-        None,
-        ImportStorageMode::AdoptAsync,
-    )
-    .unwrap();
-    stop_tiering(&c);
-    let c_id = c.id().to_string();
-    c.close().unwrap();
-    drop(c);
-
-    let cleanup = || {
-        crate::cleanup_shard_snapshot(
-            &a_config.volumes[0],
-            &[],
-            &a_id,
-            a_snapshot,
-            crate::SnapshotCleanupOptions::default(),
-        )
-        .unwrap()
-    };
-    assert!(!cleanup().preserved_snapshots.is_empty());
-    let b_options = target_config(&b_root, &[&a_root], false);
-    let b = Db::resume(b_options.clone(), &b_id).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        b.adoption_coordinator.tick().unwrap();
+        let blocked_b = target_config(&b_root, &[&a_root], true);
+        let b = if snapshot_after {
+            Db::open_new_with_manifest_path(
+                blocked_b.clone(),
+                a_manifest,
+                Some(vec![4..=5]),
+                ImportStorageMode::AdoptAsync,
+            )
+            .unwrap()
+        } else {
+            let b = Db::open(blocked_b.clone(), vec![0..=3]).unwrap();
+            b.expand_bucket_from_manifest_with_options(
+                &a_id,
+                a_manifest,
+                Some(vec![4..=5]),
+                ImportStorageMode::AdoptAsync,
+                RescaleOptions {
+                    snapshot_before: false,
+                    snapshot_after,
+                },
+            )
+            .unwrap();
+            b
+        };
+        stop_tiering(&b);
         let starts = load_import_starts(&b.file_manager).unwrap();
-        if starts.iter().all(|record| {
-            load_import_end(&b.file_manager, &record.export_id)
-                .unwrap()
-                .is_some()
-        }) {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        !b.expire_snapshot(b_snapshot).unwrap(),
-        "C's real lease retains B's dependent snapshot"
-    );
-    assert!(
-        b.wait_for_import_adoption(Duration::from_millis(30))
-            .is_err()
-    );
-    b.close().unwrap();
-    drop(b);
-    assert!(!cleanup().preserved_snapshots.is_empty());
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].import_snapshot_id.is_some(), snapshot_after);
+        assert_eq!(
+            list_snapshot_manifest_ids(&b.file_manager).unwrap().len(),
+            usize::from(snapshot_after)
+        );
+        let b_snapshot = b.create_snapshot_and_wait("retained dependent B").unwrap();
+        // This snapshot has no transitive lease or explicit retention flag. Adoption must not
+        // mistake a later user snapshot for the import's absent immediate snapshot.
+        let b_manual_snapshot = b.create_snapshot_and_wait("manual dependent B").unwrap();
+        let b_id = b.id().to_string();
+        let b_manifest = b.shard_snapshot_metadata(b_snapshot).unwrap().manifest_path;
+        b.close().unwrap();
+        drop(b);
 
-    let c_options = target_config(&c_root, &[&a_root, &b_root], false);
-    let c = Db::resume(c_options.clone(), &c_id).unwrap();
-    c.wait_for_import_adoption(Duration::from_secs(20)).unwrap();
-    assert!(c.get(4, b"key").unwrap().is_some());
-    c.close().unwrap();
-    drop(c);
-    let b = Db::resume(b_options.clone(), &b_id).unwrap();
-    assert!(b.expire_snapshot(b_snapshot).unwrap());
-    b.wait_for_import_adoption(Duration::from_secs(20)).unwrap();
-    b.close().unwrap();
-    drop(b);
-    assert!(cleanup().preserved_snapshots.is_empty());
-    for (options, id) in [(b_options, b_id), (c_options, c_id)] {
-        let db = Db::resume(options, id).unwrap();
-        assert!(db.get(4, b"key").unwrap().is_some());
-        db.put(4, b"after-cleanup", 0, b"owned").unwrap();
-        db.create_snapshot_and_wait("after source cleanup").unwrap();
-        db.close().unwrap();
+        let blocked_c = target_config(&c_root, &[&a_root, &b_root], true);
+        let c = Db::open_new_with_manifest_path(
+            blocked_c.clone(),
+            b_manifest,
+            None,
+            ImportStorageMode::AdoptAsync,
+        )
+        .unwrap();
+        stop_tiering(&c);
+        let c_id = c.id().to_string();
+        c.close().unwrap();
+        drop(c);
+
+        let cleanup = || {
+            crate::cleanup_shard_snapshot(
+                &a_config.volumes[0],
+                &[],
+                &a_id,
+                a_snapshot,
+                crate::SnapshotCleanupOptions::default(),
+            )
+            .unwrap()
+        };
+        assert!(!cleanup().preserved_snapshots.is_empty());
+        let b_options = target_config(&b_root, &[&a_root], false);
+        let b = Db::resume(b_options.clone(), &b_id).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            b.adoption_coordinator.tick().unwrap();
+            let starts = load_import_starts(&b.file_manager).unwrap();
+            if starts.iter().all(|record| {
+                load_import_end(&b.file_manager, &record.export_id)
+                    .unwrap()
+                    .is_some()
+            }) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !b.expire_snapshot(b_snapshot).unwrap(),
+            "C's real lease retains B's dependent snapshot"
+        );
+        assert!(b.shard_snapshot_metadata(b_manual_snapshot).is_ok());
+        assert!(
+            b.wait_for_import_adoption(Duration::from_millis(30))
+                .is_err()
+        );
+        b.close().unwrap();
+        drop(b);
+        assert!(!cleanup().preserved_snapshots.is_empty());
+
+        let c_options = target_config(&c_root, &[&a_root, &b_root], false);
+        let c = Db::resume(c_options.clone(), &c_id).unwrap();
+        c.wait_for_import_adoption(Duration::from_secs(20)).unwrap();
+        assert!(c.get(4, b"key").unwrap().is_some());
+        c.close().unwrap();
+        drop(c);
+        let b = Db::resume(b_options.clone(), &b_id).unwrap();
+        assert!(b.expire_snapshot(b_snapshot).unwrap());
+        assert!(b.expire_snapshot(b_manual_snapshot).unwrap());
+        b.wait_for_import_adoption(Duration::from_secs(20)).unwrap();
+        b.close().unwrap();
+        drop(b);
+        assert!(cleanup().preserved_snapshots.is_empty());
+        for (options, id) in [(b_options, b_id), (c_options, c_id)] {
+            let db = Db::resume(options, id).unwrap();
+            assert!(db.get(4, b"key").unwrap().is_some());
+            db.put(4, b"after-cleanup", 0, b"owned").unwrap();
+            db.create_snapshot_and_wait("after source cleanup").unwrap();
+            db.close().unwrap();
+        }
     }
 }
