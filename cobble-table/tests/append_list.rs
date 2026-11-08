@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use cobble::{Config, DbBuilder, ReadOptions, TimeProviderKind, VolumeDescriptor, WriteOptions};
+use cobble::{
+    Config, DbBuilder, ImportStorageMode, ReadOptions, TimeProviderKind, VolumeDescriptor,
+    WriteOptions,
+};
 use cobble_table::catalog::{
     Catalog, FileCatalog, FileCatalogConfig, SchemaChange, TableIdentifier,
 };
@@ -615,7 +618,11 @@ fn list_catalog_widening_custom_transform_and_dedicated_compaction_keep_common_e
 
     // Importing into a new store must install both custom transforms and the List resolver.
     let imported = make_store()
-        .open_new_with_manifest_path(&latest.manifest_path)
+        .open_new_with_manifest_path(
+            &latest.manifest_path,
+            None,
+            ImportStorageMode::ReferencePersistent,
+        )
         .unwrap();
     assert_ne!(imported.id(), store.id());
     assert_eq!(

@@ -73,22 +73,19 @@ impl TableStoreBuilder {
     /// Restore a new store from a source snapshot, retaining registered schema transforms.
     ///
     /// A fresh DB identity and snapshot chain are created; the builder's DB ID is ignored.
-    /// Bucket ranges come from the source manifest, not the builder. The source WAL is not replayed.
-    /// Import all source ranges using persistent references. The caller must retain source files.
-    /// TableStore import policy is unchanged; explicit policies are provided by the DB API.
+    /// `None` imports all source ranges; explicit ranges select a subset using the selected storage policy.
+    /// The builder's bucket ranges are ignored, and the source WAL is not replayed.
     pub fn open_new_with_manifest_path(
         self,
         manifest_path: impl Into<String>,
+        ranges: Option<Vec<RangeInclusive<u16>>>,
+        storage_mode: ImportStorageMode,
     ) -> Result<TableStore> {
         Ok(TableStore {
             db: Arc::new(
                 self.transforms
                     .apply_to(self.builder)?
-                    .open_new_with_manifest_path(
-                        manifest_path,
-                        None,
-                        ImportStorageMode::ReferencePersistent,
-                    )?,
+                    .open_new_with_manifest_path(manifest_path, ranges, storage_mode)?,
             ),
         })
     }
