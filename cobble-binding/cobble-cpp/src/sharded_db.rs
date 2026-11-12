@@ -1,4 +1,4 @@
-use cobble_binding::{Config, Db, RecoveryMode, WriteOptions};
+use cobble_binding::{Config, Db, RecoveryMode, RescaleOptions, WriteOptions};
 use std::{ops::RangeInclusive, sync::Arc, time::Duration};
 
 use crate::{
@@ -384,6 +384,7 @@ fn import_storage_mode(mode: u8) -> BridgeResult<cobble_binding::ImportStorageMo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn native_sharded_database_expand_bucket(
     db: &NativeShardedDatabase,
     source_db_id: &str,
@@ -392,20 +393,27 @@ pub(crate) fn native_sharded_database_expand_bucket(
     has_ranges: bool,
     ranges: Vec<ffi::NativeRange>,
     storage_mode: u8,
+    snapshot_before: bool,
+    snapshot_after: bool,
 ) -> BridgeResult<u64> {
     let ranges = has_ranges
         .then(|| bucket_ranges_from_values(ranges, "expand"))
         .transpose()?;
     db.db
-        .expand_bucket_with_storage_mode(
+        .expand_bucket_with_options(
             source_db_id,
             has_snapshot_id.then_some(snapshot_id),
             ranges,
             import_storage_mode(storage_mode)?,
+            RescaleOptions {
+                snapshot_before,
+                snapshot_after,
+            },
         )
         .map_err(format_cobble_error)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn native_sharded_database_expand_bucket_from_manifest(
     db: &NativeShardedDatabase,
     source_db_id: &str,
@@ -413,16 +421,22 @@ pub(crate) fn native_sharded_database_expand_bucket_from_manifest(
     has_ranges: bool,
     ranges: Vec<ffi::NativeRange>,
     storage_mode: u8,
+    snapshot_before: bool,
+    snapshot_after: bool,
 ) -> BridgeResult<u64> {
     let ranges = has_ranges
         .then(|| bucket_ranges_from_values(ranges, "expand"))
         .transpose()?;
     db.db
-        .expand_bucket_from_manifest(
+        .expand_bucket_from_manifest_with_options(
             source_db_id,
             source_manifest_path,
             ranges,
             import_storage_mode(storage_mode)?,
+            RescaleOptions {
+                snapshot_before,
+                snapshot_after,
+            },
         )
         .map_err(format_cobble_error)
 }
@@ -464,8 +478,21 @@ pub(crate) fn native_sharded_database_wait_for_import_adoption(
 pub(crate) fn native_sharded_database_shrink_bucket(
     db: &NativeShardedDatabase,
     ranges: Vec<ffi::NativeRange>,
-) -> BridgeResult<u64> {
-    db.db
-        .shrink_bucket(bucket_ranges_from_values(ranges, "shrink")?)
-        .map_err(format_cobble_error)
+    snapshot_before: bool,
+    snapshot_after: bool,
+) -> BridgeResult<ffi::NativeOptionalSnapshotId> {
+    let snapshot = db
+        .db
+        .shrink_bucket_with_options(
+            bucket_ranges_from_values(ranges, "shrink")?,
+            RescaleOptions {
+                snapshot_before,
+                snapshot_after,
+            },
+        )
+        .map_err(format_cobble_error)?;
+    Ok(ffi::NativeOptionalSnapshotId {
+        has_snapshot: snapshot.is_some(),
+        snapshot_id: snapshot.unwrap_or_default(),
+    })
 }

@@ -10,6 +10,11 @@ pub(crate) mod ffi {
         end_inclusive: u16,
     }
 
+    struct NativeOptionalSnapshotId {
+        has_snapshot: bool,
+        snapshot_id: u64,
+    }
+
     struct NativeWriteOptions {
         has_ttl_seconds: bool,
         ttl_seconds: u32,
@@ -611,6 +616,8 @@ pub(crate) mod ffi {
             has_ranges: bool,
             ranges: Vec<NativeBucketRange>,
             storage_mode: u8,
+            snapshot_before: bool,
+            snapshot_after: bool,
         ) -> Result<u64>;
         fn native_structured_db_wait_for_import_adoption(
             db: &NativeStructuredDb,
@@ -623,11 +630,15 @@ pub(crate) mod ffi {
             has_ranges: bool,
             ranges: Vec<NativeBucketRange>,
             storage_mode: u8,
+            snapshot_before: bool,
+            snapshot_after: bool,
         ) -> Result<u64>;
         fn native_structured_db_shrink_bucket(
             db: &NativeStructuredDb,
             ranges: Vec<NativeBucketRange>,
-        ) -> Result<u64>;
+            snapshot_before: bool,
+            snapshot_after: bool,
+        ) -> Result<NativeOptionalSnapshotId>;
         fn native_structured_db_close(db: &NativeStructuredDb) -> Result<()>;
 
         fn native_structured_single_db_put_bytes(

@@ -10,4 +10,11 @@ enum class ImportStorageMode : std::uint8_t {
   kReferencePersistentWithCache = 2,
 };
 
+struct RescaleOptions {
+  bool snapshot_before = true;
+  // If disabled, recovery sees the old topology until a later snapshot.
+  // This does not disable automatic or asynchronous adoption safety snapshots.
+  bool snapshot_after = true;
+};
+
 }  // namespace cobble

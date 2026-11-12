@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -138,16 +139,21 @@ class COBBLE_CPP_API Db final {
       std::string_view source_db_id,
       std::optional<SnapshotId> source_snapshot = std::nullopt,
       std::optional<std::span<const BucketRange>> ranges = std::nullopt,
-      ImportStorageMode storage_mode = ImportStorageMode::kAdoptAsync) const;
+      ImportStorageMode storage_mode = ImportStorageMode::kAdoptAsync,
+      RescaleOptions options = {}) const;
   // Imports the exact source manifest, including from a different metadata
   // root. The source root must be configured (READONLY is allowed).
   [[nodiscard]] SnapshotId ExpandBucketFromManifest(
       std::string_view source_db_id, std::string_view source_manifest_path,
       std::optional<std::span<const BucketRange>> ranges = std::nullopt,
-      ImportStorageMode storage_mode = ImportStorageMode::kAdoptAsync) const;
+      ImportStorageMode storage_mode = ImportStorageMode::kAdoptAsync,
+      RescaleOptions options = {}) const;
   void WaitForImportAdoption(std::chrono::milliseconds timeout) const;
   [[nodiscard]] SnapshotId ShrinkBucket(
       std::span<const BucketRange> ranges) const;
+  // Returns the pre-shrink snapshot ID, or nullopt if snapshot_before is false.
+  [[nodiscard]] std::optional<SnapshotId> ShrinkBucket(
+      std::span<const BucketRange> ranges, RescaleOptions options) const;
   void Close() const;
 
  private:

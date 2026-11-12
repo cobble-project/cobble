@@ -1,3 +1,4 @@
+use cobble_binding::RescaleOptions;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -447,6 +448,7 @@ pub(super) fn unchecked_ranges(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn native_structured_db_expand_bucket(
     db: &NativeStructuredDb,
     source_db_id: &str,
@@ -455,19 +457,26 @@ pub(crate) fn native_structured_db_expand_bucket(
     has_ranges: bool,
     values: Vec<ffi::NativeBucketRange>,
     storage_mode: u8,
+    snapshot_before: bool,
+    snapshot_after: bool,
 ) -> BridgeResult<u64> {
     let ranges = has_ranges
         .then(|| unchecked_ranges(values, "expand"))
         .transpose()?;
     db.db
-        .expand_bucket_with_storage_mode(
+        .expand_bucket_with_options(
             source_db_id,
             has_snapshot_id.then_some(snapshot_id),
             ranges,
             import_storage_mode(storage_mode)?,
+            RescaleOptions {
+                snapshot_before,
+                snapshot_after,
+            },
         )
         .map_err(format_error)
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn native_structured_db_expand_bucket_from_manifest(
     db: &NativeStructuredDb,
     source_db_id: &str,
@@ -475,16 +484,22 @@ pub(crate) fn native_structured_db_expand_bucket_from_manifest(
     has_ranges: bool,
     values: Vec<ffi::NativeBucketRange>,
     storage_mode: u8,
+    snapshot_before: bool,
+    snapshot_after: bool,
 ) -> BridgeResult<u64> {
     let ranges = has_ranges
         .then(|| unchecked_ranges(values, "expand"))
         .transpose()?;
     db.db
-        .expand_bucket_from_manifest(
+        .expand_bucket_from_manifest_with_options(
             source_db_id,
             source_manifest_path,
             ranges,
             import_storage_mode(storage_mode)?,
+            RescaleOptions {
+                snapshot_before,
+                snapshot_after,
+            },
         )
         .map_err(format_error)
 }
@@ -502,8 +517,21 @@ pub(crate) fn native_structured_db_wait_for_import_adoption(
 pub(crate) fn native_structured_db_shrink_bucket(
     db: &NativeStructuredDb,
     values: Vec<ffi::NativeBucketRange>,
-) -> BridgeResult<u64> {
-    db.db
-        .shrink_bucket(unchecked_ranges(values, "shrink")?)
-        .map_err(format_error)
+    snapshot_before: bool,
+    snapshot_after: bool,
+) -> BridgeResult<ffi::NativeOptionalSnapshotId> {
+    let snapshot = db
+        .db
+        .shrink_bucket_with_options(
+            unchecked_ranges(values, "shrink")?,
+            RescaleOptions {
+                snapshot_before,
+                snapshot_after,
+            },
+        )
+        .map_err(format_error)?;
+    Ok(ffi::NativeOptionalSnapshotId {
+        has_snapshot: snapshot.is_some(),
+        snapshot_id: snapshot.unwrap_or_default(),
+    })
 }

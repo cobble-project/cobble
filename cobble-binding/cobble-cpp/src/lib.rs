@@ -120,6 +120,10 @@ mod ffi {
         first: u16,
         last: u16,
     }
+    struct NativeOptionalSnapshotId {
+        has_snapshot: bool,
+        snapshot_id: u64,
+    }
     struct NativeFamily {
         name: String,
         id: u8,
@@ -620,6 +624,8 @@ mod ffi {
             has_ranges: bool,
             ranges: Vec<NativeRange>,
             storage_mode: u8,
+            snapshot_before: bool,
+            snapshot_after: bool,
         ) -> Result<u64>;
         fn native_sharded_database_wait_for_import_adoption(
             db: &NativeShardedDatabase,
@@ -632,11 +638,15 @@ mod ffi {
             has_ranges: bool,
             ranges: Vec<NativeRange>,
             storage_mode: u8,
+            snapshot_before: bool,
+            snapshot_after: bool,
         ) -> Result<u64>;
         fn native_sharded_database_shrink_bucket(
             db: &NativeShardedDatabase,
             ranges: Vec<NativeRange>,
-        ) -> Result<u64>;
+            snapshot_before: bool,
+            snapshot_after: bool,
+        ) -> Result<NativeOptionalSnapshotId>;
 
         fn native_read_only_database_open(
             config_json: &str,

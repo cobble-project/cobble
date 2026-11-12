@@ -22,6 +22,71 @@ std::string Config(const std::filesystem::path& root,
          R"(],"num_columns":1,"total_buckets":4,"memtable_capacity":"8KB","base_file_size":"16KB","block_cache_size":0,"wal_enabled":false})";
 }
 
+void CheckSnapshotRange(const cobble::ShardSnapshot& snapshot,
+                        cobble::BucketId end) {
+  COBBLE_CHECK(snapshot.ranges.size() == 1);
+  COBBLE_CHECK(snapshot.ranges.front().start_inclusive == 0);
+  COBBLE_CHECK(snapshot.ranges.front().end_inclusive == end);
+}
+
+template <typename Database, typename Put, typename Get>
+void VerifySnapshotOptions(std::string_view config, const Database& source,
+                           const cobble::ShardSnapshot& snapshot,
+                           std::span<const cobble::BucketRange> source_ranges,
+                           std::span<const cobble::BucketRange> target_ranges,
+                           Put put, Get get) {
+  auto target = Database::Open(config, target_ranges);
+  put(target, 0);
+  constexpr auto mode = cobble::ImportStorageMode::kReferencePersistent;
+  const std::array options = {
+      cobble::RescaleOptions{false, false}, cobble::RescaleOptions{true, false},
+      cobble::RescaleOptions{false, true}, cobble::RescaleOptions{}};
+  for (const bool from_manifest : {false, true}) {
+    for (const auto option : options) {
+      const auto snapshot_count =
+          option.snapshot_before + option.snapshot_after;
+      const auto before = target.TakeSnapshot().snapshot_id;
+      const auto imported =
+          from_manifest ? target.ExpandBucketFromManifest(
+                              source.Id(), snapshot.manifest_path,
+                              source_ranges, mode, option)
+                        : target.ExpandBucket(source.Id(), snapshot.snapshot_id,
+                                              source_ranges, mode, option);
+      COBBLE_CHECK(imported == snapshot.snapshot_id);
+      COBBLE_CHECK(get(target, 2));
+      COBBLE_CHECK(get(target, 0));
+      const auto expanded = target.TakeSnapshot();
+      COBBLE_CHECK(expanded.snapshot_id == before + snapshot_count + 1);
+      CheckSnapshotRange(expanded, 3);
+      if (option.snapshot_before) {
+        CheckSnapshotRange(target.GetShardSnapshot(before + 1), 1);
+      }
+      if (option.snapshot_after) {
+        CheckSnapshotRange(target.GetShardSnapshot(expanded.snapshot_id - 1),
+                           3);
+      }
+
+      const auto pre_shrink = target.ShrinkBucket(source_ranges, option);
+      COBBLE_CHECK(pre_shrink.has_value() == option.snapshot_before);
+      if (pre_shrink) {
+        COBBLE_CHECK(*pre_shrink == expanded.snapshot_id + 1);
+        CheckSnapshotRange(target.GetShardSnapshot(*pre_shrink), 3);
+      }
+      COBBLE_CHECK(!target.Get(2, cobble_test::Bytes("moved")).Found());
+      COBBLE_CHECK(!target.Get(2, cobble_test::Bytes("active")).Found());
+      COBBLE_CHECK(get(target, 0));
+      const auto shrunk = target.TakeSnapshot();
+      COBBLE_CHECK(shrunk.snapshot_id ==
+                   expanded.snapshot_id + snapshot_count + 1);
+      CheckSnapshotRange(shrunk, 1);
+      if (option.snapshot_after) {
+        CheckSnapshotRange(target.GetShardSnapshot(shrunk.snapshot_id - 1), 1);
+      }
+    }
+  }
+  target.Close();
+}
+
 template <typename Database, typename Put, typename Get>
 void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
   const auto old_root = root / "old";
@@ -30,7 +95,7 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
   const std::array target_ranges = {cobble::BucketRange{0, 1}};
   const auto target_config = Config(new_root, old_root);
   auto source = Database::Open(Config(old_root), source_ranges);
-  put(source);
+  put(source, 2);
   const auto snapshot = source.TakeSnapshot();
   COBBLE_CHECK(source.RetainSnapshot(snapshot.snapshot_id));
 
@@ -68,7 +133,7 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
     (void)target.ExpandBucketFromManifest(source.Id(), snapshot.manifest_path,
                                           ranges, mode);
     target.WaitForImportAdoption(std::chrono::seconds(10));
-    COBBLE_CHECK(get(target));
+    COBBLE_CHECK(get(target, 2));
     const auto imported = target.TakeSnapshot();
     COBBLE_CHECK(imported.manifest_path.starts_with(
         cobble_test::FileUrl(new_root) + "/"));
@@ -76,7 +141,7 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
     target.Close();
     auto resumed =
         Database::ResumeFromSnapshot(target_config, imported.snapshot_id, id);
-    COBBLE_CHECK(get(resumed));
+    COBBLE_CHECK(get(resumed, 2));
     resumed.Close();
     const std::array imported_ranges = {cobble::BucketRange{2, 2}};
     for (bool from_manifest : {false, true}) {
@@ -89,10 +154,12 @@ void VerifyChangedRoot(const std::filesystem::path& root, Put put, Get get) {
                                      source.Id(), imported_ranges, mode);
       COBBLE_CHECK(fresh.Id() != source.Id());
       fresh.WaitForImportAdoption(std::chrono::seconds(10));
-      COBBLE_CHECK(get(fresh));
+      COBBLE_CHECK(get(fresh, 2));
       fresh.Close();
     }
   }
+  VerifySnapshotOptions(Config(old_root), source, snapshot, source_ranges,
+                        target_ranges, put, get);
   source.Close();
 }
 
@@ -103,39 +170,40 @@ int main() {
     cobble_test::TempDirectory root("cobble-cpp-rescale-manifest");
     VerifyChangedRoot<cobble::Db>(
         root.path() / "raw",
-        [](auto& db) {
-          db.Put(2, cobble_test::Bytes("moved"), 0,
+        [](auto& db, cobble::BucketId bucket) {
+          db.Put(bucket, cobble_test::Bytes("moved"), 0,
                  cobble_test::Bytes("value"));
           db.SwitchMemtableType(cobble::MemtableType::kSkiplist, true);
-          db.Put(2, cobble_test::Bytes("active"), 0,
+          db.Put(bucket, cobble_test::Bytes("active"), 0,
                  cobble_test::Bytes("tail"));
         },
-        [](auto& db) {
+        [](auto& db, cobble::BucketId bucket) {
           return cobble_test::String(
-                     db.Get(2, cobble_test::Bytes("moved")).Column(0)) ==
+                     db.Get(bucket, cobble_test::Bytes("moved")).Column(0)) ==
                      "value" &&
                  cobble_test::String(
-                     db.Get(2, cobble_test::Bytes("active")).Column(0)) ==
+                     db.Get(bucket, cobble_test::Bytes("active")).Column(0)) ==
                      "tail";
         });
     VerifyChangedRoot<cobble::structured::Db>(
         root.path() / "structured",
-        [](auto& db) {
-          db.PutBytes(2, cobble_test::Bytes("moved"), 0,
+        [](auto& db, cobble::BucketId bucket) {
+          db.PutBytes(bucket, cobble_test::Bytes("moved"), 0,
                       cobble_test::Bytes("value"));
           db.SwitchMemtableType(cobble::MemtableType::kSkiplist, true);
-          db.PutBytes(2, cobble_test::Bytes("active"), 0,
+          db.PutBytes(bucket, cobble_test::Bytes("active"), 0,
                       cobble_test::Bytes("tail"));
         },
-        [](auto& db) {
+        [](auto& db, cobble::BucketId bucket) {
           return cobble_test::String(
-                     db.Get(2, cobble_test::Bytes("moved")).Bytes(0)) ==
+                     db.Get(bucket, cobble_test::Bytes("moved")).Bytes(0)) ==
                      "value" &&
                  cobble_test::String(
-                     db.Get(2, cobble_test::Bytes("active")).Bytes(0)) ==
+                     db.Get(bucket, cobble_test::Bytes("active")).Bytes(0)) ==
                      "tail";
         });
-    std::cout << "raw and structured changed-root manifest import passed\n";
+    std::cout
+        << "raw and structured manifest import and rescale options passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
