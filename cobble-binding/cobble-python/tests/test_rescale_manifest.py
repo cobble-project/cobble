@@ -121,3 +121,90 @@ def test_expand_manifest_changed_root(tmp_path: Path, structured: bool, mode) ->
             storage_mode=mode,
         )
     source.close()
+
+
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("from_manifest", [False, True], ids=["snapshot-id", "manifest"])
+def test_rescale_snapshot_options(
+    tmp_path: Path, structured: bool, from_manifest: bool
+) -> None:
+    database = pycobble.StructuredDb if structured else pycobble.Db
+    db_config = config(tmp_path)
+    source_ranges = [pycobble.BucketRange(2, 3)]
+    target_ranges = [pycobble.BucketRange(0, 1)]
+    mode = pycobble.ImportStorageMode.REFERENCE_PERSISTENT
+
+    def check_range(snapshot: pycobble.ShardSnapshot, end: int) -> None:
+        assert [
+            (item.start_inclusive, item.end_inclusive) for item in snapshot.ranges
+        ] == [(0, end)]
+
+    with (
+        database.open(db_config, source_ranges) as source,
+        database.open(db_config, target_ranges) as target,
+    ):
+        if structured:
+            source.put_bytes(2, b"moved", 0, b"value")
+            target.put_bytes(0, b"kept", 0, b"original")
+        else:
+            source.put(2, b"moved", 0, b"value")
+            target.put(0, b"kept", 0, b"original")
+        snapshot = source.take_snapshot()
+        assert source.retain_snapshot(snapshot.snapshot_id)
+
+        def value(bucket: int, key: bytes) -> bytes:
+            row = target.get(bucket, key)
+            return bytes(row.bytes(0) if structured else row.column(0))
+
+        for snapshot_before, snapshot_after in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
+            options = {
+                "snapshot_before": snapshot_before,
+                "snapshot_after": snapshot_after,
+            }
+            snapshot_count = snapshot_before + snapshot_after
+            before = target.take_snapshot().snapshot_id
+            if from_manifest:
+                imported = target.expand_bucket_from_manifest(
+                    source.id,
+                    snapshot.manifest_path,
+                    ranges=source_ranges,
+                    storage_mode=mode,
+                    **options,
+                )
+            else:
+                imported = target.expand_bucket(
+                    source.id,
+                    source_snapshot=snapshot.snapshot_id,
+                    ranges=source_ranges,
+                    storage_mode=mode,
+                    **options,
+                )
+            assert imported == snapshot.snapshot_id
+            assert value(2, b"moved") == b"value"
+            assert value(0, b"kept") == b"original"
+            expanded = target.take_snapshot()
+            assert expanded.snapshot_id == before + snapshot_count + 1
+            check_range(expanded, 3)
+            if snapshot_before:
+                check_range(target.get_shard_snapshot(before + 1), 1)
+            if snapshot_after:
+                check_range(target.get_shard_snapshot(expanded.snapshot_id - 1), 3)
+
+            pre_shrink = target.shrink_bucket(source_ranges, **options)
+            if snapshot_before:
+                assert pre_shrink == expanded.snapshot_id + 1
+                check_range(target.get_shard_snapshot(pre_shrink), 3)
+            else:
+                assert pre_shrink is None
+            assert not target.get(2, b"moved").found
+            assert value(0, b"kept") == b"original"
+            shrunk = target.take_snapshot()
+            assert shrunk.snapshot_id == expanded.snapshot_id + snapshot_count + 1
+            check_range(shrunk, 1)
+            if snapshot_after:
+                check_range(target.get_shard_snapshot(shrunk.snapshot_id - 1), 1)

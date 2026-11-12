@@ -11,7 +11,7 @@ use crate::snapshot::{
 };
 use crate::types::{PyBufferResult, PyImportStorageMode, PyMemtableType, PyRecoveryMode};
 use crate::write_batch::PyWriteBatch;
-use cobble_binding::{Config, Db, ReadOptions, VolumeDescriptor, WriteOptions};
+use cobble_binding::{Config, Db, ReadOptions, RescaleOptions, VolumeDescriptor, WriteOptions};
 use pyo3::prelude::*;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -588,7 +588,12 @@ impl PyDb {
         py.detach(move || db.switch_to_snapshot(snapshot_id).map_err(map_error))
     }
 
-    #[pyo3(signature = (source_db_id, *, source_snapshot=None, ranges=None, storage_mode=PyImportStorageMode::AdoptAsync))]
+    /// Import buckets from a source snapshot and return its ID.
+    ///
+    /// With snapshot_after=False, recovery sees the old topology until a later
+    /// snapshot. Automatic and asynchronous adoption safety snapshots are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (source_db_id, *, source_snapshot=None, ranges=None, storage_mode=PyImportStorageMode::AdoptAsync, snapshot_before=true, snapshot_after=true))]
     fn expand_bucket(
         &self,
         py: Python<'_>,
@@ -596,6 +601,8 @@ impl PyDb {
         source_snapshot: Option<u64>,
         ranges: Option<Vec<PyBucketRange>>,
         storage_mode: PyImportStorageMode,
+        snapshot_before: bool,
+        snapshot_after: bool,
     ) -> PyResult<u64> {
         self.ensure_open()?;
         let ranges = ranges
@@ -603,18 +610,26 @@ impl PyDb {
             .transpose()?;
         let db = Arc::clone(&self.db);
         py.detach(move || {
-            db.expand_bucket_with_storage_mode(
+            db.expand_bucket_with_options(
                 source_db_id,
                 source_snapshot,
                 ranges,
                 storage_mode.into(),
+                RescaleOptions {
+                    snapshot_before,
+                    snapshot_after,
+                },
             )
             .map_err(map_error)
         })
     }
 
     /// Import an exact source manifest; its root must be configured (READONLY is allowed).
-    #[pyo3(signature = (source_db_id, source_manifest_path, *, ranges=None, storage_mode=PyImportStorageMode::AdoptAsync))]
+    ///
+    /// With snapshot_after=False, recovery sees the old topology until a later
+    /// snapshot. Automatic and asynchronous adoption safety snapshots are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (source_db_id, source_manifest_path, *, ranges=None, storage_mode=PyImportStorageMode::AdoptAsync, snapshot_before=true, snapshot_after=true))]
     fn expand_bucket_from_manifest(
         &self,
         py: Python<'_>,
@@ -622,6 +637,8 @@ impl PyDb {
         source_manifest_path: String,
         ranges: Option<Vec<PyBucketRange>>,
         storage_mode: PyImportStorageMode,
+        snapshot_before: bool,
+        snapshot_after: bool,
     ) -> PyResult<u64> {
         self.ensure_open()?;
         let ranges = ranges
@@ -629,11 +646,15 @@ impl PyDb {
             .transpose()?;
         let db = Arc::clone(&self.db);
         py.detach(move || {
-            db.expand_bucket_from_manifest(
+            db.expand_bucket_from_manifest_with_options(
                 source_db_id,
                 source_manifest_path,
                 ranges,
                 storage_mode.into(),
+                RescaleOptions {
+                    snapshot_before,
+                    snapshot_after,
+                },
             )
             .map_err(map_error)
         })
@@ -652,11 +673,29 @@ impl PyDb {
         py.detach(move || db.wait_for_import_adoption(timeout).map_err(map_error))
     }
 
-    fn shrink_bucket(&self, py: Python<'_>, ranges: Vec<PyBucketRange>) -> PyResult<u64> {
+    /// Return the pre-shrink snapshot ID, or None if snapshot_before is false.
+    /// With snapshot_after=False, recovery sees the old topology until a later snapshot.
+    #[pyo3(signature = (ranges, *, snapshot_before=true, snapshot_after=true))]
+    fn shrink_bucket(
+        &self,
+        py: Python<'_>,
+        ranges: Vec<PyBucketRange>,
+        snapshot_before: bool,
+        snapshot_after: bool,
+    ) -> PyResult<Option<u64>> {
         self.ensure_open()?;
         let ranges = Self::unchecked_ranges(ranges, "shrink")?;
         let db = Arc::clone(&self.db);
-        py.detach(move || db.shrink_bucket(ranges).map_err(map_error))
+        py.detach(move || {
+            db.shrink_bucket_with_options(
+                ranges,
+                RescaleOptions {
+                    snapshot_before,
+                    snapshot_after,
+                },
+            )
+            .map_err(map_error)
+        })
     }
 
     fn current_schema(&self, py: Python<'_>) -> PyResult<PySchema> {
