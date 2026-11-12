@@ -27,7 +27,7 @@ use cobble_binding::structured::{
     DataStructureDb, PriorityQueue as CobblePriorityQueue, StructuredColumnValue,
     StructuredDbIterator, StructuredScanSplit, StructuredScanSplitScanner,
 };
-use cobble_binding::{Config, RecoveryMode};
+use cobble_binding::{Config, RecoveryMode, RescaleOptions};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jintArray, jlong, jobject, jstring};
@@ -3236,6 +3236,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucket(
     range_starts: JIntArray,
     range_ends: JIntArray,
     storage_mode: jint,
+    snapshot_before: jboolean,
+    snapshot_after: jboolean,
 ) -> jlong {
     let Some(db) = db_from_handle(&mut env, handle) else {
         return 0;
@@ -3277,7 +3279,16 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucket(
             return 0;
         }
     };
-    match db.expand_bucket_with_storage_mode(source_db_id, snapshot_id, ranges, storage_mode) {
+    match db.expand_bucket_with_options(
+        source_db_id,
+        snapshot_id,
+        ranges,
+        storage_mode,
+        RescaleOptions {
+            snapshot_before: snapshot_before != JNI_FALSE,
+            snapshot_after: snapshot_after != JNI_FALSE,
+        },
+    ) {
         Ok(v) => v as jlong,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -3296,6 +3307,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucketFromManifest(
     range_starts: JIntArray,
     range_ends: JIntArray,
     storage_mode: jint,
+    snapshot_before: jboolean,
+    snapshot_after: jboolean,
 ) -> jlong {
     let Some(db) = db_from_handle(&mut env, native_handle) else {
         return 0;
@@ -3319,7 +3332,16 @@ pub extern "system" fn Java_io_cobble_structured_Db_expandBucketFromManifest(
     } else {
         Some(ranges)
     };
-    match db.expand_bucket_from_manifest(source_db_id, source_manifest_path, ranges, storage_mode) {
+    match db.expand_bucket_from_manifest_with_options(
+        source_db_id,
+        source_manifest_path,
+        ranges,
+        storage_mode,
+        RescaleOptions {
+            snapshot_before: snapshot_before != JNI_FALSE,
+            snapshot_after: snapshot_after != JNI_FALSE,
+        },
+    ) {
         Ok(v) => v as jlong,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
@@ -3360,6 +3382,8 @@ pub extern "system" fn Java_io_cobble_structured_Db_shrinkBucket(
     handle: jlong,
     range_starts: JIntArray,
     range_ends: JIntArray,
+    snapshot_before: jboolean,
+    snapshot_after: jboolean,
 ) -> jlong {
     let Some(db) = db_from_handle(&mut env, handle) else {
         return 0;
@@ -3375,8 +3399,15 @@ pub extern "system" fn Java_io_cobble_structured_Db_shrinkBucket(
         throw_illegal_argument(&mut env, "shrink ranges must not be empty".to_string());
         return 0;
     }
-    match db.shrink_bucket(ranges) {
-        Ok(v) => v as jlong,
+    match db.shrink_bucket_with_options(
+        ranges,
+        RescaleOptions {
+            snapshot_before: snapshot_before != JNI_FALSE,
+            snapshot_after: snapshot_after != JNI_FALSE,
+        },
+    ) {
+        Ok(Some(id)) => id as jlong,
+        Ok(None) => -1,
         Err(err) => {
             throw_illegal_state(&mut env, err.to_string());
             0

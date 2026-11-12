@@ -2301,6 +2301,93 @@ class DbBindingTest {
                         valueBytes("rescale-target-v", 0),
                         target.get(0, keyBytes("rescale-target", 0), 0));
                 assertNull(target.get(2, keyBytes("rescale-source", 2), 0));
+
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                target.expandBucket(
+                                        source.id(),
+                                        shardSnapshot.snapshotId,
+                                        new int[] {2},
+                                        new int[] {3},
+                                        null,
+                                        new RescaleOptions()));
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                target.expandBucket(
+                                        source.id(),
+                                        shardSnapshot.snapshotId,
+                                        new int[] {2},
+                                        new int[] {3},
+                                        ImportStorageMode.REFERENCE_PERSISTENT,
+                                        null));
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> target.shrinkBucket(new int[] {2}, new int[] {3}, null));
+
+                for (boolean fromManifest : new boolean[] {false, true}) {
+                    for (int mask = 0; mask < 4; mask++) {
+                        RescaleOptions options = new RescaleOptions();
+                        assertTrue(options.snapshotBefore);
+                        assertTrue(options.snapshotAfter);
+                        options.snapshotBefore = (mask & 1) != 0;
+                        options.snapshotAfter = (mask & 2) != 0;
+                        int immediateSnapshots =
+                                (options.snapshotBefore ? 1 : 0) + (options.snapshotAfter ? 1 : 0);
+                        ShardSnapshot before = target.snapshot();
+                        long imported =
+                                fromManifest
+                                        ? target.expandBucketFromManifest(
+                                                source.id(),
+                                                shardSnapshot.manifestPath,
+                                                new int[] {2},
+                                                new int[] {3},
+                                                ImportStorageMode.REFERENCE_PERSISTENT,
+                                                options)
+                                        : target.expandBucket(
+                                                source.id(),
+                                                shardSnapshot.snapshotId,
+                                                new int[] {2},
+                                                new int[] {3},
+                                                ImportStorageMode.REFERENCE_PERSISTENT,
+                                                options);
+                        assertEquals(shardSnapshot.snapshotId, imported);
+                        assertArrayEquals(
+                                valueBytes("rescale-source-v", 2),
+                                target.get(2, keyBytes("rescale-source", 2), 0));
+                        ShardSnapshot expandedSnapshot = target.snapshot();
+                        assertEquals(
+                                before.snapshotId + immediateSnapshots + 1,
+                                expandedSnapshot.snapshotId);
+                        assertEquals(3, expandedSnapshot.ranges.get(0).end);
+                        assertEquals(
+                                options.snapshotAfter ? 3 : 1,
+                                target.getShardSnapshot(expandedSnapshot.snapshotId - 1)
+                                        .ranges
+                                        .get(0)
+                                        .end);
+                        long preShrink = target.shrinkBucket(new int[] {2}, new int[] {3}, options);
+                        assertEquals(
+                                options.snapshotBefore ? expandedSnapshot.snapshotId + 1 : -1L,
+                                preShrink);
+                        if (options.snapshotBefore) {
+                            assertEquals(3, target.getShardSnapshot(preShrink).ranges.get(0).end);
+                        }
+                        assertArrayEquals(
+                                valueBytes("rescale-target-v", 0),
+                                target.get(0, keyBytes("rescale-target", 0), 0));
+                        assertNull(target.get(2, keyBytes("rescale-source", 2), 0));
+                        ShardSnapshot shrunk = target.snapshot();
+                        assertEquals(
+                                expandedSnapshot.snapshotId + immediateSnapshots + 1,
+                                shrunk.snapshotId);
+                        assertEquals(1, shrunk.ranges.get(0).end);
+                        assertEquals(
+                                options.snapshotAfter ? 1 : 3,
+                                target.getShardSnapshot(shrunk.snapshotId - 1).ranges.get(0).end);
+                    }
+                }
             }
         }
     }

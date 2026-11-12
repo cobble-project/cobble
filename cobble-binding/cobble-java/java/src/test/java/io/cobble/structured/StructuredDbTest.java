@@ -4,6 +4,7 @@ import io.cobble.Config;
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
 import io.cobble.MetricSample;
+import io.cobble.RescaleOptions;
 import io.cobble.ShardSnapshot;
 
 import org.junit.jupiter.api.Test;
@@ -828,6 +829,105 @@ class StructuredDbTest {
                         target.get(0, "bucket-0".getBytes(StandardCharsets.UTF_8), "value-state"));
                 assertNull(
                         target.get(2, "bucket-2".getBytes(StandardCharsets.UTF_8), "value-state"));
+
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                target.expandBucketFromManifest(
+                                        source.id(),
+                                        snapshot.manifestPath,
+                                        new int[] {2},
+                                        new int[] {3},
+                                        null,
+                                        new RescaleOptions()));
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                target.expandBucketFromManifest(
+                                        source.id(),
+                                        snapshot.manifestPath,
+                                        new int[] {2},
+                                        new int[] {3},
+                                        ImportStorageMode.REFERENCE_PERSISTENT,
+                                        null));
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> target.shrinkBucket(new int[] {2}, new int[] {3}, null));
+
+                for (boolean fromManifest : new boolean[] {false, true}) {
+                    for (int mask = 0; mask < 4; mask++) {
+                        RescaleOptions options = new RescaleOptions();
+                        assertTrue(options.snapshotBefore);
+                        assertTrue(options.snapshotAfter);
+                        options.snapshotBefore = (mask & 1) != 0;
+                        options.snapshotAfter = (mask & 2) != 0;
+                        int immediateSnapshots =
+                                (options.snapshotBefore ? 1 : 0) + (options.snapshotAfter ? 1 : 0);
+                        ShardSnapshot before = target.snapshot();
+                        long imported =
+                                fromManifest
+                                        ? target.expandBucketFromManifest(
+                                                source.id(),
+                                                snapshot.manifestPath,
+                                                new int[] {2},
+                                                new int[] {3},
+                                                ImportStorageMode.REFERENCE_PERSISTENT,
+                                                options)
+                                        : target.expandBucket(
+                                                source.id(),
+                                                snapshot.snapshotId,
+                                                new int[] {2},
+                                                new int[] {3},
+                                                ImportStorageMode.REFERENCE_PERSISTENT,
+                                                options);
+                        assertEquals(snapshot.snapshotId, imported);
+                        assertArrayEquals(
+                                "value-2".getBytes(StandardCharsets.UTF_8),
+                                target.get(
+                                                2,
+                                                "bucket-2".getBytes(StandardCharsets.UTF_8),
+                                                "value-state")
+                                        .getBytes(0));
+                        ShardSnapshot expandedSnapshot = target.snapshot();
+                        assertEquals(
+                                before.snapshotId + immediateSnapshots + 1,
+                                expandedSnapshot.snapshotId);
+                        assertEquals(3, expandedSnapshot.ranges.get(0).end);
+                        assertEquals(
+                                options.snapshotAfter ? 3 : 1,
+                                target.getShardSnapshot(expandedSnapshot.snapshotId - 1)
+                                        .ranges
+                                        .get(0)
+                                        .end);
+                        long preShrink = target.shrinkBucket(new int[] {2}, new int[] {3}, options);
+                        assertEquals(
+                                options.snapshotBefore ? expandedSnapshot.snapshotId + 1 : -1L,
+                                preShrink);
+                        if (options.snapshotBefore) {
+                            assertEquals(3, target.getShardSnapshot(preShrink).ranges.get(0).end);
+                        }
+                        assertArrayEquals(
+                                "value-0".getBytes(StandardCharsets.UTF_8),
+                                target.get(
+                                                0,
+                                                "bucket-0".getBytes(StandardCharsets.UTF_8),
+                                                "value-state")
+                                        .getBytes(0));
+                        assertNull(
+                                target.get(
+                                        2,
+                                        "bucket-2".getBytes(StandardCharsets.UTF_8),
+                                        "value-state"));
+                        ShardSnapshot shrunk = target.snapshot();
+                        assertEquals(
+                                expandedSnapshot.snapshotId + immediateSnapshots + 1,
+                                shrunk.snapshotId);
+                        assertEquals(1, shrunk.ranges.get(0).end);
+                        assertEquals(
+                                options.snapshotAfter ? 1 : 3,
+                                target.getShardSnapshot(shrunk.snapshotId - 1).ranges.get(0).end);
+                    }
+                }
             }
         }
     }

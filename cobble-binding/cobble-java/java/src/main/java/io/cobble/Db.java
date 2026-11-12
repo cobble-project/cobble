@@ -1124,8 +1124,28 @@ public final class Db extends NativeObject {
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
             ImportStorageMode storageMode) {
+        return expandBucket(
+                sourceDbId,
+                snapshotId,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                storageMode,
+                new RescaleOptions());
+    }
+
+    /** Expand with snapshot options, returning the source snapshot ID. */
+    public long expandBucket(
+            String sourceDbId,
+            long snapshotId,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode,
+            RescaleOptions options) {
         if (storageMode == null) {
             throw new IllegalArgumentException("storageMode must not be null");
+        }
+        if (options == null) {
+            throw new IllegalArgumentException("options must not be null");
         }
         return expandBucket(
                 nativeHandle,
@@ -1133,7 +1153,9 @@ public final class Db extends NativeObject {
                 snapshotId,
                 rangeStartsInclusive,
                 rangeEndsInclusive,
-                storageMode.ordinal());
+                storageMode.ordinal(),
+                options.snapshotBefore,
+                options.snapshotAfter);
     }
 
     /** Expand bucket ownership from the latest retained snapshot of the source DB. */
@@ -1157,8 +1179,28 @@ public final class Db extends NativeObject {
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
             ImportStorageMode storageMode) {
+        return expandBucketFromManifest(
+                sourceDbId,
+                sourceManifestPath,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                storageMode,
+                new RescaleOptions());
+    }
+
+    /** Expand from a manifest with snapshot options, returning the source snapshot ID. */
+    public long expandBucketFromManifest(
+            String sourceDbId,
+            String sourceManifestPath,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            ImportStorageMode storageMode,
+            RescaleOptions options) {
         if (storageMode == null) {
             throw new IllegalArgumentException("storageMode must not be null");
+        }
+        if (options == null) {
+            throw new IllegalArgumentException("options must not be null");
         }
         return expandBucketFromManifest(
                 nativeHandle,
@@ -1166,7 +1208,9 @@ public final class Db extends NativeObject {
                 sourceManifestPath,
                 rangeStartsInclusive,
                 rangeEndsInclusive,
-                storageMode.ordinal());
+                storageMode.ordinal(),
+                options.snapshotBefore,
+                options.snapshotAfter);
     }
 
     /** Wait for asynchronous import adoption to finish, for both new DBs and expansion. */
@@ -1176,7 +1220,25 @@ public final class Db extends NativeObject {
 
     /** Shrink bucket ownership by removing the given ranges from the current DB. */
     public long shrinkBucket(int[] rangeStartsInclusive, int[] rangeEndsInclusive) {
-        return shrinkBucket(nativeHandle, rangeStartsInclusive, rangeEndsInclusive);
+        return shrinkBucket(rangeStartsInclusive, rangeEndsInclusive, new RescaleOptions());
+    }
+
+    /**
+     * Shrink with snapshot options.
+     *
+     * @return the pre-operation snapshot ID, or -1 when no pre-operation snapshot was created
+     */
+    public long shrinkBucket(
+            int[] rangeStartsInclusive, int[] rangeEndsInclusive, RescaleOptions options) {
+        if (options == null) {
+            throw new IllegalArgumentException("options must not be null");
+        }
+        return shrinkBucket(
+                nativeHandle,
+                rangeStartsInclusive,
+                rangeEndsInclusive,
+                options.snapshotBefore,
+                options.snapshotAfter);
     }
 
     /**
@@ -1518,7 +1580,9 @@ public final class Db extends NativeObject {
             long snapshotId,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
-            int storageMode);
+            int storageMode,
+            boolean snapshotBefore,
+            boolean snapshotAfter);
 
     private static native long expandBucketFromManifest(
             long nativeHandle,
@@ -1526,12 +1590,18 @@ public final class Db extends NativeObject {
             String sourceManifestPath,
             int[] rangeStartsInclusive,
             int[] rangeEndsInclusive,
-            int storageMode);
+            int storageMode,
+            boolean snapshotBefore,
+            boolean snapshotAfter);
 
     private static native void waitForImportAdoption(long nativeHandle, long timeoutMillis);
 
     private static native long shrinkBucket(
-            long nativeHandle, int[] rangeStartsInclusive, int[] rangeEndsInclusive);
+            long nativeHandle,
+            int[] rangeStartsInclusive,
+            int[] rangeEndsInclusive,
+            boolean snapshotBefore,
+            boolean snapshotAfter);
 
     static native String currentSchemaJson(long nativeHandle);
 
