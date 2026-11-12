@@ -111,6 +111,15 @@ pub(crate) fn table_to_java(env: &mut JNIEnv, table: Table) -> jobject {
     }
 }
 
+pub(crate) fn decode_table_schema(
+    env: &mut JNIEnv,
+    schema_json: JString,
+) -> Result<TableSchema, String> {
+    let schema_json = decode_java_string(env, schema_json)?;
+    serde_json::from_str(&schema_json)
+        .map_err(|error| format!("invalid table schema JSON: {error}"))
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_cobble_table_Table_createNative(
     mut env: JNIEnv,
@@ -129,17 +138,10 @@ pub extern "system" fn Java_io_cobble_table_Table_createNative(
             return std::ptr::null_mut();
         }
     };
-    let schema_json = match decode_java_string(&mut env, schema_json) {
+    let schema = match decode_table_schema(&mut env, schema_json) {
         Ok(value) => value,
         Err(error) => {
             throw_illegal_argument(&mut env, error);
-            return std::ptr::null_mut();
-        }
-    };
-    let schema = match serde_json::from_str::<TableSchema>(&schema_json) {
-        Ok(value) => value,
-        Err(error) => {
-            throw_illegal_argument(&mut env, format!("invalid table schema JSON: {error}"));
             return std::ptr::null_mut();
         }
     };
@@ -809,7 +811,7 @@ fn direct_range<'a>(
     Ok(unsafe { std::slice::from_raw_parts(address.add(offset), end - offset) })
 }
 
-fn throw_table_error(env: &mut JNIEnv, error: TableError) {
+pub(crate) fn throw_table_error(env: &mut JNIEnv, error: TableError) {
     match error {
         TableError::InvalidSchema(message) | TableError::Codec(message) => {
             throw_illegal_argument(env, message)

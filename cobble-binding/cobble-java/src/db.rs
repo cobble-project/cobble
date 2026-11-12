@@ -625,7 +625,7 @@ fn table_db_builder(config: Config) -> cobble_binding::Result<DbBuilder> {
     Ok(builder)
 }
 
-fn validate_total_buckets(env: &mut JNIEnv, config: &Config) -> Option<u16> {
+pub(crate) fn validate_total_buckets(env: &mut JNIEnv, config: &Config) -> Option<u16> {
     let total_buckets = config.total_buckets;
     if total_buckets == 0 || total_buckets > (u16::MAX as u32) + 1 {
         throw_illegal_argument(

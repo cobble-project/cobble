@@ -36,5 +36,6 @@ mod table_direct;
 mod table_reader;
 mod table_scan;
 mod table_snapshot;
+mod table_store;
 mod util;
 mod write_options;
