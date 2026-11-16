@@ -313,6 +313,7 @@ impl Db {
         }
         if !initial_import {
             db.adoption_coordinator.enable();
+            db.snapshot_manager.enable_import_cleanup();
             db.start_dedicated_poller();
         }
         Ok(db)
@@ -1695,17 +1696,17 @@ impl Db {
             }));
         }
         let adoption_coordinator = Arc::new(rescale::AdoptionCoordinator::new(
-            (id.clone(), config.clone()),
-            (Arc::clone(&file_manager), Arc::clone(&lsm_tree)),
+            id.clone(),
+            Arc::clone(&file_manager),
             Arc::clone(&db_state),
             Arc::clone(&db_lifecycle),
             Arc::clone(&memtable_manager),
             snapshot_manager.clone(),
-            runtime_manifest_publisher.as_ref().map(Arc::clone),
         ));
         let adoption_tick = {
             let coordinator = Arc::clone(&adoption_coordinator);
-            Arc::new(move || coordinator.tick())
+            let snapshots = snapshot_manager.clone();
+            Arc::new(move || snapshots.poll_imports(|| coordinator.tick()))
         };
         let wal_writer = if config.wal_enabled {
             Some(WalWriter::open(
@@ -1729,6 +1730,17 @@ impl Db {
                     return Err(err);
                 }
             };
+
+        snapshot_manager.install_import_cleanup(
+            id.clone(),
+            config.clone(),
+            Arc::clone(&db_state),
+            &lsm_tree,
+            runtime_manifest_publisher.as_ref(),
+            primary_tiering_worker
+                .as_ref()
+                .map(|worker| worker.wake_signal()),
+        );
 
         // Mark the DB as open before starting background observers so their
         // `ensure_open()` checks pass immediately.

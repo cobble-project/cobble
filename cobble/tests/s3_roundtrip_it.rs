@@ -283,6 +283,185 @@ fn verify_snapshot_cut(config: Config, metadata: &cobble::ShardSnapshotMetadata,
     restored.close().unwrap();
 }
 
+fn wait_for_s3_condition(description: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn s3_adoption_restarts_and_reclaims_historical_snapshot_leases() {
+    if !has_required_env() {
+        eprintln!("skipping S3 adoption test: COBBLE_S3_* env vars are not fully set");
+        return;
+    }
+    use cobble::{Db, ImportStorageMode, RescaleOptions};
+
+    let storage = SnapshotS3Prefix::new();
+    let config = |directory| Config {
+        total_buckets: 4,
+        wal_enabled: false,
+        snapshot_disable_incremental_base_link: true,
+        ..snapshot_config(storage.volume(directory), 0.0)
+    };
+    let records = |directory: &str, db_id: &str, subdir: &str| {
+        let path = format!("objects/{directory}/{db_id}/{subdir}/");
+        storage
+            .runtime
+            .block_on(storage.operator.list(&path))
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .map(|entry| entry.name().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let check_row = |db: &Db, bucket, value: &[u8]| {
+        assert_eq!(
+            db.get(bucket, b"row").unwrap().unwrap()[0].as_deref(),
+            Some(value)
+        );
+    };
+    let a = Db::open(config("source-a"), std::iter::once(2..=2).collect()).unwrap();
+    let b = Db::open(config("source-b"), std::iter::once(3..=3).collect()).unwrap();
+    let a_value = make_value(2, 4096);
+    let b_value = make_value(3, 4096);
+    a.put(2, b"row", 0, a_value.clone()).unwrap();
+    b.put(3, b"row", 0, b_value.clone()).unwrap();
+    let a_snapshot = wait_snapshot(&a);
+    let b_snapshot = wait_snapshot(&b);
+    for snapshot in [&a_snapshot, &b_snapshot] {
+        let manifest = storage.manifest(snapshot);
+        assert!(!manifest["vlog_files"].as_array().unwrap().is_empty());
+        assert!(
+            manifest["tree_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|levels| {
+                    levels
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|level| !level["files"].as_array().unwrap().is_empty())
+                })
+        );
+    }
+
+    let mut target_config = config("target");
+    for directory in ["source-a", "source-b"] {
+        let mut source = storage.volume(directory);
+        source.kinds = 0;
+        source.set_usage(VolumeUsageKind::Readonly);
+        target_config.volumes.push(source);
+    }
+    let mut blocked = target_config.clone();
+    // Leave a durable START and an external recovery point without racing the copy.
+    blocked.volumes[0].size_limit = Some(Size::from_const(1));
+    let target = Db::open(blocked, std::iter::once(0..=1).collect()).unwrap();
+    let target_id = target.id().to_owned();
+    let imports = || records("target", &target_id, "imports");
+    let a_leases = || records("source-a", a.id(), "exports");
+    let b_leases = || records("source-b", b.id(), "exports");
+    assert_eq!(
+        target
+            .expand_bucket_from_manifest_with_options(
+                a.id(),
+                &a_snapshot.manifest_path,
+                None,
+                ImportStorageMode::AdoptAsync,
+                RescaleOptions {
+                    snapshot_before: false,
+                    snapshot_after: false,
+                },
+            )
+            .unwrap(),
+        a_snapshot.snapshot_id
+    );
+    check_row(&target, 2, &a_value);
+    let historical = wait_snapshot(&target);
+    assert!(
+        target
+            .wait_for_import_adoption(Duration::from_millis(50))
+            .is_err()
+    );
+    let pending = imports();
+    assert_eq!(pending.len(), 1);
+    let end = format!("{}.END", pending[0].strip_suffix(".START").unwrap());
+    assert_eq!(a_leases().len(), 1);
+    target.close().unwrap();
+    drop(target);
+
+    let target =
+        Db::resume_from_snapshot(target_config.clone(), historical.snapshot_id, &target_id)
+            .unwrap();
+    // Observe the safety snapshot's END without using the explicit waiter to wake the worker.
+    wait_for_s3_condition("the restarted adoption's END", || imports().contains(&end));
+    let owned = wait_snapshot(&target);
+    assert_eq!(imports().len(), 2);
+    assert!(!a.expire_snapshot(a_snapshot.snapshot_id).unwrap());
+    target.close().unwrap();
+    drop(target);
+
+    let target =
+        Db::resume_from_snapshot(target_config.clone(), owned.snapshot_id, &target_id).unwrap();
+    assert!(
+        target
+            .wait_for_import_adoption(Duration::from_millis(50))
+            .is_err()
+    );
+    assert!(!a.expire_snapshot(a_snapshot.snapshot_id).unwrap());
+    assert!(target.expire_snapshot(historical.snapshot_id).unwrap());
+    wait_for_s3_condition(
+        "historical import records and source lease reclamation",
+        || imports().is_empty() && a_leases().is_empty(),
+    );
+    target
+        .wait_for_import_adoption(Duration::from_secs(60))
+        .unwrap();
+    assert!(a.expire_snapshot(a_snapshot.snapshot_id).unwrap());
+
+    // A new import must activate the same worker again after the first import reached idle.
+    assert_eq!(
+        target
+            .expand_bucket_from_manifest(
+                b.id(),
+                &b_snapshot.manifest_path,
+                None,
+                ImportStorageMode::AdoptAsync,
+            )
+            .unwrap(),
+        b_snapshot.snapshot_id
+    );
+    wait_for_s3_condition("the second import's automatic reclamation", || {
+        imports().is_empty() && b_leases().is_empty()
+    });
+    target
+        .wait_for_import_adoption(Duration::from_secs(60))
+        .unwrap();
+    assert!(b.expire_snapshot(b_snapshot.snapshot_id).unwrap());
+    check_row(&target, 2, &a_value);
+    check_row(&target, 3, &b_value);
+    let adopted = wait_snapshot(&target);
+    target.close().unwrap();
+    drop(target);
+    a.close().unwrap();
+    b.close().unwrap();
+    drop((a, b));
+    storage.delete("source-a");
+    storage.delete("source-b");
+
+    let target =
+        Db::resume_from_snapshot(config("target"), adopted.snapshot_id, target_id).unwrap();
+    check_row(&target, 2, &a_value);
+    check_row(&target, 3, &b_value);
+    target.close().unwrap();
+}
+
 #[test]
 fn s3_snapshot_cleanup_shard_global_and_exported_cases() {
     if !has_required_env() {
@@ -1059,7 +1238,7 @@ fn s3_roundtrip_write_snapshot_resume() {
         ..Config::default()
     };
 
-    // 1 GiB total payload: 131_072 keys x 4 KiB values.
+    // 512 MiB total payload: 131_072 keys x 4 KiB values.
     let value_len = 4096usize;
     let target_bytes = 512 * 1024 * 1024usize;
     let records = target_bytes / value_len;

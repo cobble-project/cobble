@@ -2,6 +2,7 @@ use super::*;
 use crate::db_state::full_bucket_range;
 use crate::file::FileManager;
 use crate::metrics_manager::MetricsManager;
+use crate::rescale_protocol::import_end_name;
 use crate::{Config, DbBuilder, RuntimeManifestMode, VolumeDescriptor};
 use serial_test::serial;
 use size::Size;
@@ -334,13 +335,12 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
         .unwrap(),
     );
     let coordinator = AdoptionCoordinator::new(
-        (target_id.clone(), target_config.clone()),
-        (import_manager.clone(), target.lsm_tree.clone()),
+        target_id.clone(),
+        import_manager.clone(),
         target.db_state.clone(),
         target.db_lifecycle.clone(),
         target.memtable_manager.clone(),
         target.snapshot_manager.clone(),
-        None,
     );
     let publish_start = |export_id: &str| {
         write_export_lease(
@@ -433,6 +433,13 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
     coordinator
         .complete_adoption(&captured, Ok(info(&retry)))
         .unwrap();
+    // Publishing END does not release leases. Snapshot retention owns cleanup.
+    assert!(
+        source_manager
+            .metadata_file_exists_untracked(&export_lease_name("second"))
+            .unwrap()
+    );
+    target.snapshot_manager.reclaim_import_leases().unwrap();
     assert!(load_import_end(&import_manager, "later").unwrap().is_none());
     assert!(
         import_manager
@@ -490,6 +497,218 @@ fn test_changed_root_adoption_lease_cleanup_after_restart() {
             .is_empty()
     );
     assert!(!root.path().join("target").join(source.id()).exists());
+}
+
+#[test]
+#[serial(file)]
+fn adoption_poll_sleeps_between_imports() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        total_buckets: 4,
+        volumes: VolumeDescriptor::single_volume(root.path().to_str().unwrap()),
+        snapshot_disable_incremental_base_link: true,
+        ..Config::default()
+    };
+    let source = Db::open(config.clone(), vec![2..=3]).unwrap();
+    let source_snapshot = snapshot_for_rescale_test(&source);
+    let target = Db::open(config, vec![0..=1]).unwrap();
+    let worker = target.primary_tiering_worker.as_ref().unwrap();
+    worker.stop();
+    worker.join();
+    let snapshots = &target.snapshot_manager;
+
+    snapshots.activate_import_cleanup();
+    snapshots
+        .poll_imports(|| {
+            // Model a new request arriving during a poll which finds no STARTs.
+            snapshots.activate_import_cleanup();
+            Ok(())
+        })
+        .unwrap();
+    let mut advanced = false;
+    snapshots
+        .poll_imports(|| {
+            advanced = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(advanced, "completion lost an activation during the poll");
+
+    // A failed directory listing is not evidence that adoption has no work.
+    let imports = root.path().join(target.id()).join("imports");
+    std::fs::write(&imports, b"not a directory").unwrap();
+    snapshots.activate_import_cleanup();
+    assert!(snapshots.poll_imports(|| Ok(())).is_err());
+    std::fs::remove_file(&imports).unwrap();
+    write_import_end(
+        &target.file_manager,
+        &ImportEnd {
+            version: 1,
+            export_id: "orphan".into(),
+            snapshot_id: 0,
+        },
+    )
+    .unwrap();
+    snapshots.poll_imports(|| Ok(())).unwrap();
+    assert!(
+        load_import_end(&target.file_manager, "orphan")
+            .unwrap()
+            .is_none()
+    );
+
+    let assert_idle = || {
+        // A START that cannot be decoded catches a scan by either half of the poll.
+        let name = import_start_name("idle");
+        target.file_manager.ensure_metadata_dir("imports").unwrap();
+        target
+            .file_manager
+            .write_plain_metadata_file_atomic(&name, b"invalid START")
+            .unwrap();
+        for _ in 0..3 {
+            snapshots
+                .poll_imports(|| panic!("adoption advanced while idle"))
+                .unwrap();
+        }
+        target.file_manager.remove_metadata_file(&name).unwrap();
+    };
+    let previous = snapshot_for_rescale_test(&target);
+    snapshot_for_rescale_test(&target);
+    assert!(target.expire_snapshot(previous.snapshot_id).unwrap());
+    assert!(
+        target
+            .shard_snapshot_metadata(previous.snapshot_id)
+            .is_err()
+    );
+    assert_idle();
+
+    for bucket in [2, 3] {
+        target
+            .expand_bucket_from_manifest_with_options(
+                source.id(),
+                &source_snapshot.manifest_path,
+                Some(std::iter::once(bucket..=bucket).collect()),
+                ImportStorageMode::AdoptAsync,
+                RescaleOptions {
+                    snapshot_before: false,
+                    snapshot_after: false,
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while has_import_starts(&target.file_manager).unwrap() {
+            let mut advanced = false;
+            snapshots
+                .poll_imports(|| {
+                    advanced = true;
+                    target.adoption_coordinator.tick()
+                })
+                .unwrap();
+            assert!(advanced, "pending adoption did not activate the poll");
+            assert!(Instant::now() < deadline, "adoption did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_idle();
+    }
+}
+
+#[test]
+#[serial(file)]
+fn test_snapshot_expiration_defers_failed_upstream_lease_release() {
+    let root = tempfile::tempdir().unwrap();
+    let source_root = root.path().join("source");
+    let target_root = root.path().join("target");
+    let source_config = Config {
+        total_buckets: 8,
+        volumes: VolumeDescriptor::single_volume(source_root.to_str().unwrap()),
+        ..Config::default()
+    };
+    let source = Db::open(source_config, vec![0..=7]).unwrap();
+    let source_snapshot = snapshot_for_rescale_test(&source);
+    let mut target_config = Config {
+        total_buckets: 8,
+        volumes: VolumeDescriptor::single_volume(target_root.to_str().unwrap()),
+        snapshot_retention: Some(1),
+        snapshot_disable_incremental_base_link: true,
+        snapshot_on_flush: false,
+        ..Config::default()
+    };
+    let target = Db::open(target_config.clone(), vec![0..=7]).unwrap();
+    // Control the collector explicitly while the source route is unavailable.
+    let worker = target.primary_tiering_worker.as_ref().unwrap();
+    worker.stop();
+    worker.join();
+    let owned = snapshot_for_rescale_test(&target);
+    write_export_lease(
+        &source.file_manager,
+        &ExportLease {
+            version: 1,
+            export_id: "deferred".into(),
+            source_db_id: source.id().into(),
+            snapshot_id: source_snapshot.snapshot_id,
+            target_db_id: target.id().into(),
+            ranges: vec![0..=7],
+        },
+    )
+    .unwrap();
+    write_import_start(
+        &target.file_manager,
+        &ImportStart {
+            version: 1,
+            export_id: "deferred".into(),
+            source_db_id: source.id().into(),
+            source_manifest_path: source_snapshot.manifest_path.clone(),
+            snapshot_id: source_snapshot.snapshot_id,
+            target_db_id: target.id().into(),
+            ranges: vec![0..=7],
+            import_snapshot_id: None,
+        },
+    )
+    .unwrap();
+    write_import_end(
+        &target.file_manager,
+        &ImportEnd {
+            version: 1,
+            export_id: "deferred".into(),
+            snapshot_id: owned.snapshot_id,
+        },
+    )
+    .unwrap();
+    target.snapshot_manager.activate_import_cleanup();
+    for _ in 0..2 {
+        assert!(
+            target
+                .snapshot_manager
+                .poll_imports(|| target.adoption_coordinator.tick())
+                .is_err(),
+            "failed cleanup must leave the poll active for retry"
+        );
+    }
+    // Both explicit expiration and automatic retention succeed despite the failed release.
+    assert!(target.expire_snapshot(owned.snapshot_id).unwrap());
+    let previous = snapshot_for_rescale_test(&target);
+    let latest = snapshot_for_rescale_test(&target);
+    assert!(
+        target
+            .shard_snapshot_metadata(previous.snapshot_id)
+            .is_err()
+    );
+    assert!(has_import_starts(&target.file_manager).unwrap());
+    assert!(!source.expire_snapshot(source_snapshot.snapshot_id).unwrap());
+    target.close().unwrap();
+    drop(target);
+
+    // Once the source route is restored, the normal background task finishes the durable retry.
+    target_config.volumes.push(VolumeDescriptor::new(
+        source_root.to_str().unwrap(),
+        vec![crate::VolumeUsageKind::Readonly],
+    ));
+    let target = Db::resume_from_snapshot(target_config, latest.snapshot_id, latest.db_id).unwrap();
+    target
+        .wait_for_import_adoption(Duration::from_secs(10))
+        .unwrap();
+    assert!(source.expire_snapshot(source_snapshot.snapshot_id).unwrap());
+    target.close().unwrap();
+    source.close().unwrap();
 }
 
 #[test]

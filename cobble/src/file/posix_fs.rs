@@ -122,7 +122,9 @@ impl FileSystem for PosixFileSystem {
 
     fn exists(&self, path: &str) -> Result<bool> {
         let resolved = self.resolve_path(path);
-        Ok(resolved.exists())
+        resolved.try_exists().map_err(|err| {
+            Error::IoError(format!("Failed to stat {}: {}", resolved.display(), err))
+        })
     }
 
     fn delete(&self, path: &str) -> Result<()> {
@@ -207,13 +209,19 @@ impl FileSystem for PosixFileSystem {
 
     fn list(&self, path: &str) -> Result<Vec<String>> {
         let resolved = self.resolve_path(path);
-        if !resolved.exists() {
-            return Ok(Vec::new());
-        }
+        let entries = match std::fs::read_dir(&resolved) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(Error::IoError(format!(
+                    "Failed to list {}: {}",
+                    resolved.display(),
+                    err
+                )));
+            }
+        };
         let mut items = Vec::new();
-        for entry in std::fs::read_dir(&resolved)
-            .map_err(|e| Error::IoError(format!("Failed to list {}: {}", resolved.display(), e)))?
-        {
+        for entry in entries {
             let entry = entry.map_err(|e| {
                 Error::IoError(format!(
                     "Failed to read entry in {}: {}",

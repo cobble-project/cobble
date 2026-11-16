@@ -11,8 +11,8 @@ use crate::lsm::LSMTree;
 use crate::metrics_manager::MetricsManager;
 use crate::paths::{schema_file_relative_path, snapshot_manifest_relative_path};
 use crate::rescale_protocol::{
-    ExportLease, IMPORT_RECORD_DIR, ImportEnd, ImportStart, export_lease_name, has_import_starts,
-    import_end_name, import_start_name, load_import_end, load_import_starts, write_export_lease,
+    ExportLease, ImportEnd, ImportStart, export_lease_name, has_import_starts, import_start_name,
+    load_import_end, load_import_starts, snapshot_source_file_manager, write_export_lease,
     write_import_end, write_import_start,
 };
 use crate::schema::collect_schema_ids_from_manifest;
@@ -21,7 +21,7 @@ use crate::snapshot::{
     build_truncation_cursors_from_manifest, build_vlog_version_from_manifest,
     list_snapshot_manifest_ids, load_manifest_entry,
 };
-use crate::storage_url::{match_storage_path, normalize_storage_path_to_url};
+use crate::storage_url::normalize_storage_path_to_url;
 use crate::util::{
     normalize_bucket_ranges, range_is_covered_by_ranges, ranges_overlap, subtract_range_by_cuts,
     subtract_ranges,
@@ -126,83 +126,6 @@ impl SnapshotImport {
     }
 }
 
-pub(super) fn snapshot_source_file_manager(
-    config: &crate::Config,
-    source_db_id: &str,
-    manifest_path: &str,
-) -> Result<(Arc<FileManager>, u64)> {
-    let location = if manifest_path.trim().contains("://") {
-        manifest_path.trim().to_string()
-    } else {
-        normalize_storage_path_to_url(manifest_path)?
-    };
-    let mut root = url::Url::parse(&location)?;
-    if !root.username().is_empty() || root.password().is_some() || root.fragment().is_some() {
-        return Err(Error::ConfigError(
-            "Source manifest location must not contain credentials or fragments".into(),
-        ));
-    }
-    let segments = root
-        .path_segments()
-        .ok_or_else(|| Error::ConfigError("Source manifest location has no path".into()))?
-        .collect::<Vec<_>>();
-    let snapshot_id = segments
-        .last()
-        .and_then(|name| name.strip_prefix("SNAPSHOT-"))
-        .and_then(|id| id.parse::<u64>().ok())
-        .ok_or_else(|| {
-            Error::ConfigError("Source manifest location must name a snapshot".into())
-        })?;
-    if segments.last().copied() != Some(format!("SNAPSHOT-{snapshot_id}").as_str()) {
-        return Err(Error::ConfigError(
-            "Source manifest location must use a canonical snapshot name".into(),
-        ));
-    }
-    if segments.len() < 3
-        || segments[segments.len() - 2] != "snapshot"
-        || segments[segments.len() - 3] != source_db_id
-    {
-        return Err(Error::ConfigError(
-            "Source manifest location does not match the source DB".into(),
-        ));
-    }
-    root.path_segments_mut()
-        .map_err(|_| Error::ConfigError("Invalid source manifest location".into()))?
-        .pop()
-        .pop()
-        .pop();
-    let source_path = root.path().trim_end_matches('/').to_string();
-    root.set_path(&source_path);
-    let source_root = root.as_str();
-    let bases = config
-        .volumes
-        .iter()
-        .map(|volume| normalize_storage_path_to_url(&volume.base_dir))
-        .collect::<Result<Vec<_>>>()?;
-    let mut source_volume =
-        match_storage_path(source_root, bases.iter().map(String::as_str).enumerate())?
-            .filter(|(_, relative)| relative.is_empty())
-            .map(|(index, _)| config.volumes[index].clone())
-            .ok_or_else(|| {
-                Error::ConfigError(format!(
-                    "Source metadata volume is not configured: {source_root}"
-                ))
-            })?;
-    source_volume.kinds = 0;
-    source_volume.set_usage(crate::VolumeUsageKind::Meta);
-    source_volume.set_usage(crate::VolumeUsageKind::Snapshot);
-    // The first metadata route selects the source's snapshot/lease root. Preserve the other
-    // configured routes for absolute file reads and FileManager's primary-storage invariant.
-    let mut source_config = config.clone();
-    source_config.volumes.insert(0, source_volume);
-    let manager = FileManager::from_config_readonly(
-        &source_config,
-        source_db_id,
-        Arc::new(MetricsManager::new(format!("{source_db_id}-expand-source"))),
-    )?;
-    Ok((Arc::new(manager), snapshot_id))
-}
-
 struct RuntimePublicationSuspension {
     publisher: Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
     owner: String,
@@ -261,72 +184,34 @@ fn copy_db_state(state: &DbState) -> DbState {
 
 pub(crate) struct AdoptionCoordinator {
     db_id: String,
-    config: crate::Config,
     file_manager: Arc<FileManager>,
-    lsm_tree: Arc<crate::lsm::LSMTree>,
     db_state: Arc<crate::db_state::DbStateHandle>,
     db_lifecycle: Arc<crate::db_status::DbLifecycle>,
     memtable_manager: Arc<crate::memtable::MemtableManager>,
     snapshot_manager: crate::snapshot::SnapshotManager,
-    runtime_manifest_publisher:
-        Option<Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>>,
     finalizing: AtomicBool,
     ready: AtomicBool,
 }
 
 impl AdoptionCoordinator {
     pub(crate) fn new(
-        target: (String, crate::Config),
-        storage: (Arc<FileManager>, Arc<crate::lsm::LSMTree>),
+        db_id: String,
+        file_manager: Arc<FileManager>,
         db_state: Arc<crate::db_state::DbStateHandle>,
         db_lifecycle: Arc<crate::db_status::DbLifecycle>,
         memtable_manager: Arc<crate::memtable::MemtableManager>,
         snapshot_manager: crate::snapshot::SnapshotManager,
-        runtime_manifest_publisher: Option<
-            Arc<crate::runtime_manifest::publisher::RuntimeManifestPublisherHandle>,
-        >,
     ) -> Self {
-        let (db_id, config) = target;
-        let (file_manager, lsm_tree) = storage;
         Self {
             db_id,
-            config,
             file_manager,
-            lsm_tree,
             db_state,
             db_lifecycle,
             memtable_manager,
             snapshot_manager,
-            runtime_manifest_publisher,
             finalizing: AtomicBool::new(false),
             ready: AtomicBool::new(false),
         }
-    }
-
-    fn current_leased_file_ids(&self) -> Vec<u64> {
-        let state = self.db_state.load();
-        state
-            .multi_lsm_version
-            .tree_versions_cloned()
-            .iter()
-            .flat_map(|tree| tree.levels.iter())
-            .flat_map(|level| level.files.iter())
-            .map(|file| file.file_id)
-            .chain(
-                state
-                    .vlog_version
-                    .tracked_files()
-                    .into_iter()
-                    .map(|file| file.file_id()),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|file_id| {
-                self.file_manager
-                    .preferred_replica_origin(*file_id)
-                    .is_some_and(|origin| matches!(origin, ReplicaOrigin::ExternalLeased { .. }))
-            })
-            .collect()
     }
 
     pub(crate) fn tick(self: &Arc<Self>) -> Result<()> {
@@ -353,7 +238,6 @@ impl AdoptionCoordinator {
     fn tick_once(self: &Arc<Self>) -> Result<bool> {
         let _access = self.db_lifecycle.begin_owned_access()?;
         let records = load_import_starts(&self.file_manager)?;
-        self.cleanup_orphan_ends()?;
         if records
             .iter()
             .any(|record| record.target_db_id != self.db_id)
@@ -366,21 +250,20 @@ impl AdoptionCoordinator {
             return Ok(false);
         }
         let mut pending = Vec::new();
-        let mut completed = Vec::new();
         for record in records {
-            if load_import_end(&self.file_manager, &record.export_id)?.is_some() {
-                completed.push(record);
-            } else {
+            if load_import_end(&self.file_manager, &record.export_id)?.is_none() {
                 pending.push(record);
             }
         }
-        self.finish_adoption(&completed)?;
         if pending.is_empty() {
             return Ok(false);
         }
         self.file_manager
             .schedule_referenced_adoptions(&self.db_state)?;
-        if !self.current_leased_file_ids().is_empty()
+        if !self
+            .file_manager
+            .referenced_import_leases(&self.db_state)
+            .is_empty()
             || self
                 .file_manager
                 .has_referenced_adoption_jobs(&self.db_state)
@@ -420,69 +303,13 @@ impl AdoptionCoordinator {
                 },
             )?;
         }
-        self.finish_adoption(records)
-    }
-
-    /// Callers pass only records whose immutable END has already been published.
-    fn finish_adoption(&self, records: &[ImportStart]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        if let Some(publisher) = &self.runtime_manifest_publisher {
-            publisher.publish_at_least(self.db_state.load().seq_id)?;
-        }
-        if self.lsm_tree.has_pending_compactions()
-            || crate::compaction::dedicated::has_active_dedicated_compaction(&self.file_manager)?
-        {
-            return Ok(());
-        }
-        for record in records {
-            if let Some(import_snapshot_id) = record.import_snapshot_id
-                && !self.snapshot_manager.is_retained(import_snapshot_id)
-            {
-                let _ = self.snapshot_manager.expire_snapshot(import_snapshot_id)?;
-            }
-            if self
-                .snapshot_manager
-                .has_live_external_lease(&record.export_id)
-            {
-                continue;
-            }
-            let (source, _) = snapshot_source_file_manager(
-                &self.config,
-                &record.source_db_id,
-                &record.source_manifest_path,
-            )?;
-            source.remove_metadata_file(&export_lease_name(&record.export_id))?;
-            self.file_manager
-                .remove_metadata_file(&import_start_name(&record.export_id))?;
-            self.file_manager
-                .remove_metadata_file(&import_end_name(&record.export_id))?;
-        }
+        // Snapshot retention owns lease release; this task only publishes the
+        // independent recovery point and its durable completion record.
         Ok(())
     }
 
     pub(crate) fn is_complete(&self) -> Result<bool> {
         Ok(!self.finalizing.load(Ordering::Acquire) && !has_import_starts(&self.file_manager)?)
-    }
-
-    fn cleanup_orphan_ends(&self) -> Result<()> {
-        for name in self.file_manager.list_metadata_names(IMPORT_RECORD_DIR)? {
-            let Some(export_id) = name
-                .strip_prefix("IMPORT-")
-                .and_then(|name| name.strip_suffix(".END"))
-            else {
-                continue;
-            };
-            if !self
-                .file_manager
-                .metadata_file_exists_untracked(&import_start_name(export_id))?
-            {
-                self.file_manager
-                    .remove_metadata_file(&format!("{IMPORT_RECORD_DIR}/{name}"))?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -971,6 +798,9 @@ impl Db {
                 )?;
             let mut start_import = |import_snapshot_id| {
                 if let Some(export_id) = &export_id {
+                    // Activate before publication in case the START write fails after persisting
+                    // the record. The worker cannot scan it until exclusive cutover ends.
+                    self.snapshot_manager.activate_import_cleanup();
                     write_import_start(
                         &self.file_manager,
                         &ImportStart {

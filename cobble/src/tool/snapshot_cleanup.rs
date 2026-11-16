@@ -23,6 +23,7 @@ use crate::{Config, Error, Result, VolumeDescriptor};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+mod leases;
 mod protection;
 pub use protection::{PreservedSnapshot, SnapshotPreservationReason};
 
@@ -107,6 +108,9 @@ pub struct SnapshotCleanupResult {
 /// use global cleanup when those references must participate in the decision.
 /// This is offline maintenance: callers must exclude concurrent readers, writers, compactors,
 /// restore/import operations, and snapshot or export-lease publication for the affected storage.
+/// After removal, surviving snapshots govern upstream import leases. An import no
+/// longer referenced by any surviving snapshot is discarded, even if its data copy
+/// never finished. Supply routes for its source metadata; release errors are retryable.
 pub fn cleanup_shard_snapshot(
     metadata_volume: &VolumeDescriptor,
     other_volumes: &[VolumeDescriptor],
@@ -151,6 +155,8 @@ pub fn cleanup_shard_snapshot(
 /// Export leases protect their source snapshots and incremental bases. A blocked global is
 /// retained with its shard inventory unless the protected shard has an exact reference from
 /// an unselected global. Partial preservation is reported as success, not an error.
+/// Selected shards use the same upstream import-lease reclamation as shard cleanup.
+/// Global manifests retain the retry inventory until those releases have succeeded.
 /// This is offline maintenance: callers must exclude concurrent readers, writers, compactors,
 /// restore/import operations, and snapshot or export-lease publication for the affected storage.
 pub fn cleanup_global_snapshot(
@@ -570,6 +576,15 @@ impl CleanupScope {
             &removed_globals,
         )?;
         Ok(CleanupPlan {
+            lease_shards: self
+                .shards
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    self.globals.is_none() || self.selected.iter().any(|(shard, _)| shard == index)
+                })
+                .map(|(_, shard)| (shard.db_id.clone(), shard.directory.clone()))
+                .collect(),
             files: deletions,
             shard_manifests: manifests.into_iter().map(|(_, key)| key).collect(),
             global_manifests: removed_globals
@@ -654,6 +669,7 @@ impl CleanupScope {
 
 /// Fully validated, metadata-only analysis. Only execute performs storage mutations.
 struct CleanupPlan {
+    lease_shards: Vec<(String, FileKey)>,
     files: BTreeSet<FileKey>,
     shard_manifests: Vec<FileKey>,
     global_manifests: Vec<FileKey>,
@@ -670,11 +686,14 @@ impl CleanupPlan {
         for key in self.shard_manifests {
             self.result.deleted_shard_snapshots += usize::from(storage.delete(&key)?);
         }
-        for key in self.global_manifests {
-            self.result.deleted_global_snapshots += usize::from(storage.delete(&key)?);
-        }
         for key in self.pointers {
             atomic_replace::delete(storage.fs(&key), &key.path)?;
+        }
+        // Keep the global shard inventory until upstream releases succeed, so a
+        // retry can find import records even after the last shard manifest is gone.
+        leases::reclaim(storage, self.lease_shards)?;
+        for key in self.global_manifests {
+            self.result.deleted_global_snapshots += usize::from(storage.delete(&key)?);
         }
         Ok(self.result)
     }

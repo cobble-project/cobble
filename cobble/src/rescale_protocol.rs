@@ -2,6 +2,9 @@ use crate::error::{Error, Result};
 use crate::file::{FileManager, ReadAllFile};
 use std::ops::RangeInclusive;
 
+mod source;
+pub(crate) use source::snapshot_source_file_manager;
+
 pub(crate) const EXPORT_LEASE_DIR: &str = "exports";
 pub(crate) const IMPORT_RECORD_DIR: &str = "imports";
 
@@ -42,12 +45,36 @@ pub(crate) struct ImportStart {
     pub(crate) import_snapshot_id: Option<u64>,
 }
 
+impl ImportStart {
+    pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<Self> {
+        let record: Self = serde_json::from_slice(bytes)
+            .map_err(|err| Error::InvalidState(format!("decode import record {name}: {err}")))?;
+        if record.version != 1 || name != format!("IMPORT-{}.START", record.export_id) {
+            return Err(Error::InvalidState(format!("invalid import START {name}")));
+        }
+        Ok(record)
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) struct ImportEnd {
     pub(crate) version: u32,
     pub(crate) export_id: String,
     /// Published only after this owned-only snapshot has materialized successfully.
     pub(crate) snapshot_id: u64,
+}
+
+impl ImportEnd {
+    pub(crate) fn decode(export_id: &str, bytes: &[u8]) -> Result<Self> {
+        let record: Self = serde_json::from_slice(bytes)
+            .map_err(|err| Error::InvalidState(format!("decode import END {export_id}: {err}")))?;
+        if record.version != 1 || record.export_id != export_id {
+            return Err(Error::InvalidState(format!(
+                "invalid import END {export_id}"
+            )));
+        }
+        Ok(record)
+    }
 }
 
 pub(crate) fn export_lease_name(export_id: &str) -> String {
@@ -126,14 +153,7 @@ pub(crate) fn load_import_starts(file_manager: &FileManager) -> Result<Vec<Impor
         .map(|name| {
             let reader = file_manager
                 .open_metadata_file_reader_untracked(&format!("{IMPORT_RECORD_DIR}/{name}"))?;
-            let record: ImportStart =
-                serde_json::from_slice(reader.read_all()?.as_ref()).map_err(|err| {
-                    Error::InvalidState(format!("decode import record {name}: {err}"))
-                })?;
-            if record.version != 1 || name != format!("IMPORT-{}.START", record.export_id) {
-                return Err(Error::InvalidState(format!("invalid import START {name}")));
-            }
-            Ok(record)
+            ImportStart::decode(&name, reader.read_all()?.as_ref())
         })
         .collect()
 }
@@ -147,12 +167,7 @@ pub(crate) fn load_import_end(
         return Ok(None);
     }
     let reader = file_manager.open_metadata_file_reader_untracked(&name)?;
-    let record: ImportEnd = serde_json::from_slice(reader.read_all()?.as_ref())
-        .map_err(|err| Error::InvalidState(format!("decode import END {name}: {err}")))?;
-    if record.version != 1 || record.export_id != export_id {
-        return Err(Error::InvalidState(format!("invalid import END {name}")));
-    }
-    Ok(Some(record))
+    ImportEnd::decode(export_id, reader.read_all()?.as_ref()).map(Some)
 }
 
 pub(crate) fn has_import_starts(file_manager: &FileManager) -> Result<bool> {

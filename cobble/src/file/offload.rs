@@ -512,6 +512,10 @@ impl PrimaryTieringWorkerHandle {
         self.wake.notify_one();
     }
 
+    pub(crate) fn wake_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.wake)
+    }
+
     pub(crate) fn join(&self) {
         let (lock, condvar) = self.finished.as_ref();
         let guard = lock.lock().unwrap();
@@ -2041,6 +2045,21 @@ impl FileManager {
         referenced_primary_file_priorities(db_state)
             .into_keys()
             .any(|file_id| self.offload_runtime.is_adoption_job(file_id))
+    }
+
+    /// Current file-route dependencies, shared by adoption progress and snapshot
+    /// retention. Historical snapshot dependencies are tracked separately.
+    pub(crate) fn referenced_import_leases(
+        &self,
+        db_state: &DbStateHandle,
+    ) -> std::collections::BTreeSet<String> {
+        referenced_primary_file_priorities(db_state)
+            .into_keys()
+            .filter_map(|file_id| match self.preferred_replica_origin(file_id) {
+                Some(ReplicaOrigin::ExternalLeased { export_id }) => Some(export_id),
+                _ => None,
+            })
+            .collect()
     }
 
     fn move_file_to_primary_volume_with_progress(

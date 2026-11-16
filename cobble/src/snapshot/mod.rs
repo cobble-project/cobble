@@ -1,4 +1,6 @@
 //! Snapshot manager and manifest encoding for LSM state.
+pub(crate) mod lease;
+mod lease_runtime;
 mod manager;
 pub(crate) mod manifest;
 mod memtable;

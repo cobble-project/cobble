@@ -2911,15 +2911,20 @@ impl FileManager {
     /// in-memory `metadata_files` index, so it works across processes (e.g. a writer
     /// discovering result files published by a separate compactor process).
     pub fn list_metadata_names(&self, relative_dir: &str) -> Result<Vec<String>> {
-        let dir = if self.options.base_dir.is_empty() {
-            relative_dir.to_string()
-        } else {
-            format!("{}/{}", self.options.base_dir, relative_dir)
-        };
-        // Ensure the directory exists; list on a missing dir is treated as empty.
-        match self.meta_volume.fs().list(&dir) {
+        let dir = self.metadata_file_path(relative_dir);
+        let fs = self.meta_volume.fs();
+        match fs.list(&dir) {
             Ok(names) => Ok(names),
-            Err(Error::IoError(_)) => Ok(Vec::new()),
+            Err(err @ Error::IoError(_)) => {
+                // A missing directory is empty, but a failed scan must not be
+                // mistaken for an empty inventory by the adoption poll.
+                let dir = format!("{}/", dir.trim_end_matches('/'));
+                if fs.exists(&dir)? {
+                    Err(err)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
             Err(err) => Err(err),
         }
     }

@@ -66,9 +66,10 @@ type SnapshotSourceFile = (
 type SnapshotReplica = (Arc<TrackedFile>, ReplicaOrigin);
 
 pub(crate) struct SnapshotManager {
-    file_manager: Arc<FileManager>,
+    pub(super) file_manager: Arc<FileManager>,
     schema_manager: Arc<SchemaManager>,
-    db_lifecycle: Arc<DbLifecycle>,
+    pub(super) db_lifecycle: Arc<DbLifecycle>,
+    pub(super) import_cleanup: Arc<std::sync::OnceLock<super::lease_runtime::RuntimeLeaseCleanup>>,
     bucket_ranges: Arc<RwLock<Vec<RangeInclusive<u16>>>>,
     state: Arc<Mutex<SnapshotManagerState>>,
     retention: Option<usize>,
@@ -88,6 +89,7 @@ impl Clone for SnapshotManager {
             file_manager: Arc::clone(&self.file_manager),
             schema_manager: Arc::clone(&self.schema_manager),
             db_lifecycle: Arc::clone(&self.db_lifecycle),
+            import_cleanup: Arc::clone(&self.import_cleanup),
             bucket_ranges: Arc::clone(&self.bucket_ranges),
             state: Arc::clone(&self.state),
             retention: self.retention,
@@ -414,6 +416,7 @@ impl SnapshotManager {
             file_manager,
             schema_manager,
             db_lifecycle,
+            import_cleanup: Arc::new(std::sync::OnceLock::new()),
             bucket_ranges: Arc::new(RwLock::new(bucket_ranges)),
             state: Arc::new(Mutex::new(SnapshotManagerState {
                 next_id: 0,
@@ -747,12 +750,22 @@ impl SnapshotManager {
         }
     }
 
-    pub(crate) fn has_live_external_lease(&self, export_id: &str) -> bool {
-        self.state.lock().unwrap().snapshots.values().any(|snapshot| {
-            snapshot.replica_origins.values().any(|origin| {
-                matches!(origin, ReplicaOrigin::ExternalLeased { export_id: current } if current == export_id)
+    pub(super) fn snapshot_lease_references(&self) -> BTreeSet<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .snapshots
+            .values()
+            .flat_map(|snapshot| {
+                snapshot
+                    .replica_origins
+                    .values()
+                    .filter_map(|origin| match origin {
+                        ReplicaOrigin::ExternalLeased { export_id } => Some(export_id.clone()),
+                        _ => None,
+                    })
             })
-        })
+            .collect()
     }
 
     pub(crate) fn is_retained(&self, id: u64) -> bool {
@@ -1327,6 +1340,7 @@ impl SnapshotManager {
         removed_snapshots: Vec<Arc<DbSnapshot>>,
         live_active_data_paths: HashSet<String>,
     ) -> Result<()> {
+        let removed_any = !removed_snapshots.is_empty();
         let cleanup_online_schemas = removed_snapshots
             .iter()
             .any(|snapshot| !snapshot.independent);
@@ -1354,6 +1368,10 @@ impl SnapshotManager {
         // schemas may not belong to any online snapshot yet and must survive export completion.
         if cleanup_online_schemas {
             self.cleanup_expired_schema_files()?;
+        }
+        // Upstream storage must not delay snapshot completion or change a successful expiration.
+        if removed_any {
+            self.request_import_cleanup();
         }
         Ok(())
     }

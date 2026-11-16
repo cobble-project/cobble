@@ -428,6 +428,7 @@ impl Db {
             return Err(err);
         }
         db.adoption_coordinator.enable();
+        db.snapshot_manager.enable_import_cleanup();
         db.start_dedicated_poller();
         Ok(db)
     }
@@ -901,6 +902,7 @@ impl Db {
         }
         db.db_lifecycle.mark_open()?;
         db.adoption_coordinator.enable();
+        db.snapshot_manager.enable_import_cleanup();
         db.start_dedicated_poller();
         Ok(db)
     }
