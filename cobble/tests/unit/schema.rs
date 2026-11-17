@@ -1,3 +1,5 @@
+use super::evolution::ColumnEvolutionFile;
+use super::manager::schema_file_from_payload;
 use super::*;
 use crate::merge_operator::{MergeOperator, U32CounterMergeOperator};
 use crate::row_merge::{SchemaMergePlan, SchemaValue, merge_schema_values};
