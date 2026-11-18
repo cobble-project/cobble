@@ -1,4 +1,4 @@
-use super::file_manager::{FileId, PhysicalDeletePolicy};
+use super::tracked_file::{FileId, PhysicalDeletePolicy};
 use crate::Error;
 use crate::config::PrimaryVolumeOffloadPolicyKind;
 use crate::data_file::{DataFile, DataFileType};

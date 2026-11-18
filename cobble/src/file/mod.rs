@@ -13,19 +13,17 @@ mod opendal_file;
 mod opendal_fs;
 #[cfg(unix)]
 mod posix_fs;
+mod tracked_file;
+mod volume;
 #[cfg(windows)]
 mod windows_fs;
 
-pub(crate) use self::file_manager::DataVolume;
+pub use self::file_manager::FileManager;
 pub(crate) use self::file_manager::FileManagerMetrics;
-pub(crate) use self::file_manager::PrimaryDataPlacement;
 pub(crate) use self::file_manager::RestoreCopyResourceRegistry;
 pub(crate) use self::file_manager::SnapshotCopyResourceRegistry;
-pub(crate) use self::file_manager::VLOG_FILE_PRIORITY;
-pub(crate) use self::file_manager::lsm_file_priority_for_level;
 #[cfg(test)]
 pub(crate) use self::file_manager::test_utils;
-pub use self::file_manager::{FileId, FileManager, TrackedFile, TrackedFileId, TrackedWriter};
 pub use self::file_system::{
     FastCopyDestination, FileSystem, FileSystemRegistry, ProcessFileSystemRegistry,
     ProcessFileSystemRequest, clear_process_custom_file_system_registry,
@@ -40,3 +38,6 @@ pub(crate) use self::metadata_io::{MetadataReader, MetadataWriter};
 pub(crate) use self::offload::{
     PrimaryOffloadFileRef, PrimaryTieringWorkerHandle, compare_primary_offload_file_refs,
 };
+pub use self::tracked_file::{FileId, TrackedFile, TrackedFileId, TrackedWriter};
+pub(crate) use self::tracked_file::{VLOG_FILE_PRIORITY, lsm_file_priority_for_level};
+pub(crate) use self::volume::{DataVolume, PrimaryDataPlacement};
